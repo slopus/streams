@@ -306,3 +306,4 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for acceptance criteria per phase.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — storage, WAL, group commit, segments,
   recovery, scheduler, concurrency, crate choices, latency budget.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build phases, acceptance criteria, benchmark plan.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — recorded Phase-2/3 in-memory baseline numbers (hardware, methodology, every applicable benchmark-plan metric).

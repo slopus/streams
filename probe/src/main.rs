@@ -1,0 +1,1841 @@
+//! streams-probe — a standalone black-box tool that runs against a LIVE
+//! streams server over HTTP (Phase-3 §4).
+//!
+//! Two subcommands:
+//!   - `conformance <base_url>`: asserts the documented `/v0` contract for every
+//!     endpoint + the semantic flows; exits NONZERO on any mismatch and prints a
+//!     clear pass/fail report.
+//!   - `bench <base_url>`: end-to-end HTTP benchmarks against the live server
+//!     (write-ack latency p50/p99/p999, write throughput, getDifference
+//!     throughput/latency, SSE fan-out write->deliver latency with 1/10/100
+//!     watchers, router forwarding overhead). Prints numbers and, with `--json`,
+//!     a machine-readable summary for BENCHMARKS.md.
+//!
+//! The crate is deliberately black-box: it does NOT depend on the `streams`
+//! crate — only its public HTTP contract.
+
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use argh::FromArgs;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+
+/// streams-probe: black-box conformance + benchmark tool for a live streams server.
+#[derive(FromArgs, Debug)]
+struct TopLevel {
+    #[argh(subcommand)]
+    cmd: Subcommand,
+}
+
+#[derive(FromArgs, Debug)]
+#[argh(subcommand)]
+enum Subcommand {
+    Conformance(ConformanceCmd),
+    Bench(BenchCmd),
+}
+
+/// Assert the documented /v0 contract against a live server.
+#[derive(FromArgs, Debug)]
+#[argh(subcommand, name = "conformance")]
+struct ConformanceCmd {
+    /// base URL of the live server, e.g. http://127.0.0.1:4000
+    #[argh(positional)]
+    base_url: String,
+
+    /// bearer token to send on every request (optional)
+    #[argh(option)]
+    token: Option<String>,
+}
+
+/// Run end-to-end HTTP benchmarks against a live server.
+#[derive(FromArgs, Debug)]
+#[argh(subcommand, name = "bench")]
+struct BenchCmd {
+    /// base URL of the live server, e.g. http://127.0.0.1:4000
+    #[argh(positional)]
+    base_url: String,
+
+    /// bearer token to send on every request (optional)
+    #[argh(option)]
+    token: Option<String>,
+
+    /// total write count for the write-latency/throughput phase (default 50000)
+    #[argh(option, default = "50_000")]
+    writes: u64,
+
+    /// comma-separated watcher counts for the SSE fan-out phase (default 1,10,100)
+    #[argh(option, default = "String::from(\"1,10,100\")")]
+    watchers: String,
+
+    /// emit a machine-readable JSON summary to stdout (for BENCHMARKS.md)
+    #[argh(switch)]
+    json: bool,
+}
+
+fn main() -> ExitCode {
+    let top: TopLevel = argh::from_env();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    match top.cmd {
+        Subcommand::Conformance(c) => rt.block_on(run_conformance(c)),
+        Subcommand::Bench(b) => rt.block_on(run_bench(b)),
+    }
+}
+
+// ===========================================================================
+// HTTP client wrapper
+// ===========================================================================
+
+/// A thin HTTP helper around `reqwest` that carries the base URL + optional
+/// bearer token and returns `(status, json_body)` for JSON endpoints.
+#[derive(Clone)]
+struct Client {
+    http: reqwest::Client,
+    base: String,
+    token: Option<String>,
+}
+
+/// A parsed HTTP response: status code + best-effort JSON body (`Value::Null`
+/// when the body is empty or not JSON).
+struct Resp {
+    status: u16,
+    body: Value,
+}
+
+impl Client {
+    fn new(base: &str, token: Option<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(256)
+            .tcp_nodelay(true)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("build reqwest client");
+        Client {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+            token,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base, path)
+    }
+
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => rb.header("authorization", format!("Bearer {t}")),
+            None => rb,
+        }
+    }
+
+    async fn send(&self, rb: reqwest::RequestBuilder) -> Result<Resp, String> {
+        let resp = self
+            .auth(rb)
+            .send()
+            .await
+            .map_err(|e| format!("request error: {e}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(|e| format!("body error: {e}"))?;
+        let body = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::Null)
+        };
+        Ok(Resp { status, body })
+    }
+
+    async fn get(&self, path: &str) -> Result<Resp, String> {
+        self.send(self.http.get(self.url(path))).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<Resp, String> {
+        self.send(self.http.delete(self.url(path))).await
+    }
+
+    async fn post(&self, path: &str, body: &Value) -> Result<Resp, String> {
+        self.send(
+            self.http
+                .post(self.url(path))
+                .header("content-type", "application/json")
+                .body(serde_json::to_vec(body).unwrap()),
+        )
+        .await
+    }
+
+    async fn put(&self, path: &str, body: &Value) -> Result<Resp, String> {
+        self.send(
+            self.http
+                .put(self.url(path))
+                .header("content-type", "application/json")
+                .body(serde_json::to_vec(body).unwrap()),
+        )
+        .await
+    }
+
+    /// POST with a raw (non-JSON) content type — used to exercise `415`.
+    async fn post_raw_ct(&self, path: &str, ct: &str, body: &str) -> Result<Resp, String> {
+        self.send(
+            self.http
+                .post(self.url(path))
+                .header("content-type", ct)
+                .body(body.to_string()),
+        )
+        .await
+    }
+
+    /// POST with no content-type header at all — also a `415` path.
+    async fn post_no_ct(&self, path: &str, body: &str) -> Result<Resp, String> {
+        self.send(self.http.post(self.url(path)).body(body.to_string()))
+            .await
+    }
+}
+
+// ===========================================================================
+// Conformance suite
+// ===========================================================================
+
+/// Accumulates per-check PASS/FAIL outcomes and renders a final report.
+struct Report {
+    passed: u64,
+    failed: u64,
+    lines: Vec<String>,
+}
+
+impl Report {
+    fn new() -> Self {
+        Report {
+            passed: 0,
+            failed: 0,
+            lines: Vec::new(),
+        }
+    }
+
+    /// Record a check: `ok` true ⇒ PASS, else FAIL with the detail message.
+    fn check(&mut self, name: &str, ok: bool, detail: impl FnOnce() -> String) {
+        if ok {
+            self.passed += 1;
+            self.lines.push(format!("  PASS  {name}"));
+        } else {
+            self.failed += 1;
+            self.lines.push(format!("  FAIL  {name}: {}", detail()));
+        }
+    }
+
+    fn status(&mut self, name: &str, r: &Result<Resp, String>, want: u16) {
+        match r {
+            Ok(resp) => self.check(name, resp.status == want, || {
+                format!("expected HTTP {want}, got {} (body {})", resp.status, resp.body)
+            }),
+            Err(e) => self.check(name, false, || format!("request failed: {e}")),
+        }
+    }
+
+    /// Assert status AND that the error envelope code matches.
+    fn error_code(&mut self, name: &str, r: &Result<Resp, String>, want_status: u16, want_code: &str) {
+        match r {
+            Ok(resp) => {
+                let code = resp.body.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str());
+                let ok = resp.status == want_status && code == Some(want_code);
+                self.check(name, ok, || {
+                    format!(
+                        "expected HTTP {want_status} code={want_code}, got HTTP {} code={code:?} (body {})",
+                        resp.status, resp.body
+                    )
+                });
+            }
+            Err(e) => self.check(name, false, || format!("request failed: {e}")),
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut s = String::new();
+        for l in &self.lines {
+            s.push('\n');
+            s.push_str(l);
+        }
+        s
+    }
+}
+
+/// Body `seqs` as a Vec<u64>.
+fn seqs_of(body: &Value) -> Vec<u64> {
+    body.get("seqs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+        .unwrap_or_default()
+}
+
+fn u64_of(body: &Value, key: &str) -> Option<u64> {
+    body.get(key).and_then(|v| v.as_u64())
+}
+
+fn bool_of(body: &Value, key: &str) -> Option<bool> {
+    body.get(key).and_then(|v| v.as_bool())
+}
+
+/// Record seqs present in a diff response body.
+fn diff_seqs(body: &Value) -> Vec<u64> {
+    body.get("records")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.get("$seq").and_then(|s| s.as_u64()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn run_conformance(cmd: ConformanceCmd) -> ExitCode {
+    let c = Client::new(&cmd.base_url, cmd.token.clone());
+    let mut rep = Report::new();
+
+    // Unique-ish namespace so repeated runs against a long-lived server don't
+    // collide on box names.
+    let ns = format!(
+        "probe{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() % 1_000_000_000)
+            .unwrap_or(0)
+    );
+
+    conformance_health(&c, &mut rep).await;
+    conformance_box_lifecycle(&c, &mut rep, &ns).await;
+    conformance_write_and_diff(&c, &mut rep, &ns).await;
+    conformance_idempotency(&c, &mut rep, &ns).await;
+    conformance_errors(&c, &mut rep, &ns).await;
+    conformance_deletion(&c, &mut rep, &ns).await;
+    conformance_cap_tombstone(&c, &mut rep, &ns).await;
+    conformance_node_loop(&c, &mut rep, &ns).await;
+    conformance_routers(&c, &mut rep, &ns).await;
+    conformance_sse(&c, &mut rep, &ns).await;
+    if cmd.token.is_some() {
+        conformance_auth(&cmd.base_url, &c, &mut rep, &ns).await;
+    }
+
+    // Best-effort cleanup of the boxes we created.
+    cleanup(&c, &ns).await;
+
+    println!("=== streams-probe conformance: {} ===", cmd.base_url);
+    print!("{}", rep.render());
+    println!(
+        "\n\n{} passed, {} failed ({} checks)",
+        rep.passed,
+        rep.failed,
+        rep.passed + rep.failed
+    );
+
+    if rep.failed == 0 {
+        println!("RESULT: PASS");
+        ExitCode::SUCCESS
+    } else {
+        println!("RESULT: FAIL");
+        ExitCode::FAILURE
+    }
+}
+
+async fn conformance_health(c: &Client, rep: &mut Report) {
+    let h = c.get("/v0/health").await;
+    rep.status("GET /v0/health -> 200", &h, 200);
+    if let Ok(r) = &h {
+        rep.check(
+            "health body has status=ok + version + uptime_ms",
+            r.body.get("status").and_then(|v| v.as_str()) == Some("ok")
+                && r.body.get("version").is_some()
+                && r.body.get("uptime_ms").is_some(),
+            || format!("body {}", r.body),
+        );
+    }
+
+    let hz = c.get("/healthz").await;
+    rep.status("GET /healthz alias -> 200", &hz, 200);
+
+    let ready = c.get("/v0/ready").await;
+    rep.status("GET /v0/ready -> 200", &ready, 200);
+    if let Ok(r) = &ready {
+        rep.check(
+            "ready body has status=ready + wal_replay_complete",
+            r.body.get("status").and_then(|v| v.as_str()) == Some("ready")
+                && r.body.get("wal_replay_complete").is_some(),
+            || format!("body {}", r.body),
+        );
+    }
+
+    let m = c.get("/v0/metrics").await;
+    rep.status("GET /v0/metrics -> 200", &m, 200);
+}
+
+async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
+    let b = format!("{ns}-life");
+    let path = format!("/v0/boxes/{b}");
+
+    // PUT create -> 201 created:true, config echoed with defaults merged.
+    let put = c
+        .put(&path, &json!({ "ttl_ms": 60000, "cap_records": 1000, "discard": "old" }))
+        .await;
+    rep.status("PUT /v0/boxes/:box create -> 201", &put, 201);
+    if let Ok(r) = &put {
+        rep.check(
+            "PUT create: created=true, box echoed, config merged",
+            bool_of(&r.body, "created") == Some(true)
+                && r.body.get("box").and_then(|v| v.as_str()) == Some(b.as_str())
+                && u64_of(r.body.get("config").unwrap_or(&Value::Null), "ttl_ms") == Some(60000)
+                && r.body
+                    .get("config")
+                    .and_then(|c| c.get("dedupe_node"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Identical PUT -> 200 created:false (idempotent).
+    let put2 = c
+        .put(&path, &json!({ "ttl_ms": 60000, "cap_records": 1000, "discard": "old" }))
+        .await;
+    rep.status("PUT identical -> 200 (idempotent)", &put2, 200);
+    if let Ok(r) = &put2 {
+        rep.check("PUT identical: created=false", bool_of(&r.body, "created") == Some(false), || {
+            format!("body {}", r.body)
+        });
+    }
+
+    // Changed PUT -> 200, config updated.
+    let put3 = c.put(&path, &json!({ "ttl_ms": 120000 })).await;
+    rep.status("PUT changed config -> 200", &put3, 200);
+
+    // GET state on a fresh (empty) box: head_seq=0, count=0.
+    let get = c.get(&path).await;
+    rep.status("GET /v0/boxes/:box state -> 200", &get, 200);
+    if let Ok(r) = &get {
+        rep.check(
+            "GET state: fresh box head_seq=0, count=0, next_seq=1, has effective_priority",
+            u64_of(&r.body, "head_seq") == Some(0)
+                && u64_of(&r.body, "count") == Some(0)
+                && u64_of(&r.body, "next_seq") == Some(1)
+                && r.body.get("effective_priority").is_some(),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // GET ?touch=false still 200.
+    let gett = c.get(&format!("{path}?touch=false")).await;
+    rep.status("GET /v0/boxes/:box?touch=false -> 200", &gett, 200);
+
+    // List boxes (with prefix) shows the box.
+    let list = c.get(&format!("/v0/boxes?prefix={ns}-life")).await;
+    rep.status("GET /v0/boxes?prefix -> 200", &list, 200);
+    if let Ok(r) = &list {
+        let found = r
+            .body
+            .get("boxes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|x| x.get("box").and_then(|v| v.as_str()) == Some(b.as_str())))
+            .unwrap_or(false);
+        rep.check("list boxes: created box present", found, || format!("body {}", r.body));
+    }
+
+    // GET missing box -> 404 box_not_found (no auto-create on state read).
+    let miss = c.get(&format!("/v0/boxes/{ns}-doesnotexist")).await;
+    rep.error_code("GET missing box -> 404 box_not_found", &miss, 404, "box_not_found");
+
+    // DELETE box -> 200 deleted:true.
+    let del = c.delete(&path).await;
+    rep.status("DELETE /v0/boxes/:box -> 200", &del, 200);
+    if let Ok(r) = &del {
+        rep.check("DELETE: deleted=true", bool_of(&r.body, "deleted") == Some(true), || {
+            format!("body {}", r.body)
+        });
+    }
+
+    // DELETE absent box -> 200 deleted:false (idempotent).
+    let del2 = c.delete(&path).await;
+    rep.status("DELETE absent box -> 200", &del2, 200);
+    if let Ok(r) = &del2 {
+        rep.check("DELETE absent: deleted=false", bool_of(&r.body, "deleted") == Some(false), || {
+            format!("body {}", r.body)
+        });
+    }
+
+    // if_empty on a non-empty box -> 409 box_not_empty.
+    let b2 = format!("{ns}-ifempty");
+    let _ = c.post(&format!("/v0/boxes/{b2}"), &json!({ "records": [{ "data": 1 }] })).await;
+    let ife = c.delete(&format!("/v0/boxes/{b2}?if_empty=true")).await;
+    rep.error_code("DELETE ?if_empty=true non-empty -> 409 box_not_empty", &ife, 409, "box_not_empty");
+}
+
+async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
+    let b = format!("{ns}-wd");
+    let path = format!("/v0/boxes/{b}");
+    let dpath = format!("{path}/diff");
+
+    // First write auto-creates -> 201 created:true, contiguous seqs from 1.
+    let w = c
+        .post(
+            &path,
+            &json!({ "records": [
+                { "data": { "n": 1 }, "tag": "t:1", "node": "wA", "meta": { "trace": "x" } },
+                { "data": { "n": 2 }, "tag": "t:2" }
+            ] }),
+        )
+        .await;
+    rep.status("POST first write -> 201 (auto-create)", &w, 201);
+    if let Ok(r) = &w {
+        let seqs = seqs_of(&r.body);
+        rep.check(
+            "write: created=true, contiguous seqs [1,2], first/last/head/count consistent",
+            bool_of(&r.body, "created") == Some(true)
+                && seqs == vec![1, 2]
+                && u64_of(&r.body, "first_seq") == Some(1)
+                && u64_of(&r.body, "last_seq") == Some(2)
+                && u64_of(&r.body, "head_seq") == Some(2)
+                && u64_of(&r.body, "count") == Some(2)
+                && bool_of(&r.body, "deduped") == Some(false),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Second write -> 200 created:false, seqs continue at 3.
+    let w2 = c.post(&path, &json!({ "records": [{ "data": { "n": 3 } }] })).await;
+    rep.status("POST second write -> 200", &w2, 200);
+    if let Ok(r) = &w2 {
+        rep.check(
+            "write 2: created=false, seq=3, head=3",
+            bool_of(&r.body, "created") == Some(false)
+                && seqs_of(&r.body) == vec![3]
+                && u64_of(&r.body, "head_seq") == Some(3),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Diff from 0 returns all three, caught_up, tombstone null, $tag omitted by default.
+    let d = c.post(&dpath, &json!({ "from_seq": 0 })).await;
+    rep.status("POST diff from 0 -> 200", &d, 200);
+    if let Ok(r) = &d {
+        let recs = r.body.get("records").and_then(|v| v.as_array());
+        let has_tag = recs
+            .map(|a| a.iter().any(|x| x.get("$tag").is_some()))
+            .unwrap_or(true);
+        let has_node = recs
+            .map(|a| a.iter().any(|x| x.get("$node").and_then(|v| v.as_str()) == Some("wA")))
+            .unwrap_or(false);
+        let has_meta = recs
+            .map(|a| a.first().map(|x| x.get("meta").is_some()).unwrap_or(false))
+            .unwrap_or(false);
+        rep.check(
+            "diff: seqs [1,2,3], caught_up, tombstone null, $tag omitted, $node + meta present",
+            diff_seqs(&r.body) == vec![1, 2, 3]
+                && bool_of(&r.body, "caught_up") == Some(true)
+                && r.body.get("tombstone") == Some(&Value::Null)
+                && u64_of(&r.body, "head_seq") == Some(3)
+                && u64_of(&r.body, "next_from_seq") == Some(3)
+                && !has_tag
+                && has_node
+                && has_meta,
+            || format!("body {}", r.body),
+        );
+    }
+
+    // include_tags=true surfaces $tag; include_meta=false drops meta.
+    let dt = c
+        .post(&dpath, &json!({ "from_seq": 0, "include_tags": true, "include_meta": false }))
+        .await;
+    if let Ok(r) = &dt {
+        let recs = r.body.get("records").and_then(|v| v.as_array());
+        let tag_ok = recs
+            .and_then(|a| a.first())
+            .and_then(|x| x.get("$tag"))
+            .and_then(|v| v.as_str())
+            == Some("t:1");
+        let no_meta = recs
+            .map(|a| a.iter().all(|x| x.get("meta").is_none()))
+            .unwrap_or(false);
+        rep.check("diff include_tags=true / include_meta=false honored", tag_ok && no_meta, || {
+            format!("body {}", r.body)
+        });
+    }
+
+    // Diff with limit clamps the batch; cursor advances.
+    let dl = c.post(&dpath, &json!({ "from_seq": 0, "limit": 2 })).await;
+    if let Ok(r) = &dl {
+        rep.check(
+            "diff limit=2 returns 2 records, next_from_seq=2, not caught_up",
+            diff_seqs(&r.body) == vec![1, 2]
+                && u64_of(&r.body, "next_from_seq") == Some(2)
+                && bool_of(&r.body, "caught_up") == Some(false)
+                && u64_of(&r.body, "lag") == Some(1),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Tail read from head: nothing new, caught_up.
+    let dtail = c.post(&dpath, &json!({ "from_seq": 3 })).await;
+    if let Ok(r) = &dtail {
+        rep.check(
+            "diff from head: 0 records, caught_up",
+            diff_seqs(&r.body).is_empty() && bool_of(&r.body, "caught_up") == Some(true),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // ?return_seqs=false suppresses seqs.
+    let wns = c
+        .post(&format!("{path}?return_seqs=false"), &json!({ "records": [{ "data": 9 }] }))
+        .await;
+    if let Ok(r) = &wns {
+        rep.check(
+            "write ?return_seqs=false: seqs omitted, first/last present",
+            r.body.get("seqs").is_none()
+                && u64_of(&r.body, "first_seq").is_some()
+                && u64_of(&r.body, "last_seq").is_some(),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // create:false on absent box -> 404 (NOMKSTREAM).
+    let nomk = c
+        .post(
+            &format!("/v0/boxes/{ns}-nomk"),
+            &json!({ "records": [{ "data": 1 }], "create": false }),
+        )
+        .await;
+    rep.error_code("write create:false on absent -> 404 box_not_found", &nomk, 404, "box_not_found");
+
+    // diff on absent box -> 404.
+    let dmiss = c.post(&format!("/v0/boxes/{ns}-nodiff/diff"), &json!({ "from_seq": 0 })).await;
+    rep.error_code("diff on absent box -> 404 box_not_found", &dmiss, 404, "box_not_found");
+}
+
+async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
+    let b = format!("{ns}-idem");
+    let path = format!("/v0/boxes/{b}");
+
+    let key = "probe-idem-1";
+    let w1 = c
+        .post(&path, &json!({ "records": [{ "data": "a" }, { "data": "b" }], "idempotency_key": key }))
+        .await;
+    let first_seqs = w1.as_ref().ok().map(|r| seqs_of(&r.body)).unwrap_or_default();
+    rep.check("idempotency: first write succeeded with seqs", !first_seqs.is_empty(), || {
+        format!("w1 {w1:?}", w1 = w1.as_ref().map(|r| r.body.clone()))
+    });
+
+    // Retry with the same key -> deduped:true, same seqs, no new append.
+    let w2 = c
+        .post(&path, &json!({ "records": [{ "data": "a" }, { "data": "b" }], "idempotency_key": key }))
+        .await;
+    if let Ok(r) = &w2 {
+        rep.check(
+            "idempotency: retry deduped=true, original seqs, no new append",
+            bool_of(&r.body, "deduped") == Some(true) && seqs_of(&r.body) == first_seqs,
+            || format!("body {}", r.body),
+        );
+    } else {
+        rep.check("idempotency retry request", false, || "request failed".into());
+    }
+
+    // Head must not have advanced: still 2 records.
+    let st = c.get(&path).await;
+    if let Ok(r) = &st {
+        rep.check("idempotency: head not advanced (count=2)", u64_of(&r.body, "count") == Some(2), || {
+            format!("body {}", r.body)
+        });
+    }
+
+    // Header-based idempotency key (body omits it) is honored.
+    let bh = format!("{ns}-idemhdr");
+    let hpath = format!("/v0/boxes/{bh}");
+    let _ = c
+        .send(
+            c.http
+                .post(c.url(&hpath))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "hdr-key-1")
+                .body(json!({ "records": [{ "data": 1 }] }).to_string()),
+        )
+        .await;
+    let hr2 = c
+        .send(
+            c.http
+                .post(c.url(&hpath))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "hdr-key-1")
+                .body(json!({ "records": [{ "data": 1 }] }).to_string()),
+        )
+        .await;
+    if let Ok(r) = &hr2 {
+        rep.check("idempotency via header: retry deduped=true", bool_of(&r.body, "deduped") == Some(true), || {
+            format!("body {}", r.body)
+        });
+    }
+}
+
+async fn conformance_errors(c: &Client, rep: &mut Report, ns: &str) {
+    let b = format!("{ns}-err");
+    let path = format!("/v0/boxes/{b}");
+
+    // 415: non-JSON content type on a write.
+    let r415 = c.post_raw_ct(&path, "text/plain", "{}").await;
+    rep.error_code("write wrong content-type -> 415", &r415, 415, "unsupported_media_type");
+
+    // 415: missing content type entirely.
+    let r415b = c.post_no_ct(&path, "{}").await;
+    rep.error_code("write missing content-type -> 415", &r415b, 415, "unsupported_media_type");
+
+    // 400: malformed JSON.
+    let r400 = c.post_raw_ct(&path, "application/json", "{bad json").await;
+    rep.error_code("write malformed JSON -> 400 invalid_request", &r400, 400, "invalid_request");
+
+    // 400: empty records array.
+    let rempty = c.post(&path, &json!({ "records": [] })).await;
+    rep.error_code("write empty records -> 400 invalid_request", &rempty, 400, "invalid_request");
+
+    // Error envelope shape: error.code + error.message present.
+    if let Ok(r) = &r400 {
+        let has_msg = r
+            .body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        rep.check("error envelope has error.code + error.message", has_msg, || format!("body {}", r.body));
+    }
+
+    // 405: wrong method for a path (PUT on /diff which only accepts POST -> 405).
+    let r405 = c.put(&format!("{path}/diff"), &json!({})).await;
+    rep.error_code("PUT on /diff (POST-only) -> 405 method_not_allowed", &r405, 405, "method_not_allowed");
+
+    // 404: unknown route under /v0.
+    let r404 = c.get("/v0/nonexistent/route").await;
+    rep.status("GET unknown /v0 route -> 404", &r404, 404);
+
+    // 400: invalid box name (PUT). A '.' leading char is invalid.
+    let rname = c.put("/v0/boxes/.bad", &json!({})).await;
+    rep.error_code("PUT invalid box name -> 400 invalid_request", &rname, 400, "invalid_request");
+
+    // 422: write to a full discard:"reject" box.
+    let rb = format!("{ns}-reject");
+    let _ = c
+        .put(&format!("/v0/boxes/{rb}"), &json!({ "cap_records": 1, "discard": "reject" }))
+        .await;
+    let _ = c.post(&format!("/v0/boxes/{rb}"), &json!({ "records": [{ "data": 1 }] })).await;
+    let full = c.post(&format!("/v0/boxes/{rb}"), &json!({ "records": [{ "data": 2 }] })).await;
+    rep.error_code("write to full discard:reject box -> 422 box_full", &full, 422, "box_full");
+}
+
+async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
+    // Snapshot delete (before_seq), silent, point-in-time + match flows.
+    let b = format!("{ns}-del");
+    let path = format!("/v0/boxes/{b}");
+    let dpath = format!("{path}/diff");
+    let delpath = format!("{path}/delete");
+
+    let _ = c
+        .post(
+            &path,
+            &json!({ "records": [
+                { "data": 1, "tag": "tenant:job-1" },
+                { "data": 2, "tag": "tenant:job-2" },
+                { "data": 3, "tag": "other:job-9" },
+                { "data": 4 },
+                { "data": 5, "tag": "tenant:job-5" }
+            ] }),
+        )
+        .await;
+
+    // before_seq snapshot delete of seqs < 3 (removes 1,2).
+    let snap = c.post(&delpath, &json!({ "before_seq": 3 })).await;
+    rep.status("POST delete before_seq -> 200", &snap, 200);
+    if let Ok(r) = &snap {
+        rep.check(
+            "delete before_seq: deleted=2, earliest_seq=3",
+            u64_of(&r.body, "deleted") == Some(2) && u64_of(&r.body, "earliest_seq") == Some(3),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Read across the purely-deleted prefix is SILENT (tombstone null), cursor advances.
+    let d = c.post(&dpath, &json!({ "from_seq": 0 })).await;
+    if let Ok(r) = &d {
+        rep.check(
+            "delete is silent: from 0 yields [3,4,5], tombstone null",
+            diff_seqs(&r.body) == vec![3, 4, 5] && r.body.get("tombstone") == Some(&Value::Null),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Tag exact match delete of tenant:job-5 (the bare-string shorthand).
+    let me = c.post(&delpath, &json!({ "match": "tenant:job-5" })).await;
+    if let Ok(r) = &me {
+        rep.check("delete match exact (shorthand): deleted=1", u64_of(&r.body, "deleted") == Some(1), || {
+            format!("body {}", r.body)
+        });
+    }
+
+    // Tag prefix glob delete of tenant:* — but only existing matching records (job-2 already deleted).
+    // Only seq 2 was tenant:* but it's gone; nothing left matches tenant:* now.
+    let mg = c.post(&delpath, &json!({ "match": ["tag", "Glob", "tenant:*"] })).await;
+    if let Ok(r) = &mg {
+        rep.check(
+            "delete match Glob tuple: deleted=0 (all tenant:* already gone)",
+            u64_of(&r.body, "deleted") == Some(0),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Point-in-time: a NEW record with a matching tag after a tag delete survives.
+    let b2 = format!("{ns}-pit");
+    let p2 = format!("/v0/boxes/{b2}");
+    let _ = c.post(&p2, &json!({ "records": [{ "data": 1, "tag": "a:1" }] })).await;
+    let _ = c.post(&format!("{p2}/delete"), &json!({ "match": ["tag", "Glob", "a:*"] })).await;
+    let _ = c.post(&p2, &json!({ "records": [{ "data": 2, "tag": "a:2" }] })).await;
+    let dp = c.post(&format!("{p2}/diff"), &json!({ "from_seq": 0 })).await;
+    if let Ok(r) = &dp {
+        rep.check(
+            "delete point-in-time: future matching record survives ([2])",
+            diff_seqs(&r.body) == vec![2] && r.body.get("tombstone") == Some(&Value::Null),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // delete with neither selector -> 400.
+    let dn = c.post(&delpath, &json!({})).await;
+    rep.error_code("delete with no selector -> 400 invalid_request", &dn, 400, "invalid_request");
+
+    // Glob without trailing '*' -> 400.
+    let dg = c.post(&delpath, &json!({ "match": ["tag", "Glob", "noasterisk"] })).await;
+    rep.error_code("delete Glob without trailing '*' -> 400", &dg, 400, "invalid_request");
+
+    // delete on absent box -> 404.
+    let da = c.post(&format!("/v0/boxes/{ns}-noxdel/delete"), &json!({ "before_seq": 1 })).await;
+    rep.error_code("delete on absent box -> 404 box_not_found", &da, 404, "box_not_found");
+}
+
+async fn conformance_cap_tombstone(c: &Client, rep: &mut Report, ns: &str) {
+    // Dual watermark: cap eviction still tombstones (reason=cap), while a delete
+    // is silent. We verify the cap-tombstone half here (TTL-correctness is in
+    // engine unit tests with TestClock; over HTTP we can deterministically force
+    // cap eviction via discard:"old").
+    let b = format!("{ns}-cap");
+    let path = format!("/v0/boxes/{b}");
+    let dpath = format!("{path}/diff");
+
+    let _ = c
+        .put(&path, &json!({ "cap_records": 3, "discard": "old" }))
+        .await;
+    // Write 6 records (seqs 1..=6); cap=3 ⇒ earliest advances to 4, evict_floor advances.
+    for i in 1..=6 {
+        let _ = c.post(&path, &json!({ "records": [{ "data": i }] })).await;
+    }
+    let st = c.get(&path).await;
+    if let Ok(r) = &st {
+        rep.check(
+            "cap: head_seq=6, count=3 after eviction",
+            u64_of(&r.body, "head_seq") == Some(6) && u64_of(&r.body, "count") == Some(3),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // A consumer at from_seq=0 fell below the involuntary floor -> tombstone reason=cap.
+    let d = c.post(&dpath, &json!({ "from_seq": 0 })).await;
+    if let Ok(r) = &d {
+        let t = r.body.get("tombstone");
+        let reason = t.and_then(|x| x.get("reason")).and_then(|v| v.as_str());
+        let gap_from = t.and_then(|x| x.get("gap_from")).and_then(|v| v.as_u64());
+        let earliest = u64_of(&r.body, "earliest_seq");
+        // After a tombstone, the delivered records resume at earliest_seq.
+        let resumes_at_earliest = diff_seqs(&r.body).first().copied() == earliest;
+        rep.check(
+            "cap eviction emits tombstone reason=cap, gap_from=1, records resume at earliest",
+            reason == Some("cap")
+                && gap_from == Some(1)
+                && resumes_at_earliest
+                && t.and_then(|x| x.get("earliest_seq")).and_then(|v| v.as_u64()) == earliest,
+            || format!("body {}", r.body),
+        );
+    }
+}
+
+async fn conformance_node_loop(c: &Client, rep: &mut Report, ns: &str) {
+    // A node never receives its own records via diff, but the cursor advances to
+    // caught_up (no infinite empty loop).
+    let b = format!("{ns}-node");
+    let path = format!("/v0/boxes/{b}");
+    let dpath = format!("{path}/diff");
+
+    let _ = c
+        .post(
+            &path,
+            &json!({ "records": [
+                { "data": 1, "node": "self" },
+                { "data": 2, "node": "other" },
+                { "data": 3, "node": "self" }
+            ] }),
+        )
+        .await;
+
+    // Reader presents node=self: drops 1 and 3, delivers only 2, but advances to head.
+    let d = c.post(&dpath, &json!({ "from_seq": 0, "node": "self" })).await;
+    if let Ok(r) = &d {
+        rep.check(
+            "node loop-prevention: own records skipped, only [2] delivered, caught_up at head",
+            diff_seqs(&r.body) == vec![2]
+                && bool_of(&r.body, "caught_up") == Some(true)
+                && u64_of(&r.body, "next_from_seq") == Some(3),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Multi-id node filter ["self","other"] drops all -> 0 records, caught_up.
+    let d2 = c.post(&dpath, &json!({ "from_seq": 0, "node": ["self", "other"] })).await;
+    if let Ok(r) = &d2 {
+        rep.check(
+            "node filter set: all dropped, 0 records, caught_up (cursor advanced past)",
+            diff_seqs(&r.body).is_empty()
+                && bool_of(&r.body, "caught_up") == Some(true)
+                && u64_of(&r.body, "next_from_seq") == Some(3),
+            || format!("body {}", r.body),
+        );
+    }
+}
+
+async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
+    let src = format!("{ns}-rsrc");
+    let dst = format!("{ns}-rdst");
+    let rname = format!("{ns}-r1");
+    let rpath = format!("/v0/routers/{rname}");
+
+    // PUT router -> 201, fields echoed.
+    let put = c
+        .put(&rpath, &json!({ "source": src, "dest": dst, "preserve_node": true, "preserve_tag": true }))
+        .await;
+    rep.status("PUT /v0/routers/:router create -> 201", &put, 201);
+    if let Ok(r) = &put {
+        rep.check(
+            "router create: created=true, source/dest echoed",
+            bool_of(&r.body, "created") == Some(true)
+                && r.body.get("source").and_then(|v| v.as_str()) == Some(src.as_str())
+                && r.body.get("dest").and_then(|v| v.as_str()) == Some(dst.as_str()),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Identical PUT -> 200 created:false.
+    let put2 = c.put(&rpath, &json!({ "source": src, "dest": dst })).await;
+    rep.status("PUT router identical -> 200", &put2, 200);
+
+    // Write to source: forwarded copy appears in dest with $node preserved + fresh seq.
+    let _ = c
+        .post(
+            &format!("/v0/boxes/{src}"),
+            &json!({ "records": [{ "data": { "k": "v" }, "node": "origin-1", "tag": "tag-1" }] }),
+        )
+        .await;
+    let dd = c
+        .post(&format!("/v0/boxes/{dst}/diff"), &json!({ "from_seq": 0, "include_tags": true }))
+        .await;
+    if let Ok(r) = &dd {
+        let recs = r.body.get("records").and_then(|v| v.as_array());
+        let node_ok = recs
+            .and_then(|a| a.first())
+            .and_then(|x| x.get("$node"))
+            .and_then(|v| v.as_str())
+            == Some("origin-1");
+        let tag_ok = recs
+            .and_then(|a| a.first())
+            .and_then(|x| x.get("$tag"))
+            .and_then(|v| v.as_str())
+            == Some("tag-1");
+        rep.check(
+            "router fan-out: record appears in dest with $node + $tag preserved",
+            recs.map(|a| a.len()).unwrap_or(0) == 1 && node_ok && tag_ok,
+            || format!("body {}", r.body),
+        );
+    }
+
+    // GET router.
+    let g = c.get(&rpath).await;
+    rep.status("GET /v0/routers/:router -> 200", &g, 200);
+    if let Ok(r) = &g {
+        rep.check(
+            "router get: forwarded_total >= 1",
+            u64_of(&r.body, "forwarded_total").map(|n| n >= 1).unwrap_or(false),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // GET missing router -> 404 router_not_found.
+    let gm = c.get(&format!("/v0/routers/{ns}-nope")).await;
+    rep.error_code("GET missing router -> 404 router_not_found", &gm, 404, "router_not_found");
+
+    // List routers (filtered by source).
+    let l = c.get(&format!("/v0/routers?source={src}")).await;
+    rep.status("GET /v0/routers?source -> 200", &l, 200);
+    if let Ok(r) = &l {
+        let found = r
+            .body
+            .get("routers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|x| x.get("router").and_then(|v| v.as_str()) == Some(rname.as_str())))
+            .unwrap_or(false);
+        rep.check("list routers: created router present", found, || format!("body {}", r.body));
+    }
+
+    // source == dest -> 400.
+    let sd = c.put(&format!("/v0/routers/{ns}-rsd"), &json!({ "source": src, "dest": src })).await;
+    rep.error_code("router source==dest -> 400 invalid_request", &sd, 400, "invalid_request");
+
+    // Cycle: create dst->src (closing src->dst) -> 409 router_cycle with detail.cycle.
+    let cyc = c
+        .put(&format!("/v0/routers/{ns}-rcyc"), &json!({ "source": dst, "dest": src }))
+        .await;
+    rep.error_code("router cycle -> 409 router_cycle", &cyc, 409, "router_cycle");
+    if let Ok(r) = &cyc {
+        let has_cycle = r
+            .body
+            .get("error")
+            .and_then(|e| e.get("detail"))
+            .and_then(|d| d.get("cycle"))
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        rep.check("router cycle: error.detail.cycle present", has_cycle, || format!("body {}", r.body));
+    }
+
+    // allow_cycle:true permits dst->src and terminates via hop cap (no error).
+    let ac = c
+        .put(
+            &format!("/v0/routers/{ns}-rcyc-ok"),
+            &json!({ "source": dst, "dest": src, "allow_cycle": true }),
+        )
+        .await;
+    rep.status("router allow_cycle:true -> 201/200 (permitted)", &ac, if matches!(ac.as_ref().map(|r| r.status), Ok(200)) { 200 } else { 201 });
+    // A write into the cycle must terminate (no hang) — the timeout on the client
+    // guards against an infinite loop; we just confirm the write returns.
+    let cyclic_write = c
+        .post(&format!("/v0/boxes/{src}"), &json!({ "records": [{ "data": "cycle", "node": "n9" }] }))
+        .await;
+    rep.status("write into allow_cycle topology terminates (returns 200)", &cyclic_write, 200);
+
+    // create_dest:false to a missing dest -> 404.
+    let cdf = c
+        .put(
+            &format!("/v0/routers/{ns}-rcdf"),
+            &json!({ "source": src, "dest": format!("{ns}-rmissing"), "create_dest": false }),
+        )
+        .await;
+    rep.error_code("router create_dest:false missing dest -> 404 box_not_found", &cdf, 404, "box_not_found");
+
+    // DELETE router -> 200 deleted:true; idempotent -> deleted:false.
+    let dr = c.delete(&rpath).await;
+    rep.status("DELETE /v0/routers/:router -> 200", &dr, 200);
+    if let Ok(r) = &dr {
+        rep.check("router delete: deleted=true", bool_of(&r.body, "deleted") == Some(true), || {
+            format!("body {}", r.body)
+        });
+    }
+    let dr2 = c.delete(&rpath).await;
+    if let Ok(r) = &dr2 {
+        rep.check("router delete idempotent: deleted=false", bool_of(&r.body, "deleted") == Some(false), || {
+            format!("body {}", r.body)
+        });
+    }
+}
+
+async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
+    let b = format!("{ns}-sse");
+    let path = format!("/v0/boxes/{b}");
+
+    // Seed a couple of records so the stream has backlog + a caught-up transition.
+    let _ = c
+        .post(&path, &json!({ "records": [{ "data": "r1", "tag": "x1" }, { "data": "r2" }] }))
+        .await;
+
+    // POST /v0/watch -> 200 with wid + stream_url + per-box head/earliest.
+    let watch = c
+        .post("/v0/watch", &json!({ "boxes": { b.clone(): { "from_seq": 0 } }, "include_tags": true }))
+        .await;
+    rep.status("POST /v0/watch -> 200", &watch, 200);
+    let stream_url = watch
+        .as_ref()
+        .ok()
+        .and_then(|r| r.body.get("stream_url").and_then(|v| v.as_str()).map(String::from));
+    if let Ok(r) = &watch {
+        rep.check(
+            "watch create: wid + stream_url + per-box head/earliest",
+            r.body.get("wid").is_some()
+                && stream_url.is_some()
+                && r.body
+                    .get("boxes")
+                    .and_then(|m| m.get(&b))
+                    .and_then(|s| s.get("head_seq"))
+                    .is_some(),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // POST /v0/watch missing boxes -> 400.
+    let wbad = c.post("/v0/watch", &json!({ "boxes": {} })).await;
+    rep.error_code("watch create empty boxes -> 400 invalid_request", &wbad, 400, "invalid_request");
+
+    // POST /v0/watch unknown box -> 404.
+    let wmiss = c.post("/v0/watch", &json!({ "boxes": { format!("{ns}-ssemiss"): {} } })).await;
+    rep.error_code("watch create unknown box -> 404 box_not_found", &wmiss, 404, "box_not_found");
+
+    let Some(stream_url) = stream_url else {
+        rep.check("SSE stream available", false, || "no stream_url from watch create".into());
+        return;
+    };
+
+    // GET the stream with a non-SSE Accept -> 406.
+    let na = c
+        .send(c.http.get(c.url(&stream_url)).header("accept", "application/json"))
+        .await;
+    rep.error_code("GET stream Accept!=event-stream -> 406 not_acceptable", &na, 406, "not_acceptable");
+
+    // GET an unknown wid -> 404.
+    let nf = c
+        .send(c.http.get(c.url("/v0/watch/wid_doesnotexist")).header("accept", "text/event-stream"))
+        .await;
+    rep.status("GET unknown wid -> 404", &nf, 404);
+
+    // Open the SSE stream and collect frames: expect a `record` frame for the
+    // backlog and a `caught-up` frame; then write a live record and observe a
+    // second `record` frame; then verify resume via Last-Event-ID.
+    let frames = collect_sse(c, &stream_url, None, 3, Duration::from_secs(5), || {
+        // Trigger a live append shortly after connecting so we see a live record.
+        Some(json!({ "records": [{ "data": "live", "tag": "x3" }] }))
+    }, &path)
+    .await;
+
+    let events: Vec<&str> = frames.iter().map(|f| f.event.as_str()).collect();
+    rep.check(
+        "SSE delivers a `record` frame for backlog",
+        frames.iter().any(|f| f.event == "record"),
+        || format!("events seen: {events:?}"),
+    );
+    rep.check(
+        "SSE delivers a `caught-up` frame",
+        frames.iter().any(|f| f.event == "caught-up"),
+        || format!("events seen: {events:?}"),
+    );
+    // The live write should appear as another record frame mentioning "live".
+    rep.check(
+        "SSE delivers the live-written record after caught-up",
+        frames.iter().any(|f| f.event == "record" && f.data.contains("live")),
+        || format!("events seen: {events:?}; datas: {:?}", frames.iter().map(|f| &f.data).collect::<Vec<_>>()),
+    );
+    // Frames carry composite `id:` cursors.
+    rep.check(
+        "SSE data frames carry an `id:` cursor",
+        frames.iter().filter(|f| f.event == "record").all(|f| !f.id.is_empty()),
+        || "a record frame had an empty id".into(),
+    );
+
+    // Resume: reconnect with Last-Event-ID set to the FIRST record frame's id
+    // (which encodes the cursor after the backlog). With that resume the server
+    // should NOT redeliver the backlog records before "live".
+    if let Some(first_rec_id) = frames.iter().find(|f| f.event == "record").map(|f| f.id.clone()) {
+        let resume_frames = collect_sse(
+            c,
+            &stream_url,
+            Some(&first_rec_id),
+            2,
+            Duration::from_secs(4),
+            || None,
+            &path,
+        )
+        .await;
+        // After resuming at the post-backlog cursor, the next record frame should
+        // be the live one (seq 3), not the backlog (seqs 1,2).
+        let redelivered_backlog = resume_frames
+            .iter()
+            .filter(|f| f.event == "record")
+            .any(|f| f.data.contains("\"$seq\":1") || f.data.contains("\"$seq\":2"));
+        rep.check(
+            "SSE resume via Last-Event-ID does not redeliver acked backlog",
+            !redelivered_backlog,
+            || format!("resume datas: {:?}", resume_frames.iter().map(|f| &f.data).collect::<Vec<_>>()),
+        );
+    }
+}
+
+/// Auth checks (only run when --token is supplied). They additionally require
+/// the SERVER to be started with that key (STREAMS_API_KEYS); otherwise auth is
+/// disabled server-side and the unauthorized check is skipped as inconclusive.
+async fn conformance_auth(base_url: &str, c: &Client, rep: &mut Report, ns: &str) {
+    // An anonymous client (no token) hitting a data endpoint should be 401 IF
+    // the server has auth enabled. We detect "auth enabled" by checking that the
+    // authed client works but the anon client is rejected.
+    let anon = Client::new(base_url, None);
+    let b = format!("{ns}-auth");
+    let path = format!("/v0/boxes/{b}");
+
+    // Authed write must succeed.
+    let authed = c.post(&path, &json!({ "records": [{ "data": 1 }] })).await;
+    rep.check(
+        "auth: request WITH valid token is accepted",
+        authed.as_ref().map(|r| r.status == 200 || r.status == 201).unwrap_or(false),
+        || format!("authed write: {:?}", authed.as_ref().map(|r| r.status)),
+    );
+
+    let anon_resp = anon.get(&path).await;
+    match &anon_resp {
+        Ok(r) if r.status == 401 => {
+            rep.error_code("auth: request WITHOUT token -> 401 unauthorized", &anon_resp, 401, "unauthorized");
+        }
+        Ok(r) => {
+            // Server likely started without keys; auth disabled. Don't fail.
+            rep.check(
+                "auth: (server has auth DISABLED — anon allowed, --token ignored server-side)",
+                true,
+                || format!("anon status {}", r.status),
+            );
+        }
+        Err(e) => rep.check("auth anon request", false, || format!("request failed: {e}")),
+    }
+
+    // Probe endpoints remain open without a token (default probe_auth=false).
+    let h = anon.get("/v0/health").await;
+    rep.status("auth: /v0/health open without token", &h, 200);
+}
+
+// ---------------------------------------------------------------------------
+// SSE frame parsing (manual, over reqwest's byte stream)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SseFrame {
+    id: String,
+    event: String,
+    data: String,
+}
+
+/// Open the SSE stream at `stream_url`, optionally with a `Last-Event-ID`
+/// resume header, and collect up to `max_frames` named (non-heartbeat) frames,
+/// bounded by `deadline`. The `trigger` closure, if it returns a body, is POSTed
+/// to `trigger_path` shortly after the stream opens (to produce a live record).
+async fn collect_sse(
+    c: &Client,
+    stream_url: &str,
+    last_event_id: Option<&str>,
+    max_frames: usize,
+    deadline: Duration,
+    trigger: impl FnOnce() -> Option<Value>,
+    trigger_path: &str,
+) -> Vec<SseFrame> {
+    let mut rb = c.http.get(c.url(stream_url)).header("accept", "text/event-stream");
+    if let Some(t) = &c.token {
+        rb = rb.header("authorization", format!("Bearer {t}"));
+    }
+    if let Some(leid) = last_event_id {
+        rb = rb.header("last-event-id", leid);
+    }
+
+    let resp = match rb.send().await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+
+    // Fire the trigger write after a short delay so the stream is established and
+    // the backlog drained before the live append arrives.
+    if let Some(body) = trigger() {
+        let cc = c.clone();
+        let tp = trigger_path.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = cc.post(&tp, &body).await;
+        });
+    }
+
+    let mut frames = Vec::new();
+    let mut buf = String::new();
+    let mut stream = resp.bytes_stream();
+
+    let res = tokio::time::timeout(deadline, async {
+        while let Some(chunk) = stream.next().await {
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            // SSE frames are separated by a blank line.
+            while let Some(idx) = buf.find("\n\n") {
+                let block: String = buf.drain(..idx + 2).collect();
+                if let Some(frame) = parse_sse_block(&block) {
+                    frames.push(frame);
+                    if frames.len() >= max_frames {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let _ = res; // timeout is expected/acceptable; we return whatever we got.
+    frames
+}
+
+/// Parse one SSE block into a frame, ignoring heartbeats (`: hb`) and bare
+/// `retry:` blocks (returns None for those).
+fn parse_sse_block(block: &str) -> Option<SseFrame> {
+    let mut id = String::new();
+    let mut event = String::new();
+    let mut data = String::new();
+    let mut saw_named = false;
+    for line in block.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(':') {
+            // Comment / heartbeat — ignore.
+            let _ = rest;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("id:") {
+            id = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("event:") {
+            event = v.trim().to_string();
+            saw_named = true;
+        } else if let Some(v) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(v.trim_start());
+        } else if line.starts_with("retry:") {
+            // retry block, no event — skip.
+        }
+    }
+    if saw_named {
+        Some(SseFrame { id, event, data })
+    } else {
+        None
+    }
+}
+
+/// Best-effort delete of every box we created under `ns`.
+async fn cleanup(c: &Client, ns: &str) {
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(cur) => format!("/v0/boxes?prefix={ns}&page_size=1000&cursor={cur}"),
+            None => format!("/v0/boxes?prefix={ns}&page_size=1000"),
+        };
+        let Ok(r) = c.get(&path).await else { break };
+        let names: Vec<String> = r
+            .body
+            .get("boxes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.get("box").and_then(|v| v.as_str()).map(String::from)).collect())
+            .unwrap_or_default();
+        for n in &names {
+            let _ = c.delete(&format!("/v0/boxes/{n}")).await;
+        }
+        cursor = r.body.get("next_cursor").and_then(|v| v.as_str()).map(String::from);
+        if cursor.is_none() || names.is_empty() {
+            break;
+        }
+    }
+}
+
+// ===========================================================================
+// Benchmark suite
+// ===========================================================================
+
+/// Percentile (p in [0,100]) of an already-collected sample of latencies (ms).
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (p / 100.0) * (sorted.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let frac = rank - lo as f64;
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
+}
+
+fn summarize(mut samples: Vec<f64>) -> Value {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    json!({
+        "count": samples.len(),
+        "min_ms": samples.first().copied().unwrap_or(0.0),
+        "p50_ms": percentile(&samples, 50.0),
+        "p99_ms": percentile(&samples, 99.0),
+        "p999_ms": percentile(&samples, 99.9),
+        "max_ms": samples.last().copied().unwrap_or(0.0),
+    })
+}
+
+fn round3(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+async fn run_bench(cmd: BenchCmd) -> ExitCode {
+    let c = Client::new(&cmd.base_url, cmd.token.clone());
+
+    // Verify the server is reachable before benching.
+    if c.get("/v0/health").await.map(|r| r.status != 200).unwrap_or(true) {
+        eprintln!("error: server at {} did not return 200 on /v0/health", cmd.base_url);
+        return ExitCode::FAILURE;
+    }
+
+    let ns = format!("bench{}", std::process::id());
+    eprintln!("benchmarking {} (writes={}, watchers={})", cmd.base_url, cmd.writes, cmd.watchers);
+
+    let write_bench = bench_write(&c, &ns, cmd.writes).await;
+    let diff_bench = bench_diff(&c, &ns).await;
+    let watcher_counts: Vec<usize> = cmd
+        .watchers
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .collect();
+    let sse_bench = bench_sse_fanout(&c, &ns, &watcher_counts).await;
+    let router_bench = bench_router(&c, &ns).await;
+
+    cleanup(&c, &ns).await;
+
+    let summary = json!({
+        "base_url": cmd.base_url,
+        "writes": cmd.writes,
+        "write": write_bench,
+        "diff": diff_bench,
+        "sse_fanout": sse_bench,
+        "router": router_bench,
+    });
+
+    if cmd.json {
+        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    } else {
+        print_bench_table(&summary);
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Write-ack latency (single-record writes) + write throughput (concurrent
+/// writers, batched).
+async fn bench_write(c: &Client, ns: &str, total_writes: u64) -> Value {
+    // --- Latency: single-record writes measured one at a time. ---
+    let lat_box = format!("{ns}-wlat");
+    let _ = c.put(&format!("/v0/boxes/{lat_box}"), &json!({})).await;
+    let lat_path = format!("/v0/boxes/{lat_box}");
+    let lat_samples_n = 5_000.min(total_writes).max(1);
+    let mut latencies = Vec::with_capacity(lat_samples_n as usize);
+    let body = json!({ "records": [{ "data": { "x": "abcdefghij0123456789" } }] });
+    for _ in 0..lat_samples_n {
+        let t = Instant::now();
+        let r = c.post(&lat_path, &body).await;
+        if r.map(|r| r.status == 200 || r.status == 201).unwrap_or(false) {
+            latencies.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    let lat_summary = summarize(latencies);
+
+    // --- Throughput: concurrent writers, batched appends. ---
+    let tput_box = format!("{ns}-wtput");
+    let _ = c.put(&format!("/v0/boxes/{tput_box}"), &json!({})).await;
+    let tput_path = Arc::new(format!("/v0/boxes/{tput_box}"));
+    let writers = 16usize;
+    let batch = 100u64;
+    let total = total_writes;
+    let batches = (total / batch).max(1);
+    let per_worker = (batches / writers as u64).max(1);
+    let actual_batches = per_worker * writers as u64;
+    let actual_records = actual_batches * batch;
+
+    let payload = {
+        let recs: Vec<Value> = (0..batch).map(|i| json!({ "data": { "i": i } })).collect();
+        Arc::new(json!({ "records": recs, "return_seqs": false }))
+    };
+
+    let done = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..writers {
+        let cc = c.clone();
+        let path = tput_path.clone();
+        let pl = payload.clone();
+        let done = done.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..per_worker {
+                let r = cc.post(&format!("{}?return_seqs=false", path), &pl).await;
+                if r.map(|r| r.status == 200 || r.status == 201).unwrap_or(false) {
+                    done.fetch_add(batch, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let recs_acked = done.load(Ordering::Relaxed);
+    let throughput = if elapsed > 0.0 { recs_acked as f64 / elapsed } else { 0.0 };
+
+    json!({
+        "single_record_ack_latency": lat_summary,
+        "throughput": {
+            "writers": writers,
+            "batch_size": batch,
+            "records_appended": actual_records,
+            "records_acked": recs_acked,
+            "elapsed_s": round3(elapsed),
+            "records_per_s": round3(throughput),
+        }
+    })
+}
+
+/// getDifference throughput + per-call latency at limits 1 / 256 / 1000.
+async fn bench_diff(c: &Client, ns: &str) -> Value {
+    let b = format!("{ns}-diff");
+    let path = format!("/v0/boxes/{b}");
+    let dpath = format!("/v0/boxes/{b}/diff");
+
+    // Seed ~20k records so deep reads have something to chew on.
+    let seed_total = 20_000u64;
+    let batch = 500u64;
+    let recs: Vec<Value> = (0..batch).map(|i| json!({ "data": { "i": i, "p": "padpadpadpadpad" } })).collect();
+    let body = json!({ "records": recs, "return_seqs": false });
+    for _ in 0..(seed_total / batch) {
+        let _ = c.post(&format!("{path}?return_seqs=false"), &body).await;
+    }
+
+    let mut out = serde_json::Map::new();
+    for &limit in &[1u32, 256, 1000] {
+        // Latency: repeated deep replay from from_seq=0.
+        let iters = 1_000usize;
+        let mut lat = Vec::with_capacity(iters);
+        let req = json!({ "from_seq": 0, "limit": limit });
+        let mut total_records: u64 = 0;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let t = Instant::now();
+            if let Ok(r) = c.post(&dpath, &req).await {
+                lat.push(t.elapsed().as_secs_f64() * 1000.0);
+                total_records += r.body.get("records").and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let recs_per_s = if elapsed > 0.0 { total_records as f64 / elapsed } else { 0.0 };
+        out.insert(
+            format!("limit_{limit}"),
+            json!({
+                "latency": summarize(lat),
+                "records_served": total_records,
+                "records_per_s": round3(recs_per_s),
+                "calls_per_s": round3(iters as f64 / elapsed),
+            }),
+        );
+    }
+
+    // Tail-read latency (caught-up near head): cheapest path.
+    let head = c.get(&path).await.ok().and_then(|r| u64_of(&r.body, "head_seq")).unwrap_or(seed_total);
+    let mut tail_lat = Vec::with_capacity(2000);
+    let treq = json!({ "from_seq": head });
+    for _ in 0..2000 {
+        let t = Instant::now();
+        if c.post(&dpath, &treq).await.is_ok() {
+            tail_lat.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    out.insert("tail_caught_up_latency".to_string(), summarize(tail_lat));
+
+    Value::Object(out)
+}
+
+/// SSE fan-out write->deliver latency with N watchers on one box.
+async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Value {
+    let mut out = serde_json::Map::new();
+
+    // A shared monotonic baseline: the writer stamps each pulse with the ns
+    // elapsed since `epoch`, the watchers (same process, same clock) subtract it
+    // from their own elapsed-ns at receipt. That yields a TRUE write->deliver
+    // latency without any wall-clock/server-time skew.
+    let epoch = Arc::new(Instant::now());
+
+    for &n in watcher_counts {
+        let b = format!("{ns}-sse{n}");
+        let path = format!("/v0/boxes/{b}");
+        // Create + seed one record so the box exists and watchers tail the head.
+        let _ = c.post(&path, &json!({ "records": [{ "data": "seed" }] })).await;
+
+        let pulses = 50usize; // number of timed writes
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+        let mut watcher_handles = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            // Create a session tailing the box (only records after subscribe).
+            let watch = c
+                .post("/v0/watch", &json!({ "boxes": { b.clone(): { "tail": true } }, "heartbeat_ms": 1000 }))
+                .await;
+            let Some(stream_url) = watch.ok().and_then(|r| r.body.get("stream_url").and_then(|v| v.as_str()).map(String::from)) else {
+                continue;
+            };
+            let cc = c.clone();
+            let tx = tx.clone();
+            let epoch = epoch.clone();
+            watcher_handles.push(tokio::spawn(async move {
+                watcher_loop(cc, stream_url, pulses, tx, epoch).await;
+            }));
+        }
+        drop(tx);
+
+        // Give the watchers a moment to establish their streams and reach the
+        // caught-up (tailing) state before timed writes begin.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Emit timed writes; each carries the writer's ns-since-epoch so each
+        // watcher can compute the per-pulse write->deliver latency.
+        for i in 0..pulses {
+            let stamp = epoch.elapsed().as_nanos() as u64;
+            let _ = c
+                .post(&path, &json!({ "records": [{ "data": { "pulse": i, "t": stamp } }] }))
+                .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Collect per-watcher per-pulse delivery-latency samples (give the tail
+        // a short grace window to flush the last pulse to every watcher).
+        let mut samples = Vec::new();
+        let collect = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(latency_ms) = rx.recv().await {
+                samples.push(latency_ms);
+            }
+        })
+        .await;
+        let _ = collect;
+        for h in watcher_handles {
+            h.abort();
+        }
+
+        out.insert(
+            format!("watchers_{n}"),
+            json!({
+                "watchers": n,
+                "pulses": pulses,
+                "deliveries_measured": samples.len(),
+                "write_to_deliver_latency": summarize(samples),
+            }),
+        );
+        // Tear down the box so the next watcher tier starts clean.
+        let _ = c.delete(&path).await;
+    }
+
+    Value::Object(out)
+}
+
+/// A single SSE watcher: opens the stream and, for each `record` frame carrying
+/// a `"t"` writer-stamp (ns since the shared `epoch`), reports the write->deliver
+/// latency = (receipt ns since epoch) - (stamped ns) over the channel. Writer
+/// and watcher run in the same process and share `epoch`, so the subtraction is
+/// a true end-to-end latency with no clock skew.
+async fn watcher_loop(
+    c: Client,
+    stream_url: String,
+    expected_pulses: usize,
+    tx: tokio::sync::mpsc::UnboundedSender<f64>,
+    epoch: Arc<Instant>,
+) {
+    let mut rb = c.http.get(c.url(&stream_url)).header("accept", "text/event-stream");
+    if let Some(t) = &c.token {
+        rb = rb.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match rb.send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut seen = 0usize;
+
+    while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(idx) = buf.find("\n\n") {
+            let block: String = buf.drain(..idx + 2).collect();
+            let Some(frame) = parse_sse_block(&block) else { continue };
+            if frame.event != "record" {
+                continue;
+            }
+            // The frame's `data` is a JSON object with a `records` array; each
+            // record carries `data.t`. Parse and time-stamp on arrival.
+            let recv_ns = epoch.elapsed().as_nanos() as u64;
+            let Ok(payload): Result<Value, _> = serde_json::from_str(&frame.data) else { continue };
+            let Some(records) = payload.get("records").and_then(|v| v.as_array()) else { continue };
+            for rec in records {
+                let stamp = rec
+                    .get("data")
+                    .and_then(|d| d.get("t"))
+                    .and_then(|v| v.as_u64());
+                if let Some(stamp) = stamp {
+                    let latency_ms = recv_ns.saturating_sub(stamp) as f64 / 1_000_000.0;
+                    let _ = tx.send(latency_ms);
+                    seen += 1;
+                }
+            }
+            if seen >= expected_pulses {
+                return;
+            }
+        }
+    }
+}
+
+/// Router forwarding added latency: time from a write into `src` until the
+/// forwarded copy is observable in `dst` via diff, vs a direct write+read.
+async fn bench_router(c: &Client, ns: &str) -> Value {
+    let src = format!("{ns}-rsrc");
+    let dst = format!("{ns}-rdst");
+    let rname = format!("{ns}-rbench");
+    let _ = c.put(&format!("/v0/boxes/{src}"), &json!({})).await;
+    let _ = c.put(&format!("/v0/boxes/{dst}"), &json!({})).await;
+    let _ = c
+        .put(&format!("/v0/routers/{rname}"), &json!({ "source": src, "dest": dst }))
+        .await;
+
+    let iters = 1_000usize;
+
+    // Forwarded path: write to src, then read dst from its prior head to confirm
+    // the forwarded record landed; measure end-to-end.
+    let mut fwd = Vec::with_capacity(iters);
+    let src_path = format!("/v0/boxes/{src}");
+    let dst_diff = format!("/v0/boxes/{dst}/diff");
+    for i in 0..iters {
+        // current dst head
+        let dst_head = c.get(&format!("/v0/boxes/{dst}")).await.ok().and_then(|r| u64_of(&r.body, "head_seq")).unwrap_or(0);
+        let t = Instant::now();
+        let _ = c.post(&src_path, &json!({ "records": [{ "data": { "i": i } }] })).await;
+        // Poll dst until the forwarded record is visible (synchronous forwarding
+        // means it should already be there on the first read).
+        loop {
+            if let Ok(r) = c.post(&dst_diff, &json!({ "from_seq": dst_head })).await {
+                if !diff_seqs(&r.body).is_empty() {
+                    break;
+                }
+            }
+            if t.elapsed() > Duration::from_secs(1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        fwd.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // Direct baseline: write to a plain box + read it back (no router).
+    let direct_box = format!("{ns}-direct");
+    let _ = c.put(&format!("/v0/boxes/{direct_box}"), &json!({})).await;
+    let dpath = format!("/v0/boxes/{direct_box}");
+    let ddiff = format!("/v0/boxes/{direct_box}/diff");
+    let mut direct = Vec::with_capacity(iters);
+    for i in 0..iters {
+        let head = c.get(&dpath).await.ok().and_then(|r| u64_of(&r.body, "head_seq")).unwrap_or(0);
+        let t = Instant::now();
+        let _ = c.post(&dpath, &json!({ "records": [{ "data": { "i": i } }] })).await;
+        let _ = c.post(&ddiff, &json!({ "from_seq": head })).await;
+        direct.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let fwd_summary = summarize(fwd.clone());
+    let direct_summary = summarize(direct.clone());
+    let fwd_p50 = fwd_summary.get("p50_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let direct_p50 = direct_summary.get("p50_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    json!({
+        "forwarded_write_to_visible": fwd_summary,
+        "direct_write_read_baseline": direct_summary,
+        "added_p50_ms": round3(fwd_p50 - direct_p50),
+    })
+}
+
+fn print_bench_table(s: &Value) {
+    println!("\n=== streams-probe bench: {} ===", s.get("base_url").and_then(|v| v.as_str()).unwrap_or("?"));
+
+    let pr = |label: &str, v: &Value| {
+        let g = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+        println!(
+            "  {label:<34} p50={:>8.3}ms  p99={:>8.3}ms  p999={:>8.3}ms  max={:>8.3}ms  (n={})",
+            g("p50_ms"),
+            g("p99_ms"),
+            g("p999_ms"),
+            g("max_ms"),
+            v.get("count").and_then(|c| c.as_u64()).unwrap_or(0),
+        );
+    };
+
+    println!("\n-- Write --");
+    if let Some(w) = s.get("write") {
+        if let Some(l) = w.get("single_record_ack_latency") {
+            pr("single-record write-ack", l);
+        }
+        if let Some(t) = w.get("throughput") {
+            println!(
+                "  throughput: {:.0} records/s  ({} writers x batch {}, {} records in {:.3}s)",
+                t.get("records_per_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                t.get("writers").and_then(|v| v.as_u64()).unwrap_or(0),
+                t.get("batch_size").and_then(|v| v.as_u64()).unwrap_or(0),
+                t.get("records_acked").and_then(|v| v.as_u64()).unwrap_or(0),
+                t.get("elapsed_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            );
+        }
+    }
+
+    println!("\n-- getDifference --");
+    if let Some(d) = s.get("diff") {
+        for limit in ["limit_1", "limit_256", "limit_1000"] {
+            if let Some(dl) = d.get(limit) {
+                if let Some(lat) = dl.get("latency") {
+                    pr(&format!("diff {limit}"), lat);
+                }
+                println!(
+                    "      -> {:.0} records/s, {:.0} calls/s",
+                    dl.get("records_per_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    dl.get("calls_per_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                );
+            }
+        }
+        if let Some(t) = d.get("tail_caught_up_latency") {
+            pr("diff tail (caught-up)", t);
+        }
+    }
+
+    println!("\n-- SSE fan-out (write -> deliver) --");
+    if let Some(sse) = s.get("sse_fanout").and_then(|v| v.as_object()) {
+        let mut keys: Vec<&String> = sse.keys().collect();
+        keys.sort_by_key(|k| k.trim_start_matches("watchers_").parse::<usize>().unwrap_or(0));
+        for k in keys {
+            let v = &sse[k];
+            if let Some(lat) = v.get("write_to_deliver_latency") {
+                pr(
+                    &format!("{} watcher(s)", v.get("watchers").and_then(|x| x.as_u64()).unwrap_or(0)),
+                    lat,
+                );
+            }
+        }
+    }
+
+    println!("\n-- Router forwarding --");
+    if let Some(r) = s.get("router") {
+        if let Some(f) = r.get("forwarded_write_to_visible") {
+            pr("src->dst write-to-visible", f);
+        }
+        if let Some(d) = r.get("direct_write_read_baseline") {
+            pr("direct write+read baseline", d);
+        }
+        println!(
+            "  added forwarding latency (p50): {:.3} ms",
+            r.get("added_p50_ms").and_then(|v| v.as_f64()).unwrap_or(0.0)
+        );
+    }
+    println!();
+}
