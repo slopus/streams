@@ -1,0 +1,181 @@
+# streams — Roadmap
+
+Four build phases, each with crisp acceptance criteria, plus the benchmark plan. The guiding rule:
+**the API and its semantics are fixed in phase 1 and never change**; later phases add persistence,
+tests, and scalability *underneath* an unchanging contract. See [API.md](API.md),
+[DESIGN.md](DESIGN.md), [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
+## Phase 1 — Define API + docs (this repository)
+
+Produce the complete, internally consistent specification the implementation must satisfy.
+
+**Deliverables**
+- `README.md` — pitch, mental model, quickstart, use-case recipes, feature list, phases, doc links.
+- `docs/API.md` — the complete `/v0` HTTP reference (the contract).
+- `docs/DESIGN.md` — data model & semantics (seq, watermarks, tombstones, tag-deletion, node
+  loop-prevention, routers, priority).
+- `docs/ARCHITECTURE.md` — storage, WAL, group commit, segments, recovery, scheduler, concurrency,
+  crates, latency budget.
+- `docs/ROADMAP.md` — this file.
+
+**Acceptance criteria**
+- [ ] Every endpoint in the §9 index of API.md has a documented method, path, request, response, and
+      error set.
+- [ ] Field names, config keys, defaults, and status codes are **identical** across all four docs
+      (one vocabulary: `cap_records`/`cap_bytes`/`discard`/`durable`/`priority`+`auto_priority`,
+      `from_seq`/`next_from_seq`/`head_seq`/`earliest_seq`, tombstone `reason ∈ {cap, ttl, mixed,
+      recreated, from_seq_too_old}`, `meta` for record headers, `$`-prefixed server fields).
+- [ ] The three use-case recipes (job queue / pub/sub / strong delivery) are expressible purely with
+      documented endpoints.
+- [ ] The seven safety invariants (DESIGN §9) are stated and traceable to specific mechanisms.
+
+---
+
+## Phase 2 — Simplest possible server (in-memory, no WAL)
+
+A correct, **complete** implementation of the entire `/v0` API with all data in memory. Not
+persistent, not yet scalable — but every endpoint, every semantic, and every error path works.
+
+**Scope**
+- Full HTTP surface (axum/hyper): boxes CRUD, write, diff, tag-delete, routers CRUD, SSE
+  (POST-create + GET-stream), health/ready/metrics.
+- In-memory `BoxIndex` (base+offset vector), `head_seq`/`earliest_seq`/`epoch` atomics.
+- Cap (`cap_records`/`cap_bytes`) + TTL eviction with watermark advance and in-band tombstones.
+- `discard: "old" | "reject"` full-box policy (`422 box_full`).
+- Read-time tag-delete filters (exact + prefix), node loop-prevention, cursor-advance reads.
+- Routers: at-least-once forwarding, per-source FIFO, DAG cycle check (`409`), `allow_cycle` hop cap.
+- Multiplexed SSE: named events (`record`, `tombstone`, `caught-up`, `box-deleted`, `error`),
+  composite `id:` cursors, heartbeats, `retry:`, resume via `Last-Event-ID`.
+- Idempotency keys, `performance` blocks, error envelope, auth bearer.
+- Priority scheduler present in simplified form (banded ready-set + recency); no fsync to gate.
+
+**Explicitly out of scope (phase 4):** WAL, fsync/durability gating, segments, restart recovery,
+metadata snapshots, elastic throttling under real CPU pressure. `durable: true` is *accepted* but is
+a no-op fast path in phase 2 (documented).
+
+**Acceptance criteria**
+- [ ] A conformance test suite drives every endpoint and asserts the documented JSON shapes and
+      status codes.
+- [ ] Tombstone behavior verified: a consumer whose `from_seq` falls below `earliest_seq` after cap
+      eviction and after TTL expiry receives the correct `reason`, `gap_from`, `gap_to`.
+- [ ] Node loop-prevention verified: a node never receives its own records via `diff` or `watch`, and
+      the cursor advances past them (`caught_up` reached, not an infinite empty loop).
+- [ ] Tag-delete verified: exact and `tag*` prefix suppress matching records on all subsequent reads;
+      future matching records are also suppressed; no tombstone is emitted for tag-deletes.
+- [ ] Router fan-out verified: a write to `src` appears in all `dst` boxes with `$node` preserved; a
+      cycle-creating router is rejected `409`; an `allow_cycle` mirror terminates via the hop cap.
+- [ ] SSE verified: multi-box stream delivers `record`/`tombstone`/`caught-up`/heartbeat frames; a
+      reconnect with `Last-Event-ID` resumes all per-box cursors atomically.
+- [ ] Server starts, serves, and shuts down cleanly; restart loses all data (expected, documented).
+
+---
+
+## Phase 3 — Maximum-coverage tests + benchmarks (baseline)
+
+Lock in correctness and record initial performance numbers against the phase-2 server.
+
+**Scope**
+- Unit tests for every module (index, eviction, filters, scheduler, SSE framing, cursor math).
+- Property/fuzz tests for the seq/watermark/tombstone invariants (e.g. "a consumer reading from any
+  `from_seq` either sees a contiguous-after-filter stream or exactly one tombstone, never silent
+  loss").
+- Integration tests for the use-case recipes end to end.
+- A criterion-based benchmark suite (see Benchmark plan below).
+- `docs/BENCHMARKS.md` recording the **initial baseline numbers** (in-memory phase-2), with hardware
+  and methodology noted.
+
+**Acceptance criteria**
+- [ ] Line/branch coverage target met on the core engine modules (goal: ≥ 90% on
+      index/eviction/filters/scheduler).
+- [ ] Invariant property tests pass over randomized write/evict/expire/delete/read sequences.
+- [ ] The benchmark suite runs reproducibly and `docs/BENCHMARKS.md` contains baseline figures for
+      every metric listed below.
+- [ ] No test depends on wall-clock sleeps for correctness (use injected clocks for TTL/priority).
+
+---
+
+## Phase 4 — Make it scalable (WAL, durability, segments, scheduler, throttling)
+
+Add persistence and scale underneath the unchanged API, staying a single restartable process.
+
+**Scope**
+- WAL: framing (§ARCHITECTURE 2.1), single-writer task, adaptive group commit, per-box durable
+  fsync, preallocation, rotation.
+- Compactor: WAL→segment checkpointing; segment `.data`/`.idx`; mmap serving of sealed segments,
+  buffered `pread` of the active one, WAL-direct serving of the newest records.
+- Segment-granular lazy eviction + persisted `EvictWatermark`.
+- Metadata store: WAL control frames + atomic bincode snapshots; interned `box_id`s.
+- Restart recovery: snapshot load → segment `.idx` bulk load → WAL replay from last checkpoint → CRC
+  torn-tail truncation → idempotent segment reclaim.
+- Full priority scheduler: banded DWRR + aging; governor-driven elastic throttling
+  (coalesce → widen group commit → defer low priority → `429`).
+- Slow-consumer isolation for SSE (bounded channels, lagged-degrade-to-tombstone).
+
+**Acceptance criteria**
+- [ ] **Durability:** for `durable: true` boxes, an acked write survives a hard kill (`SIGKILL`) at
+      any instant and is present after restart; no acked durable write is ever lost.
+- [ ] **Crash consistency:** a kill during a write leaves the WAL recoverable — recovery truncates the
+      torn tail (CRC/length), and no partial frame is ever interpreted as data.
+- [ ] **Recovery correctness:** after restart, `head_seq`/`earliest_seq`/`count`, config, routers, and
+      tag-delete filters match the pre-crash state (modulo un-fsynced non-durable tail).
+- [ ] **No silent loss across restart:** a consumer whose cursor fell below the recovered
+      `earliest_seq` receives a tombstone, never silent skip.
+- [ ] **Eviction is segment-granular:** physical occupancy may transiently exceed cap by ≤ one
+      segment; `earliest_seq`/`count` always report the logical floor.
+- [ ] **Latency target met:** non-durable / `eventual` SSE delivery p99 ≤ 5 ms at a defined sustained
+      load (see benchmark plan); durable write-ack p99 within budget with adaptive group commit.
+- [ ] **Elastic throttling:** under induced CPU pressure, high-priority boxes keep their latency while
+      low-priority boxes degrade visibly (`429` / SSE `error` frames), with **zero** data loss
+      attributable to throttling.
+- [ ] **No regressions:** the full phase-3 test suite still passes; `docs/BENCHMARKS.md` is updated
+      with phase-4 numbers alongside the phase-2 baseline.
+
+---
+
+## Benchmark plan
+
+Measured with criterion (micro) + a load harness (macro). Each metric is recorded for the in-memory
+baseline (phase 3) and re-recorded for the persistent build (phase 4), so the cost of durability is
+explicit. Results land in `docs/BENCHMARKS.md` with hardware (CPU model, NVMe model), OS, build
+flags (`--release`), and methodology.
+
+| Metric | What | How |
+|---|---|---|
+| **Write throughput** | records/s and MB/s appended | sustained `POST` batches at varied batch sizes (1, 10, 100, 1000) and payload sizes (64 B, 1 KiB, 64 KiB); durable vs non-durable. |
+| **Append latency p50/p99/p999** | end-to-end ack latency | single-record and batched writes, durable (fsync-gated, group-committed) vs non-durable; report the group-commit batch-size distribution. |
+| **getDifference throughput** | records/s served | replay reads at varied `limit` (1, 256, 1000) from cold (mmap fault) and warm (page cache) segments; with and without tag/node filters active. |
+| **getDifference latency p50/p99** | per-call latency | tail reads (caught-up, near head) vs deep replay (cold segments). |
+| **SSE fan-out latency** | write→deliver p50/p99 | 1 writer, N watchers (1, 10, 100, 1000) on one box; measure per-watcher delivery latency; verify the 1–5 ms target for `eventual`. |
+| **SSE fan-out scale** | max watchers / connection churn | connection setup cost, heartbeat overhead, memory per idle connection. |
+| **Router forwarding** | added latency + throughput | src→dst delivery latency vs direct write; fan-out to N dests; chain depth cost. |
+| **Eviction / TTL cost** | impact on write path | sustained writes against a small cap and short TTL; confirm segment-granular drop, measure write-latency impact and tombstone-emission rate. |
+| **Recovery time** | time to ready after restart | WAL replay + segment `.idx` load for boxes holding 10⁶ / 10⁷ / 10⁸ records; report seconds-to-`ready` vs data size. |
+| **Throttling behavior** | latency under pressure | drive CPU saturation; chart high- vs low-priority box latency and `429` rate; assert zero loss. |
+| **Memory footprint** | bytes/record resident | index + buffers per retained record at varied payload sizes; confirm the base+offset index overhead. |
+
+**Baseline doc:** `docs/BENCHMARKS.md` (created in phase 3). It records the phase-2/3 in-memory
+numbers first; phase 4 appends a persistent-build column and a short analysis of the durability and
+recovery costs.
+
+---
+
+## Open questions (carried into implementation)
+
+- **Tombstone placement in `diff`:** chosen — a dedicated top-level `tombstone` field (not inline in
+  `records`), so consumers branch cleanly. (Resolved; documented in API §3.3.)
+- **Cursor epoch encoding:** recommended yes — include an opaque `epoch` so delete+recreate is
+  detected exactly rather than heuristically (DESIGN §5.5). Whether to expose the epoch in
+  `next_from_seq`/SSE `id:` or keep it server-side is an implementation detail to settle in phase 4.
+- **Tag-delete un-delete:** `/v0` is monotonic (no un-delete). Since records are never physically
+  removed, a `/v1` could add lossless rule removal — defer the decision until a concrete operational
+  need appears.
+- **Per-message explicit ack / lease / heartbeat (BullMQ stalled-job mode):** deliberately out of the
+  core; a planned higher-level mode layered on tags + a side in-flight box. Decide its API shape
+  (and capped-redelivery → dead-letter policy) after the core ships.
+- **Compacted box type (Kafka log compaction, last-record-per-key):** noted as a possible future box
+  mode; not in `/v0`.
+- **Auto-priority constants** (`AUTO_MAX=500`, `HALF_LIFE_MS=30000`) and **band weights/boundaries**
+  are starting defaults; phase 3/4 benchmarks may retune them. The formula and knobs are stable; the
+  numbers are tunable.

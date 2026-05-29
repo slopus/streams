@@ -1,0 +1,506 @@
+# streams — Data Model & Semantics
+
+This document specifies the data model and runtime semantics of streams precisely enough to
+implement directly. It is **normative**: where it says MUST / MUST NOT / SHOULD, treat it as a
+requirement on every implementation phase (in-memory, then WAL-backed). The wire encoding is
+JSON; see [API.md](API.md) for the HTTP surface and [ARCHITECTURE.md](ARCHITECTURE.md) for how
+the storage layer enforces these guarantees.
+
+**Conventions.** Server-computed fields on the wire are `$`-prefixed (`$seq`, `$ts`, `$node`,
+`$tag`, `$type`) so they never collide with the user-controlled `data` namespace. All times are
+integer milliseconds since Unix epoch (`ts`) or integer millisecond durations (`*_ms`). `u64`
+and `i64` are the literal Rust types.
+
+---
+
+## 1. Record
+
+A record is one immutable event in a box. Once assigned a `seq`, a record's fields never change.
+"Deletion" (§7) and eviction (§5) do not mutate records; they affect visibility only.
+
+### 1.1 Fields
+
+| Field | Wire key (in → out) | Type | Origin | Required | Notes |
+|---|---|---|---|---|---|
+| Sequence | — / `$seq` | u64 | server | n/a | Per-box monotonic id, assigned at commit (§4). |
+| Timestamp | — / `$ts` | u64 ms | server | n/a | Server wall-clock at commit; used for TTL (§5.2). |
+| Origin node | `node` / `$node` | string | client | optional | Loop-prevention key (§6). |
+| Tag | `tag` / `$tag` | string | client | optional | Read-time deletion match key (§7). |
+| Meta | `meta` / `meta` | object<string,string> | client | optional | Small opaque metadata/headers. |
+| Data | `data` / `data` | arbitrary JSON | client | required | Opaque payload; the product treats it as bytes. |
+
+On **write** the client sets `node`/`tag` as plain top-level keys; on **read** the server echoes
+them as `$node`/`$tag` (now server-canonical, immutable). `data`/`meta` keep the same key both
+ways (pure passthrough). `$node`/`$tag`/`meta` are omitted from a response when absent (absence,
+not `null`); `data` is always present (may be JSON `null`). A read-returned record:
+
+```json
+{ "$seq": 4096, "$ts": 1748470000123, "$node": "worker-7", "$tag": "job:tenantA:1234",
+  "meta": { "content-type": "application/json" },
+  "data": { "url": "https://...", "attempts": 0 } }
+```
+
+### 1.2 Size limits (hard, enforced at write; violation → `400`)
+
+| Limit | Default | Justification |
+|---|---|---|
+| `data`+`meta` (canonical bytes) | 1 MiB | Fat job payloads / batched events, yet small enough that one record can't blow a WAL frame or group-commit budget. |
+| `tag` length | 256 bytes | Bounds the per-entry cost of the deletion-filter structure (§7) and keeps prefix matching cheap. |
+| `node` length | 128 bytes | Node ids are identifiers, not data. |
+| `meta` total | 16 KiB, ≤ 64 keys | "Small metadata." |
+| Records per write request | 10 000 | Bounds a single append's latency and WAL frame size. |
+| Total write body | 64 MiB | Backstop against batch-size × per-record interaction. |
+
+`seq`/`ts` are server-assigned and do not count against the `data`+`meta` size.
+
+---
+
+## 2. Box
+
+A box is an append-only log of records ordered by `seq`, plus a small config and derived
+watermarks.
+
+### 2.1 Identity & naming
+
+- Addressed by **name** in the path: `/v0/boxes/:box`. The name *is* the identity.
+- Naming rule: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts alphanumeric, allows
+  `. _ : -`; `:` enables namespacing like `jobs:tenantA`). Case-sensitive, byte-exact, no Unicode
+  normalization.
+- **Creation policy** is per-request, defaulting to lazy-create (turbopuffer ergonomics) with an
+  opt-out (Redis `NOMKSTREAM` lesson against typo-boxes):
+  - Write with `create: true` (or the box's `auto_create: true`) auto-creates using inline
+    `config` or defaults.
+  - Write with `create: false` to a missing box → `404 box_not_found`.
+  - Explicit `PUT /v0/boxes/:box` creates-or-updates per the upsert rules (API §1.1).
+- **Deleting** a box tears down all records, the delete-filter set, dedupe state, and any routers
+  with it as `source` or `dest`. Irreversible. A later lazy-create makes a **new, empty** box
+  whose `seq` restarts at the base; stale consumers detect this exactly like full eviction
+  (§5.5).
+
+### 2.2 Config — see [API.md §0.10](API.md) for the canonical field table
+
+The config struct is `{ ttl_ms, cap_records, cap_bytes, discard, durable, priority,
+auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Defaults: `ttl_ms=0`,
+`cap_records=0`, `cap_bytes=0` (all "off"/unbounded), `discard="old"`, `durable=false`,
+`priority=null` + `auto_priority=true`, `auto_create=true`, `dedupe_node=true`.
+
+**Defaults rationale.**
+- All caps/TTL off ⇒ an out-of-the-box box loses nothing. The safe default for a persistence
+  product is "keep everything"; pub/sub users *opt into* small cap+TTL. Silent loss must be a
+  deliberate choice.
+- `discard="old"` matches the "append log" mental model and the pub/sub/recent-state cases;
+  durable-queue users flip to `"reject"`. With both caps off, `discard` is inert.
+- `durable=false`: the 1–5 ms target on NVMe means fsync-by-default would make the common
+  pub/sub case pay for a guarantee it doesn't want. One bool away.
+- `priority=null` + `auto_priority=true`: most users never think about priority; recency-based
+  auto does the right thing. Power users pin an integer.
+
+When both `cap_records` and `cap_bytes` are set, **whichever is hit first** triggers eviction
+(Kafka dual-retention). TTL and cap are independent and both apply; a record leaves the retained
+set when *any* of (ttl expired) OR (beyond `cap_records`) OR (beyond `cap_bytes`) holds.
+
+### 2.3 State (read via `GET /v0/boxes/:box`)
+
+`head_seq` (highest assigned seq, log end; `0` if never written), `earliest_seq` (lowest
+retained non-expired deliverable seq, log start; `head_seq + 1` when empty), `next_seq`,
+`count`, `bytes`, `config`, `effective_priority`, `last_write_ts`, `last_read_ts`. See §5.1 for
+the exact definition of `earliest_seq` and API §1.2 for the response shape.
+
+---
+
+## 3. Priority & effective priority
+
+Every box has an **effective priority** combining a manual component and an automatic
+recency component. It affects **delivery scheduling only** — never `seq` order, retention, or
+which records are visible.
+
+### 3.1 Formula & defaults
+
+```
+P_eff(box, now) =
+      W_manual * clamp(priority, -1000, 1000)
+    + W_auto   * auto_recency(box, now)
+    + W_age    * age_boost(box, now)
+
+auto_recency = AUTO_MAX * 2^( -(now - last_consumed_at) / HALF_LIFE_MS )
+age_boost    = AGE_RATE * min(now - enqueued_at, AGE_CAP_MS)
+```
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `W_manual`, `W_auto`, `W_age` | `1.0` each | Component weights. |
+| `priority` | `0` (config `null` ⇒ auto-only) | Operator-set base, clamped `[-1000, 1000]`. |
+| `AUTO_MAX` | `500` | A freshly-consumed box ≈ a +500 manual box. |
+| `HALF_LIFE_MS` | `30000` | Auto bonus halves every 30 s of inactivity. |
+| `AUTO_FLOOR_MS` | `300000` | After 5 min untouched, auto term forced to 0 (skip the math). |
+| `AGE_RATE` | `+100 / s waited` | Anti-starvation climb. |
+| `AGE_CAP_MS` | `10000` | Aging capped at +1000 after 10 s. |
+
+A box is "consumed" by any `GET /v0/boxes/:box` (untouched if `touch=false`),
+`POST /v0/boxes/:box/diff`, or SSE attach/delivery; each sets `last_consumed_at = now`.
+
+Decay (AUTO_MAX 500, half-life 30 s): 0 s → 500, 15 s → 354, 30 s → 250, 60 s → 125, 120 s →
+31, ≥300 s → 0. Half-life 30 s means an actively-polling consumer keeps its box "hot" with
+negligible upkeep, while a quiet box sheds priority within a couple of minutes — matching
+"recently consumed boxes get higher effective priority" without letting a once-busy box hog the
+scheduler. `AUTO_MAX=500` keeps recency worth roughly half the manual range, so an operator can
+still force a box above all auto traffic with `priority=1000` (or below with `-1000`).
+
+`P_eff` is never stored as ground truth; it is computed on demand at enqueue time and on a 50 ms
+aging tick, using integer/fixed-point math (a 64-entry LUT for `2^-x`, no `powf` on the hot
+path). Higher `P_eff` is served first; under CPU pressure the scheduler throttles elastically
+but always drains higher priority before lower, with aging guaranteeing no starvation. See
+ARCHITECTURE §4–5.
+
+---
+
+## 4. Seq assignment
+
+### 4.1 Exact contract
+
+- Each box has its own `u64` counter `next_seq`, starting at `seq_base` (default `1`; `0` is
+  reserved to mean "no records").
+- On commit of a write of N records, the server atomically assigns `next_seq, …, next_seq+N-1`,
+  sets `next_seq += N`, and returns the seqs in write order. Assignment is at **commit**
+  (post-WAL-ordering), so `seq` order == durable commit order == delivery order.
+- `seq` is **strictly increasing and contiguous at assignment** — no gaps in the assigned
+  sequence. A single write request is **atomic**: all N records commit (contiguous seqs) or none.
+- **"Mostly sequential" refers to what a consumer reading the retained window observes:** after
+  eviction/TTL/tag-deletion/node-filtering the seqs a consumer sees can have holes (4097, 4098,
+  4101, …). The underlying assignment never skips; visibility does. A consumer MUST NOT assume
+  received seqs are contiguous, but MAY assume they are strictly increasing, and that any missing
+  seq below `head_seq` was either evicted/expired (tombstone if it crossed the cursor — §5) or
+  tag-deleted/node-filtered (silently skipped — §6, §7). **The distinction between "you missed
+  data" (tombstone) and "data was intentionally filtered for you" (silent) is the core safety
+  property.**
+
+### 4.2 Restart / recreate
+
+- After restart, `next_seq` is recovered as `max(committed seq) + 1`. Records buffered in the WAL
+  but not yet durably committed (for non-durable boxes) are lost; their seqs are never reused, so
+  seq is monotonic across restarts. Gaps from lost-but-acked non-durable writes are treated
+  exactly like eviction by consumers.
+- A deleted-and-recreated box restarts `next_seq` at `seq_base`; because the new `head_seq` can
+  be *below* a stale consumer's cursor, this is made non-silent via §5.5.
+
+### 4.3 Cursors
+
+- The canonical order is ascending `seq`; there is no secondary sort.
+- A **cursor** is a plain `seq`, interpreted as exclusive lower bound: "records with
+  `$seq > from_seq`." `from_seq = 0` means "from the beginning of what's retained." A tail /
+  only-new cursor is `from_seq = head_seq` at subscription (Redis `$`).
+- Reads are cursor-free in the turbopuffer sense (no opaque token); `diff` and SSE also return an
+  explicit `next_from_seq` for convenience and batch boundaries.
+
+---
+
+## 5. Watermarks, eviction, TTL, tombstones
+
+### 5.1 The earliest-seq watermark
+
+Let the **retained set** R = seqs physically present (not eviction-reclaimed) AND not
+TTL-expired. Then `earliest_seq = min(R)` if R is non-empty, else `head_seq + 1`. It is
+**monotonically non-decreasing** over a box instance's life (only moves forward as records
+evict/expire); it resets only on delete+recreate (§5.5).
+
+A consumer cursor `from_seq` is **valid** iff `from_seq + 1 >= earliest_seq`. If
+`from_seq + 1 < earliest_seq`, the consumer has fallen off the start and MUST be told (tombstone,
+§5.4).
+
+Two floors govern the two loss mechanisms, tracked separately so the tombstone can report *why*:
+- `evict_floor`: highest seq removed by **cap** eviction.
+- `expiry_floor`: as a function of time, the highest seq that is **TTL-expired**; moves
+  continuously with wall-clock even with no writes.
+
+`earliest_seq = max(evict_floor, expiry_floor) + 1`, clamped into `[seq_base, head_seq + 1]`.
+
+### 5.2 TTL expiry
+
+- A record is **expired** when `now - $ts > ttl_ms` (strict). Expired records are never delivered
+  and are excluded from `count`/`bytes`/`earliest_seq`.
+- Expiry is evaluated at read/delivery time against current `now`; the implementation MAY also
+  reclaim expired records lazily in the background (segment-granular, §5.6). A record can be
+  logically expired (invisible) before physically reclaimed — never observable as anything but
+  "expired."
+- Because `$ts` is commit-assigned and `seq` is commit-ordered, `$ts` is **non-decreasing in
+  `seq`** within a box. So "all seqs ≤ X are expired" is a binary-searchable predicate (Redis
+  time-id lesson) — `expiry_floor` is O(log n) over segments, not O(n).
+
+### 5.3 Eviction by cap & full policy
+
+When a write would push the box beyond `cap_records` or `cap_bytes`:
+- `discard = "old"` (default): commit the write, then advance `evict_floor` by removing oldest
+  records until back within cap — segment-granular and lazy (§5.6), so the box may transiently
+  exceed cap by up to one segment; `earliest_seq`/`count` reflect the logical floor.
+- `discard = "reject"`: the write is **rejected synchronously before assigning any seq**, with
+  `422 box_full` and `error.detail` carrying `cap_records`/`cap_bytes` and current
+  `head_seq`/`earliest_seq`. No record is acked-then-dropped (the NATS DiscardNew foot-gun is
+  avoided). A single write larger than the entire cap is a permanent `400 record_too_large` (not
+  retryable), distinguished from `422 box_full` (retryable after consumers drain).
+
+### 5.4 Tombstone / gap — the exact consumer contract
+
+A tombstone is an **in-band 200-level signal** (never an HTTP error) telling a consumer "there is
+a gap below where you're reading; you missed `[gap_from, gap_to]` and here is why." It is the
+single mechanism for *all* non-silent loss.
+
+**When emitted.** A `diff` or SSE delivery for cursor `from_seq` MUST emit a tombstone (before
+any subsequent records) iff `from_seq + 1 < earliest_seq`. After emitting it the read continues
+from `earliest_seq` (cursor advanced to `earliest_seq - 1`).
+
+**Shape** (a pseudo-record; carries a resumable position so SSE `id:` works on it too):
+
+```json
+{ "$type": "tombstone", "$seq": 479101,
+  "gap_from": 478501, "gap_to": 479100,
+  "reason": "cap", "missed_estimate": 600,
+  "earliest_seq": 479101, "head_seq": 480234 }
+```
+
+- `gap_from = from_seq + 1` (what they asked for next), `gap_to = earliest_seq - 1` (last lost
+  seq); the lost range is inclusive both ends.
+- `$seq` of the tombstone equals `earliest_seq` (first live seq after the gap), so it slots into
+  the monotonic id stream as a valid resume point.
+- `reason` ∈ `"cap"` (evicted for capacity), `"ttl"` (TTL-expired), `"mixed"` (both contributed),
+  `"recreated"` (box deleted+recreated, §5.5). In SSE the connect-time variant `"from_seq_too_old"`
+  is also used (same meaning as cap/ttl discovered at connect). The reason is informational; the
+  **gap range is authoritative**.
+
+**In `diff`:** the tombstone is the `tombstone` field (`null` when none); `records` begin at
+`earliest_seq`; `next_from_seq` continues past it. At most one tombstone per response (the gap is
+always one contiguous range because `earliest_seq` is monotonic).
+
+**In SSE:** a framed `event: tombstone` with `id:` encoding the post-gap cursor (so reconnect
+resumes correctly). The consumer handles `record` and `tombstone` uniformly.
+
+**The three loss/removal kinds — a hard contract:**
+
+| Kind | Detectable? | Mechanism | Consumer sees |
+|---|---|---|---|
+| **Eviction by cap** | YES, never silent | `evict_floor` advanced; crossing a cursor ⇒ tombstone `reason:"cap"` | gap range + tombstone |
+| **Expiry by TTL** | YES, never silent | `expiry_floor` advanced by clock; crossing a cursor ⇒ tombstone `reason:"ttl"` | gap range + tombstone |
+| **Explicit tag-deletion** | NO, intentionally silent | read-time filter drops matching records (§7) | matching seqs simply absent; no tombstone |
+| **Node loop-prevention** | NO, intentionally silent | reader's own-node records dropped (§6) | own seqs absent; no tombstone |
+
+The principle: **loss the consumer did not ask for ⇒ tombstone; removal the system/operator
+deliberately requested for this consumer ⇒ silent skip.** Tag-deletion and node-filtering are
+intentional, content-based drops, so they don't trip the gap alarm; a consumer that wants to
+detect them compares received seqs against `head_seq`/`earliest_seq`. Cap/TTL are capacity-driven
+drops the consumer never consented to, so they always alarm. Mixing these would make the gap
+signal useless.
+
+### 5.5 Delete+recreate / seq rewind
+
+If a box is deleted and a new box of the same name is created, a stale consumer presenting
+`from_seq >= new head_seq` (from the future relative to the new box) MUST receive a tombstone with
+`reason:"recreated"`, `gap_from = seq_base`, `gap_to = new head_seq` (possibly empty), then the
+read proceeds from the new `earliest_seq`. The server detects this via a per-box-instance
+**epoch** (monotonic counter bumped on create); cursors MAY encode the epoch so the rewind is
+detected exactly. Absent an epoch, the server treats `from_seq > head_seq` as a recreate signal.
+
+### 5.6 Eviction is segment-granular and lazy (perf contract)
+
+Records are stored in append-ordered **segments**. Eviction and TTL reclamation remove **whole
+segments** once *all* records in a segment are beyond cap or expired (Redis `~` / Kafka segment
+lesson). Per-record physical deletion on the hot path is forbidden. Consequence (documented
+honestly): `earliest_seq`/`count`/`bytes` are computed against the *logical* floor (exact);
+physical occupancy may transiently exceed cap by up to one segment. **Consumers always reason
+from the reported `earliest_seq`, never from cap arithmetic.**
+
+---
+
+## 6. Node loop-prevention
+
+Purpose: make router fan-out across N symmetric nodes safe (multi-master replication), so a node
+never receives back events it produced.
+
+- Every record MAY carry an origin `node` string (set by the writing client), recorded as
+  `$node`, immutable, and **preserved verbatim through router forwards** (§8.3).
+- A read (`diff` or SSE) MAY carry a reader node id `node` (the filter). When present the read
+  MUST drop every record whose `$node == node` (byte-exact) before delivery. Records with no
+  `$node`, or a different `$node`, pass through.
+- The filter is applied **after** retention/TTL but is content-based and intentional, so dropping
+  own-node records is **silent** (no tombstone — §5.4). Dropped seqs are simply absent; the cursor
+  still advances past them.
+- Matching is exact equality only (no prefix). A read MAY pass multiple node ids
+  (`"node": ["a","b"]`) → "drop if `$node` ∈ set."
+- **Batching interaction:** because node-filtered records are dropped *after* the bounded batch
+  window is selected, a batch may return fewer than `limit` records (even zero) while still
+  advancing the cursor. The consumer relies on `next_from_seq`/`head_seq`/`caught_up`, not on
+  batch fullness, to know whether it is caught up (avoids unbounded scanning to "fill" a batch).
+- Disable per-box with `dedupe_node: false` if you genuinely want echoes.
+
+---
+
+## 7. Read-time deletion filters (tag-deletion)
+
+### 7.1 Model & lifecycle — a persistent delete-rule set per box
+
+A tag-delete request adds a **rule** (`Eq "x"` or `Glob "x*"`) to the box; every read evaluates
+records against the active rule set and drops matches. This (not a one-shot scan) is the model
+because:
+- The spec's framing is "a filter applied at read time," and a delete must also suppress *future*
+  matching records (e.g. "cancel all jobs for tenant X" should cancel jobs enqueued a moment
+  later by an in-flight producer, which a one-shot scan would race).
+- It composes cleanly with the append log: no record is mutated, eviction is unaffected, and the
+  rule set is small (bounded by number of delete operations, not records).
+- Honest semantics (Kafka tombstone lesson): a rule is "drop matching tags at read time," not
+  "physically gone" — exactly the spec's "mark deleted during reading."
+
+Each rule: `{ op: "Eq" | "Glob", tag, rule_seq, created_ts }`.
+- `Eq` matches `$tag == tag` exactly. `Glob` matches the wildcard-prefix form: the rule's `tag`
+  ends in `*` and a record matches iff `$tag` has the literal prefix preceding the `*`. **Only a
+  trailing `*` is supported** (the spec's "tag" and "tag*" forms); no general globbing — keeps
+  matching a prefix test.
+- Rules **do not expire** with TTL and are **not subject to cap eviction**; they live for the
+  box's lifetime or until the box is deleted. This avoids Kafka's `delete.retention.ms` race where
+  a lagging consumer misses a delete: a rule is evaluated at every read regardless of lag, so no
+  consumer can "read past" a delete.
+- Adding a rule is a committed, WAL-logged mutation (durable rules survive restart). It is
+  idempotent and additive.
+- **Deletion is monotonic in `/v0`: there is no un-delete.** A record once tag-deleted stays
+  filtered for the box's life; to resurrect, write a new record. This keeps the filter set
+  append-only and cheap. (A `/v1` may add rule removal — records are never physically removed, so
+  removal would be lossless undo; it is deferred deliberately. See ROADMAP open questions.)
+
+### 7.2 Matching data structure (efficient over many records)
+
+The active rule set per box is two structures evaluated per candidate record:
+- **Exact set:** a hash set of `Eq` tags → O(1) per record.
+- **Prefix set:** the `Glob` prefixes in a sorted array (or trie). A record matches iff any stored
+  prefix is a prefix of `$tag`; binary search is O(log P) (trie is O(len(tag))). Since `$tag` ≤
+  256 bytes, this is a small bounded cost.
+
+A record passes the delete filter iff it is in neither structure. Both structures are tiny
+relative to record count and evaluated as a single pass alongside TTL/node filtering, so
+tag-deletion adds bounded per-record overhead and never scans the box. The set is held behind a
+copy-on-write `ArcSwap` so the (frequent) read path is wait-free.
+
+### 7.3 Composition with reads / SSE / eviction (the read pipeline)
+
+Per candidate record, for both `diff` and SSE:
+
+1. **Retention/TTL gate** — record in retained set R? If the cursor fell below `earliest_seq`,
+   emit tombstone (§5.4). *Capacity loss, non-silent.*
+2. **Tag-delete filter** — drop if it matches a rule (§7). *Intentional, silent.*
+3. **Node filter** — drop if `$node` ∈ reader node set (§6). *Intentional, silent.*
+4. Deliver the surviving record (respecting batch `limit` / SSE flow).
+
+Eviction/TTL are computed on the *unfiltered* log (tag-deleted and node records still count toward
+cap/age and still age out normally) — deletion filters change *visibility*, not *retention*. A
+tag-deleted record that later evicts contributes to a `cap` gap like any other; since it was
+already invisible to readers, the tombstone's range still uses raw seq math (the consumer can't
+tell and doesn't need to). Tag-deletion never propagates through routers: `dst` has its own rule
+set (§8.3).
+
+---
+
+## 8. Router semantics
+
+A router is a forwarding rule `src → dst`: every record committed to `src` is forwarded (appended)
+to `dst`. `{ name, source, dest, preserve_node, preserve_tag, filter, allow_cycle, created_ts }`.
+
+### 8.1 Forward mechanics & ordering
+
+- When record `r` commits to `src` at `src.$seq = s`, the router appends a forwarded copy to
+  `dst`, which assigns it a **fresh `dst.$seq`** (dst's own counter). `dst.$seq` is unrelated to
+  `s`.
+- **Ordering:** records forwarded from a single `src` to a single `dst` preserve `src` commit
+  order in `dst` (per-route FIFO). If multiple routers/writers feed one `dst`, its order is the
+  interleaving by `dst` commit time — only **per-source FIFO** is guaranteed (same as Kafka with
+  multiple producers into one partition).
+- The forward is driven off the same committed log as consumers (a server-internal consumer of
+  `src` with its own cursor), so a router never forwards a record that didn't durably commit to
+  `src`.
+
+### 8.2 Delivery guarantee: at-least-once
+
+- Forwarding is **at-least-once**. The router persists its forward cursor over `src`; on restart
+  it resumes from the last *durably forwarded* position. A crash between "appended to dst" and
+  "advanced router cursor" can re-forward → duplicates in `dst`.
+- Exactly-once is not offered (it would require distributed-style dedup the single-process design
+  avoids). De-dup is the consumer's job; `$node` + an optional client dedup key in `meta` make
+  idempotent consumption practical. **Consumers must be idempotent** (BullMQ at-least-once
+  lesson).
+- Forwarding respects `dst.durable`: if `dst` is durable, the router advances its cursor only after
+  `dst` fsyncs the forwarded record.
+
+### 8.3 What carries through a forward
+
+- The forwarded record in `dst` preserves `$node` (origin node — **never** rewritten when
+  `preserve_node`; this is what makes loop-prevention work across the route), `$tag` (when
+  `preserve_tag`), `meta`, and `data` verbatim.
+- `$seq` and `$ts` are reassigned by `dst`. Original src seq/ts are optionally preserved in
+  reserved meta `$src_box` / `$src_seq` for traceability (off by default to keep payloads lean).
+- Tag-delete rules and node filters are **per-box** and do not propagate through routers: `dst`
+  has its own rule set. A delete on `src` suppresses reads of `src`, but the record may already
+  have been forwarded to `dst`; to cancel in `dst` too, add a rule on `dst`. Honest and
+  predictable.
+
+### 8.4 dst cap / ttl behavior
+
+A forward into `dst` is an ordinary append obeying `dst`'s config:
+- `dst.discard = "old"`: forward succeeds, oldest `dst` records evict, router cursor advances.
+- `dst.discard = "reject"`: the forward is rejected (`dst` full); the router **does not advance**
+  its cursor and **retries with backoff** (the record is still in `src`) — backpressure up the
+  route rather than data loss. If `src` itself then caps out under `discard:"old"`, an unforwarded
+  src record can evict before being forwarded; the router records the skip and emits an internal
+  warning metric (a durable fan-out should size `dst ≥ src` or use `discard:"old"` on `dst`). The
+  single-process design favors local backpressure over unbounded buffering.
+- `dst` TTL applies to forwarded records by `dst.$ts` (forward time), not src time.
+
+### 8.5 Loop prevention across routers — two complementary layers
+
+1. **Node loop-prevention (content-level, primary).** Because `$node` is preserved verbatim
+   through every forward, a symmetric topology works: node A writes `$node=A`; routers fan it to
+   B's and C's boxes; B and C read with their own `node` filters, so they receive A's record but
+   never re-emit it as their own. Routers forwarding a record do not change `$node`, so a record
+   that loops back to a box read by its origin node is filtered at read. This makes N-way
+   multi-master safe even with cyclic router graphs, *as long as nodes set and filter their node
+   ids* — the documented contract for the multi-master use case.
+
+2. **Router graph cycle control (topology-level, resource safety).** Node filtering stops a node
+   from *consuming* its own events but does not stop a record from being *forwarded* around a cycle
+   forever (wasteful, can amplify). Therefore:
+   - The server maintains the router graph. **Creating a router that would introduce a directed
+     cycle is rejected at creation with `409 router_cycle`** (`error.detail.cycle:["a","b","a"]`).
+     DAG-by-default is the simplest correct rule.
+   - For intentional cyclic/multi-master topologies (A↔B mirrors), set `allow_cycle: true` on the
+     router; the route then uses **runtime hop-cap loop-breaking**: a forwarded record carries a
+     bounded hop counter (`$ttl_hops`, default max 8) and/or a hop set (`$route_path`); a router
+     MUST NOT forward a record whose `dst` already appears in `$route_path` or whose `$ttl_hops` is
+     exhausted, so forwarding always terminates.
+
+   Complementary: node-filtering prevents *delivery* of your own events (correctness); the
+   DAG/hop-cap prevents *unbounded forwarding* (resource safety).
+
+### 8.6 Router lifecycle
+
+- `PUT /v0/routers/:router` creates after the DAG/cycle check; `source`/`dest` auto-created (lazy)
+  if missing unless `create_dest: false`.
+- `DELETE /v0/routers/:router` stops forwarding immediately; already-forwarded records in `dst`
+  remain.
+- Deleting a box deletes the routers touching it (a router referencing a missing endpoint cannot
+  exist).
+
+---
+
+## 9. Summary of the safety invariants (the load-bearing contract)
+
+1. **`seq` is strictly increasing and gap-free at assignment**; visibility holes are normal and
+   are categorized for the consumer.
+2. **No silent capacity loss.** Any cap-eviction or TTL-expiry crossing a consumer's cursor
+   produces an in-band tombstone with an authoritative `[gap_from, gap_to]` and a best-effort
+   `reason`. Identical contract in `diff` and SSE.
+3. **Intentional, content-based removal is silent.** Tag-deletion and own-node filtering drop
+   records without tombstones; consumers detect them (if they care) via `head_seq`/`earliest_seq`
+   arithmetic, never confusing them with data loss.
+4. **`earliest_seq` is the single source of truth** for "what can I still read"; cap arithmetic is
+   never authoritative (lazy, segment-granular eviction may exceed cap transiently).
+5. **`$node` is immutable and preserved through routers**, making N-way multi-master fan-out safe
+   by construction.
+6. **Routers are at-least-once, per-source FIFO, DAG-by-default** (with an explicit hop-capped
+   `allow_cycle` escape hatch); `dst` enforces its own retention and `discard:"reject"` applies
+   backpressure rather than silently dropping.
+7. **Durability is per-box and explicit**; only data not yet in the (fsynced, for durable boxes)
+   WAL is lost on crash, and such loss appears to consumers as ordinary eviction-style gaps.

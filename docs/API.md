@@ -1,0 +1,979 @@
+# streams — HTTP API Reference (`/v0`)
+
+A persistent event engine exposed as a JSON-first HTTP API. Single binary, single
+machine. This document is the complete `/v0` surface — every endpoint, its body, its
+response, and its errors. It is the contract the implementation must satisfy.
+
+---
+
+## 0. Conventions
+
+### 0.1 Base URL & versioning
+
+```
+http://{host}:{port}/v0/...
+```
+
+The API version is the **first path segment** (`/v0`). Breaking changes ship as a new
+prefix (`/v1`) and may run concurrently. Within a version only additive changes are made
+(new optional request fields, new response fields, new endpoints). **Clients must ignore
+unknown response fields.** There is no region in the host — streams is single-machine.
+
+### 0.2 Auth
+
+```
+Authorization: Bearer <API_KEY>
+```
+
+Plain bearer token. Keys are supplied at startup (`STREAMS_API_KEYS`, comma-separated). A
+missing/unknown key returns `401`. If the server starts with **no** keys configured, auth
+is disabled (single-tenant dev mode) and the header is ignored — logged loudly at boot.
+There are no scopes in `/v0`; a valid key has full access.
+
+### 0.3 Content types & encoding
+
+- **Request bodies:** `Content-Type: application/json; charset=utf-8`, required on every
+  `POST`/`PUT` with a body.
+- **Response bodies:** `application/json`, except the SSE stream which is `text/event-stream`.
+- **`data` payloads** are arbitrary JSON (object, array, string, number, bool, null),
+  stored and returned **verbatim** — never parsed, indexed, or validated for shape. For
+  binary, put a base64 string in `data` and a hint in `meta`.
+- **Compression:** the server honors `Accept-Encoding: gzip` / `Content-Encoding: gzip`,
+  but clients default it **off** — on a local-NVMe single-machine deployment the
+  bottleneck is CPU, not bandwidth. Turn it on only for large bulk writes over a slow link.
+- **Timestamps** are integer **milliseconds since Unix epoch** (`ts`, `*_ms`). Durations
+  are integer milliseconds. There are no string dates anywhere.
+- **`seq`** is a `u64` rendered as a JSON number. Seqs fit in IEEE-754 doubles until
+  ~9 quadrillion, well beyond any single-machine box lifetime, so no string encoding is
+  needed. Clients SHOULD parse as 64-bit integers regardless.
+
+### 0.4 The `$`-prefixed metadata convention
+
+Server-computed, per-record metadata is returned under `$`-prefixed keys so it can never
+collide with user content (`data` and `meta` are the user's namespaces). On **write**, a
+client sets `node`/`tag` as plain top-level keys (no sigil to remember); on **read**, the
+server echoes them as `$node`/`$tag` to signal they are now server-canonical and immutable.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `$seq` | `u64` | Server-assigned sequence id. |
+| `$ts` | `i64` (ms) | Server commit time. |
+| `$node` | `string` | Origin node id supplied by the writer (loop prevention). Omitted if absent. |
+| `$tag` | `string` | Tag supplied by the writer (tag-deletion matching). Omitted if absent. |
+| `$type` | `string` | `"record"` (default, omitted on plain records) or `"tombstone"`. Used in SSE framing. |
+
+`data`/`meta` keep the same key in both directions (pure passthrough). `$node`/`$tag`/
+`meta` are omitted from a response object when absent (absence, not `null`). `data` is
+always present (may be JSON `null`).
+
+### 0.5 Canonical error body
+
+Every non-2xx response (except in-stream SSE errors, §7) carries this exact shape:
+
+```json
+{
+  "error": {
+    "code": "box_not_found",
+    "message": "box \"jobs\" does not exist",
+    "detail": { "box": "jobs" }
+  }
+}
+```
+
+- `error.code` — stable machine-readable snake_case string. Clients branch on this.
+- `error.message` — human-readable, may change between versions, never parsed.
+- `error.detail` — optional structured context. May be absent.
+
+Success responses carry **bare data** — no `{"status":"ok"}` envelope. The presence of a
+top-level `error` key is the only success/failure discriminator.
+
+> **Tombstones/gaps are NOT errors.** Eviction and TTL crossings surface as in-band `200`
+> payload signals (a `tombstone` object in a diff, an `event: tombstone` frame in SSE).
+> Data loss is always explicit but never an HTTP error. See §4.4.
+
+### 0.6 Status codes (global table)
+
+| Code | Meaning | `error.code` examples |
+|---|---|---|
+| `200` | OK (read, idempotent write/create/delete) | — |
+| `201` | Created (box/router created on this call) | — |
+| `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large`, `too_many_filters` |
+| `401` | Missing/invalid bearer token | `unauthorized` |
+| `404` | Box/router does not exist (and was not auto-created) | `box_not_found`, `router_not_found` |
+| `405` | Wrong method for path | `method_not_allowed` |
+| `406` | `Accept` not `text/event-stream` (SSE GET) | `not_acceptable` |
+| `409` | Conflict: router cycle, config conflict | `router_cycle`, `box_exists_incompatible`, `box_not_empty` |
+| `413` | Body exceeds server hard limit (pre-parse) | `payload_too_large` |
+| `415` | Wrong/missing `Content-Type` | `unsupported_media_type` |
+| `422` | Semantically invalid (write to a full `discard:"reject"` box) | `box_full` |
+| `429` | Elastic throttle / backpressure under CPU pressure | `throttled` — carries `Retry-After` + `error.detail.retry_after_ms` |
+| `500` | Internal error (bug) | `internal` |
+| `503` | Not ready (WAL replay on boot) / shutting down | `not_ready`, `shutting_down` — carries `Retry-After` |
+
+`429` is the elastic-throttle signal. Bulk writers that prefer to push through may set
+`"disable_backpressure": true` in the write body (trusted-loader opt-out); the server then
+admits the write but may queue it, trading latency for not failing.
+
+### 0.7 Pagination & cursors
+
+Three cursor styles for three read shapes:
+
+1. **Box reads are seq-cursored, not opaque.** The cursor *is* `from_seq`. `POST .../diff`
+   returns `next_from_seq`; pass it back. When fully caught up, `next_from_seq == head_seq`
+   and `"caught_up": true`. We always return `next_from_seq`; `caught_up` is the "done for
+   now" flag (for a live log "done for now" is not "done forever").
+2. **List endpoints use opaque cursors.** `GET /v0/boxes` and `GET /v0/routers` return
+   `next_cursor` (opaque base64), **present only when more pages exist** — its absence means
+   the last page. Pass it back as `?cursor=`. `page_size` default `100`, max `1000`.
+3. **SSE uses a composite cursor.** The multiplex watch encodes per-box `(box → seq)`
+   positions as a base64url-encoded JSON map, usable as both `Last-Event-ID` and the
+   `cursor` request field. See §7.
+
+### 0.8 Idempotency
+
+Two complementary mechanisms; no global idempotency-token service.
+
+1. **Control-plane is idempotent by construction.** Create/configure is `PUT` and
+   upsertable: an identical `PUT` is a no-op `200`; a changed `PUT` applies the diff.
+   `DELETE` of an absent resource returns `200` with `"deleted": false`.
+2. **Writes use an optional `idempotency_key`.** If supplied, the server remembers
+   `(box, idempotency_key) → assigned seqs` for `idempotency_window_ms` (default 120000,
+   per box). A retried write with the same key in-window returns the **original** seqs with
+   `"deduped": true` and does **not** append again. The key may also be sent as header
+   `Idempotency-Key:` (body field wins). A log has no "old value," so a dedup key — not a
+   CAS condition — is the right primitive for safe append retries.
+
+### 0.9 The `performance` block
+
+Every JSON response (and most errors) includes a `performance` object so observability
+lives in the response, not a side channel:
+
+```json
+"performance": {
+  "server_total_ms": 0.41,
+  "wal_append_ms": 0.12,
+  "fsync_ms": 0.0,
+  "records_scanned": 128,
+  "throttle_wait_ms": 0.0
+}
+```
+
+Fields are best-effort and additive; clients must tolerate any subset. `fsync_ms` is `0.0`
+for non-durable boxes. `throttle_wait_ms` is time parked behind the elastic scheduler.
+
+### 0.10 The Box config object
+
+This object appears in box-create requests and box-state responses. All fields are
+optional on create; omitted fields take the documented default.
+
+```json
+{
+  "ttl_ms": 0,
+  "cap_records": 0,
+  "cap_bytes": 0,
+  "discard": "old",
+  "durable": false,
+  "priority": null,
+  "auto_priority": true,
+  "auto_create": true,
+  "idempotency_window_ms": 120000,
+  "dedupe_node": true
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `ttl_ms` | `u64` | `0` (off) | Records older than this (by `$ts`) are not delivered (expired). `0` = no TTL. Expiry is a read-time filter plus lazy segment reclamation; crossing a consumer's cursor yields a tombstone (§4.4). |
+| `cap_records` | `u64` | `0` (off) | Max retained record count. On overflow the box evicts per `discard`. `0` = unbounded. |
+| `cap_bytes` | `u64` | `0` (off) | Max retained payload bytes (`data` + `meta` + framing). `0` = unbounded. Whichever of `cap_records`/`cap_bytes` is hit first triggers eviction. |
+| `discard` | `"old" \| "reject"` | `"old"` | Full-box policy. `old` = evict oldest (pub/sub friendly). `reject` = refuse the write with `422 box_full` so durable queues fail loudly rather than dropping unconsumed work. |
+| `durable` | `bool` | `false` | If `true`, a write is not acked until its WAL entry is `fsync`'d. If `false`, the fast path acks after the in-memory + WAL-buffer append (group-committed later); only data not yet flushed is lost on crash. |
+| `priority` | `i32 \| null` | `null` | Manual delivery priority (higher served first under pressure), clamped `[-1000, 1000]`. `null` ⇒ use auto-priority. |
+| `auto_priority` | `bool` | `true` | If `priority` is `null`, derive effective priority from recency of the last read/SSE/state call on this box. A manual `priority` always overrides. |
+| `auto_create` | `bool` | `true` | Whether a write to this box name may lazily create it. The per-write `create` flag can override downward. |
+| `idempotency_window_ms` | `u64` | `120000` | How long `(box, idempotency_key)` dedupe state is retained (§0.8). |
+| `dedupe_node` | `bool` | `true` | Whether node loop-prevention filtering is enabled on reads of this box (§4.5/§7.1). Essentially always `true`; exposed so a box can opt out of node filtering entirely. |
+
+**Caps and `earliest_seq`:** eviction is *segment-granular and lazy* (whole segments
+dropped, may transiently exceed cap), so the true retained floor is reported as
+`earliest_seq` in box state and **must be read from the server** — never computed by the
+client from `head_seq - cap_records`.
+
+---
+
+## 1. Box lifecycle
+
+### 1.1 Create / configure a box — `PUT /v0/boxes/:box`
+
+Create a box, or update its config. Idempotent and upsertable.
+
+**Path** — `:box`, name `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts
+alphanumeric, allows `. _ : -`; `:` enables namespacing like `jobs:tenantA`). Case-sensitive,
+byte-exact.
+
+**Request body** — the Box config object (§0.10). All fields optional; empty `{}` creates
+all-default.
+
+```json
+{ "ttl_ms": 60000, "cap_records": 1000000, "discard": "old", "durable": true, "priority": 10 }
+```
+
+**Behavior**
+- Box absent → created with given config merged over defaults → `201`.
+- Box exists, identical config → no-op → `200`.
+- Box exists, different config → updated → `200`. Changes apply going forward; they never
+  rewrite stored records, but a tightened `cap`/`ttl` makes existing records eligible for
+  lazy eviction/expiry. No fields are immutable in `/v0`.
+
+**Response** (`201` / `200`)
+
+```json
+{
+  "box": "jobs",
+  "created": true,
+  "config": { "ttl_ms": 60000, "cap_records": 1000000, "cap_bytes": 0,
+              "discard": "old", "durable": true, "priority": 10,
+              "auto_priority": true, "auto_create": true,
+              "idempotency_window_ms": 120000, "dedupe_node": true },
+  "performance": { "server_total_ms": 0.22 }
+}
+```
+
+`created` is `true` only when this call brought the box into existence.
+
+**Errors** — `400 invalid_request` (bad name/field/value); `409 box_exists_incompatible`.
+
+### 1.2 Get box state — `GET /v0/boxes/:box`
+
+Read current state: head seq, earliest retained seq, count, byte size, config. The cheap
+"where am I / how much lag" call. By default it **bumps the box's auto-priority recency
+clock**.
+
+**Query** — `touch` (bool, default `true`): if `false`, do not update auto-priority recency
+(for monitoring scrapes that shouldn't make a box look "hot").
+
+**Response** (`200`)
+
+```json
+{
+  "box": "jobs",
+  "head_seq": 480231,
+  "earliest_seq": 479101,
+  "next_seq": 480232,
+  "count": 1130,
+  "bytes": 2310912,
+  "config": { "...": "..." },
+  "effective_priority": 500,
+  "last_write_ts": 1748450000123,
+  "last_read_ts": 1748450009000,
+  "performance": { "server_total_ms": 0.05 }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `head_seq` | Highest assigned seq (log end). `0` for a fresh empty box. |
+| `earliest_seq` | Lowest retained, non-expired, deliverable seq (log start). If the box is empty, `earliest_seq = head_seq + 1`. A consumer whose `from_seq + 1 < earliest_seq` has fallen off the start and will receive a tombstone. |
+| `next_seq` | Seq the next append will receive (`head_seq + 1`). A handy "tail" cursor: read from `next_seq - 1` to get only new records. |
+| `count`, `bytes` | Currently retained records and payload bytes (approximate under lazy eviction). |
+| `effective_priority` | The priority the scheduler is using right now (manual, or auto-derived). |
+| `last_write_ts` / `last_read_ts` | Recency clocks (ms); `null` if never. |
+
+**Errors** — `404 box_not_found` (state read never auto-creates).
+
+### 1.3 List boxes — `GET /v0/boxes`
+
+Enumerate boxes with summary state. Opaque-cursor paginated.
+
+**Query** — `prefix` (string), `page_size` (default 100, max 1000), `cursor` (opaque),
+`touch` (bool, default `false` — listing does not bump auto-priority).
+
+**Response** (`200`)
+
+```json
+{
+  "boxes": [
+    { "box": "jobs",   "head_seq": 480231, "earliest_seq": 479101, "count": 1130, "bytes": 2310912, "durable": true,  "effective_priority": 500 },
+    { "box": "events", "head_seq": 99,     "earliest_seq": 1,      "count": 99,   "bytes": 8112,    "durable": false, "effective_priority": 3 }
+  ],
+  "next_cursor": "eyJhZnRlciI6ImpvYnMifQ==",
+  "performance": { "server_total_ms": 0.18 }
+}
+```
+
+`next_cursor` is omitted on the final page.
+
+**Errors** — `400 invalid_request` (malformed/corrupt cursor).
+
+### 1.4 Delete a box — `DELETE /v0/boxes/:box`
+
+Permanently remove a box and all its records, dedupe state, delete-filters, and routers
+referencing it. Idempotent. Irreversible.
+
+**Query** — `if_empty` (bool, default `false`): if `true`, delete only when `count == 0`,
+else `409 box_not_empty`.
+
+**Response** (`200`)
+
+```json
+{ "box": "jobs", "deleted": true,
+  "routers_removed": ["jobs->audit", "jobs->mirror"],
+  "performance": { "server_total_ms": 0.31 } }
+```
+
+Deleting an absent box returns `200` with `"deleted": false` and empty `routers_removed`. A
+later lazy-create makes a **new, empty** box (seq restarts); stale consumers detect this via
+the `recreated` tombstone (§4.4 / DESIGN §5.5).
+
+**Errors** — `409 box_not_empty`.
+
+---
+
+## 2. Write — `POST /v0/boxes/:box`
+
+Append one or many records. The server assigns `seq`s and returns them. The single write
+endpoint also carries inline config (applied only on lazy create) so the common case needs
+no separate configure call.
+
+**Request body**
+
+```json
+{
+  "records": [
+    { "data": { "type": "resize", "url": "s3://b/a.png", "w": 256 },
+      "tag": "tenant42:job-9001", "node": "worker-eu-1", "meta": { "trace": "abc123" } },
+    { "data": "raw-opaque-or-base64", "tag": "tenant42:job-9002" }
+  ],
+  "node": "worker-eu-1",
+  "idempotency_key": "client-batch-7f3a",
+  "create": true,
+  "config": { "ttl_ms": 60000, "cap_records": 1000000 },
+  "disable_backpressure": false
+}
+```
+
+| Field | Type | Req? | Meaning |
+|---|---|---|---|
+| `records` | array | yes | 1..=`MAX_BATCH_RECORDS`. Seqs assigned in array order, contiguously. |
+| `records[].data` | any JSON | yes | Opaque payload (may be `null`). |
+| `records[].tag` | string | no | Tag for read-time deletion. ≤ `MAX_TAG_BYTES`. |
+| `records[].node` | string | no | Per-record origin node; overrides batch-level `node`. ≤ `MAX_NODE_BYTES`. |
+| `records[].meta` | object | no | Small headers, returned verbatim. ≤ `MAX_META_BYTES`, ≤ 64 keys. |
+| `node` | string | no | Batch-level default origin node (the common one-writer case). |
+| `idempotency_key` | string | no | Dedupe key (§0.8), scoped to this box. ≤ 256 chars. |
+| `create` | bool | no | Overrides the box's `auto_create` for this write only. `true` ⇒ auto-create if absent; `false` ⇒ `404 box_not_found` if absent (Redis `NOMKSTREAM`, prevents typo-boxes). Default = box's `auto_create`. |
+| `config` | Box config | no | Applied **only if this write creates the box**. Ignored if the box exists (config changes on an existing box go through `PUT`). |
+| `disable_backpressure` | bool | no | If `true`, opt out of `429` for this write; server may queue instead. Default `false`. |
+
+**Behavior**
+- A write is **atomic**: all N records commit with contiguous seqs, or none do. No partial
+  append.
+- `node` is recorded as `$node`; on later reads/SSE by that same node these records are
+  filtered out (§4.5).
+- Durable boxes: response held until `fsync` completes. Non-durable: acked on buffered
+  append.
+- **Full box:** `discard:"old"` evicts oldest and the write succeeds (eviction may later
+  surface as a tombstone to lagging consumers). `discard:"reject"` ⇒ `422 box_full`,
+  **nothing appended** (all-or-nothing), writer learns synchronously (never ack-then-drop).
+
+**Response** (`200`, or `201` if this write created the box)
+
+```json
+{
+  "box": "jobs",
+  "first_seq": 480232, "last_seq": 480234,
+  "seqs": [480232, 480233, 480234],
+  "head_seq": 480234, "count": 3,
+  "created": false, "deduped": false,
+  "performance": { "server_total_ms": 0.62, "wal_append_ms": 0.10, "fsync_ms": 0.39 }
+}
+```
+
+`seqs` may be suppressed with `?return_seqs=false` for huge batches (then only
+`first_seq`/`last_seq` are returned). `deduped: true` means an `idempotency_key` matched a
+prior in-window write; `seqs` are the original ones and no new append happened.
+
+**Batching limits** (documented hard limits — design within them)
+
+| Limit | Default | Config var |
+|---|---|---|
+| Max records per write | `10000` | `STREAMS_MAX_BATCH_RECORDS` |
+| Max single record `data`+`meta` | `1 MiB` | `STREAMS_MAX_RECORD_BYTES` |
+| Max total request body | `64 MiB` | `STREAMS_MAX_BODY_BYTES` |
+| Max `meta` per record | `16 KiB`, ≤ 64 keys | `STREAMS_MAX_META_BYTES` |
+| Max `tag` length | `256` bytes | `STREAMS_MAX_TAG_BYTES` |
+| Max `node` length | `128` bytes | `STREAMS_MAX_NODE_BYTES` |
+
+**Errors** — `400 invalid_request` / `batch_too_large` / `record_too_large`;
+`404 box_not_found` (`create:false` and absent); `413 payload_too_large`;
+`415 unsupported_media_type`; `422 box_full`; `429 throttled`.
+
+---
+
+## 3. Read difference (getDifference) — `POST /v0/boxes/:box/diff`
+
+The core consume operation. Given a cursor `from_seq`, return the records after it, bounded
+to a batch, with a continuation cursor and any tombstone. Applies TTL, tag-deletion, and
+node loop-prevention filters at read time. Bumps auto-priority recency. `POST` (not `GET`)
+because the operation is described by the JSON body; it is read-only and safe to retry.
+
+**Request body**
+
+```json
+{
+  "from_seq": 479100,
+  "limit": 500,
+  "node": "worker-eu-1",
+  "include_tags": false,
+  "include_meta": true,
+  "include_deleted": false,
+  "wait_ms": 0
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `from_seq` | `u64` | `0` | Exclusive lower bound: return records with `$seq > from_seq`. `0` = from earliest retained. To tail, pass the current `head_seq`. |
+| `limit` | `u32` | `256` | Max records this call. Clamped to `STREAMS_MAX_LIMIT` (`1000`), not rejected. `0` ⇒ default. |
+| `node` | string \| array | none | Node loop-prevention filter (§4.5): records whose `$node` ∈ this set are omitted (but still advance the cursor). |
+| `include_tags` | bool | `false` | Include `$tag` on each record. |
+| `include_meta` | bool | `true` | Include each record's `meta`. |
+| `include_deleted` | bool | `false` | If `true`, tag-deleted records are returned with `$deleted: true` instead of being filtered (audit/debug). |
+| `wait_ms` | `u32` | `0` | Long-poll: if nothing is available, block up to this many ms for new records. Clamped to `30000`. SSE is preferred for true streaming; this is the XREAD `BLOCK` analog. |
+
+**Response** (`200`)
+
+```json
+{
+  "box": "jobs",
+  "records": [
+    { "$seq": 479101, "$ts": 1748450001000, "$node": "worker-us-2", "$tag": "tenant42:job-8800",
+      "data": { "type": "resize", "url": "s3://b/x.png" }, "meta": { "trace": "z9" } },
+    { "$seq": 479102, "$ts": 1748450001050,
+      "data": { "type": "thumbnail", "url": "s3://b/y.png" } }
+  ],
+  "next_from_seq": 479102,
+  "head_seq": 480234,
+  "earliest_seq": 479101,
+  "caught_up": false,
+  "tombstone": null,
+  "lag": 1132,
+  "performance": { "server_total_ms": 0.30, "records_scanned": 134 }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `records` | Up to `limit` records with `$seq > from_seq`, ascending, after TTL + tag-delete + node filtering. `$tag` only if `include_tags`; `meta` only if `include_meta`. |
+| `next_from_seq` | Pass back as `from_seq`. Equals the `$seq` of the last **examined** record (filtered records still advance it), so filtered records are never re-scanned. |
+| `head_seq` / `earliest_seq` | Log end / retained floor — for lag math and fall-off detection. |
+| `caught_up` | `true` when `next_from_seq == head_seq`. The reliable "no more right now" signal. |
+| `tombstone` | `null`, or a gap marker (§3.2). |
+| `lag` | `head_seq - next_from_seq` — records still behind the cursor. |
+
+### 3.1 The cursor is the ack (ack-all / cursor-advance)
+
+The default consume model is **cursor-advance = ack-all** (Kafka offset, NATS AckAll):
+advancing your stored `from_seq` past seq N acks 1..N. The client owns its cursor; the
+server keeps **no** per-consumer state on this path. Per-message explicit-ack / lease /
+heartbeat (the BullMQ stalled-job model) is not in `/v0`; it is a planned higher-level mode
+(ROADMAP) layered on tags + a side in-flight box, kept out of the core to preserve the
+stateless-log primitive.
+
+### 3.2 Filtered records still advance the cursor
+
+Node-filtered and tag-deleted records are **omitted from `records`** but `next_from_seq`
+advances **past** them. Otherwise a consumer reading a box full of its own (node-filtered)
+events would loop forever. So `records.length` may be less than the number of seqs
+traversed, and may be `0` while `next_from_seq` advanced. **`caught_up` is the reliable
+"no more" signal — never `records.length == 0`.**
+
+### 3.3 Tombstone / gap markers (never silent loss)
+
+If `from_seq + 1 < earliest_seq` — the cursor fell below the retained floor because records
+were evicted (cap) or expired (TTL) — the response returns a `tombstone` and resumes from
+the floor:
+
+```json
+{
+  "box": "jobs",
+  "records": [ { "$seq": 479101, "...": "..." } ],
+  "tombstone": {
+    "gap_from": 478501,
+    "gap_to": 479100,
+    "reason": "cap",
+    "missed_estimate": 600,
+    "earliest_seq": 479101,
+    "head_seq": 480234
+  },
+  "next_from_seq": 479200,
+  "head_seq": 480234,
+  "earliest_seq": 479101,
+  "caught_up": false
+}
+```
+
+| `tombstone` field | Meaning |
+|---|---|
+| `gap_from` | First missing seq (= stale `from_seq + 1`). |
+| `gap_to` | Last missing seq (= `earliest_seq - 1`). The lost range `[gap_from, gap_to]` is inclusive both ends. |
+| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), or `"recreated"` (box was deleted+recreated). Best-effort/informational; the range is authoritative. |
+| `missed_estimate` | Approximate count of dropped records (approximate because eviction is segment-granular). |
+| `earliest_seq` / `head_seq` | Current watermarks, echoed for convenience. |
+
+`records` begin at `earliest_seq`; `next_from_seq` continues normally. The tombstone is a
+`200` in-band signal, never an error. At most one tombstone per response (the gap is always
+one contiguous range because `earliest_seq` is monotonic). The same shape is emitted by SSE
+as `event: tombstone` (§7).
+
+> **Deletion-marker honesty:** tag-deletions (§5) are read-time filters tied to the box's
+> lifetime, not separately TTL'd, so a lagging consumer cannot "miss a deletion" the way
+> Kafka compacted tombstones can. A tag-deleted record is filtered for every reader at every
+> read until the underlying record is itself evicted/expired (then it falls under the normal
+> cap/TTL tombstone, not a separate signal).
+
+**Errors** — `400 invalid_request` (type errors only; `wait_ms`/`limit` over max are
+clamped, not errored); `404 box_not_found` (diff never auto-creates); `429 throttled`.
+
+---
+
+## 4. Node loop-prevention (applies to diff §3 and watch §7)
+
+A record is stamped with the writer's `$node`. When a reader presents the **same** `node`
+value on `/diff` or `/watch`, records whose `$node` equals it are **filtered out** — a node
+never receives back events it produced. Combined with routers (§6) preserving `$node` across
+forwards, this makes symmetric multi-master fan-out safe: N nodes all write to and watch a
+shared topology, each sees only the *others'* records, with no echo and no infinite loop.
+
+- Matching is byte-exact equality only (no prefix); a node id is an opaque identity token.
+- A read MAY pass multiple node ids (`"node": ["a","b"]`) to filter several of its own
+  identities; semantics are "drop if `$node` ∈ set."
+- Filtering happens **after** retention/TTL but is **content-based and intentional**, so it
+  is **silent** (no tombstone — see DESIGN §5.4). Dropped seqs are simply absent; the cursor
+  advances past them (§3.2).
+- Disable per-box with `dedupe_node: false` (§0.10) if you genuinely want echoes.
+
+---
+
+## 5. Read-time deletion (mark deleted by tag)
+
+### 5.1 Add delete filters — `POST /v0/boxes/:box/delete`
+
+Mark records "deleted during reading" by **tag** match. This is **not** a physical delete:
+it installs an efficient read-time filter that drops matching records from all future reads
+and SSE, for all consumers. Used to cancel jobs (`tag` = job id) or bulk-cancel
+(`tenantX:*`).
+
+**Request body** — tuple-filter style (compact, copy-pasteable):
+
+```json
+{ "filters": [
+    ["tag", "Eq",   "tenant42:job-9001"],
+    ["tag", "Glob", "tenant42:*"]
+] }
+```
+
+| Op | Meaning |
+|---|---|
+| `["tag","Eq","X"]` | Exact match: drop records whose `$tag == "X"`. |
+| `["tag","Glob","X*"]` | **Prefix wildcard only**: pattern is a literal prefix followed by a single trailing `*`. Drops records whose `$tag` starts with the prefix. Full glob/regex is deliberately excluded so read-time evaluation stays O(len(tag)) via a sorted prefix set — a documented hard limit. |
+
+A bare-string shorthand is accepted: `"filters": ["tenant42:job-9001", "tenant42:*"]` — a
+trailing `*` means prefix, otherwise exact. The tuple form is canonical.
+
+**Behavior**
+- Filters are stored on the box and evaluated at read time against `$tag`, for every record
+  on every read. Matching is exact-set + sorted-prefix-set lookup (efficient over many
+  records, no per-pattern scan). Persisted via a WAL control frame (survives restart).
+- Idempotent and additive; re-posting the same filter is a no-op. New future records that
+  match are also suppressed (so "cancel tenant X" cancels jobs enqueued a moment later by an
+  in-flight producer — a one-shot scan would race).
+- Records with **no tag** are never matched. Tag-deletion is a **distinct outcome from
+  consume/ack** (never advances any cursor; shows in metrics as `tag_deleted`, not
+  `consumed`).
+- Deletion is **monotonic in `/v0`**: there is no un-delete endpoint. A record once
+  tag-deleted stays filtered for the box's life; to "resurrect," write a new record. This
+  keeps the filter set append-only and cheap. (A future `/v1` may add rule removal; see
+  ROADMAP open questions.)
+
+**Response** (`200`)
+
+```json
+{ "box": "jobs",
+  "filters_added": [["tag", "Glob", "tenant42:*"]],
+  "filters_total": 7,
+  "matched_estimate": 14,
+  "performance": { "server_total_ms": 0.12 } }
+```
+
+**Hard limit** — max active delete-filters per box `STREAMS_MAX_DELETE_FILTERS` default
+`4096` (prefix + exact combined); exceeding ⇒ `400 too_many_filters`. Lazy compaction folds
+exact filters covered by an existing prefix.
+
+**Errors** — `400 invalid_request` (bad tuple, op not in `{Eq, Glob}`, `Glob` without a
+trailing `*`); `400 too_many_filters`; `404 box_not_found`.
+
+### 5.2 List active filters — `GET /v0/boxes/:box/delete`
+
+```json
+{ "box": "jobs",
+  "filters": [["tag","Eq","x"], ["tag","Glob","tenant42:*"]],
+  "performance": { "server_total_ms": 0.03 } }
+```
+
+---
+
+## 6. Routers (fan-out)
+
+A **router** is a server-side forwarding rule: every record appended to `source` is also
+appended to `dest`. Routers make pub/sub fan-out safe across N symmetric nodes because
+forwarded records keep their origin `$node`, and node loop-prevention stops a node from
+receiving back what it produced. Routers live in their own namespace (`/v0/routers`).
+Forwarding is **at-least-once, per-source FIFO** (a crash between "appended to dest" and
+"advanced router cursor" can re-forward; consumers must be idempotent — see DESIGN §6).
+
+### 6.1 Create / configure — `PUT /v0/routers/:router`
+
+**Path** — `:router`, same charset as box names. Convention default name `"<source>-><dest>"`.
+
+**Request body**
+
+```json
+{ "source": "jobs", "dest": "audit",
+  "preserve_node": true, "preserve_tag": true,
+  "create_dest": true, "filter": null, "allow_cycle": false }
+```
+
+| Field | Type | Req? | Default | Meaning |
+|---|---|---|---|---|
+| `source` | string | yes | — | Source box; records here are forwarded. |
+| `dest` | string | yes | — | Destination box; must differ from `source`. |
+| `preserve_node` | bool | no | `true` | Keep original `$node` on forwarded records (required for loop prevention across the fan-out). `false` clears it. |
+| `preserve_tag` | bool | no | `true` | Keep `$tag` (so tag-deletion can apply at the dest too). |
+| `create_dest` | bool | no | `true` | Auto-create `dest` if absent. `false` ⇒ `404` if missing. |
+| `filter` | tuple \| null | no | `null` | Optional forward-time filter (same tuple language as §5), e.g. `["tag","Glob","public:*"]`. `null` = forward all. |
+| `allow_cycle` | bool | no | `false` | If `false`, creating a router that would introduce a directed cycle is rejected `409 router_cycle` (DAG-by-default). If `true`, the route is permitted and runtime hop-cap loop-breaking applies instead (for intentional A↔B multi-master). |
+
+**Behavior**
+- Forwarding is applied at append time to `source`. The forwarded copy gets its own fresh
+  `$seq` and `$ts` in `dest` (an independent log); `$node`/`$tag`/`data`/`meta` carry through
+  verbatim (subject to `preserve_*`). Optional reserved meta `$src_box`/`$src_seq` aid
+  traceability (off by default).
+- `dest`'s own config governs the forward: `discard:"old"` evicts to make room; `discard:"reject"`
+  rejects the forward, the router **does not advance** its cursor and retries with backoff
+  (backpressure up the route). See DESIGN §6.4.
+- Idempotent: identical `PUT` ⇒ `200`; changed ⇒ `200`; new ⇒ `201`.
+
+**Response** (`201` / `200`)
+
+```json
+{ "router": "jobs->audit", "created": true,
+  "source": "jobs", "dest": "audit",
+  "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
+  "performance": { "server_total_ms": 0.20 } }
+```
+
+**Errors** — `400 invalid_request` (missing `source`/`dest`, `source == dest`, bad filter);
+`404 box_not_found`; `409 router_cycle` (`error.detail.cycle: ["A","B","A"]`).
+
+### 6.2 Get a router — `GET /v0/routers/:router`
+
+```json
+{ "router": "jobs->audit", "source": "jobs", "dest": "audit",
+  "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
+  "forwarded_total": 480231, "performance": { "server_total_ms": 0.04 } }
+```
+`404 router_not_found` if absent.
+
+### 6.3 List routers — `GET /v0/routers`
+
+**Query** — `prefix`, `source`, `dest`, `page_size` (default 100, max 1000), `cursor`.
+
+```json
+{ "routers": [
+    { "router": "jobs->audit",  "source": "jobs", "dest": "audit",  "forwarded_total": 480231 },
+    { "router": "jobs->mirror", "source": "jobs", "dest": "mirror", "forwarded_total": 480231 }
+  ],
+  "next_cursor": "eyJhZnRlciI6ImpvYnMtPmF1ZGl0In0=",
+  "performance": { "server_total_ms": 0.09 } }
+```
+`next_cursor` omitted on last page.
+
+### 6.4 Delete a router — `DELETE /v0/routers/:router`
+
+Idempotent. Stops forwarding immediately; already-forwarded records in `dest` are untouched
+(forwarding is a copy, not a link).
+
+```json
+{ "router": "jobs->audit", "deleted": true, "performance": { "server_total_ms": 0.06 } }
+```
+`"deleted": false` if absent. Deleting a **box** (§1.4) cascades to every router with that
+box as `source` or `dest`.
+
+---
+
+## 7. Multiplexed SSE watch
+
+Watch **many boxes** over a single long-lived connection. The server pushes new records,
+tombstone/gap events, and periodic heartbeats, all resumable via a composite cursor.
+
+### 7.1 Two-step shape — POST to create, GET to stream
+
+```
+POST /v0/watch          -> creates a watch session, returns a wid + stream_url
+GET  /v0/watch/:wid     -> opens the SSE stream (text/event-stream)
+```
+
+A multiplexed watch can name dozens of boxes with per-box cursors and options — too much
+for a query string, and browser `EventSource` is GET-only with no body/headers. So the
+**POST** carries the full JSON subscription (and returns `400`/`404` *before* any stream is
+open, while the client can still read the error body), and the **GET** is a tiny,
+`EventSource`-compatible URL. A session holds the subscription definition plus the
+last-delivered cursor per box (so GET reconnects resume exactly) and is GC'd after
+`session_ttl_ms` (default 300000) of no active GET.
+
+Auth is `Authorization: Bearer` on both calls; for browser `EventSource` the GET also
+accepts `?token=<key>`.
+
+### 7.2 POST /v0/watch — create session
+
+```json
+{
+  "node": "worker-eu-1",
+  "boxes": {
+    "jobs":   { "from_seq": 4096 },
+    "events": { "tail": true },
+    "audit":  { "from_seq": 1 }
+  },
+  "limit": 256,
+  "max_batch_bytes": 262144,
+  "heartbeat_ms": 15000,
+  "include_meta": true,
+  "include_tags": false,
+  "include_data": true,
+  "consistency": "eventual"
+}
+```
+
+| Field | Meaning | Default |
+|---|---|---|
+| `node` | Loop-prevention filter applied to all watched boxes (this node never receives its own records). Omit for none. | none |
+| `boxes` | Map of `box → per-box options`. The key is the box (keeps cursors unambiguous and doubles as the resume map). Up to `STREAMS_MAX_WATCH_BOXES` (default 256). | required, ≥1 |
+| `boxes[b].from_seq` | Deliver records with `$seq > from_seq`. `0` = from earliest. | `0` |
+| `boxes[b].tail` | If `true`, ignore `from_seq` and start at the box's current head (only records after subscribe; the SSE analog of Redis `XREAD $`). | `false` |
+| `limit` | Max records per `record` frame (per box, per flush). | `256` |
+| `max_batch_bytes` | Soft cap on a single frame's `data` size. | `262144` (256 KiB) |
+| `heartbeat_ms` | Heartbeat interval. Clamped to `[1000, 60000]`. | `15000` |
+| `include_meta` | Include record `meta` in frames. | `true` |
+| `include_tags` | Include `$tag` in frames. | `false` |
+| `include_data` | If `false`, frames carry only `$seq`/`$ts`/`$tag`/`$node` metadata, not `data` (lightweight tailing). | `true` |
+| `consistency` | `eventual` (push as soon as in WAL buffer) or `strong` (push only after fsync/commit). | `eventual` |
+
+**Response** (`200`)
+
+```json
+{
+  "wid": "wid_8f3ac21be9",
+  "stream_url": "/v0/watch/wid_8f3ac21be9",
+  "session_ttl_ms": 300000,
+  "boxes": {
+    "jobs":   { "from_seq": 4096,  "head_seq": 5210,  "earliest_seq": 3001 },
+    "events": { "from_seq": 88123, "head_seq": 88123, "earliest_seq": 80000 },
+    "audit":  { "from_seq": 1,     "head_seq": 990,   "earliest_seq": 1 }
+  },
+  "performance": { "server_total_ms": 0.7 }
+}
+```
+
+Per-box `head_seq`/`earliest_seq` let the client compute lag and see, before streaming,
+whether a cursor has already fallen off the start (it gets a tombstone on connect if so).
+
+**Errors** — `400 invalid_request` (malformed `boxes`, too many boxes); `404 box_not_found`
+(unknown box, unless `?lenient=true` skips it and reports via an opening warning frame).
+
+### 7.3 GET /v0/watch/:wid — open the stream
+
+```
+GET /v0/watch/wid_8f3ac21be9 HTTP/1.1
+Accept: text/event-stream
+Last-Event-ID: eyJqb2JzIjo1MjEwLCJldmVudHMiOjg4MTMwfQ
+```
+
+Response headers (tuned for low latency through proxies):
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream; charset=utf-8
+Cache-Control: no-store
+Connection: keep-alive
+X-Accel-Buffering: no
+```
+
+`X-Accel-Buffering: no` disables nginx-style proxy buffering; the server flushes after every
+frame and sets `TCP_NODELAY` to hit the 1–5 ms target.
+
+### 7.4 Resume via composite cursor (`Last-Event-ID`)
+
+Every data-bearing frame carries an `id:` encoding the **entire per-box cursor map** at that
+moment, as base64url-encoded JSON:
+
+```
+id = base64url( {"jobs":5210,"events":88130,"audit":990} )
+```
+
+On reconnect, resolution order: (1) the server-side session cursors (authoritative, survive a
+lost `Last-Event-ID`); (2) the `Last-Event-ID` header, if present, used only to **rewind**
+the session to that exact map (never advance past it — protects the gap between "server
+flushed" and "client processed"); (3) the session's initial `from_seq`/`tail` if neither.
+Because the id is a full map, one reconnect restores all per-box positions atomically. For
+very large box sets (>64) the server may emit an opaque session-checkpoint token instead of
+the full map; clients treat `id` as opaque either way.
+
+### 7.5 Frame types
+
+`retry:` is sent once at open (deliberate 2 s backoff, not the EventSource default 3 s):
+
+```
+retry: 2000
+```
+
+**`event: record`** — new records for one box, batched. `id` is the post-batch composite cursor.
+
+```
+id: eyJqb2JzIjo0MDk4fQ
+event: record
+data: {"box":"jobs","records":[{"$seq":4097,"$ts":1748467200111,"$tag":"job:render","$node":"node-B","data":{"url":"..."}},{"$seq":4098,"$ts":1748467200119,"$node":"node-C","data":{"id":42}}],"from_seq":4096,"to_seq":4098,"head_seq":5210}
+```
+
+Payload: `box`, `records[]`, and a `from_seq`/`to_seq`/`head_seq` triple per batch (lag =
+`head_seq - to_seq`). `$tag` present only if `include_tags`; `$node` present when set;
+`data` omitted per-record if `include_data:false`.
+
+**`event: tombstone`** — explicit, never-silent loss. Emitted whenever a gap crosses *this
+consumer's* cursor for a box.
+
+```
+id: eyJldmVudHMiOjgzMDAwfQ
+event: tombstone
+data: {"box":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
+```
+
+`reason` ∈ `cap` | `ttl` | `mixed` | `recreated` | `from_seq_too_old`. The `from_seq_too_old`
+value is emitted **immediately on connect** when the requested `from_seq + 1 < earliest_seq`
+(the SSE expression of Kafka `OffsetOutOfRange`). The frame's `id` already advances the box
+cursor to `gap_to`, so a resume after it is correct.
+
+**`event: caught-up`** — the box is drained to head; the client is now live (one per box,
+re-emitted on each backlog→tailing transition).
+
+```
+id: eyJqb2JzIjo1MjEwfQ
+event: caught-up
+data: {"box":"jobs","head_seq":5210}
+```
+
+**Heartbeat** — a bare SSE comment, no `id:` (never perturbs the resume cursor), trailing
+epoch-ms for liveness/skew. Suppressed when real data went out within the window.
+
+```
+: hb 1748467205000
+```
+
+**`event: box-deleted`** — the box was deleted while watched; terminal for that box only,
+the rest of the stream continues.
+
+```
+id: eyJqb2JzLmRscSI6MTJ9
+event: box-deleted
+data: {"box":"jobs.dlq","head_seq":12,"reason":"deleted"}
+```
+
+**`event: error`** — a per-stream problem with an HTTP-aligned `code`. `code: 429` is
+advisory (the stream stays open but the named boxes are paced); `code: 410` (session GC'd) is
+terminal (re-POST).
+
+```
+event: error
+data: {"code":429,"error":"watch throttled under CPU pressure","retry_after_ms":1500,"boxes":["events"]}
+```
+
+### 7.6 Heartbeats, liveness, backpressure
+
+- **Heartbeat cadence:** emitted when the connection has been idle `heartbeat_ms`; suppressed
+  if real data went out in the window. Comment frames don't disturb the event stream or `id`.
+- **Client liveness watchdog:** arm at `2 × heartbeat_ms + slack` (~35 s for the 15 s
+  default); any frame resets it; on timeout, reconnect with `Last-Event-ID`.
+- **Slow consumers** (see ARCHITECTURE §5): each connection has a bounded outbound queue.
+  While it can't drain, records coalesce into larger/fewer batches. If it stays full past
+  `buffer_grace_ms` (5 s), a lossy box degrades to a `tombstone(from_seq_too_old)` on resume;
+  a durable/unbounded box simply lags and replays. Past `slow_consumer_timeout` (30 s) the
+  server sends a final `error` frame and closes; the session survives `session_ttl_ms` so the
+  client resumes with no loss beyond the box's own cap/TTL.
+
+**Errors at establishment** — `200` (stream opened); `400 invalid_request` (bad/expired wid
+or boxes); `404 not_found` (wid GC'd → POST again); `406 not_acceptable` (Accept not
+`text/event-stream`); `429 throttled`.
+
+---
+
+## 8. Health / readiness / metrics
+
+These live at the version root (and aliases at the server root for load balancers). They do
+not require auth by default (`STREAMS_PROBE_AUTH=true` to require it).
+
+### 8.1 Liveness — `GET /v0/health` (alias `GET /healthz`)
+
+```json
+{ "status": "ok", "version": "0.1.0", "uptime_ms": 84012 }
+```
+`200` always while the process can serve.
+
+### 8.2 Readiness — `GET /v0/ready` (alias `GET /readyz`)
+
+```json
+{ "status": "ready", "wal_replay_complete": true, "boxes": 42 }
+```
+`200 ready` when serving; `503 not_ready` during WAL replay (carries `Retry-After` and
+`error.detail.replay_progress` 0.0–1.0); `503 shutting_down` while draining.
+
+### 8.3 Metrics — `GET /v0/metrics`
+
+Prometheus text exposition (`text/plain; version=0.0.4`) by default; `Accept:
+application/json` for a JSON snapshot. Per-box counters (appends, reads, evictions,
+tombstones emitted, bytes), scheduler stats (throttle events, queue depth by band), WAL
+stats (group-commit batch size, fsync latency histogram), and SSE connection counts.
+
+```
+# HELP streams_box_appends_total Records appended.
+# TYPE streams_box_appends_total counter
+streams_box_appends_total{box="jobs"} 480231
+streams_box_evictions_total{box="jobs"} 12044
+streams_tombstones_emitted_total{box="jobs"} 3
+streams_wal_fsync_seconds{quantile="0.99"} 0.0007
+streams_scheduler_throttle_total 0
+```
+`200` always (even when not ready — metrics describe the recovering process).
+
+---
+
+## 9. Endpoint index
+
+| Method | Path | Purpose |
+|---|---|---|
+| `PUT` | `/v0/boxes/:box` | Create/configure box (idempotent upsert) |
+| `GET` | `/v0/boxes/:box` | Get box state (head/earliest/count/config) |
+| `GET` | `/v0/boxes` | List boxes (opaque-cursor paginated) |
+| `DELETE` | `/v0/boxes/:box` | Delete box (cascades routers) |
+| `POST` | `/v0/boxes/:box` | Append record(s); returns assigned seqs + head |
+| `POST` | `/v0/boxes/:box/diff` | Read difference from cursor (batched + tombstones) |
+| `POST` | `/v0/boxes/:box/delete` | Add read-time tag-delete filters (exact/prefix) |
+| `GET` | `/v0/boxes/:box/delete` | List active delete-filters |
+| `PUT` | `/v0/routers/:router` | Create/configure router (idempotent upsert) |
+| `GET` | `/v0/routers/:router` | Get router |
+| `GET` | `/v0/routers` | List routers |
+| `DELETE` | `/v0/routers/:router` | Delete router |
+| `POST` | `/v0/watch` | Create a multiplexed SSE watch session |
+| `GET` | `/v0/watch/:wid` | Open the SSE stream for a session |
+| `GET` | `/v0/health` (`/healthz`) | Liveness |
+| `GET` | `/v0/ready` (`/readyz`) | Readiness (WAL replay / drain aware) |
+| `GET` | `/v0/metrics` | Prometheus / JSON metrics |
