@@ -182,6 +182,21 @@ pub fn parse_json_body<T: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) ->
         .map_err(|e| Error::invalid_request(format!("malformed JSON body: {e}")))
 }
 
+/// Run a synchronous, possibly-blocking engine call (a mutating op that may wait
+/// on a WAL group fsync) on tokio's blocking pool, so the fsync wait never parks
+/// a reactor thread (ARCHITECTURE §8.5). Maps a join failure (only on panic) to a
+/// `500`.
+pub async fn run_blocking<T, F>(f: F) -> Result<T, Error>
+where
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(res) => res,
+        Err(e) => Err(Error::internal(format!("engine task failed: {e}"))),
+    }
+}
+
 /// Parse a boolean query parameter (`true`/`false`/`1`/`0`), falling back to
 /// `default` when absent or unparseable.
 pub fn query_bool(params: &HashMap<String, String>, key: &str, default: bool) -> bool {

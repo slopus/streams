@@ -57,6 +57,9 @@ pub struct Harness {
     /// Kept alive so the background runtime/thread lives as long as the harness.
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _thread: thread::JoinHandle<()>,
+    /// Unique per-harness data dir for the WAL; removed on drop so tests stay
+    /// isolated and leave no on-disk residue.
+    _data_dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -68,8 +71,10 @@ impl Harness {
     }
 
     /// Like [`start`](Self::start) but with a caller-supplied [`ServerConfig`]
-    /// (e.g. to enable bearer auth via `api_keys`).
-    pub fn start_with(config: ServerConfig) -> Harness {
+    /// (e.g. to enable bearer auth via `api_keys`). Each harness gets a UNIQUE
+    /// temp data dir for the WAL (via `tempfile::tempdir`), so the durable write
+    /// path is exercised while tests stay isolated and leave nothing behind.
+    pub fn start_with(mut config: ServerConfig) -> Harness {
         // Reserve an ephemeral port on the std listener, then hand the address to
         // the async runtime (which re-binds it). Closing this std listener first
         // avoids the address being held while tokio binds.
@@ -77,6 +82,11 @@ impl Harness {
             StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral port");
         let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
         drop(std_listener);
+
+        // Unique per-harness data dir; kept alive (and auto-removed) by the
+        // `_data_dir` field on the returned `Harness`.
+        let data_dir = tempfile::tempdir().expect("create temp data dir");
+        config.data_dir = Some(data_dir.path().to_string_lossy().into_owned());
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -90,7 +100,8 @@ impl Harness {
                     .expect("build harness runtime");
                 rt.block_on(async move {
                     let clock: SharedClock = Arc::new(SystemClock);
-                    let engine = Engine::new(config, clock);
+                    let engine =
+                        Engine::with_data_dir(config, clock).expect("open durable engine");
                     let app = http::build_router(engine);
 
                     let listener = tokio::net::TcpListener::bind(addr)
@@ -121,6 +132,7 @@ impl Harness {
             client,
             _shutdown: shutdown_tx,
             _thread: thread,
+            _data_dir: data_dir,
         };
         h.wait_healthy(Duration::from_secs(5));
         h

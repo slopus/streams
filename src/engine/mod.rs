@@ -14,15 +14,21 @@ use crate::clock::SharedClock;
 use crate::config::{self, ServerConfig};
 use crate::error::{Error, Result};
 use crate::sched::Scheduler;
+use crate::storage::{MatchSel, RouterOp, WalRecord, WalWriter};
 use crate::types::*;
 use box_state::{BoxState, DedupeEntry, StoredRecord};
 use dashmap::DashMap;
 use eviction::AdmitDecision;
 use parking_lot::Mutex;
 use router::RouterGraph;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+mod recovery;
+pub mod snapshot;
+pub mod wal_glue;
+pub use wal_glue::WalHandle;
 
 /// Default first seq for a fresh box instance (`0` is reserved for "no
 /// records").
@@ -35,8 +41,35 @@ pub struct Engine {
     boxes: DashMap<String, Arc<BoxState>>,
     /// Router registry + forwarding graph.
     routers: Mutex<RouterGraph>,
-    /// Monotonic interned box-id allocator (used by WAL framing in phase 4).
+    /// Monotonic interned box-id allocator (used by WAL framing, ARCHITECTURE §2.1).
     next_box_id: AtomicU64,
+    /// The WAL writer, present once a data dir is configured (durability layer,
+    /// phase 4). `None` ⇒ pure in-memory mode (engine unit tests / phase-2 shape):
+    /// mutating ops skip WAL append and `fsync_ms`/`wal_append_ms` report `0.0`.
+    wal: Option<WalWriter>,
+    /// Keeps the owned [`crate::storage::Wal`] alive (its `Drop` drains + fsyncs
+    /// the writer and joins the thread). `None` in pure in-memory mode.
+    _wal_owner: Option<Arc<WalHandle>>,
+    /// The resolved data directory (durable mode only). Snapshots are written
+    /// under `<data_dir>/meta`; `None` in pure in-memory mode.
+    data_dir: Option<std::path::PathBuf>,
+    /// `bytes_written` (WAL) observed at the last snapshot, for the size-based
+    /// snapshot trigger (ARCHITECTURE §3: snapshot on a size/time threshold).
+    last_snapshot_bytes: AtomicU64,
+    /// Wall-clock ms of the last snapshot, for the time-based trigger.
+    last_snapshot_ms: AtomicU64,
+    /// Readiness gate (ARCHITECTURE §4, ROADMAP Phase-4). `false` until restart
+    /// recovery (snapshot load + WAL replay) has rebuilt the in-memory state;
+    /// flipped to `true` exactly once, just before data-plane traffic is served.
+    /// `/v0/ready` returns `503 not_ready` while this is `false` and `200 ready`
+    /// after. An in-memory engine ([`Engine::new`]) has nothing to replay and is
+    /// ready immediately. `/v0/health` ignores this (liveness is independent).
+    ready: AtomicBool,
+    /// Total WAL frames seen during recovery, and how many have been replayed so
+    /// far — drives `error.detail.replay_progress` (0.0–1.0) on a `not_ready`
+    /// response (API §8.2). Both `0` (⇒ progress reported as `1.0`) once ready.
+    replay_total: AtomicU64,
+    replay_done: AtomicU64,
     /// The priority/delivery scheduler (simplified in phase 2).
     pub scheduler: Scheduler,
     /// Time source (real or test).
@@ -48,17 +81,199 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Build a new in-memory engine.
+    /// Build a new **pure in-memory** engine (no WAL). Used by engine unit tests,
+    /// property tests, and any caller that supplies no data dir. Mutating ops do
+    /// not touch disk and report `wal_append_ms`/`fsync_ms` as `0.0`.
     pub fn new(config: ServerConfig, clock: SharedClock) -> Arc<Self> {
         Arc::new(Engine {
             boxes: DashMap::new(),
             routers: Mutex::new(RouterGraph::new()),
             next_box_id: AtomicU64::new(1),
+            wal: None,
+            _wal_owner: None,
+            data_dir: None,
+            last_snapshot_bytes: AtomicU64::new(0),
+            last_snapshot_ms: AtomicU64::new(0),
+            // Pure in-memory: no WAL to replay ⇒ ready as soon as it is built.
+            ready: AtomicBool::new(true),
+            replay_total: AtomicU64::new(0),
+            replay_done: AtomicU64::new(0),
             scheduler: Scheduler::new(clock.clone()),
             clock,
             config,
             started_at: Instant::now(),
         })
+    }
+
+    /// Build a **durable** engine backed by a WAL under `config.data_dir` (falling
+    /// back to [`config::DEFAULT_DATA_DIR`]). Opens (or creates) the data dir,
+    /// **replays the WAL** to rebuild the in-memory index (so durable writes
+    /// survive restart), truncates any torn tail, then resumes the writer for new
+    /// appends. A missing/empty data dir is a fresh start.
+    pub fn with_data_dir(config: ServerConfig, clock: SharedClock) -> Result<Arc<Self>> {
+        let data_dir = config
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| config::DEFAULT_DATA_DIR.to_string());
+
+        let engine = Arc::new(Engine {
+            boxes: DashMap::new(),
+            routers: Mutex::new(RouterGraph::new()),
+            next_box_id: AtomicU64::new(1),
+            wal: None,
+            _wal_owner: None,
+            data_dir: Some(std::path::PathBuf::from(&data_dir)),
+            last_snapshot_bytes: AtomicU64::new(0),
+            last_snapshot_ms: AtomicU64::new(0),
+            // Durable engine starts NOT ready: recovery (below) must finish before
+            // `/v0/ready` flips to 200, so a consumer never reads a half-replayed
+            // state across a restart (ARCHITECTURE §4, ROADMAP Phase-4 ready gate).
+            ready: AtomicBool::new(false),
+            replay_total: AtomicU64::new(0),
+            replay_done: AtomicU64::new(0),
+            scheduler: Scheduler::new(clock.clone()),
+            clock,
+            config,
+            started_at: Instant::now(),
+        });
+
+        // Recover from any existing WAL, then open the writer for new appends.
+        // The engine stays `not ready` for the whole of this call; recovery
+        // rebuilds the box indexes, watermarks, routers, deletes, and name<->id
+        // table BEFORE we mark ready and accept data-plane traffic.
+        let (handle, writer) = recovery::recover_and_open(&engine, std::path::Path::new(&data_dir))
+            .map_err(|e| Error::internal(format!("WAL recovery failed: {e}")))?;
+
+        // Install the writer + owner. `engine` is uniquely owned here (just built),
+        // so `Arc::get_mut` succeeds.
+        let engine = {
+            let mut e = engine;
+            let m = Arc::get_mut(&mut e).expect("unique Arc during construction");
+            m.wal = Some(writer);
+            m._wal_owner = Some(Arc::new(handle));
+            // Seed the snapshot triggers from the just-recovered WAL byte total and
+            // the current clock, so the first auto-snapshot fires on growth/age
+            // measured from startup, not from zero.
+            if let Some(w) = &m.wal {
+                m.last_snapshot_bytes
+                    .store(w.metrics().bytes_written.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            m.last_snapshot_ms
+                .store(m.clock.now_ms().max(0) as u64, Ordering::Relaxed);
+            e
+        };
+        // Recovery is complete and the writer is open: open the readiness gate so
+        // `/v0/ready` answers 200. Release ordering pairs with the Acquire load in
+        // `is_ready` so a reader that observes `ready` also observes all replayed
+        // state. `replay_done`/`replay_total` are cleared so progress reads as 1.0.
+        engine.replay_total.store(0, Ordering::Relaxed);
+        engine.replay_done.store(0, Ordering::Relaxed);
+        engine.ready.store(true, Ordering::Release);
+        Ok(engine)
+    }
+
+    /// Whether this engine is durable (has a WAL + data dir).
+    pub fn is_durable(&self) -> bool {
+        self.wal.is_some() && self.data_dir.is_some()
+    }
+
+    /// Whether restart recovery has completed and the data plane may be served
+    /// (ROADMAP Phase-4 ready gate). `/v0/ready` returns `200 ready` iff this is
+    /// `true`, `503 not_ready` otherwise. An in-memory engine is always ready.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// WAL-replay progress in `[0.0, 1.0]` for the `not_ready` response detail
+    /// (API §8.2). Reported as `1.0` once ready or when no frame count is known.
+    pub fn replay_progress(&self) -> f64 {
+        if self.is_ready() {
+            return 1.0;
+        }
+        let total = self.replay_total.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        let done = self.replay_done.load(Ordering::Relaxed);
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    }
+
+    /// Set the total number of WAL frames recovery will replay (for progress
+    /// reporting). Called once by recovery before the replay loop begins.
+    pub(crate) fn set_replay_total(&self, total: u64) {
+        self.replay_total.store(total, Ordering::Relaxed);
+    }
+
+    /// Record one replayed WAL frame (advances `replay_progress`).
+    pub(crate) fn note_replayed_frame(&self) {
+        self.replay_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Force the readiness gate open/closed (with optional replay-progress
+    /// figures). Exposed only so the readiness gate can be exercised end-to-end
+    /// through the real `/v0/ready` handler in tests — production code flips the
+    /// gate exactly once, inside [`Engine::with_data_dir`], after recovery.
+    #[doc(hidden)]
+    pub fn set_ready_for_test(&self, ready: bool, done: u64, total: u64) {
+        self.replay_total.store(total, Ordering::Relaxed);
+        self.replay_done.store(done, Ordering::Relaxed);
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    /// Capture a metadata + materialized-state snapshot, write it atomically
+    /// under `<data_dir>/meta`, then truncate/drop the WAL files fully absorbed
+    /// by the checkpoint (ARCHITECTURE §3.1). No-op (returns `Ok(false)`) for a
+    /// pure in-memory engine. Returns `Ok(true)` once a snapshot is durably
+    /// written. Safe to call concurrently with writes (capture records the WAL
+    /// checkpoint position *before* materializing state; see [`snapshot`]).
+    pub fn write_snapshot(&self) -> Result<bool> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(false);
+        };
+        if self.wal.is_none() {
+            return Ok(false);
+        }
+        let id = crate::storage::next_snapshot_id(dir);
+        let Some(snap) = snapshot::capture(self, id) else {
+            return Ok(false);
+        };
+        let checkpoint = snap.checkpoint;
+        crate::storage::write_snapshot(dir, &snap)
+            .map_err(|e| Error::internal(format!("snapshot write failed: {e}")))?;
+
+        // The snapshot is durably in place: WAL files numbered strictly below the
+        // checkpoint's active file are fully absorbed and can be dropped
+        // (ARCHITECTURE §3.1, §2.4). The active file is kept (replay resumes from
+        // its checkpoint offset).
+        recovery::drop_absorbed_wal_files(dir, checkpoint.wal_idx);
+
+        // Reset the snapshot triggers.
+        if let Some(w) = &self.wal {
+            self.last_snapshot_bytes
+                .store(w.metrics().bytes_written.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        self.last_snapshot_ms
+            .store(self.clock.now_ms().max(0) as u64, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// Whether an auto-snapshot threshold has been crossed: either
+    /// [`config::SNAPSHOT_BYTES_THRESHOLD`] of WAL bytes written, or
+    /// [`config::SNAPSHOT_INTERVAL_MS`] elapsed, since the last snapshot. Used by
+    /// the background snapshotter (no-op when there are no boxes to snapshot).
+    pub fn snapshot_due(&self) -> bool {
+        let Some(w) = &self.wal else { return false };
+        if self.boxes.is_empty() {
+            return false;
+        }
+        let written = w.metrics().bytes_written.load(Ordering::Relaxed);
+        let since_bytes = written.saturating_sub(self.last_snapshot_bytes.load(Ordering::Relaxed));
+        if since_bytes >= config::SNAPSHOT_BYTES_THRESHOLD {
+            return true;
+        }
+        let now = self.clock.now_ms().max(0) as u64;
+        let since_ms = now.saturating_sub(self.last_snapshot_ms.load(Ordering::Relaxed));
+        since_ms >= config::SNAPSHOT_INTERVAL_MS
     }
 
     /// Number of boxes currently registered.
@@ -71,9 +286,94 @@ impl Engine {
         self.boxes.get(name).map(|b| b.clone())
     }
 
-    /// Allocate the next interned box id.
-    fn alloc_box_id(&self) -> u64 {
-        self.next_box_id.fetch_add(1, Ordering::Relaxed)
+    /// Allocate the next interned box id (ARCHITECTURE §2.1).
+    fn alloc_box_id(&self) -> u32 {
+        self.next_box_id.fetch_add(1, Ordering::Relaxed) as u32
+    }
+
+    /// Append a WAL frame for a mutating op and return `(wal_append_ms,
+    /// fsync_ms)`. In pure in-memory mode (no WAL) this is a no-op returning
+    /// `(0.0, 0.0)`. For a `durable` frame the call blocks until the group fsync
+    /// returns (so `fsync_ms` is real); a non-durable frame is fire-and-forget
+    /// (its durability follows the next group fsync) and `fsync_ms` is `0.0`.
+    ///
+    /// On a WAL error the in-memory state is already applied; we surface the
+    /// error so the durability contract isn't silently violated.
+    fn wal_commit(&self, record: WalRecord, durable: bool) -> Result<(f64, f64)> {
+        let Some(w) = &self.wal else {
+            return Ok((0.0, 0.0));
+        };
+        let t0 = Instant::now();
+        let token = w
+            .submit(record, durable)
+            .map_err(|e| Error::internal(format!("WAL append failed: {e}")))?;
+        let wal_append_ms = elapsed_ms(t0);
+        if durable {
+            let t1 = Instant::now();
+            token
+                .wait()
+                .map_err(|e| Error::internal(format!("WAL fsync failed: {e}")))?;
+            return Ok((wal_append_ms, elapsed_ms(t1)));
+        }
+        // Non-durable: don't wait; durability follows on the next group fsync.
+        drop(token);
+        Ok((wal_append_ms, 0.0))
+    }
+
+    /// Best-effort control-frame log (box config/delete, routers). Control frames
+    /// share the WAL's durability boundary (ARCHITECTURE §2.1) and are logged
+    /// durably so a crash right after the HTTP response cannot lose the mutation.
+    /// In pure in-memory mode this is a no-op.
+    fn wal_log(&self, record: WalRecord, durable: bool) {
+        let _ = self.wal_commit(record, durable);
+    }
+
+    /// Enqueue one WAL `Append` frame per record in a write batch to the single
+    /// ordered writer, returning the **last** frame's commit token (the ordered
+    /// writer guarantees every prior frame in the batch commits no later) plus
+    /// the enqueue time. Does **not** wait — the caller blocks on the token
+    /// *after* releasing the per-box append lock, so the fsync wait never
+    /// serializes other boxes' writes and durable group commit still coalesces.
+    ///
+    /// MUST be called while holding the box's `append_lock`, immediately after
+    /// `BoxState::append` assigned the seqs, so a box's WAL frames are enqueued
+    /// in the same order their seqs were assigned (recovery applies frames in
+    /// WAL order and skips `seq <= head`, so out-of-order enqueue would silently
+    /// drop the lower-seq frame — see `BoxState::append_lock`).
+    fn wal_enqueue_batch(
+        &self,
+        box_id: u32,
+        seqs: &[u64],
+        records: &[StoredRecord],
+        now: i64,
+        durable: bool,
+    ) -> Result<(f64, Option<crate::storage::CommitToken>)> {
+        let Some(w) = &self.wal else {
+            return Ok((0.0, None));
+        };
+        let t0 = Instant::now();
+        let ts = now.max(0) as u64;
+        let mut last_token = None;
+        for (seq, rec) in seqs.iter().zip(records.iter()) {
+            // `data` carries the opaque payload blob (data + meta, as canonical
+            // JSON) so a replayed Append fully reconstructs the StoredRecord.
+            let data = encode_record_payload(&rec.data, &rec.meta);
+            let token = w
+                .submit(
+                    WalRecord::Append {
+                        box_id,
+                        seq: *seq,
+                        ts,
+                        node: rec.node.clone(),
+                        tag: rec.tag.clone(),
+                        data,
+                    },
+                    durable,
+                )
+                .map_err(|e| Error::internal(format!("WAL append failed: {e}")))?;
+            last_token = Some(token);
+        }
+        Ok((elapsed_ms(t0), last_token))
     }
 
     /// Compute the effective priority of a box right now (DESIGN §3.1).
@@ -95,7 +395,8 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     /// `PUT /v0/boxes/:box` — create or update a box. Returns the config and
-    /// whether it was created on this call.
+    /// whether it was created on this call. Logs a `BoxConfig` (create/update)
+    /// WAL frame so config survives restart.
     pub fn put_box(&self, name: &str, config: BoxConfig) -> Result<(bool, BoxConfig)> {
         if !config::is_valid_name(name) {
             return Err(Error::invalid_request(format!(
@@ -104,27 +405,158 @@ impl Engine {
         }
         validate_config(&config)?;
 
+        let (created, box_id) = self.apply_put_box(name, config.clone(), None, None);
+
+        // Log the config mutation (create or update). Box config is durable as a
+        // matter of policy (control frames share the WAL's durability boundary).
+        self.wal_log(WalRecord::BoxConfig {
+            box_id,
+            op: crate::storage::BoxConfigOp {
+                name: name.to_string(),
+                config: serde_json::to_vec(&config).unwrap_or_default(),
+            },
+            tombstone: false,
+            ts: self.clock.now_ms().max(0) as u64,
+        }, true);
+
+        Ok((created, config))
+    }
+
+    /// Apply a box create/update to the in-memory registry (no WAL logging).
+    /// Shared by the live `put_box` and WAL replay. `forced_id`/`forced_epoch`
+    /// let recovery restore the interned id + epoch from the log; live calls pass
+    /// `None` and allocate fresh. Returns `(created, box_id)`.
+    fn apply_put_box(
+        &self,
+        name: &str,
+        config: BoxConfig,
+        forced_id: Option<u32>,
+        forced_epoch: Option<u64>,
+    ) -> (bool, u32) {
         use dashmap::mapref::entry::Entry;
         match self.boxes.entry(name.to_string()) {
             Entry::Occupied(e) => {
                 // Existing box → replace config in place (no epoch bump, no
                 // record rewrite). Tightened caps/ttl take effect immediately.
                 let b = e.get();
-                *b.config.write() = config.clone();
+                *b.config.write() = config;
                 b.enforce_retention(self.clock.now_ms());
-                Ok((false, config))
+                (false, b.box_id)
             }
             Entry::Vacant(e) => {
-                let _ = self.alloc_box_id(); // interned id reserved for phase 4.
+                let box_id = forced_id.unwrap_or_else(|| self.alloc_box_id());
+                if let Some(fid) = forced_id {
+                    // Keep the allocator ahead of any replayed id.
+                    let mut cur = self.next_box_id.load(Ordering::Relaxed);
+                    while (fid as u64) >= cur {
+                        match self.next_box_id.compare_exchange_weak(
+                            cur,
+                            fid as u64 + 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(c) => cur = c,
+                        }
+                    }
+                }
                 e.insert(Arc::new(BoxState::new(
                     name.to_string(),
-                    config.clone(),
+                    box_id,
+                    config,
                     SEQ_BASE,
-                    1,
+                    forced_epoch.unwrap_or(1),
                 )));
-                Ok((true, config))
+                (true, box_id)
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL-replay apply paths (recovery only; never re-log to the WAL).
+    // -----------------------------------------------------------------------
+
+    /// Find a box by its interned id (linear over the registry; used only by
+    /// recovery, which is one-shot at startup).
+    pub(crate) fn get_box_by_id(&self, box_id: u32) -> Option<Arc<BoxState>> {
+        self.boxes
+            .iter()
+            .find(|e| e.value().box_id == box_id)
+            .map(|e| e.value().clone())
+    }
+
+    /// Create/update a box during replay (no WAL logging). Returns `(created,
+    /// box_id)`.
+    pub(crate) fn apply_put_box_for_recovery(
+        &self,
+        name: &str,
+        config: BoxConfig,
+        forced_id: Option<u32>,
+    ) -> (bool, u32) {
+        self.apply_put_box(name, config, forced_id, None)
+    }
+
+    /// Remove a box during replay (box-delete tombstone). No cascade logging.
+    pub(crate) fn remove_box_for_recovery(&self, name: &str) {
+        self.boxes.remove(name);
+        self.routers.lock().remove_touching_box(name);
+    }
+
+    /// Re-insert a replayed record at its logged seq (no WAL logging). Appends in
+    /// the WAL are in per-box seq order with no gaps, so `BoxState::append`
+    /// reproduces the same seq; `expected_seq` is asserted in debug builds.
+    pub(crate) fn apply_append_for_recovery(
+        &self,
+        b: &BoxState,
+        expected_seq: u64,
+        rec: ReplayRecord,
+    ) {
+        let bytes = payload_bytes(&rec.data, &rec.meta);
+        let sr = StoredRecord {
+            ts: rec.ts,
+            node: rec.node,
+            tag: rec.tag,
+            data: rec.data,
+            meta: rec.meta,
+            bytes,
+            deleted: false,
+        };
+        let assigned = b.append(vec![sr], rec.ts);
+        debug_assert_eq!(
+            assigned.first().copied(),
+            Some(expected_seq),
+            "replay seq mismatch (box {})",
+            b.name
+        );
+    }
+
+    /// Re-create a router during replay (no WAL logging, no auto-create — the
+    /// boxes were already materialized by their own replayed config frames; if a
+    /// box is missing the router simply has no effect until one exists).
+    pub(crate) fn apply_router_create_for_recovery(&self, op: RouterOp) {
+        let router = Router {
+            name: op.name.clone(),
+            source: op.source.clone(),
+            dest: op.dest.clone(),
+            preserve_node: op.preserve_node,
+            preserve_tag: op.preserve_tag,
+            create_dest: op.create_dest,
+            filter: op.filter.as_ref().map(matchsel_to_filter),
+            allow_cycle: op.allow_cycle,
+        };
+        // Use the source's current head so a replayed router doesn't re-forward
+        // historical records (matches live `put_router` semantics).
+        let src_head = self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0);
+        let mut graph = self.routers.lock();
+        // `upsert` can only fail on a cycle; a logged router was already accepted
+        // live, so ignore the (impossible-here) error to keep replay total.
+        let _ = graph.upsert(router);
+        graph.note_forwarded(&op.name, src_head, 0);
+    }
+
+    /// Remove a router during replay (no WAL logging).
+    pub(crate) fn apply_router_delete_for_recovery(&self, name: &str) {
+        self.routers.lock().remove(name);
     }
 
     /// `GET /v0/boxes/:box` — box state. Never auto-creates.
@@ -252,8 +684,34 @@ impl Engine {
             }
         }
 
+        let box_id = b.box_id;
         self.boxes.remove(name);
         let routers_removed = self.routers.lock().remove_touching_box(name);
+
+        // Log the box tombstone + each cascaded router removal so the delete and
+        // its cascade replay deterministically (durable control frames).
+        let now = self.clock.now_ms().max(0) as u64;
+        self.wal_log(
+            WalRecord::BoxConfig {
+                box_id,
+                op: crate::storage::BoxConfigOp {
+                    name: name.to_string(),
+                    config: Vec::new(),
+                },
+                tombstone: true,
+                ts: now,
+            },
+            true,
+        );
+        for r in &routers_removed {
+            self.wal_log(
+                WalRecord::RouterDelete {
+                    name: r.clone(),
+                    ts: now,
+                },
+                true,
+            );
+        }
 
         Ok(BoxDeleteResponse {
             box_name: name.to_string(),
@@ -363,7 +821,9 @@ impl Engine {
         let discard = cfg.discard;
         let cap_records = cfg.cap_records;
         let cap_bytes = cfg.cap_bytes;
+        let durable = cfg.durable;
         drop(cfg);
+        let box_id = b.box_id;
 
         // A single write larger than the whole byte cap is a permanent
         // `400 record_too_large`, distinct from a retryable `422 box_full`.
@@ -410,8 +870,42 @@ impl Engine {
         // Snapshot the resolved records for router forwarding before `append`
         // consumes the vec (forwarding reads the canonical $node/$tag).
         let stored_snapshot = stored.clone();
-        let seqs = b.append(stored, now);
-        let head = b.head_seq();
+
+        // The per-box append lock makes seq-assignment + WAL-enqueue one atomic
+        // unit (ARCHITECTURE §2.2): a box's WAL frames are enqueued to the single
+        // ordered writer in exactly their seq order, so recovery (which applies
+        // frames in WAL order, skipping `seq <= head`) never drops an acked write
+        // because a higher seq from a concurrent writer raced ahead of it. The
+        // commit token is waited on *after* the lock is released, so the fsync
+        // does not serialize other writers and durable group commit still
+        // coalesces across boxes (see `BoxState::append_lock`).
+        let (seqs, head, wal_append_ms, commit_token) = {
+            let _guard = b.append_lock.lock();
+            let seqs = b.append(stored, now);
+            let head = b.head_seq();
+            let (wal_append_ms, token) =
+                self.wal_enqueue_batch(box_id, &seqs, &stored_snapshot, now, durable)?;
+            (seqs, head, wal_append_ms, token)
+        };
+
+        // --- WAL durability gate (ARCHITECTURE §2.2). ----------------------
+        // For a `durable` box block on the last frame's commit token (the single
+        // ordered writer guarantees all prior frames in the batch are fsynced by
+        // then) so the response is fsync-gated. A non-durable write's frames are
+        // buffered and group-committed shortly after; we don't wait.
+        let fsync_ms = if durable {
+            if let Some(token) = commit_token {
+                let t1 = Instant::now();
+                token
+                    .wait()
+                    .map_err(|e| Error::internal(format!("WAL fsync failed: {e}")))?;
+                elapsed_ms(t1)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
 
         // Post-append eviction for discard:"old" (may surface as a tombstone to
         // lagging consumers later).
@@ -447,11 +941,11 @@ impl Engine {
         self.scheduler
             .mark_dirty(name, self.effective_priority(&b));
 
-        // `durable:true` is accepted in phase 2 but is a no-op fast path: there
-        // is no WAL yet, so `fsync_ms` is reported as 0.0 (ROADMAP §2).
+        // Populate WAL timings: real `fsync_ms` for a durable box (the response
+        // is fsync-gated), `0.0` for non-durable and for pure in-memory mode.
         let mut perf = Performance::with_total(elapsed_ms(start));
-        perf.wal_append_ms = Some(0.0);
-        perf.fsync_ms = Some(0.0);
+        perf.wal_append_ms = Some(wal_append_ms);
+        perf.fsync_ms = Some(fsync_ms);
 
         Ok(WriteResponse {
             box_name: name.to_string(),
@@ -721,8 +1215,23 @@ impl Engine {
         }
         let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
         let now = self.clock.now_ms();
+        let box_id = b.box_id;
 
         let deleted = b.apply_delete(req.before_seq, req.match_.as_ref(), now);
+
+        // Log the delete so it replays deterministically on recovery (the deleted
+        // seqs are re-derived from the rebuilt index + tag index, not stored;
+        // ARCHITECTURE §2.1). Durable so a crash after the response can't revive
+        // deleted records.
+        self.wal_log(
+            WalRecord::Delete {
+                box_id,
+                before_seq: req.before_seq,
+                match_: req.match_.as_ref().map(filter_to_matchsel),
+                ts: now.max(0) as u64,
+            },
+            true,
+        );
 
         Ok(DeleteResponse {
             box_name: name.to_string(),
@@ -794,6 +1303,24 @@ impl Engine {
             graph.note_forwarded(name, src_head, 0);
             created
         };
+
+        // Log the router upsert (durable control frame) so it replays on restart.
+        self.wal_log(
+            WalRecord::RouterCreate {
+                op: RouterOp {
+                    name: name.to_string(),
+                    source: req.source.clone(),
+                    dest: req.dest.clone(),
+                    preserve_node: req.preserve_node,
+                    preserve_tag: req.preserve_tag,
+                    create_dest: req.create_dest,
+                    allow_cycle: req.allow_cycle,
+                    filter: req.filter.as_ref().map(filter_to_matchsel),
+                },
+                ts: self.clock.now_ms().max(0) as u64,
+            },
+            true,
+        );
 
         Ok((
             created,
@@ -878,6 +1405,16 @@ impl Engine {
     pub fn delete_router(&self, name: &str) -> Result<RouterDeleteResponse> {
         let start = Instant::now();
         let deleted = self.routers.lock().remove(name);
+        if deleted {
+            // Only log a real removal (idempotent no-op needn't be logged).
+            self.wal_log(
+                WalRecord::RouterDelete {
+                    name: name.to_string(),
+                    ts: self.clock.now_ms().max(0) as u64,
+                },
+                true,
+            );
+        }
         Ok(RouterDeleteResponse {
             router: name.to_string(),
             deleted,
@@ -950,6 +1487,66 @@ fn elapsed_ms(start: Instant) -> f64 {
 /// additional invalid combinations, so this currently always succeeds.
 fn validate_config(_config: &BoxConfig) -> Result<()> {
     Ok(())
+}
+
+/// The parts of a replayed `Append` frame handed to
+/// [`Engine::apply_append_for_recovery`] (bundled to keep the arg count sane).
+pub(crate) struct ReplayRecord {
+    pub ts: i64,
+    pub node: Option<String>,
+    pub tag: Option<String>,
+    pub data: serde_json::Value,
+    pub meta: Option<serde_json::Value>,
+}
+
+/// Map a wire [`Filter`] onto the storage-layer [`MatchSel`] logged in a
+/// `Delete`/`RouterCreate` frame (the storage layer must not depend on wire
+/// types).
+fn filter_to_matchsel(f: &Filter) -> MatchSel {
+    match f.op {
+        FilterOp::Eq => MatchSel::Eq(f.value.clone()),
+        FilterOp::Glob => MatchSel::Glob(f.value.clone()),
+    }
+}
+
+/// Inverse of [`filter_to_matchsel`], used by WAL replay.
+fn matchsel_to_filter(m: &MatchSel) -> Filter {
+    match m {
+        MatchSel::Eq(v) => Filter {
+            op: FilterOp::Eq,
+            value: v.clone(),
+        },
+        MatchSel::Glob(v) => Filter {
+            op: FilterOp::Glob,
+            value: v.clone(),
+        },
+    }
+}
+
+/// Encode a record's `data` + optional `meta` into the opaque WAL `data` blob.
+/// A tiny JSON envelope `{"d":<data>,"m":<meta>}` (meta omitted when absent) so
+/// replay reconstructs the [`StoredRecord`] exactly. `node`/`tag` ride in the
+/// frame's own fields, not this blob.
+fn encode_record_payload(data: &serde_json::Value, meta: &Option<serde_json::Value>) -> Vec<u8> {
+    let mut obj = serde_json::Map::with_capacity(2);
+    obj.insert("d".to_string(), data.clone());
+    if let Some(m) = meta {
+        obj.insert("m".to_string(), m.clone());
+    }
+    serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default()
+}
+
+/// Decode the opaque WAL `data` blob back into `(data, meta)` for replay.
+fn decode_record_payload(blob: &[u8]) -> (serde_json::Value, Option<serde_json::Value>) {
+    match serde_json::from_slice::<serde_json::Value>(blob) {
+        Ok(serde_json::Value::Object(mut obj)) => {
+            let data = obj.remove("d").unwrap_or(serde_json::Value::Null);
+            let meta = obj.remove("m");
+            (data, meta)
+        }
+        // Defensive: a malformed/legacy blob round-trips as raw data.
+        _ => (serde_json::Value::Null, None),
+    }
 }
 
 /// Estimate the accounted byte size of a record's payload (`data` + `meta` +

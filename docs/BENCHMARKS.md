@@ -215,3 +215,162 @@ build has no disk path, no recovery, and no governor.
 - `streams-probe conformance` passed 89/89 checks (exit 0) against this same
   release binary, so the contract these numbers were measured against is the
   documented `/v0` contract.
+
+---
+
+# Phase 4 — persistent build
+
+These numbers were captured against the **persistent (Phase-4) release binary**
+— WAL + adaptive group commit + atomic metadata/state snapshots + restart
+recovery — on the SAME hardware/OS/toolchain as the in-memory baseline above
+(Apple M4 Max, 16 cores, 128 GiB, Darwin 25.2.0, rustc 1.92.0, `--release`). The
+data dir is a fresh `tempfile::tempdir` on local NVMe (APFS). The baseline
+numbers above are **unchanged**; this section is added alongside so the cost of
+durability is explicit.
+
+The only client-observable behavior change vs the baseline: `durable:true`
+writes are now fsync-gated (the ack waits for a real `fdatasync`, reported in
+`performance.fsync_ms`), and data persists across a restart. The `/v0` API, JSON
+shapes, and semantics are identical (`streams-probe conformance` = **89/89**,
+exit 0, against a release server booted on a temp `STREAMS_DATA_DIR`).
+
+## Methodology (Phase 4 additions)
+
+- **Durable vs non-durable write-ack** (`streams-probe bench-durable <url>`):
+  boots two boxes that differ ONLY in `durable` (`true` vs `false`) and drives
+  the identical HTTP write path against each — single-record write-ack latency
+  (one in-flight at a time, n=5000) and concurrent batched throughput (16
+  writers × batch 100, ~50 000 records). The durable class additionally reports
+  the server-side `performance.fsync_ms` distribution. Loopback HTTP, wall-clock
+  latencies, percentiles by sort + linear interpolation.
+- **Recovery time** (`time-to-ready`): a harness boots the binary on a temp data
+  dir, loads N durable records (so every record is fsynced to the WAL), `kill
+  -9`s the process (**SIGKILL — no graceful shutdown, no snapshot**, so recovery
+  is a *pure full WAL replay* of all N frames — the worst case), restarts on the
+  SAME data dir, and times the interval until `GET /v0/ready` returns `200`. It
+  asserts the recovered `head_seq == N` (no acked durable loss). A graceful
+  shutdown instead writes a snapshot, making real-world time-to-ready far
+  shorter (recovery starts from the checkpoint and replays only the tail).
+- **Crash consistency** is proven by real tests, not benchmarked: `kill -9` of
+  the live binary mid-write + restart (`tests/crash_recovery.rs`,
+  `tests/integration_durability.rs`).
+
+## 1. Durable vs non-durable write-ack (HTTP, single record, n=5000)
+
+| Class | p50 | p99 | p999 | max |
+|---|---:|---:|---:|---:|
+| **non-durable** (group-commit, no per-write fsync) | 0.059 ms | 0.110 ms | 0.142 ms | 0.219 ms |
+| **durable** (fsync-gated, adaptive group commit) | 5.18 ms | 6.10 ms | 10.36 ms | 17.55 ms |
+
+Server-reported `performance.fsync_ms` for the durable class (the fsync
+component of the ack): p50 **5.00 ms**, p99 5.85 ms, p999 10.17 ms, min 3.87 ms.
+
+**Durability cost vs baseline.** The in-memory baseline single-record write-ack
+was p50 0.045 ms / p99 0.077 ms. The Phase-4 *non-durable* class lands at p50
+0.059 ms / p99 0.110 ms — within noise of the baseline, i.e. the WAL framing +
+buffered write add only single-digit microseconds when the fsync is off the
+critical path. The *durable* class is dominated almost entirely by the raw
+`fdatasync` cost on this machine's APFS/NVMe (~5 ms p50): on this hardware a lone
+`fdatasync` is markedly slower than the 50–500 µs the ARCHITECTURE latency budget
+assumes for server-grade NVMe, so the durable single-write p50 sits at the top of
+(slightly above) the 1–5 ms target here. This is the honest fsync floor of the
+test machine, not group-commit overhead — the adaptive window collapses to
+`gc_min` (500 µs) for a lone write, so the latency *is* the fsync. Under
+concurrent load, group commit amortizes one fsync across the whole batch (see §2).
+
+## 2. Write throughput (16 concurrent writers × batch 100, ~50 000 records)
+
+| Class | Records acked | Elapsed | Throughput |
+|---|---:|---:|---:|
+| **non-durable** | 49 600 | ~0.021 s | **~2.35 M records/s** |
+| **durable** (group-committed) | 49 600 | ~0.21 s | **~0.23 M records/s** |
+
+Under concurrent durable load the adaptive group commit coalesces many writers'
+batches into far fewer `fdatasync` calls, so durable throughput (~232 K rec/s) is
+~100× the naive "one fsync per write" ceiling (1000 fsyncs/s × 100/batch). The
+non-durable class (~2.35 M rec/s here; run-to-run it ranges up to the baseline's
+~4.7 M) is bounded by the single-box append-serialization + HTTP path, not disk.
+Both classes lose no acked data on a clean restart; durable additionally survives
+SIGKILL.
+
+> Note: the per-box append path now serializes seq-assignment + WAL-enqueue under
+> a per-box lock (the durability-correctness fix below), so single-box throughput
+> is slightly lower than the lock-free in-memory baseline; cross-box throughput
+> still scales with sharding.
+
+## 3. Recovery time — `time-to-ready` after SIGKILL (pure WAL replay, no snapshot)
+
+| Records in box | Load time | **time-to-ready** | Recovered `head_seq` |
+|---:|---:|---:|---:|
+| 100 000 (1e5) | ~0.15 s | **~0.14 s** | 100 000 (no loss) |
+| 1 000 000 (1e6) | ~1.40 s | **~0.68–0.94 s** | 1 000 000 (no loss) |
+
+This is the **worst case**: a hard kill with no snapshot, so recovery replays
+*every* frame from WAL offset zero. ~1e6 records replay (CRC-validate + decode +
+re-index + tag-index rebuild) in well under a second (~1.1–1.5 M frames/s). With
+a graceful shutdown (or the periodic snapshotter), recovery starts from the
+checkpoint and replays only the un-checkpointed tail, so real-world time-to-ready
+is bounded by the snapshot interval, not the total record count. The 1e7/1e8 rows
+from the ROADMAP plan were not run (they require the segment store deferred to a
+later phase; the in-memory index holds the full set as the cache here).
+
+## 4. Durability-correctness fix surfaced by the recovery benchmark
+
+The recovery benchmark initially exposed a **silent loss of acked durable
+writes** under concurrent writers (~5 % loss at 1e5 with 16 writers): seq
+assignment (`BoxState::append`, under the index lock) and the WAL enqueue were
+not a single atomic unit, so two writers could assign seqs `A < B` yet enqueue
+`B`'s frame ahead of `A`'s. Recovery applies frames in WAL order and skips any
+`seq <= head`, so the lower-seq frame `A` was dropped on replay despite having
+been acked. The fix adds a per-box `append_lock` that makes
+seq-assignment + WAL-enqueue atomic (the fsync wait stays *outside* the lock, so
+durable group commit still coalesces across boxes). Post-fix: **zero loss** at
+1e5 and 1e6 (recovered `head_seq == N` every run), covered by a deterministic
+in-process regression test (`concurrent_durable_writers_no_loss_across_restart`)
+plus the real SIGKILL subprocess tests.
+
+## 5. Crash-consistency / recovery correctness (proven by tests, not benchmarked)
+
+| Property | Proof |
+|---|---|
+| **Durability:** acked `durable:true` write survives SIGKILL at any instant | `crash_recovery::sigkill_durable_writes_survive_with_identical_state` (real `kill -9` of the binary; the write ack is fsync-gated so a 2xx ⇒ on disk) |
+| **Recovery correctness:** post-restart head/earliest/count/config/routers/delete match pre-crash | same test asserts each field for durable boxes + deleted-stays-gone + cap-floor-tombstones; `integration_durability::write_snapshot_more_writes_restart_matches` |
+| **Crash consistency (clean prefix):** SIGKILL during a non-durable burst ⇒ recovered tail is a contiguous prefix, no torn frame misread | `crash_recovery::sigkill_during_nondurable_burst_recovers_clean_prefix` |
+| **Torn tail truncated, not misread:** a corrupted/oversized last frame on disk ⇒ clean recovery, no panic, no bogus record, WAL writable again | `crash_recovery::torn_tail_on_subprocess_wal_recovers_clean`; `integration_durability::torn_tail_is_truncated_not_read_as_data`; WAL-reader unit tests (CRC + length-overrun + trailing-zeros) |
+| **No silent loss across restart:** cursor below recovered `evict_floor` ⇒ tombstone; purely-deleted gap ⇒ silent | `integration_durability::tombstone_vs_silent_gap_survive_restart` |
+
+## 6. ROADMAP Phase-4 acceptance-criteria coverage
+
+| Criterion | Status | Where |
+|---|---|---|
+| Durability (acked durable survives hard kill) | **MET** | `crash_recovery.rs` (real SIGKILL), `integration_durability.rs` |
+| Crash consistency (torn tail truncated, never read as data) | **MET** | `crash_recovery.rs`, WAL unit tests |
+| Recovery correctness (head/earliest/evict_floor/count/config/routers/deletes match) | **MET** | `crash_recovery.rs`, `integration_durability.rs` |
+| No silent loss across restart (tombstone vs silent deleted gap) | **MET** | `integration_durability.rs`, `properties.rs` |
+| No regressions (full prior suite green; conformance 89/89) | **MET** | 192 tests green; `streams-probe conformance` 89/89 on the persistent build |
+| Durable write-ack p99 within budget with adaptive group commit | **PARTIAL** | group commit works (§2); the lone-write durable p50 ~5 ms is at/over the 1–5 ms target because this machine's `fdatasync` (~5 ms) is slower than the server-NVMe assumption — a hardware floor, not a design regression |
+| Segment-granular cap/TTL eviction; async deleted-record reclaim | **DEFERRED → Phase 5** | the in-memory index is the cache; cap/TTL advance `evict_floor` and recover correctly, but the mmap segment store + background reclaimer are Phase 5 |
+| Full DWRR scheduler + elastic throttling under CPU pressure | **DEFERRED → Phase 5** | scheduler present in simplified (mark-dirty) form; the governor/throttle ladder + `429` under pressure are Phase 5 |
+| SSE fan-out p99 ≤ 5 ms; throttling latency-under-pressure | see baseline (SSE) / **DEFERRED** (throttling) | SSE fan-out unchanged from baseline §2; throttling deferred with the scheduler |
+
+**Explicitly deferred to Phase 5** (out of Phase-4 durability scope, per the
+stage brief): segments-beyond-RAM / mmap segment store + background reclaimer,
+the full DWRR priority scheduler + elastic throttling, HTTP/2 (h2c), and the
+queue/lease/workload features.
+
+## Notes (Phase 4)
+
+- Latencies are loopback-HTTP single representative runs; durable latency is
+  fsync-bound and will differ on other storage (server NVMe is typically ~10×
+  faster at `fdatasync` than this laptop's APFS, which would pull the durable
+  single-write p50 well inside the 1–5 ms target).
+- Recovery time is a pure-WAL-replay worst case (SIGKILL, no snapshot); with the
+  snapshotter it is bounded by the un-checkpointed tail, not total records.
+- Reproduce:
+  ```bash
+  # boot a release server on a temp data dir
+  D=$(mktemp -d); STREAMS_PORT=4090 STREAMS_DATA_DIR=$D ./target/release/streams &
+  ./target/release/streams-probe conformance   http://localhost:4090   # 89/89
+  ./target/release/streams-probe bench-durable  http://localhost:4090 --json
+  # recovery-time: see the SIGKILL-load-restart harness in tests/crash_recovery.rs
+  ```

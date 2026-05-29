@@ -47,6 +47,18 @@ pub const SSE_RETRY_MS: u64 = 2_000;
 /// Max router forwarding hops when `allow_cycle` is set (`$ttl_hops`).
 pub const MAX_ROUTER_HOPS: u8 = 8;
 
+/// Default data directory for the WAL/segments when `STREAMS_DATA_DIR` is unset
+/// (phase 4 durability layer; see [`crate::storage`]).
+pub const DEFAULT_DATA_DIR: &str = "./streams-data";
+
+/// WAL bytes written since the last snapshot that triggers a new snapshot
+/// (ARCHITECTURE §3: snapshot on a size threshold). Keeps WAL replay bounded.
+pub const SNAPSHOT_BYTES_THRESHOLD: u64 = 64 << 20; // 64 MiB
+/// Max wall-clock ms between snapshots (the time-based snapshot trigger).
+pub const SNAPSHOT_INTERVAL_MS: u64 = 60_000; // 60 s
+/// How often the background snapshotter checks the snapshot triggers (ms).
+pub const SNAPSHOT_CHECK_INTERVAL_MS: u64 = 5_000;
+
 // ---------------------------------------------------------------------------
 // Priority scheduler constants (DESIGN §3, ARCHITECTURE §7)
 // ---------------------------------------------------------------------------
@@ -80,9 +92,12 @@ pub struct ServerConfig {
     pub probe_auth: bool,
     /// Max total request body before parse (`413`).
     pub max_body_bytes: usize,
-    /// Data directory for the WAL/segments (`STREAMS_DATA_DIR`). Phase 2 keeps
-    /// all state in memory, so this is an accepted placeholder, reported but
-    /// unused until phase 4 wires the storage layer underneath.
+    /// Data directory for the WAL/segments (`STREAMS_DATA_DIR`, default
+    /// [`DEFAULT_DATA_DIR`] = `./streams-data`). The storage layer
+    /// ([`crate::storage`]) writes the WAL under `<data_dir>/wal`; a missing/empty
+    /// dir is a fresh start. [`crate::engine::Engine::with_data_dir`] opens it,
+    /// replays the WAL on startup, and fsync-gates `durable:true` writes. `None`
+    /// selects pure in-memory mode (engine/property unit tests).
     pub data_dir: Option<String>,
 }
 
@@ -134,8 +149,8 @@ impl ServerConfig {
             }
         }
 
-        // Accepted placeholder; phase 2 is in-memory so the directory is only
-        // recorded, never written to (phase 4 wires the WAL/segments here).
+        // The WAL/segments live under this directory; the engine opens it and
+        // replays the WAL on startup (durability layer). Unset ⇒ DEFAULT_DATA_DIR.
         if let Ok(dir) = std::env::var("STREAMS_DATA_DIR") {
             let dir = dir.trim();
             if !dir.is_empty() {

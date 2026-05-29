@@ -22,13 +22,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("STREAMS_API_KEYS not set: AUTH IS DISABLED (single-tenant dev mode)");
     }
 
-    if let Some(dir) = &config.data_dir {
-        info!(data_dir = %dir, "STREAMS_DATA_DIR set (phase 2 is in-memory; placeholder only)");
-    }
-    warn!("phase 2: all state is in-memory; a restart loses all data");
+    let data_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| streams::config::DEFAULT_DATA_DIR.to_string());
+    info!(data_dir = %data_dir, "durable mode: WAL under <data_dir>/wal (replayed on start)");
 
     let clock: SharedClock = Arc::new(SystemClock);
-    let engine = Engine::new(config.clone(), clock);
+    // Durable engine: opens/creates the data dir, loads the latest valid
+    // snapshot, replays the WAL forward from its checkpoint (truncating any torn
+    // tail), and resumes the writer — all BEFORE this returns. The engine starts
+    // NOT ready and flips to ready only after that recovery completes, so the
+    // readiness gate (`/v0/ready`) is 503 during replay and 200 after. Durable
+    // writes are fsync-gated.
+    let recover_started = std::time::Instant::now();
+    let engine = Engine::with_data_dir(config.clone(), clock)?;
+    info!(
+        ready = engine.is_ready(),
+        boxes = engine.box_count(),
+        recover_ms = recover_started.elapsed().as_millis() as u64,
+        "recovery complete; readiness gate open (/v0/ready -> 200)"
+    );
+
+    // Background snapshotter: periodically checks the size/time snapshot triggers
+    // and writes an atomic snapshot when due (keeping WAL replay bounded). The
+    // capture+fsync is blocking, so it runs on the blocking pool.
+    let snap_engine = engine.clone();
+    let snapshotter = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+            streams::config::SNAPSHOT_CHECK_INTERVAL_MS,
+        ));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if snap_engine.snapshot_due() {
+                let e = snap_engine.clone();
+                let res = tokio::task::spawn_blocking(move || e.write_snapshot()).await;
+                match res {
+                    Ok(Ok(true)) => info!("periodic snapshot written"),
+                    Ok(Ok(false)) => {}
+                    Ok(Err(err)) => warn!(error = %err, "periodic snapshot failed"),
+                    Err(join) => warn!(error = %join, "snapshot task panicked"),
+                }
+            }
+        }
+    });
 
     let app = http::build_router(engine.clone());
 
@@ -38,6 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Graceful shutdown: stop the background snapshotter and write a final
+    // snapshot so a clean restart starts from a current checkpoint.
+    snapshotter.abort();
+    let snap_engine = engine.clone();
+    match tokio::task::spawn_blocking(move || snap_engine.write_snapshot()).await {
+        Ok(Ok(true)) => info!("shutdown snapshot written"),
+        Ok(Ok(false)) => {}
+        Ok(Err(err)) => warn!(error = %err, "shutdown snapshot failed"),
+        Err(join) => warn!(error = %join, "shutdown snapshot task panicked"),
+    }
 
     info!("shutdown complete");
     Ok(())

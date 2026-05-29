@@ -14,7 +14,7 @@
 
 use crate::engine::eviction::Floors;
 use crate::types::{BoxConfig, Filter};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -210,6 +210,9 @@ impl BoxIndex {
 pub struct BoxState {
     /// The box name (also the identity).
     pub name: String,
+    /// Interned numeric id used in WAL frames (ARCHITECTURE §2.1). Stable for the
+    /// lifetime of this box instance; reassigned on delete+recreate.
+    pub box_id: u32,
     /// Live config (read-mostly; mutated under `index` write lock on `PUT`).
     pub config: RwLock<BoxConfig>,
     /// The seq→record index (carries the per-box tag index + `delete_below`).
@@ -240,16 +243,28 @@ pub struct BoxState {
 
     /// Wakes SSE/diff long-pollers on append (ARCHITECTURE §1.2).
     pub notify: Notify,
+
+    /// Serializes the **seq-assignment + WAL-enqueue** critical section on the
+    /// write path so a box's WAL frames are appended to the single ordered writer
+    /// in the *same order* their seqs were assigned. Without this, two concurrent
+    /// durable writers can assign seqs `A < B` under the index lock yet enqueue
+    /// `B` before `A`; recovery (which applies frames in WAL order and skips any
+    /// `seq <= head`) would then drop the lower-seq frame — a silent loss of an
+    /// acked durable write. Held only across the (fast, non-blocking) channel
+    /// enqueue; the fsync wait happens *after* the lock is released, so durable
+    /// group commit still coalesces across boxes (ARCHITECTURE §2.2/§2.3).
+    pub append_lock: Mutex<()>,
 }
 
 /// Sentinel for a recency clock that has never fired.
 pub const TS_NEVER: i64 = i64::MIN;
 
 impl BoxState {
-    /// Create a fresh box with the given config and epoch.
-    pub fn new(name: String, config: BoxConfig, seq_base: u64, epoch: u64) -> Self {
+    /// Create a fresh box with the given config, interned id, and epoch.
+    pub fn new(name: String, box_id: u32, config: BoxConfig, seq_base: u64, epoch: u64) -> Self {
         BoxState {
             name,
+            box_id,
             config: RwLock::new(config),
             index: RwLock::new(BoxIndex::new(seq_base)),
             floors: RwLock::new(Floors::default()),
@@ -263,6 +278,7 @@ impl BoxState {
             last_read_ms: AtomicI64::new(TS_NEVER),
             last_consumed_ms: AtomicI64::new(TS_NEVER),
             notify: Notify::new(),
+            append_lock: Mutex::new(()),
         }
     }
 

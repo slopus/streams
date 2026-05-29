@@ -1,6 +1,6 @@
 //! Router endpoints: PUT/GET/DELETE `/v0/routers/:router`, GET `/v0/routers`.
 
-use super::{parse_json_body, AppState};
+use super::{parse_json_body, run_blocking, AppState};
 use crate::config;
 use crate::error::Result;
 use crate::types::*;
@@ -21,7 +21,8 @@ pub async fn put_router(
     body: Bytes,
 ) -> Result<Response> {
     let req: RouterCreateRequest = parse_json_body(&headers, &body)?;
-    let (created, resp) = state.engine.put_router(&router, req)?;
+    let engine = state.engine.clone();
+    let (created, resp) = run_blocking(move || engine.put_router(&router, req)).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -61,5 +62,7 @@ pub async fn delete_router(
     State(state): State<AppState>,
     Path(router): Path<String>,
 ) -> Result<Json<RouterDeleteResponse>> {
-    Ok(Json(state.engine.delete_router(&router)?))
+    let engine = state.engine.clone();
+    let resp = run_blocking(move || engine.delete_router(&router)).await?;
+    Ok(Json(resp))
 }

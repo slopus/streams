@@ -11,4 +11,5 @@ pub mod engine;
 pub mod error;
 pub mod http;
 pub mod sched;
+pub mod storage;
 pub mod types;

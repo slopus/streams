@@ -2,7 +2,8 @@
 //! by default; the auth middleware skips them unless `STREAMS_PROBE_AUTH`.
 
 use super::AppState;
-use crate::types::{HealthResponse, ReadyResponse};
+use crate::error::Error;
+use crate::types::{ErrorCode, HealthResponse, ReadyResponse};
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -22,14 +23,28 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// `GET /v0/ready` (alias `/readyz`) — readiness. Phase 2 is always ready
-/// (no WAL replay); `503 shutting_down` is emitted during drain in main.
-pub async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
-    Json(ReadyResponse {
-        status: "ready".to_string(),
-        wal_replay_complete: true,
-        boxes: state.engine.box_count(),
-    })
+/// `GET /v0/ready` (alias `/readyz`) — readiness (API §8.2). `200 ready` once
+/// restart recovery (snapshot load + WAL replay) has rebuilt the in-memory
+/// state; `503 not_ready` while replay is in progress, carrying `Retry-After`
+/// and `error.detail.replay_progress` (0.0–1.0). `/v0/health` stays `200`
+/// throughout (liveness is independent of the ready gate).
+pub async fn ready(State(state): State<AppState>) -> Response {
+    if state.engine.is_ready() {
+        return Json(ReadyResponse {
+            status: "ready".to_string(),
+            wal_replay_complete: true,
+            boxes: state.engine.box_count(),
+        })
+        .into_response();
+    }
+    // Still replaying the WAL: `503 not_ready` with the canonical error envelope,
+    // a `Retry-After`, and the replay progress so a probe/LB can back off.
+    Error::new(ErrorCode::NotReady, "WAL replay in progress")
+        .with_detail(serde_json::json!({
+            "replay_progress": state.engine.replay_progress(),
+        }))
+        .with_retry_after(1)
+        .into_response()
 }
 
 /// `GET /v0/metrics` — Prometheus text exposition by default; JSON snapshot

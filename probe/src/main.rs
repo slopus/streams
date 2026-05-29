@@ -35,6 +35,7 @@ struct TopLevel {
 enum Subcommand {
     Conformance(ConformanceCmd),
     Bench(BenchCmd),
+    BenchDurable(BenchDurableCmd),
 }
 
 /// Assert the documented /v0 contract against a live server.
@@ -75,6 +76,32 @@ struct BenchCmd {
     json: bool,
 }
 
+/// Compare durable (fsync-gated, group-committed) vs non-durable write-ack
+/// latency + throughput against a live server (Phase-4 persistent build).
+#[derive(FromArgs, Debug)]
+#[argh(subcommand, name = "bench-durable")]
+struct BenchDurableCmd {
+    /// base URL of the live server, e.g. http://127.0.0.1:4000
+    #[argh(positional)]
+    base_url: String,
+
+    /// bearer token to send on every request (optional)
+    #[argh(option)]
+    token: Option<String>,
+
+    /// single-record write-ack latency samples per class (default 5000)
+    #[argh(option, default = "5_000")]
+    samples: u64,
+
+    /// total records for the concurrent throughput phase per class (default 50000)
+    #[argh(option, default = "50_000")]
+    writes: u64,
+
+    /// emit a machine-readable JSON summary to stdout (for BENCHMARKS.md)
+    #[argh(switch)]
+    json: bool,
+}
+
 fn main() -> ExitCode {
     let top: TopLevel = argh::from_env();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -85,6 +112,7 @@ fn main() -> ExitCode {
     match top.cmd {
         Subcommand::Conformance(c) => rt.block_on(run_conformance(c)),
         Subcommand::Bench(b) => rt.block_on(run_bench(b)),
+        Subcommand::BenchDurable(b) => rt.block_on(run_bench_durable(b)),
     }
 }
 
@@ -1421,6 +1449,174 @@ async fn run_bench(cmd: BenchCmd) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Durability cost benchmark: durable (fsync-gated, group-committed) vs
+/// non-durable write-ack latency + throughput, side by side. Drives a `durable`
+/// box and a `non-durable` box over the same HTTP path so the only difference is
+/// the per-write fsync gate.
+async fn run_bench_durable(cmd: BenchDurableCmd) -> ExitCode {
+    let c = Client::new(&cmd.base_url, cmd.token.clone());
+    if c.get("/v0/health").await.map(|r| r.status != 200).unwrap_or(true) {
+        eprintln!("error: server at {} did not return 200 on /v0/health", cmd.base_url);
+        return ExitCode::FAILURE;
+    }
+    // Require the server be ready (recovery complete) before benchmarking.
+    if c.get("/v0/ready").await.map(|r| r.status != 200).unwrap_or(true) {
+        eprintln!("error: server at {} is not ready (/v0/ready != 200)", cmd.base_url);
+        return ExitCode::FAILURE;
+    }
+
+    let ns = format!("durbench{}", std::process::id());
+    eprintln!(
+        "durability bench {} (samples={}, writes={})",
+        cmd.base_url, cmd.samples, cmd.writes
+    );
+
+    let durable = bench_one_durability_class(&c, &ns, true, cmd.samples, cmd.writes).await;
+    let nondurable = bench_one_durability_class(&c, &ns, false, cmd.samples, cmd.writes).await;
+
+    cleanup(&c, &ns).await;
+
+    let summary = json!({
+        "base_url": cmd.base_url,
+        "samples": cmd.samples,
+        "writes": cmd.writes,
+        "durable": durable,
+        "non_durable": nondurable,
+    });
+
+    if cmd.json {
+        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    } else {
+        print_durable_bench_table(&summary);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Measure single-record write-ack latency + concurrent batched throughput for
+/// one durability class. Also reports the observed group-commit batching factor
+/// (frames-per-fsync, derived from the durable single-record `fsync_ms` only as
+/// an informational latency, since the server does not expose internal counters
+/// over HTTP).
+async fn bench_one_durability_class(
+    c: &Client,
+    ns: &str,
+    durable: bool,
+    samples: u64,
+    total_writes: u64,
+) -> Value {
+    let label = if durable { "dur" } else { "nodur" };
+
+    // --- Single-record write-ack latency (one in-flight at a time). ----------
+    let lat_box = format!("{ns}-{label}-lat");
+    let _ = c
+        .put(&format!("/v0/boxes/{lat_box}"), &json!({ "durable": durable }))
+        .await;
+    let lat_path = format!("/v0/boxes/{lat_box}");
+    let n = samples.max(1);
+    let mut latencies = Vec::with_capacity(n as usize);
+    let mut fsync_ms_samples = Vec::with_capacity(n as usize);
+    let body = json!({ "records": [{ "data": { "x": "abcdefghij0123456789" } }] });
+    for _ in 0..n {
+        let t = Instant::now();
+        if let Ok(r) = c.post(&lat_path, &body).await {
+            if r.status == 200 || r.status == 201 {
+                latencies.push(t.elapsed().as_secs_f64() * 1000.0);
+                if let Some(f) = r.body.get("performance").and_then(|p| p.get("fsync_ms")).and_then(|v| v.as_f64()) {
+                    fsync_ms_samples.push(f);
+                }
+            }
+        }
+    }
+    let lat_summary = summarize(latencies);
+    let server_fsync = summarize(fsync_ms_samples);
+
+    // --- Concurrent batched throughput. --------------------------------------
+    let tput_box = format!("{ns}-{label}-tput");
+    let _ = c
+        .put(&format!("/v0/boxes/{tput_box}"), &json!({ "durable": durable }))
+        .await;
+    let tput_path = Arc::new(format!("/v0/boxes/{tput_box}"));
+    let writers = 16usize;
+    let batch = 100u64;
+    let batches = (total_writes / batch).max(1);
+    let per_worker = (batches / writers as u64).max(1);
+    let actual_records = per_worker * writers as u64 * batch;
+    let payload = {
+        let recs: Vec<Value> = (0..batch).map(|i| json!({ "data": { "i": i } })).collect();
+        Arc::new(json!({ "records": recs, "return_seqs": false }))
+    };
+    let done = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..writers {
+        let cc = c.clone();
+        let path = tput_path.clone();
+        let pl = payload.clone();
+        let done = done.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..per_worker {
+                if cc
+                    .post(&format!("{}?return_seqs=false", path), &pl)
+                    .await
+                    .map(|r| r.status == 200 || r.status == 201)
+                    .unwrap_or(false)
+                {
+                    done.fetch_add(batch, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let acked = done.load(Ordering::Relaxed);
+    let throughput = if elapsed > 0.0 { acked as f64 / elapsed } else { 0.0 };
+
+    json!({
+        "durable": durable,
+        "single_record_ack_latency_ms": lat_summary,
+        "server_reported_fsync_ms": server_fsync,
+        "throughput": {
+            "writers": writers,
+            "batch_size": batch,
+            "records_appended": actual_records,
+            "records_acked": acked,
+            "elapsed_s": round3(elapsed),
+            "records_per_s": round3(throughput),
+        }
+    })
+}
+
+/// Pretty-print the durability bench summary as two side-by-side blocks.
+fn print_durable_bench_table(s: &Value) {
+    let row = |class: &str, v: &Value| {
+        let l = &v["single_record_ack_latency_ms"];
+        let tp = &v["throughput"];
+        println!(
+            "  {class:<12} p50={:.3} p99={:.3} p999={:.3} max={:.3} ms | throughput={:.0} rec/s ({} acked in {:.3}s)",
+            l["p50_ms"].as_f64().unwrap_or(0.0),
+            l["p99_ms"].as_f64().unwrap_or(0.0),
+            l["p999_ms"].as_f64().unwrap_or(0.0),
+            l["max_ms"].as_f64().unwrap_or(0.0),
+            tp["records_per_s"].as_f64().unwrap_or(0.0),
+            tp["records_acked"].as_u64().unwrap_or(0),
+            tp["elapsed_s"].as_f64().unwrap_or(0.0),
+        );
+    };
+    println!("=== streams-probe bench-durable: {} ===", s["base_url"]);
+    println!("single-record write-ack latency + concurrent batched throughput:");
+    row("durable", &s["durable"]);
+    row("non-durable", &s["non_durable"]);
+    let dfs = &s["durable"]["server_reported_fsync_ms"];
+    println!(
+        "  durable server-reported fsync_ms: p50={:.3} p99={:.3} max={:.3}",
+        dfs["p50_ms"].as_f64().unwrap_or(0.0),
+        dfs["p99_ms"].as_f64().unwrap_or(0.0),
+        dfs["max_ms"].as_f64().unwrap_or(0.0),
+    );
 }
 
 /// Write-ack latency (single-record writes) + write throughput (concurrent

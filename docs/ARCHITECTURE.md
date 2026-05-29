@@ -169,14 +169,14 @@ multi-record writes produce many frames committed as one batch). Multi-byte inte
   34    N   node        bytes (node_len)
    .    M   tag         bytes (tag_len)
    .    P   data+meta   bytes (data_len)   -- opaque payload
-   .    4   crc32c      u32   CRC32C (Castagnoli) over bytes [4 .. crc_start)
+   .    8   xxh3        u64   XXH3-64 over bytes [4 .. crc_start)
 ```
 
 - **`frame_len` first** lets recovery validate frame boundaries without parsing the body and
   detect a torn tail (frame_len past EOF ⇒ truncated write ⇒ discard from here).
-- **CRC32C** (hardware-accelerated on modern x86/ARM) over everything between `frame_len` and the
-  CRC. A mismatch ⇒ torn/partial frame ⇒ logical end of log (truncate). This is the crash-consistency
-  anchor (§4).
+- **XXH3-64** (fast, modern 64-bit hash; ~2³² lower false-accept than a 32-bit CRC) over everything
+  between `frame_len` and the checksum. A mismatch ⇒ torn/partial frame ⇒ logical end of log
+  (truncate). This is the crash-consistency anchor (§4).
 - **`box_id` is an interned u32** (not the string name), keeping frames small; the name↔id mapping
   lives in the metadata store (§5).
 - **Control frames** (BoxCreate, Delete, EvictWatermark, ConfigUpdate, …) share the same WAL, so
@@ -367,7 +367,7 @@ instant.
    surviving tagged records.
 3. Replay the WAL from the frame after the last CheckpointMark. For each frame, in order:
      - frame_len fits remaining bytes? else torn tail -> STOP (truncate here).
-     - crc32c valid? else torn/partial -> STOP (truncate here).
+     - xxh3 valid? else torn/partial -> STOP (truncate here).
      - apply: Append -> push RecordLoc (location=WAL), index tag, bump head_seq.
               Delete -> re-apply before_seq/match: mark slots deleted, free payloads,
                         prune tag index, advance earliest_seq (NOT evict_floor).
@@ -379,9 +379,9 @@ instant.
 ```
 
 **Crash-consistency guarantees:**
-- **Torn tail:** detected by `frame_len` overrunning EOF or CRC mismatch; stop at the last fully
-  written, CRC-valid frame and truncate. Since a write is acked only after its frame is committed
-  (and fsynced, for durable boxes), an **acked durable write is always a complete CRC-valid frame ⇒
+- **Torn tail:** detected by `frame_len` overrunning EOF or checksum mismatch; stop at the last fully
+  written, checksum-valid frame and truncate. Since a write is acked only after its frame is committed
+  (and fsynced, for durable boxes), an **acked durable write is always a complete checksum-valid frame ⇒
   never lost.**
 - **Partial `write()`:** the trailing partial frame fails CRC/length and is discarded; never
   interpreted as data.
@@ -660,7 +660,7 @@ deliberate pacing of low-priority boxes under CPU pressure — both explicit and
 | `serde` + `serde_json` | (de)serialization | JSON-first API bodies; `#[serde]` on request/response structs. |
 | `bincode` | compact meta snapshots | Fast compact binary for the metadata snapshot. |
 | `bytes` | zero-copy buffers | `Bytes`/`BytesMut` for reference-counted payload slices and reusable WAL framing scratch. |
-| `crc32fast` | frame integrity | Hardware-accelerated CRC32C for WAL/segment checksums — the torn-tail crash anchor. |
+| `xxhash-rust` (xxh3) | frame integrity | XXH3-64 for WAL/segment checksums — modern, fast, 64-bit (~2³² lower false-accept than 32-bit CRC); the torn-tail crash anchor. |
 | `memmap2` | segment reads | mmap sealed immutable segments for zero-copy, page-cache-backed `getDifference`. |
 | `parking_lot` | locks | Faster, smaller `RwLock`/`Mutex` for the per-box index lock on the hot path. |
 | `dashmap` | box registry | Sharded concurrent `HashMap<BoxId, Arc<Box>>` — many boxes without a global lock. |

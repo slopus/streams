@@ -1,7 +1,7 @@
 //! Box endpoints: PUT/GET/DELETE/POST `/v0/boxes/:box`, GET `/v0/boxes`
 //! (list), and POST `/v0/boxes/:box/diff`.
 
-use super::{parse_json_body, query_bool, AppState};
+use super::{parse_json_body, query_bool, run_blocking, AppState};
 use crate::config;
 use crate::error::Result;
 use crate::types::*;
@@ -30,7 +30,13 @@ pub async fn put_box(
         parse_json_body(&headers, &body)?
     };
 
-    let (created, _cfg) = state.engine.put_box(&box_name, config)?;
+    // The engine call may block on a WAL fsync (durable control frame); run it
+    // on the blocking pool so it never parks a reactor thread (ARCHITECTURE §8.5).
+    let created = {
+        let engine = state.engine.clone();
+        let name = box_name.clone();
+        run_blocking(move || engine.put_box(&name, config)).await?.0
+    };
     // Re-read the merged config so the response reflects the box's current state.
     let stored = state
         .engine
@@ -89,7 +95,9 @@ pub async fn delete_box(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<BoxDeleteResponse>> {
     let if_empty = query_bool(&params, "if_empty", false);
-    Ok(Json(state.engine.delete_box(&box_name, if_empty)?))
+    let engine = state.engine.clone();
+    let resp = run_blocking(move || engine.delete_box(&box_name, if_empty)).await?;
+    Ok(Json(resp))
 }
 
 /// `POST /v0/boxes/:box` — append record(s). `?return_seqs=false` suppresses the
@@ -112,7 +120,13 @@ pub async fn write(
     }
 
     let return_seqs = query_bool(&params, "return_seqs", true);
-    let resp = state.engine.write(&box_name, req, return_seqs)?;
+    // A durable write blocks on the group fsync; run it on the blocking pool so
+    // the fsync wait never parks a reactor thread (ARCHITECTURE §8.5).
+    let resp = {
+        let engine = state.engine.clone();
+        let name = box_name.clone();
+        run_blocking(move || engine.write(&name, req, return_seqs)).await?
+    };
 
     // `201` only when this write created the box (API §2).
     let status = if resp.created {

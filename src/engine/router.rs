@@ -118,6 +118,30 @@ impl RouterGraph {
         *self.forwarded_total.entry(router.to_string()).or_insert(0) += count;
     }
 
+    /// Snapshot every router with its forward cursor + total (for a metadata
+    /// snapshot). Returns `(router, cursor, forwarded_total)` tuples.
+    pub fn snapshot_all(&self) -> Vec<(Router, u64, u64)> {
+        self.routers
+            .values()
+            .map(|r| {
+                (
+                    r.clone(),
+                    self.cursors.get(&r.name).copied().unwrap_or(0),
+                    self.forwarded_total.get(&r.name).copied().unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
+    /// Restore a router (with its cursor + total) during snapshot load. Bypasses
+    /// the cycle check (the router was already accepted live).
+    pub fn restore(&mut self, router: Router, cursor: u64, forwarded_total: u64) {
+        let name = router.name.clone();
+        self.routers.insert(name.clone(), router);
+        self.cursors.insert(name.clone(), cursor);
+        self.forwarded_total.insert(name, forwarded_total);
+    }
+
     /// Whether adding `source -> dest` would create a directed cycle in the
     /// existing graph. Returns the offending cycle path (box names) if so.
     pub fn would_create_cycle(&self, source: &str, dest: &str) -> Option<Vec<String>> {

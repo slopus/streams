@@ -263,6 +263,7 @@ fn bench_cap_evict(c: &mut Criterion) {
 fn warm_box(n: usize) -> Arc<BoxState> {
     let b = Arc::new(BoxState::new(
         BOX.to_string(),
+        1, // interned box_id (irrelevant to the in-memory bench).
         BoxConfig::default(),
         SEQ_BASE,
         1,
