@@ -1,0 +1,1786 @@
+//! Engine facade: the box registry, lazy auto-create, and dispatch of
+//! write/diff/state/delete plus router forwarding.
+//!
+//! Phase 2 keeps all state in memory behind a [`DashMap`] of boxes and a
+//! single lock over the router graph. Module boundaries are kept clean so a
+//! WAL/storage layer can slide underneath in phase 4.
+
+pub mod box_state;
+pub mod eviction;
+pub mod filters;
+pub mod router;
+
+use crate::clock::SharedClock;
+use crate::config::{self, ServerConfig};
+use crate::error::{Error, Result};
+use crate::sched::Scheduler;
+use crate::types::*;
+use box_state::{BoxState, DedupeEntry, StoredRecord};
+use dashmap::DashMap;
+use eviction::AdmitDecision;
+use parking_lot::Mutex;
+use router::RouterGraph;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+/// Default first seq for a fresh box instance (`0` is reserved for "no
+/// records").
+pub const SEQ_BASE: u64 = 1;
+
+/// The shared engine handle.
+pub struct Engine {
+    /// Box registry by name. `Arc<BoxState>` so handlers hold a box without
+    /// keeping the shard locked.
+    boxes: DashMap<String, Arc<BoxState>>,
+    /// Router registry + forwarding graph.
+    routers: Mutex<RouterGraph>,
+    /// Monotonic interned box-id allocator (used by WAL framing in phase 4).
+    next_box_id: AtomicU64,
+    /// The priority/delivery scheduler (simplified in phase 2).
+    pub scheduler: Scheduler,
+    /// Time source (real or test).
+    pub clock: SharedClock,
+    /// Server config (limits, auth).
+    pub config: ServerConfig,
+    /// Process start, for `uptime_ms`.
+    pub started_at: Instant,
+}
+
+impl Engine {
+    /// Build a new in-memory engine.
+    pub fn new(config: ServerConfig, clock: SharedClock) -> Arc<Self> {
+        Arc::new(Engine {
+            boxes: DashMap::new(),
+            routers: Mutex::new(RouterGraph::new()),
+            next_box_id: AtomicU64::new(1),
+            scheduler: Scheduler::new(clock.clone()),
+            clock,
+            config,
+            started_at: Instant::now(),
+        })
+    }
+
+    /// Number of boxes currently registered.
+    pub fn box_count(&self) -> u64 {
+        self.boxes.len() as u64
+    }
+
+    /// Look up a box by name.
+    pub fn get_box(&self, name: &str) -> Option<Arc<BoxState>> {
+        self.boxes.get(name).map(|b| b.clone())
+    }
+
+    /// Allocate the next interned box id.
+    fn alloc_box_id(&self) -> u64 {
+        self.next_box_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Compute the effective priority of a box right now (DESIGN §3.1).
+    fn effective_priority(&self, b: &BoxState) -> i64 {
+        let cfg = b.config.read();
+        let manual = cfg.priority;
+        let auto = cfg.auto_priority;
+        drop(cfg);
+        let last_consumed = BoxState::read_ts(&b.last_consumed_ms);
+        // The age boost wants the wait time of the oldest unread record; phase 2
+        // uses the box's earliest retained write recency as a stand-in. With no
+        // queued work the term is 0, which is correct for the state read.
+        self.scheduler
+            .effective_priority(manual, auto, last_consumed, None)
+    }
+
+    // -----------------------------------------------------------------------
+    // Box lifecycle (API §1)
+    // -----------------------------------------------------------------------
+
+    /// `PUT /v0/boxes/:box` — create or update a box. Returns the config and
+    /// whether it was created on this call.
+    pub fn put_box(&self, name: &str, config: BoxConfig) -> Result<(bool, BoxConfig)> {
+        if !config::is_valid_name(name) {
+            return Err(Error::invalid_request(format!(
+                "invalid box name {name:?}"
+            )));
+        }
+        validate_config(&config)?;
+
+        use dashmap::mapref::entry::Entry;
+        match self.boxes.entry(name.to_string()) {
+            Entry::Occupied(e) => {
+                // Existing box → replace config in place (no epoch bump, no
+                // record rewrite). Tightened caps/ttl take effect immediately.
+                let b = e.get();
+                *b.config.write() = config.clone();
+                b.enforce_retention(self.clock.now_ms());
+                Ok((false, config))
+            }
+            Entry::Vacant(e) => {
+                let _ = self.alloc_box_id(); // interned id reserved for phase 4.
+                e.insert(Arc::new(BoxState::new(
+                    name.to_string(),
+                    config.clone(),
+                    SEQ_BASE,
+                    1,
+                )));
+                Ok((true, config))
+            }
+        }
+    }
+
+    /// `GET /v0/boxes/:box` — box state. Never auto-creates.
+    pub fn box_state(&self, name: &str, touch: bool) -> Result<BoxStateResponse> {
+        let start = Instant::now();
+        let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
+        let now = self.clock.now_ms();
+
+        // Lazily advance floors so count/earliest_seq reflect current TTL/cap.
+        b.enforce_retention(now);
+
+        if touch {
+            // A state read bumps the box's auto-priority recency clock and the
+            // read recency (DESIGN §3.1).
+            b.last_read_ms.store(now, Ordering::Relaxed);
+            b.last_consumed_ms.store(now, Ordering::Relaxed);
+        }
+
+        let head = b.head_seq();
+        let earliest = b.earliest_seq();
+        let config = b.config.read().clone();
+        let effective_priority = self.effective_priority(&b);
+
+        Ok(BoxStateResponse {
+            box_name: name.to_string(),
+            head_seq: head,
+            earliest_seq: earliest,
+            next_seq: head.saturating_add(1),
+            count: b.count(),
+            bytes: b.bytes(),
+            config,
+            effective_priority,
+            last_write_ts: BoxState::read_ts(&b.last_write_ms),
+            last_read_ts: BoxState::read_ts(&b.last_read_ms),
+            performance: Performance::with_total(elapsed_ms(start)),
+        })
+    }
+
+    /// `GET /v0/boxes` — list boxes (opaque-cursor paginated).
+    pub fn list_boxes(
+        &self,
+        prefix: Option<&str>,
+        page_size: usize,
+        cursor: Option<&str>,
+        touch: bool,
+    ) -> Result<BoxListResponse> {
+        let start = Instant::now();
+        let page_size = page_size.clamp(1, config::MAX_PAGE_SIZE);
+        let after = decode_cursor(cursor)?;
+        let now = self.clock.now_ms();
+
+        // Collect + sort names for stable opaque-cursor paging (API §0.7).
+        let mut names: Vec<String> = self
+            .boxes
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|n| prefix.map(|p| n.starts_with(p)).unwrap_or(true))
+            .filter(|n| after.as_deref().map(|a| n.as_str() > a).unwrap_or(true))
+            .collect();
+        names.sort();
+
+        let has_more = names.len() > page_size;
+        names.truncate(page_size);
+
+        let mut boxes = Vec::with_capacity(names.len());
+        for n in &names {
+            if let Some(b) = self.get_box(n) {
+                b.enforce_retention(now);
+                if touch {
+                    b.last_consumed_ms.store(now, Ordering::Relaxed);
+                }
+                let cfg = b.config.read();
+                let durable = cfg.durable;
+                drop(cfg);
+                boxes.push(BoxSummary {
+                    box_name: n.clone(),
+                    head_seq: b.head_seq(),
+                    earliest_seq: b.earliest_seq(),
+                    count: b.count(),
+                    bytes: b.bytes(),
+                    durable,
+                    effective_priority: self.effective_priority(&b),
+                });
+            }
+        }
+
+        let next_cursor = if has_more {
+            names.last().map(|n| encode_cursor(n))
+        } else {
+            None
+        };
+
+        Ok(BoxListResponse {
+            boxes,
+            next_cursor,
+            performance: Performance::with_total(elapsed_ms(start)),
+        })
+    }
+
+    /// `DELETE /v0/boxes/:box` — delete box + cascade routers.
+    pub fn delete_box(&self, name: &str, if_empty: bool) -> Result<BoxDeleteResponse> {
+        let start = Instant::now();
+
+        // Absent box → idempotent no-op (API §1.4): deleted:false, no cascade.
+        let b = match self.get_box(name) {
+            Some(b) => b,
+            None => {
+                return Ok(BoxDeleteResponse {
+                    box_name: name.to_string(),
+                    deleted: false,
+                    routers_removed: Vec::new(),
+                    performance: Performance::with_total(elapsed_ms(start)),
+                });
+            }
+        };
+
+        if if_empty {
+            b.enforce_retention(self.clock.now_ms());
+            if b.count() != 0 {
+                return Err(Error::new(
+                    ErrorCode::BoxNotEmpty,
+                    format!("box {name:?} is not empty"),
+                )
+                .with_detail(serde_json::json!({ "box": name, "count": b.count() })));
+            }
+        }
+
+        self.boxes.remove(name);
+        let routers_removed = self.routers.lock().remove_touching_box(name);
+
+        Ok(BoxDeleteResponse {
+            box_name: name.to_string(),
+            deleted: true,
+            routers_removed,
+            performance: Performance::with_total(elapsed_ms(start)),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Write (API §2)
+    // -----------------------------------------------------------------------
+
+    /// `POST /v0/boxes/:box` — append records, assign seqs, forward to routers.
+    pub fn write(&self, name: &str, req: WriteRequest, return_seqs: bool) -> Result<WriteResponse> {
+        let start = Instant::now();
+        let now = self.clock.now_ms();
+
+        // --- Validate the batch + per-record limits (DESIGN §1.2). ----------
+        if req.records.is_empty() {
+            return Err(Error::invalid_request("write must contain >=1 record"));
+        }
+        if req.records.len() > config::MAX_BATCH_RECORDS {
+            return Err(Error::new(
+                ErrorCode::BatchTooLarge,
+                format!(
+                    "batch of {} exceeds max {}",
+                    req.records.len(),
+                    config::MAX_BATCH_RECORDS
+                ),
+            ));
+        }
+        if let Some(k) = &req.idempotency_key {
+            if k.len() > config::MAX_IDEMPOTENCY_KEY_LEN {
+                return Err(Error::invalid_request("idempotency_key too long"));
+            }
+        }
+
+        // Build the stored records (validating tag/node/meta/data sizes). The
+        // batch-level `node` is the default; a per-record `node` overrides it.
+        let mut stored = Vec::with_capacity(req.records.len());
+        let mut incoming_bytes: u64 = 0;
+        for rec in &req.records {
+            let node = rec.node.clone().or_else(|| req.node.clone());
+            let sr = build_stored(rec, node, now)?;
+            incoming_bytes = incoming_bytes.saturating_add(sr.bytes);
+            stored.push(sr);
+        }
+
+        // --- Resolve the box, honoring create / auto_create. ----------------
+        let (b, created) = match self.get_box(name) {
+            Some(b) => (b, false),
+            None => {
+                // Box absent: may we create it? `create:false` always refuses;
+                // `create:true` always creates; an absent flag defers to the
+                // would-be config's `auto_create` (the inline `config`).
+                let create_cfg = req.config.clone().unwrap_or_default();
+                let may_create = match req.create {
+                    Some(c) => c,
+                    None => create_cfg.auto_create,
+                };
+                if !may_create {
+                    return Err(Error::box_not_found(name));
+                }
+                if !config::is_valid_name(name) {
+                    return Err(Error::invalid_request(format!(
+                        "invalid box name {name:?}"
+                    )));
+                }
+                validate_config(&create_cfg)?;
+                let (was_created, _cfg) = self.put_box(name, create_cfg)?;
+                let b = self
+                    .get_box(name)
+                    .ok_or_else(|| Error::internal("box vanished after create"))?;
+                (b, was_created)
+            }
+        };
+
+        // --- Idempotency dedupe (API §0.8). --------------------------------
+        let window_ms = b.config.read().idempotency_window_ms as i64;
+        if let Some(key) = &req.idempotency_key {
+            let mut dedupe = b.dedupe.write();
+            // Prune stale entries lazily.
+            dedupe.retain(|_, e| now.saturating_sub(e.created_ms) <= window_ms);
+            if let Some(entry) = dedupe.get(key) {
+                let seqs = entry.seqs.clone();
+                let head = entry.head_seq;
+                drop(dedupe);
+                return Ok(WriteResponse {
+                    box_name: name.to_string(),
+                    first_seq: *seqs.first().unwrap_or(&0),
+                    last_seq: *seqs.last().unwrap_or(&0),
+                    seqs: if return_seqs { Some(seqs.clone()) } else { None },
+                    head_seq: head,
+                    count: seqs.len() as u64,
+                    created: false,
+                    deduped: true,
+                    performance: Performance::with_total(elapsed_ms(start)),
+                });
+            }
+        }
+
+        // --- Admission (discard:"reject" full-box check, DESIGN §5.3). ------
+        // Enforce retention first so current occupancy is the logical floor.
+        b.enforce_retention(now);
+        let cfg = b.config.read();
+        let discard = cfg.discard;
+        let cap_records = cfg.cap_records;
+        let cap_bytes = cfg.cap_bytes;
+        drop(cfg);
+
+        // A single write larger than the whole byte cap is a permanent
+        // `400 record_too_large`, distinct from a retryable `422 box_full`.
+        if cap_bytes > 0 && incoming_bytes > cap_bytes && discard == Discard::Reject {
+            return Err(Error::new(
+                ErrorCode::RecordTooLarge,
+                "write exceeds the box's entire cap_bytes",
+            ));
+        }
+        if cap_records > 0
+            && stored.len() as u64 > cap_records
+            && discard == Discard::Reject
+        {
+            return Err(Error::new(
+                ErrorCode::RecordTooLarge,
+                "write exceeds the box's entire cap_records",
+            ));
+        }
+
+        let decision = eviction::admit(
+            discard,
+            cap_records,
+            cap_bytes,
+            b.count(),
+            b.bytes(),
+            stored.len() as u64,
+            incoming_bytes,
+        );
+        if decision == AdmitDecision::Reject {
+            return Err(Error::new(
+                ErrorCode::BoxFull,
+                format!("box {name:?} is full (discard=reject)"),
+            )
+            .with_detail(serde_json::json!({
+                "box": name,
+                "cap_records": cap_records,
+                "cap_bytes": cap_bytes,
+                "head_seq": b.head_seq(),
+                "earliest_seq": b.earliest_seq(),
+            })));
+        }
+
+        // --- Append atomically; assign contiguous seqs. --------------------
+        // Snapshot the resolved records for router forwarding before `append`
+        // consumes the vec (forwarding reads the canonical $node/$tag).
+        let stored_snapshot = stored.clone();
+        let seqs = b.append(stored, now);
+        let head = b.head_seq();
+
+        // Post-append eviction for discard:"old" (may surface as a tombstone to
+        // lagging consumers later).
+        b.enforce_retention(now);
+
+        // Record dedupe state for retries.
+        if let Some(key) = &req.idempotency_key {
+            b.dedupe.write().insert(
+                key.clone(),
+                DedupeEntry {
+                    seqs: seqs.clone(),
+                    head_seq: head,
+                    created_ms: now,
+                },
+            );
+        }
+
+        // --- Router forwarding (at-least-once, per-source FIFO). -----------
+        // Forward off the freshly-stored records (carrying resolved $node/$tag),
+        // recursing through chained routers with a bounded hop counter.
+        let forwarded: Vec<ForwardRecord> = stored_snapshot
+            .into_iter()
+            .map(|sr| ForwardRecord {
+                data: sr.data,
+                tag: sr.tag,
+                node: sr.node,
+                meta: sr.meta,
+            })
+            .collect();
+        self.forward_from(name, &forwarded, now, 0);
+
+        // Mark the box dirty in the scheduler (advisory in phase 2).
+        self.scheduler
+            .mark_dirty(name, self.effective_priority(&b));
+
+        // `durable:true` is accepted in phase 2 but is a no-op fast path: there
+        // is no WAL yet, so `fsync_ms` is reported as 0.0 (ROADMAP §2).
+        let mut perf = Performance::with_total(elapsed_ms(start));
+        perf.wal_append_ms = Some(0.0);
+        perf.fsync_ms = Some(0.0);
+
+        Ok(WriteResponse {
+            box_name: name.to_string(),
+            first_seq: *seqs.first().unwrap_or(&0),
+            last_seq: *seqs.last().unwrap_or(&0),
+            seqs: if return_seqs { Some(seqs.clone()) } else { None },
+            head_seq: head,
+            count: seqs.len() as u64,
+            created,
+            deduped: false,
+            performance: perf,
+        })
+    }
+
+    /// Forward freshly-committed records from `source` to every router whose
+    /// source is this box (at-least-once, per-source FIFO; DESIGN §8).
+    ///
+    /// Recurses through chained routers (A→B→C) so a forward into a box that is
+    /// itself a router source fans on. `hops` is the bounded loop-breaker: a
+    /// record carrying `hops >= MAX_ROUTER_HOPS` is not forwarded again, so even
+    /// `allow_cycle` topologies terminate (DESIGN §8.5).
+    ///
+    /// Phase 2 forwards synchronously on the append path but routes the delivery
+    /// work through the scheduler (`mark_dirty` on each dest) so the phase-4
+    /// DWRR governor can take over without changing call sites.
+    fn forward_from(&self, source: &str, records: &[ForwardRecord], now: i64, hops: u8) {
+        if hops >= config::MAX_ROUTER_HOPS {
+            // Hop budget exhausted: stop forwarding (loop-breaking). The records
+            // already landed in this box; we just don't fan them out further.
+            return;
+        }
+        let routes = self.routers.lock().routers_for_source(source);
+        for r in routes {
+            let Some(dest) = self.get_box(&r.dest) else {
+                continue; // dest gone; cascade should have removed the router.
+            };
+
+            // Build the forwarded copies, applying the optional forward filter
+            // and preserve_node/preserve_tag.
+            let mut to_append = Vec::new();
+            let mut forwarded_next = Vec::new();
+            for rec in records {
+                if let Some(f) = &r.filter {
+                    match &rec.tag {
+                        Some(t) if f.matches(t) => {}
+                        _ => continue, // no tag, or tag doesn't match ⇒ skip.
+                    }
+                }
+                let fwd_node = if r.preserve_node {
+                    rec.node.clone()
+                } else {
+                    None
+                };
+                let fwd_tag = if r.preserve_tag { rec.tag.clone() } else { None };
+                if let Ok(sr) = build_stored_owned(
+                    rec.data.clone(),
+                    fwd_tag.clone(),
+                    fwd_node.clone(),
+                    rec.meta.clone(),
+                    now,
+                ) {
+                    to_append.push(sr);
+                    forwarded_next.push(ForwardRecord {
+                        data: rec.data.clone(),
+                        tag: fwd_tag,
+                        node: fwd_node,
+                        meta: rec.meta.clone(),
+                    });
+                }
+            }
+
+            if to_append.is_empty() {
+                continue;
+            }
+
+            // dst.discard="reject": if the forward would overflow, drop it and do
+            // not advance the cursor (backpressure; DESIGN §6.4). Phase 2 has no
+            // background retry, so an unforwardable record is simply not
+            // forwarded this tick — at-least-once is preserved by the source log.
+            let cfg = dest.config.read();
+            let discard = cfg.discard;
+            let cap_records = cfg.cap_records;
+            let cap_bytes = cfg.cap_bytes;
+            drop(cfg);
+            if discard == Discard::Reject {
+                dest.enforce_retention(now);
+                let incoming_bytes: u64 = to_append.iter().map(|s| s.bytes).sum();
+                let decision = eviction::admit(
+                    discard,
+                    cap_records,
+                    cap_bytes,
+                    dest.count(),
+                    dest.bytes(),
+                    to_append.len() as u64,
+                    incoming_bytes,
+                );
+                if decision == AdmitDecision::Reject {
+                    continue; // backpressure: leave it in src, don't advance.
+                }
+            }
+
+            let count = to_append.len() as u64;
+            dest.append(to_append, now);
+            dest.enforce_retention(now);
+
+            // Mark the dest dirty in the scheduler (delivery work; advisory).
+            self.scheduler
+                .mark_dirty(&r.dest, self.effective_priority(&dest));
+
+            // Advance the per-router cursor + forwarded_total.
+            let src_head = self.get_box(source).map(|b| b.head_seq()).unwrap_or(0);
+            self.routers.lock().note_forwarded(&r.name, src_head, count);
+
+            // Recurse: the dest may itself be a router source (chains / cycles).
+            self.forward_from(&r.dest, &forwarded_next, now, hops + 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Diff (API §3)
+    // -----------------------------------------------------------------------
+
+    /// `POST /v0/boxes/:box/diff` — read difference from a cursor. Never
+    /// auto-creates.
+    pub fn diff(&self, name: &str, req: DiffRequest) -> Result<DiffResponse> {
+        let start = Instant::now();
+        let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
+        let now = self.clock.now_ms();
+
+        // Advance floors so the retention/tombstone boundary reflects the clock.
+        b.enforce_retention(now);
+
+        // Bump auto-priority recency (a diff "consumes" the box; DESIGN §3.1).
+        b.last_read_ms.store(now, Ordering::Relaxed);
+        b.last_consumed_ms.store(now, Ordering::Relaxed);
+
+        // `limit` is clamped, never rejected (API §3): `0` ⇒ default.
+        let limit = if req.limit == 0 {
+            config::DEFAULT_LIMIT
+        } else {
+            req.limit.min(config::MAX_LIMIT)
+        } as usize;
+
+        let head = b.head_seq();
+        let earliest = b.earliest_seq();
+        let from_seq = req.from_seq;
+
+        let cfg = b.config.read();
+        let ttl_ms = cfg.ttl_ms;
+        let dedupe_node = cfg.dedupe_node;
+        drop(cfg);
+        let node_filter = if dedupe_node { req.node.as_ref() } else { None };
+
+        // --- Tombstone / recreate detection (DESIGN §5.4/§5.5). -------------
+        let mut tombstone: Option<Tombstone> = None;
+        // A cursor that fell below the retained floor: `from_seq + 1 < earliest`.
+        let mut cursor = from_seq;
+        if from_seq > head {
+            // From the future relative to this box instance ⇒ delete+recreate
+            // (or a stale cursor). Emit a `recreated` tombstone and resume from
+            // earliest (DESIGN §5.5).
+            let ts = eviction::build_tombstone(
+                head, // gap_from = head + 1 (seq_base..head, possibly empty)
+                earliest,
+                head,
+                TombstoneReason::Recreated,
+            );
+            // For recreate the gap range is [seq_base, head]; recompute.
+            tombstone = Some(Tombstone {
+                gap_from: b.seq_base,
+                gap_to: head,
+                reason: TombstoneReason::Recreated,
+                missed_estimate: head.saturating_sub(b.seq_base).saturating_add(1),
+                earliest_seq: earliest,
+                head_seq: head,
+            });
+            let _ = ts;
+            cursor = earliest.saturating_sub(1);
+        } else if from_seq.saturating_add(1) < earliest {
+            let reason = b.floors.read().reason_for_gap(from_seq.saturating_add(1));
+            tombstone = Some(eviction::build_tombstone(from_seq, earliest, head, reason));
+            cursor = earliest.saturating_sub(1);
+        }
+
+        // --- Walk records, applying the read pipeline (DESIGN §7.3). --------
+        let mut records = Vec::new();
+        let mut scanned: u64 = 0;
+        let mut next_from_seq = cursor;
+        {
+            let index = b.index.read();
+            let filters = b.filters.read();
+            let mut seq = cursor.saturating_add(1);
+            while seq <= head && records.len() < limit {
+                let Some(rec) = index.get(seq) else {
+                    // Below base_seq (shouldn't happen after floor sync) — skip.
+                    next_from_seq = seq;
+                    seq += 1;
+                    continue;
+                };
+                scanned += 1;
+                let decision = filters::evaluate(
+                    &filters,
+                    node_filter,
+                    ttl_ms,
+                    now,
+                    rec.ts,
+                    rec.tag.as_deref(),
+                    rec.node.as_deref(),
+                );
+                match decision {
+                    filters::ReadDecision::Deliver => {
+                        records.push(record_out(seq, rec, &req, false));
+                    }
+                    filters::ReadDecision::TagDeleted => {
+                        if req.include_deleted {
+                            records.push(record_out(seq, rec, &req, true));
+                        }
+                        // else: silently skipped, cursor still advances.
+                    }
+                    filters::ReadDecision::NodeFiltered => {
+                        // Silently skipped; cursor advances (DESIGN §6).
+                    }
+                    filters::ReadDecision::Expired => {
+                        // Should be below the floor after enforce_retention; if a
+                        // record expires mid-walk it is simply not delivered.
+                    }
+                }
+                next_from_seq = seq;
+                seq += 1;
+            }
+        }
+
+        let caught_up = next_from_seq == head;
+        let lag = head.saturating_sub(next_from_seq);
+
+        let mut perf = Performance::with_total(elapsed_ms(start));
+        perf.records_scanned = Some(scanned);
+
+        Ok(DiffResponse {
+            box_name: name.to_string(),
+            records,
+            next_from_seq,
+            head_seq: head,
+            earliest_seq: earliest,
+            caught_up,
+            tombstone,
+            lag,
+            performance: perf,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Tag-delete (API §5)
+    // -----------------------------------------------------------------------
+
+    /// `POST /v0/boxes/:box/delete` — add tag-delete filters.
+    pub fn add_filters(
+        &self,
+        name: &str,
+        filters: Vec<Filter>,
+    ) -> Result<DeleteFiltersResponse> {
+        let start = Instant::now();
+        let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
+        let now = self.clock.now_ms();
+
+        let mut set = b.filters.write();
+        // Enforce the per-box hard cap (API §5.1).
+        let projected = set.len() + filters.len();
+        if projected > config::MAX_DELETE_FILTERS {
+            return Err(Error::new(
+                ErrorCode::TooManyFilters,
+                format!(
+                    "would exceed max {} delete filters",
+                    config::MAX_DELETE_FILTERS
+                ),
+            ));
+        }
+
+        let mut added = Vec::new();
+        for f in &filters {
+            if set.add(f) {
+                added.push(f.clone());
+            }
+        }
+        let total = set.len();
+        drop(set);
+
+        // Best-effort estimate: how many currently-retained records the newly
+        // added filters now match (informational; API §5.1).
+        let matched_estimate = if added.is_empty() {
+            0
+        } else {
+            b.enforce_retention(now);
+            let index = b.index.read();
+            let added_set: Vec<&Filter> = added.iter().collect();
+            index
+                .records
+                .iter()
+                .filter(|r| {
+                    r.tag
+                        .as_deref()
+                        .map(|t| added_set.iter().any(|f| f.matches(t)))
+                        .unwrap_or(false)
+                })
+                .count() as u64
+        };
+
+        Ok(DeleteFiltersResponse {
+            box_name: name.to_string(),
+            filters_added: added,
+            filters_total: total,
+            matched_estimate,
+            performance: Performance::with_total(elapsed_ms(start)),
+        })
+    }
+
+    /// `GET /v0/boxes/:box/delete` — list active filters.
+    pub fn list_filters(&self, name: &str) -> Result<ListFiltersResponse> {
+        let start = Instant::now();
+        let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
+        let filters = b.filters.read().to_filters();
+        Ok(ListFiltersResponse {
+            box_name: name.to_string(),
+            filters,
+            performance: Performance::with_total(elapsed_ms(start)),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Routers (API §6)
+    // -----------------------------------------------------------------------
+
+    /// `PUT /v0/routers/:router` — create/configure a router (idempotent upsert).
+    ///
+    /// Validates the request, auto-creates `source`/`dest` (unless
+    /// `create_dest:false`), runs the DAG cycle check, then upserts. The router's
+    /// forward cursor starts at the source's current head so it only forwards
+    /// records committed *after* creation (no historical backfill).
+    pub fn put_router(
+        &self,
+        name: &str,
+        req: RouterCreateRequest,
+    ) -> Result<(bool, RouterCreateResponse)> {
+        let start = Instant::now();
+        if !config::is_valid_router_name(name) {
+            return Err(Error::invalid_request(format!(
+                "invalid router name {name:?}"
+            )));
+        }
+        router::validate_router(&req.source, &req.dest)?;
+
+        // Ensure `source` exists (lazy auto-create with defaults).
+        if self.get_box(&req.source).is_none() {
+            self.put_box(&req.source, BoxConfig::default())?;
+        }
+        // Ensure `dest` exists, honoring `create_dest`.
+        if self.get_box(&req.dest).is_none() {
+            if !req.create_dest {
+                return Err(Error::box_not_found(&req.dest));
+            }
+            self.put_box(&req.dest, BoxConfig::default())?;
+        }
+
+        let router = Router {
+            name: name.to_string(),
+            source: req.source.clone(),
+            dest: req.dest.clone(),
+            preserve_node: req.preserve_node,
+            preserve_tag: req.preserve_tag,
+            create_dest: req.create_dest,
+            filter: req.filter.clone(),
+            allow_cycle: req.allow_cycle,
+        };
+
+        // Forward cursor starts at the source's current head: only records
+        // committed after this PUT are forwarded (per-source FIFO from "now").
+        let src_head = self
+            .get_box(&req.source)
+            .map(|b| b.head_seq())
+            .unwrap_or(0);
+
+        let created = {
+            let mut graph = self.routers.lock();
+            let created = graph.upsert(router)?;
+            graph.note_forwarded(name, src_head, 0);
+            created
+        };
+
+        Ok((
+            created,
+            RouterCreateResponse {
+                router: name.to_string(),
+                created,
+                source: req.source,
+                dest: req.dest,
+                preserve_node: req.preserve_node,
+                preserve_tag: req.preserve_tag,
+                filter: req.filter,
+                allow_cycle: req.allow_cycle,
+                performance: Performance::with_total(elapsed_ms(start)),
+            },
+        ))
+    }
+
+    /// `GET /v0/routers/:router`.
+    pub fn get_router(&self, name: &str) -> Result<RouterGetResponse> {
+        let start = Instant::now();
+        let graph = self.routers.lock();
+        let r = graph.get(name).ok_or_else(|| Error::router_not_found(name))?;
+        let resp = RouterGetResponse {
+            router: r.name.clone(),
+            source: r.source.clone(),
+            dest: r.dest.clone(),
+            preserve_node: r.preserve_node,
+            preserve_tag: r.preserve_tag,
+            filter: r.filter.clone(),
+            allow_cycle: r.allow_cycle,
+            forwarded_total: graph.forwarded_total(name),
+            performance: Performance::with_total(elapsed_ms(start)),
+        };
+        Ok(resp)
+    }
+
+    /// `GET /v0/routers` — list routers (filtered + opaque-cursor paginated).
+    pub fn list_routers(
+        &self,
+        prefix: Option<&str>,
+        source: Option<&str>,
+        dest: Option<&str>,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Result<RouterListResponse> {
+        let start = Instant::now();
+        let page_size = page_size.clamp(1, config::MAX_PAGE_SIZE);
+        let after = decode_cursor(cursor)?;
+
+        let graph = self.routers.lock();
+        let mut summaries: Vec<RouterSummary> = graph
+            .iter()
+            .filter(|r| prefix.map(|p| r.name.starts_with(p)).unwrap_or(true))
+            .filter(|r| source.map(|s| r.source == s).unwrap_or(true))
+            .filter(|r| dest.map(|d| r.dest == d).unwrap_or(true))
+            .filter(|r| after.as_deref().map(|a| r.name.as_str() > a).unwrap_or(true))
+            .map(|r| RouterSummary {
+                router: r.name.clone(),
+                source: r.source.clone(),
+                dest: r.dest.clone(),
+                forwarded_total: graph.forwarded_total(&r.name),
+            })
+            .collect();
+        summaries.sort_by(|a, b| a.router.cmp(&b.router));
+
+        let has_more = summaries.len() > page_size;
+        summaries.truncate(page_size);
+        let next_cursor = if has_more {
+            summaries.last().map(|s| encode_cursor(&s.router))
+        } else {
+            None
+        };
+
+        Ok(RouterListResponse {
+            routers: summaries,
+            next_cursor,
+            performance: Performance::with_total(elapsed_ms(start)),
+        })
+    }
+
+    /// `DELETE /v0/routers/:router` — stops forwarding immediately. Idempotent.
+    pub fn delete_router(&self, name: &str) -> Result<RouterDeleteResponse> {
+        let start = Instant::now();
+        let deleted = self.routers.lock().remove(name);
+        Ok(RouterDeleteResponse {
+            router: name.to_string(),
+            deleted,
+            performance: Performance::with_total(elapsed_ms(start)),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Watch (API §7) — session bookkeeping lives in http::watch; the engine
+    // exposes the per-box read primitive used by both diff and SSE.
+    // -----------------------------------------------------------------------
+
+    /// Resolve initial per-box watch state (head/earliest) for the create
+    /// response, validating that each named box exists (unless lenient).
+    pub fn watch_box_states(
+        &self,
+        boxes: &std::collections::HashMap<String, WatchBoxOptions>,
+        lenient: bool,
+    ) -> Result<std::collections::HashMap<String, WatchBoxState>> {
+        let now = self.clock.now_ms();
+        let mut out = std::collections::HashMap::with_capacity(boxes.len());
+        for (name, opts) in boxes {
+            match self.get_box(name) {
+                Some(b) => {
+                    b.enforce_retention(now);
+                    let head = b.head_seq();
+                    let earliest = b.earliest_seq();
+                    // `tail:true` starts at the current head (only new records).
+                    let from_seq = if opts.tail { head } else { opts.from_seq };
+                    out.insert(
+                        name.clone(),
+                        WatchBoxState {
+                            from_seq,
+                            head_seq: head,
+                            earliest_seq: earliest,
+                        },
+                    );
+                }
+                None if lenient => continue,
+                None => return Err(Error::box_not_found(name)),
+            }
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+/// A record in flight through the router fan-out. Carries the resolved
+/// `$node`/`$tag` (post-`preserve_*`) so chained forwards see the canonical
+/// values, decoupled from the `seq`/`ts` which each dest reassigns.
+#[derive(Debug, Clone)]
+struct ForwardRecord {
+    data: serde_json::Value,
+    tag: Option<String>,
+    node: Option<String>,
+    meta: Option<serde_json::Value>,
+}
+
+/// Wall-time elapsed since `start`, in fractional milliseconds.
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Validate a box config's value ranges (API §1.1). `priority` is clamped on
+/// read, but an out-of-range value supplied here is accepted and clamped by the
+/// scheduler; only structurally-impossible values are rejected. Phase 2 has no
+/// additional invalid combinations, so this currently always succeeds.
+fn validate_config(_config: &BoxConfig) -> Result<()> {
+    Ok(())
+}
+
+/// Estimate the accounted byte size of a record's payload (`data` + `meta` +
+/// framing). Phase 2 uses the serialized JSON length as a stable proxy.
+fn payload_bytes(data: &serde_json::Value, meta: &Option<serde_json::Value>) -> u64 {
+    let mut n = serde_json::to_vec(data).map(|v| v.len()).unwrap_or(0);
+    if let Some(m) = meta {
+        n += serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0);
+    }
+    n as u64
+}
+
+/// Build a [`StoredRecord`] from an input record, validating size limits
+/// (DESIGN §1.2). `node` is already resolved (per-record over batch default).
+fn build_stored(rec: &RecordIn, node: Option<String>, now: i64) -> Result<StoredRecord> {
+    build_stored_owned(rec.data.clone(), rec.tag.clone(), node, rec.meta.clone(), now)
+}
+
+/// Build a [`StoredRecord`] from owned parts (shared by writes + forwarding).
+fn build_stored_owned(
+    data: serde_json::Value,
+    tag: Option<String>,
+    node: Option<String>,
+    meta: Option<serde_json::Value>,
+    now: i64,
+) -> Result<StoredRecord> {
+    if let Some(t) = &tag {
+        if t.len() > config::MAX_TAG_BYTES {
+            return Err(Error::invalid_request(format!(
+                "tag exceeds {} bytes",
+                config::MAX_TAG_BYTES
+            )));
+        }
+    }
+    if let Some(n) = &node {
+        if n.len() > config::MAX_NODE_BYTES {
+            return Err(Error::invalid_request(format!(
+                "node exceeds {} bytes",
+                config::MAX_NODE_BYTES
+            )));
+        }
+    }
+    if let Some(m) = &meta {
+        let mbytes = serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0);
+        if mbytes > config::MAX_META_BYTES {
+            return Err(Error::invalid_request(format!(
+                "meta exceeds {} bytes",
+                config::MAX_META_BYTES
+            )));
+        }
+        if let Some(obj) = m.as_object() {
+            if obj.len() > config::MAX_META_KEYS {
+                return Err(Error::invalid_request(format!(
+                    "meta exceeds {} keys",
+                    config::MAX_META_KEYS
+                )));
+            }
+        }
+    }
+    let bytes = payload_bytes(&data, &meta);
+    if bytes as usize > config::MAX_RECORD_BYTES {
+        return Err(Error::new(
+            ErrorCode::RecordTooLarge,
+            format!("record data+meta exceeds {} bytes", config::MAX_RECORD_BYTES),
+        ));
+    }
+    Ok(StoredRecord {
+        ts: now,
+        node,
+        tag,
+        data,
+        meta,
+        bytes,
+    })
+}
+
+/// Project a stored record onto the wire `RecordOut`, respecting the diff
+/// request's `include_tags`/`include_meta`/`include_deleted` flags.
+fn record_out(seq: u64, rec: &StoredRecord, req: &DiffRequest, deleted: bool) -> RecordOut {
+    RecordOut {
+        seq,
+        ts: rec.ts,
+        node: rec.node.clone(),
+        tag: if req.include_tags { rec.tag.clone() } else { None },
+        type_: None,
+        deleted: if deleted { Some(true) } else { None },
+        data: rec.data.clone(),
+        meta: if req.include_meta { rec.meta.clone() } else { None },
+    }
+}
+
+/// Encode an opaque list-pagination cursor as base64url JSON `{"after": name}`.
+fn encode_cursor(after: &str) -> String {
+    use base64::Engine;
+    let json = serde_json::json!({ "after": after }).to_string();
+    base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+}
+
+/// Decode an opaque list cursor back to its `after` value; `400` if corrupt.
+fn decode_cursor(cursor: Option<&str>) -> Result<Option<String>> {
+    let Some(c) = cursor else { return Ok(None) };
+    if c.is_empty() {
+        return Ok(None);
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(c)
+        .map_err(|_| Error::invalid_request("malformed cursor"))?;
+    let val: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| Error::invalid_request("malformed cursor"))?;
+    Ok(val
+        .get("after")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (engine core, driven through the public API with a TestClock).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::TestClock;
+    use serde_json::json;
+
+    /// Build an engine backed by a manually-advanceable clock.
+    fn engine_with_clock() -> (Arc<Engine>, TestClock) {
+        let clock = TestClock::new(1_000_000);
+        let shared: SharedClock = Arc::new(clock.clone());
+        let engine = Engine::new(ServerConfig::default(), shared);
+        (engine, clock)
+    }
+
+    /// A write request of one record with the given data/tag/node.
+    fn rec(data: serde_json::Value, tag: Option<&str>, node: Option<&str>) -> RecordIn {
+        RecordIn {
+            data,
+            tag: tag.map(str::to_string),
+            node: node.map(str::to_string),
+            meta: None,
+        }
+    }
+
+    fn write_req(records: Vec<RecordIn>) -> WriteRequest {
+        WriteRequest {
+            records,
+            node: None,
+            idempotency_key: None,
+            create: None,
+            config: None,
+            disable_backpressure: false,
+        }
+    }
+
+    fn diff_from(from_seq: u64) -> DiffRequest {
+        DiffRequest {
+            from_seq,
+            ..DiffRequest::default()
+        }
+    }
+
+    #[test]
+    fn append_then_diff_happy_path() {
+        let (engine, _clock) = engine_with_clock();
+        let resp = engine
+            .write(
+                "jobs",
+                write_req(vec![
+                    rec(json!({"n": 1}), Some("t1"), None),
+                    rec(json!({"n": 2}), Some("t2"), None),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(resp.first_seq, 1);
+        assert_eq!(resp.last_seq, 2);
+        assert_eq!(resp.seqs, Some(vec![1, 2]));
+        assert_eq!(resp.head_seq, 2);
+        assert!(resp.created);
+        assert!(!resp.deduped);
+
+        // Read from the beginning.
+        let d = engine.diff("jobs", diff_from(0)).unwrap();
+        assert_eq!(d.records.len(), 2);
+        assert_eq!(d.records[0].seq, 1);
+        assert_eq!(d.records[1].seq, 2);
+        assert_eq!(d.next_from_seq, 2);
+        assert_eq!(d.head_seq, 2);
+        assert_eq!(d.earliest_seq, 1);
+        assert!(d.caught_up);
+        assert!(d.tombstone.is_none());
+        assert_eq!(d.lag, 0);
+        // include_tags defaults false → $tag omitted.
+        assert!(d.records[0].tag.is_none());
+
+        // Reading from head yields nothing new but stays caught up.
+        let d2 = engine.diff("jobs", diff_from(2)).unwrap();
+        assert!(d2.records.is_empty());
+        assert!(d2.caught_up);
+        assert_eq!(d2.next_from_seq, 2);
+
+        // include_tags=true surfaces $tag.
+        let dt = engine
+            .diff(
+                "jobs",
+                DiffRequest {
+                    from_seq: 0,
+                    include_tags: true,
+                    ..DiffRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(dt.records[0].tag.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn diff_on_missing_box_is_404() {
+        let (engine, _clock) = engine_with_clock();
+        let err = engine.diff("nope", diff_from(0)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoxNotFound);
+    }
+
+    #[test]
+    fn cap_eviction_emits_cap_tombstone() {
+        let (engine, _clock) = engine_with_clock();
+        // cap_records=3, discard:"old".
+        let cfg = BoxConfig {
+            cap_records: 3,
+            ..BoxConfig::default()
+        };
+        engine.put_box("cap", cfg).unwrap();
+
+        // Write 5 records → seqs 1..=5; cap=3 evicts 1,2 → earliest_seq=3.
+        for i in 1..=5 {
+            engine
+                .write("cap", write_req(vec![rec(json!({"i": i}), None, None)]), true)
+                .unwrap();
+        }
+        let st = engine.box_state("cap", false).unwrap();
+        assert_eq!(st.head_seq, 5);
+        assert_eq!(st.earliest_seq, 3);
+        assert_eq!(st.count, 3);
+
+        // A consumer at from_seq=0 fell below earliest (0+1 < 3) → tombstone.
+        let d = engine.diff("cap", diff_from(0)).unwrap();
+        let tomb = d.tombstone.expect("expected a cap tombstone");
+        assert_eq!(tomb.reason, TombstoneReason::Cap);
+        assert_eq!(tomb.gap_from, 1); // from_seq + 1
+        assert_eq!(tomb.gap_to, 2); // earliest_seq - 1
+        assert_eq!(tomb.earliest_seq, 3);
+        assert_eq!(tomb.head_seq, 5);
+        // Records resume at earliest_seq.
+        assert_eq!(d.records.first().map(|r| r.seq), Some(3));
+        assert_eq!(d.records.len(), 3);
+        assert!(d.caught_up);
+    }
+
+    #[test]
+    fn ttl_expiry_emits_ttl_tombstone() {
+        let (engine, clock) = engine_with_clock();
+        let cfg = BoxConfig {
+            ttl_ms: 1000,
+            ..BoxConfig::default()
+        };
+        engine.put_box("ttl", cfg).unwrap();
+
+        // Write 3 records at t0.
+        for i in 1..=3 {
+            engine
+                .write("ttl", write_req(vec![rec(json!({"i": i}), None, None)]), true)
+                .unwrap();
+        }
+        // Advance past the TTL so all three expire (now - ts > ttl_ms).
+        clock.advance(2000);
+        // Write one more so head moves and earliest can advance past expired.
+        engine
+            .write("ttl", write_req(vec![rec(json!({"i": 4}), None, None)]), true)
+            .unwrap();
+
+        let st = engine.box_state("ttl", false).unwrap();
+        assert_eq!(st.head_seq, 4);
+        // Records 1..=3 expired; only seq 4 remains.
+        assert_eq!(st.earliest_seq, 4);
+        assert_eq!(st.count, 1);
+
+        let d = engine.diff("ttl", diff_from(0)).unwrap();
+        let tomb = d.tombstone.expect("expected a ttl tombstone");
+        assert_eq!(tomb.reason, TombstoneReason::Ttl);
+        assert_eq!(tomb.gap_from, 1);
+        assert_eq!(tomb.gap_to, 3);
+        assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn tag_delete_exact_and_prefix_suppress() {
+        let (engine, _clock) = engine_with_clock();
+        engine
+            .write(
+                "jobs",
+                write_req(vec![
+                    rec(json!({"i": 1}), Some("tenant42:job-1"), None),
+                    rec(json!({"i": 2}), Some("tenant42:job-2"), None),
+                    rec(json!({"i": 3}), Some("other:job-9"), None),
+                    rec(json!({"i": 4}), None, None),
+                ]),
+                true,
+            )
+            .unwrap();
+
+        // Exact delete of job-1.
+        engine
+            .add_filters("jobs", vec![Filter::from_shorthand("tenant42:job-1")])
+            .unwrap();
+        let d = engine.diff("jobs", diff_from(0)).unwrap();
+        let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![2, 3, 4]); // 1 suppressed, cursor still at head.
+        assert!(d.tombstone.is_none()); // tag-delete is silent.
+        assert!(d.caught_up);
+        assert_eq!(d.next_from_seq, 4);
+
+        // Prefix delete of all tenant42:* → suppresses 2 as well.
+        let resp = engine
+            .add_filters("jobs", vec![Filter::from_shorthand("tenant42:*")])
+            .unwrap();
+        assert!(resp.filters_added.iter().any(|f| f.op == FilterOp::Glob));
+        let d2 = engine.diff("jobs", diff_from(0)).unwrap();
+        let seqs2: Vec<u64> = d2.records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs2, vec![3, 4]); // tenant42:* gone; untagged stays.
+        assert!(d2.tombstone.is_none());
+        assert!(d2.caught_up);
+
+        // include_deleted surfaces them with $deleted.
+        let d3 = engine
+            .diff(
+                "jobs",
+                DiffRequest {
+                    from_seq: 0,
+                    include_deleted: true,
+                    ..DiffRequest::default()
+                },
+            )
+            .unwrap();
+        let deleted: Vec<u64> = d3
+            .records
+            .iter()
+            .filter(|r| r.deleted == Some(true))
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(deleted, vec![1, 2]);
+
+        // Listing returns the canonical tuples.
+        let listed = engine.list_filters("jobs").unwrap();
+        assert_eq!(listed.filters.len(), 2);
+    }
+
+    #[test]
+    fn future_matching_records_also_suppressed() {
+        let (engine, _clock) = engine_with_clock();
+        engine
+            .write("jobs", write_req(vec![rec(json!({}), Some("a:1"), None)]), true)
+            .unwrap();
+        engine
+            .add_filters("jobs", vec![Filter::from_shorthand("a:*")])
+            .unwrap();
+        // A record written AFTER the filter still gets suppressed.
+        engine
+            .write("jobs", write_req(vec![rec(json!({}), Some("a:2"), None)]), true)
+            .unwrap();
+        let d = engine.diff("jobs", diff_from(0)).unwrap();
+        assert!(d.records.is_empty());
+        assert!(d.caught_up);
+        assert_eq!(d.next_from_seq, 2);
+    }
+
+    #[test]
+    fn node_loop_prevention_advances_cursor_to_caught_up() {
+        let (engine, _clock) = engine_with_clock();
+        // All records written by node "self".
+        engine
+            .write(
+                "box",
+                WriteRequest {
+                    records: vec![
+                        rec(json!({"i": 1}), None, Some("self")),
+                        rec(json!({"i": 2}), None, Some("self")),
+                        rec(json!({"i": 3}), None, Some("other")),
+                    ],
+                    node: None,
+                    idempotency_key: None,
+                    create: None,
+                    config: None,
+                    disable_backpressure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        // Reader presenting node "self" never receives its own records, but the
+        // cursor advances past them to caught_up (no infinite empty loop).
+        let d = engine
+            .diff(
+                "box",
+                DiffRequest {
+                    from_seq: 0,
+                    node: Some(NodeFilter::One("self".to_string())),
+                    ..DiffRequest::default()
+                },
+            )
+            .unwrap();
+        let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![3]); // only the "other"-node record.
+        assert!(d.caught_up);
+        assert_eq!(d.next_from_seq, 3);
+        assert!(d.tombstone.is_none()); // node filtering is silent.
+
+        // A box of ONLY own-node records: zero delivered but caught_up reached.
+        engine
+            .write(
+                "selfbox",
+                WriteRequest {
+                    records: vec![
+                        rec(json!({}), None, Some("me")),
+                        rec(json!({}), None, Some("me")),
+                    ],
+                    node: None,
+                    idempotency_key: None,
+                    create: None,
+                    config: None,
+                    disable_backpressure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let d2 = engine
+            .diff(
+                "selfbox",
+                DiffRequest {
+                    from_seq: 0,
+                    node: Some(NodeFilter::One("me".to_string())),
+                    ..DiffRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(d2.records.is_empty());
+        assert!(d2.caught_up);
+        assert_eq!(d2.next_from_seq, 2);
+    }
+
+    #[test]
+    fn idempotency_dedupe_returns_original_seqs() {
+        let (engine, clock) = engine_with_clock();
+        let req = || WriteRequest {
+            records: vec![rec(json!({"job": 1}), None, None)],
+            node: None,
+            idempotency_key: Some("batch-7".to_string()),
+            create: None,
+            config: None,
+            disable_backpressure: false,
+        };
+
+        let first = engine.write("q", req(), true).unwrap();
+        assert_eq!(first.seqs, Some(vec![1]));
+        assert!(!first.deduped);
+
+        // Retry with the same key in-window → original seqs, no new append.
+        let second = engine.write("q", req(), true).unwrap();
+        assert!(second.deduped);
+        assert_eq!(second.seqs, Some(vec![1]));
+        assert_eq!(second.head_seq, 1);
+
+        // Box still has exactly one record.
+        assert_eq!(engine.box_state("q", false).unwrap().head_seq, 1);
+
+        // After the dedupe window elapses, the same key appends again.
+        clock.advance(default_idempotency_window_ms_for_test() + 1);
+        let third = engine.write("q", req(), true).unwrap();
+        assert!(!third.deduped);
+        assert_eq!(third.seqs, Some(vec![2]));
+    }
+
+    fn default_idempotency_window_ms_for_test() -> i64 {
+        BoxConfig::default().idempotency_window_ms as i64
+    }
+
+    #[test]
+    fn discard_reject_full_box_is_422() {
+        let (engine, _clock) = engine_with_clock();
+        let cfg = BoxConfig {
+            cap_records: 2,
+            discard: Discard::Reject,
+            ..BoxConfig::default()
+        };
+        engine.put_box("q", cfg).unwrap();
+        engine
+            .write("q", write_req(vec![rec(json!({}), None, None)]), true)
+            .unwrap();
+        engine
+            .write("q", write_req(vec![rec(json!({}), None, None)]), true)
+            .unwrap();
+        // Third write overflows cap=2 with discard:reject → 422 box_full.
+        let err = engine
+            .write("q", write_req(vec![rec(json!({}), None, None)]), true)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoxFull);
+        // Nothing appended (all-or-nothing).
+        assert_eq!(engine.box_state("q", false).unwrap().head_seq, 2);
+    }
+
+    #[test]
+    fn create_false_on_missing_box_is_404() {
+        let (engine, _clock) = engine_with_clock();
+        let req = WriteRequest {
+            records: vec![rec(json!({}), None, None)],
+            node: None,
+            idempotency_key: None,
+            create: Some(false),
+            config: None,
+            disable_backpressure: false,
+        };
+        let err = engine.write("typo", req, true).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoxNotFound);
+    }
+
+    #[test]
+    fn delete_recreate_emits_recreated_tombstone() {
+        let (engine, _clock) = engine_with_clock();
+        for _ in 0..5 {
+            engine
+                .write("b", write_req(vec![rec(json!({}), None, None)]), true)
+                .unwrap();
+        }
+        // A stale consumer is at from_seq=5 (== head).
+        engine.delete_box("b", false).unwrap();
+        // Recreate (lazy) — seq restarts at 1.
+        engine
+            .write("b", write_req(vec![rec(json!({}), None, None)]), true)
+            .unwrap();
+        // Consumer's old cursor 5 is now from the future (head=1).
+        let d = engine.diff("b", diff_from(5)).unwrap();
+        let tomb = d.tombstone.expect("expected a recreated tombstone");
+        assert_eq!(tomb.reason, TombstoneReason::Recreated);
+        // New record delivered after the rewind.
+        assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// A router-create request with the documented defaults.
+    fn router_req(source: &str, dest: &str) -> RouterCreateRequest {
+        RouterCreateRequest {
+            source: source.to_string(),
+            dest: dest.to_string(),
+            preserve_node: true,
+            preserve_tag: true,
+            create_dest: true,
+            filter: None,
+            allow_cycle: false,
+        }
+    }
+
+    #[test]
+    fn router_fanout_forwards_and_preserves_node() {
+        let (engine, _clock) = engine_with_clock();
+        // src exists; router auto-creates dst.
+        let (created, resp) = engine
+            .put_router("src->dst", router_req("src", "dst"))
+            .unwrap();
+        assert!(created);
+        assert_eq!(resp.source, "src");
+        assert_eq!(resp.dest, "dst");
+
+        // Write to src with an origin node; it must appear in dst with $node kept.
+        engine
+            .write(
+                "src",
+                write_req(vec![
+                    rec(json!({"i": 1}), Some("t1"), Some("nodeA")),
+                    rec(json!({"i": 2}), None, Some("nodeB")),
+                ]),
+                true,
+            )
+            .unwrap();
+
+        // dst received both, in src commit order, $node preserved.
+        let d = engine
+            .diff(
+                "dst",
+                DiffRequest {
+                    from_seq: 0,
+                    include_tags: true,
+                    ..DiffRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(d.records.len(), 2);
+        assert_eq!(d.records[0].data, json!({"i": 1}));
+        assert_eq!(d.records[0].node.as_deref(), Some("nodeA"));
+        assert_eq!(d.records[0].tag.as_deref(), Some("t1")); // preserve_tag.
+        assert_eq!(d.records[1].node.as_deref(), Some("nodeB"));
+        // dst assigned its own fresh seqs starting at 1.
+        assert_eq!(d.records[0].seq, 1);
+        assert_eq!(d.records[1].seq, 2);
+
+        // forwarded_total reflects the two forwarded records.
+        let g = engine.get_router("src->dst").unwrap();
+        assert_eq!(g.forwarded_total, 2);
+
+        // Deleting the router stops forwarding; already-forwarded records remain.
+        assert!(engine.delete_router("src->dst").unwrap().deleted);
+        engine
+            .write("src", write_req(vec![rec(json!({"i": 3}), None, None)]), true)
+            .unwrap();
+        let d2 = engine.diff("dst", diff_from(0)).unwrap();
+        assert_eq!(d2.records.len(), 2); // still just the first two.
+
+        // Re-deleting is idempotent (deleted:false).
+        assert!(!engine.delete_router("src->dst").unwrap().deleted);
+    }
+
+    #[test]
+    fn router_preserve_node_false_clears_node() {
+        let (engine, _clock) = engine_with_clock();
+        engine
+            .put_router(
+                "s->d",
+                RouterCreateRequest {
+                    preserve_node: false,
+                    ..router_req("s", "d")
+                },
+            )
+            .unwrap();
+        engine
+            .write("s", write_req(vec![rec(json!({}), None, Some("origin"))]), true)
+            .unwrap();
+        let d = engine.diff("d", diff_from(0)).unwrap();
+        assert_eq!(d.records.len(), 1);
+        assert!(d.records[0].node.is_none()); // cleared.
+    }
+
+    #[test]
+    fn router_forward_filter_drops_nonmatching() {
+        let (engine, _clock) = engine_with_clock();
+        engine
+            .put_router(
+                "s->d",
+                RouterCreateRequest {
+                    filter: Some(Filter::from_shorthand("public:*")),
+                    ..router_req("s", "d")
+                },
+            )
+            .unwrap();
+        engine
+            .write(
+                "s",
+                write_req(vec![
+                    rec(json!({"a": 1}), Some("public:1"), None),
+                    rec(json!({"a": 2}), Some("private:1"), None),
+                    rec(json!({"a": 3}), None, None), // no tag ⇒ never matches.
+                ]),
+                true,
+            )
+            .unwrap();
+        let d = engine.diff("d", diff_from(0)).unwrap();
+        let data: Vec<_> = d.records.iter().map(|r| r.data.clone()).collect();
+        assert_eq!(data, vec![json!({"a": 1})]); // only public:1 forwarded.
+    }
+
+    #[test]
+    fn router_cycle_rejected_409() {
+        let (engine, _clock) = engine_with_clock();
+        engine.put_router("a->b", router_req("a", "b")).unwrap();
+        engine.put_router("b->c", router_req("b", "c")).unwrap();
+        // c->a would close a cycle a->b->c->a.
+        let err = engine
+            .put_router("c->a", router_req("c", "a"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::RouterCycle);
+        // The cycle path is reported in detail.
+        let detail = err.detail.expect("cycle detail");
+        assert!(detail.get("cycle").is_some());
+
+        // A re-PUT of an existing (non-cycle) router is idempotent, not a cycle.
+        let (created, _) = engine.put_router("a->b", router_req("a", "b")).unwrap();
+        assert!(!created);
+    }
+
+    #[test]
+    fn router_allow_cycle_terminates_via_hop_cap() {
+        let (engine, _clock) = engine_with_clock();
+        // A two-box mirror a<->b with allow_cycle on both edges.
+        let edge = |s, d| RouterCreateRequest {
+            allow_cycle: true,
+            ..router_req(s, d)
+        };
+        engine.put_router("a->b", edge("a", "b")).unwrap();
+        engine.put_router("b->a", edge("b", "a")).unwrap();
+
+        // One write to `a` would loop forever without the hop cap; it must
+        // terminate. Just assert the call returns and both boxes have a bounded
+        // number of records (no hang / unbounded growth).
+        engine
+            .write("a", write_req(vec![rec(json!({"x": 1}), None, Some("A"))]), true)
+            .unwrap();
+
+        let a = engine.box_state("a", false).unwrap();
+        let b = engine.box_state("b", false).unwrap();
+        // Bounded by the hop cap (MAX_ROUTER_HOPS=8): a handful of copies, never
+        // unbounded. The exact count is implementation-defined but small.
+        assert!(a.head_seq >= 1 && a.head_seq <= config::MAX_ROUTER_HOPS as u64 + 1);
+        assert!(b.head_seq >= 1 && b.head_seq <= config::MAX_ROUTER_HOPS as u64 + 1);
+        // $node is preserved through the cycle (loop-prevention key intact).
+        let d = engine.diff("b", diff_from(0)).unwrap();
+        assert_eq!(d.records[0].node.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn router_create_dest_false_on_missing_is_404() {
+        let (engine, _clock) = engine_with_clock();
+        let err = engine
+            .put_router(
+                "s->d",
+                RouterCreateRequest {
+                    create_dest: false,
+                    ..router_req("s", "d")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoxNotFound);
+    }
+
+    #[test]
+    fn delete_box_cascades_routers() {
+        let (engine, _clock) = engine_with_clock();
+        engine.put_router("a->b", router_req("a", "b")).unwrap();
+        engine.put_router("b->c", router_req("b", "c")).unwrap();
+        // Deleting `b` removes both routers touching it.
+        let resp = engine.delete_box("b", false).unwrap();
+        assert!(resp.deleted);
+        let mut removed = resp.routers_removed.clone();
+        removed.sort();
+        assert_eq!(removed, vec!["a->b".to_string(), "b->c".to_string()]);
+        // Neither router resolvable anymore.
+        assert!(engine.get_router("a->b").is_err());
+        assert!(engine.list_routers(None, None, None, 100, None).unwrap().routers.is_empty());
+    }
+
+    #[test]
+    fn router_get_missing_is_404_and_list_filters() {
+        let (engine, _clock) = engine_with_clock();
+        let err = engine.get_router("nope").unwrap_err();
+        assert_eq!(err.code, ErrorCode::RouterNotFound);
+
+        engine.put_router("a->b", router_req("a", "b")).unwrap();
+        engine.put_router("a->c", router_req("a", "c")).unwrap();
+        // Filter by source.
+        let listed = engine
+            .list_routers(None, Some("a"), None, 100, None)
+            .unwrap();
+        assert_eq!(listed.routers.len(), 2);
+        // Filter by dest.
+        let by_dest = engine
+            .list_routers(None, None, Some("c"), 100, None)
+            .unwrap();
+        assert_eq!(by_dest.routers.len(), 1);
+        assert_eq!(by_dest.routers[0].router, "a->c");
+    }
+
+    #[test]
+    fn list_boxes_prefix_and_paging() {
+        let (engine, _clock) = engine_with_clock();
+        for n in ["a1", "a2", "a3", "b1"] {
+            engine
+                .write(n, write_req(vec![rec(json!({}), None, None)]), true)
+                .unwrap();
+        }
+        // Prefix filter.
+        let page = engine.list_boxes(Some("a"), 100, None, false).unwrap();
+        assert_eq!(page.boxes.len(), 3);
+        assert!(page.next_cursor.is_none());
+
+        // Paging: page_size 2 → cursor → next page.
+        let p1 = engine.list_boxes(Some("a"), 2, None, false).unwrap();
+        assert_eq!(p1.boxes.len(), 2);
+        let cursor = p1.next_cursor.expect("more pages");
+        let p2 = engine
+            .list_boxes(Some("a"), 2, Some(&cursor), false)
+            .unwrap();
+        assert_eq!(p2.boxes.len(), 1);
+        assert!(p2.next_cursor.is_none());
+    }
+}

@@ -1,0 +1,462 @@
+//! Multiplexed SSE watch: POST `/v0/watch` (create session) and
+//! GET `/v0/watch/:wid` (open the SSE stream).
+//!
+//! Frame types (API §7.5): `record`, `tombstone`, `caught-up`, `box-deleted`,
+//! `error`; data-bearing frames carry a composite base64url `id:` (the per-box
+//! `box → seq` cursor map), heartbeats are bare `:` comments, and `retry:` is
+//! sent once at open. Resume via `Last-Event-ID`.
+
+use super::AppState;
+use crate::config;
+use crate::engine::Engine;
+use crate::error::{Error, Result};
+use crate::types::*;
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, HeaderMap},
+    response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Json, Response},
+};
+use base64::Engine as _;
+use dashmap::DashMap;
+use futures::stream::Stream;
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A stored watch session: the immutable subscription definition plus the
+/// authoritative, mutable per-box cursor map (so a GET reconnect resumes
+/// exactly; API §7.1/§7.4).
+pub struct Session {
+    pub req: WatchCreateRequest,
+    /// Authoritative `box → last-delivered seq` cursor map.
+    pub cursors: Mutex<BTreeMap<String, u64>>,
+}
+
+/// In-memory registry of watch sessions, keyed by `wid`. Phase 2 keeps them in
+/// a `DashMap`; phase 4 may persist. GC of idle sessions is best-effort.
+pub struct SessionStore {
+    sessions: DashMap<String, Arc<Session>>,
+    next_id: AtomicU64,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        SessionStore {
+            sessions: DashMap::new(),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn alloc_wid(&self) -> String {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Opaque-ish, monotonic; hex keeps it in the path charset.
+        format!("wid_{n:010x}")
+    }
+
+    fn insert(&self, session: Session) -> String {
+        let wid = self.alloc_wid();
+        self.sessions.insert(wid.clone(), Arc::new(session));
+        wid
+    }
+
+    fn get(&self, wid: &str) -> Option<Arc<Session>> {
+        self.sessions.get(wid).map(|s| s.clone())
+    }
+}
+
+/// `POST /v0/watch` — create a watch session; returns a `wid` + `stream_url`.
+///
+/// Validates the `boxes` map (size, names) and resolves each box's initial
+/// `from_seq`/`tail` against current watermarks, returning per-box
+/// head/earliest so the client can see fall-off before streaming. `?lenient=true`
+/// skips unknown boxes instead of `404`.
+pub async fn create_watch(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<WatchCreateResponse>> {
+    let mut req: WatchCreateRequest = super::parse_json_body(&headers, &body)?;
+
+    if req.boxes.is_empty() {
+        return Err(Error::invalid_request("watch must name >=1 box"));
+    }
+    if req.boxes.len() > config::MAX_WATCH_BOXES {
+        return Err(Error::invalid_request(format!(
+            "watch names {} boxes, exceeds max {}",
+            req.boxes.len(),
+            config::MAX_WATCH_BOXES
+        )));
+    }
+    // Clamp heartbeat into the documented bounds (API §7.2).
+    req.heartbeat_ms = req
+        .heartbeat_ms
+        .clamp(config::MIN_HEARTBEAT_MS, config::MAX_HEARTBEAT_MS);
+
+    let lenient = super::query_bool(&params, "lenient", false);
+    let states = state.engine.watch_box_states(&req.boxes, lenient)?;
+
+    // Seed the authoritative cursor map from the resolved per-box `from_seq`.
+    let mut cursors = BTreeMap::new();
+    for (name, st) in &states {
+        cursors.insert(name.clone(), st.from_seq);
+    }
+
+    let wid = state.sessions.insert(Session {
+        req: req.clone(),
+        cursors: Mutex::new(cursors),
+    });
+
+    Ok(Json(WatchCreateResponse {
+        stream_url: format!("/v0/watch/{wid}"),
+        wid,
+        session_ttl_ms: config::SESSION_TTL_MS,
+        boxes: states,
+        performance: Performance::default(),
+    }))
+}
+
+/// `GET /v0/watch/:wid` — open the SSE stream for a session.
+///
+/// Validates `Accept: text/event-stream` (else `406`), resolves the session and
+/// any `Last-Event-ID` rewind, then streams named events with low-latency
+/// headers (`X-Accel-Buffering: no`, `Cache-Control: no-store`).
+pub async fn stream_watch(
+    State(state): State<AppState>,
+    Path(wid): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    require_event_stream_accept(&headers)?;
+
+    let session = state
+        .sessions
+        .get(&wid)
+        .ok_or_else(|| Error::new(ErrorCode::NotFound, "watch session not found (re-POST)"))?;
+
+    // `Last-Event-ID` (or the `cursor` query) may rewind the session cursors to
+    // an exact prior map — never advance past the authoritative server state.
+    if let Some(leid) = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(map) = decode_cursor_id(leid) {
+            let mut cursors = session.cursors.lock();
+            for (b, seq) in map {
+                if let Some(cur) = cursors.get_mut(&b) {
+                    // Rewind only: take the lower of stored vs resumed.
+                    *cur = (*cur).min(seq);
+                }
+            }
+        }
+    }
+
+    let engine = state.engine.clone();
+    let stream = build_stream(engine, session);
+
+    let sse = Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text(": hb"),
+    );
+
+    // Low-latency headers (API §7.3).
+    let mut resp = sse.into_response();
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    h.insert("x-accel-buffering", "no".parse().unwrap());
+    Ok(resp)
+}
+
+/// Build the SSE event stream for a resolved session. Reuses the engine's diff
+/// primitive per box (TTL + tag-delete + node filter + tombstone), emits
+/// `record`/`tombstone`/`caught-up`/`box-deleted` frames with composite `id:`
+/// cursors, and parks on each box's `Notify` between flushes (no busy poll).
+fn build_stream(
+    engine: Arc<Engine>,
+    session: Arc<Session>,
+) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
+    let heartbeat_ms = session.req.heartbeat_ms;
+    async_stream::stream! {
+        // `retry:` once at open (deliberate 2 s backoff; API §7.5).
+        yield Ok(Event::default().retry(Duration::from_millis(config::SSE_RETRY_MS)));
+
+        // Track which boxes we've already reported as deleted (terminal per box)
+        // and whether each box was last seen caught-up (to re-emit on the
+        // backlog→tailing transition only).
+        let box_names: Vec<String> =
+            session.cursors.lock().keys().cloned().collect();
+        let mut deleted: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut was_caught_up: HashMap<String, bool> = HashMap::new();
+        // Boxes not yet read once: a tombstone on the *first* read is the
+        // connect-time "offset out of range" case (`from_seq_too_old`; API §7.5),
+        // distinct from a gap that crosses the cursor while live.
+        let mut first_read: std::collections::HashSet<String> =
+            box_names.iter().cloned().collect();
+
+        loop {
+            // Hold the live box `Arc`s for this pass so the `Notified` futures
+            // we build at the end (which borrow each box's `Notify`) outlive the
+            // per-box loop body.
+            let mut live: Vec<Arc<crate::engine::box_state::BoxState>> = Vec::new();
+
+            for name in &box_names {
+                if deleted.contains(name) {
+                    continue;
+                }
+                let Some(b) = engine.get_box(name) else {
+                    // Box vanished mid-watch ⇒ terminal box-deleted frame.
+                    let head = 0;
+                    deleted.insert(name.clone());
+                    let id = encode_session_id(&session);
+                    let data = serde_json::json!({
+                        "box": name, "head_seq": head, "reason": "deleted"
+                    });
+                    yield Ok(Event::default()
+                        .id(id)
+                        .event("box-deleted")
+                        .data(data.to_string()));
+                    continue;
+                };
+                live.push(b);
+
+                // Drain this box up to head in `limit`-sized batches.
+                loop {
+                    let from_seq = session
+                        .cursors
+                        .lock()
+                        .get(name)
+                        .copied()
+                        .unwrap_or(0);
+                    let req = DiffRequest {
+                        from_seq,
+                        limit: session.req.limit,
+                        node: session.req.node.clone(),
+                        include_tags: session.req.include_tags,
+                        include_meta: session.req.include_meta,
+                        include_deleted: false,
+                        wait_ms: 0,
+                    };
+                    let Ok(d) = engine.diff(name, req) else {
+                        // Diff only fails with box_not_found here.
+                        deleted.insert(name.clone());
+                        let id = encode_session_id(&session);
+                        let data = serde_json::json!({
+                            "box": name, "head_seq": 0, "reason": "deleted"
+                        });
+                        yield Ok(Event::default()
+                            .id(id)
+                            .event("box-deleted")
+                            .data(data.to_string()));
+                        break;
+                    };
+
+                    // A tombstone crossed this consumer's cursor: emit it first,
+                    // its `id` already advances the box cursor to `gap_to`.
+                    if let Some(tomb) = &d.tombstone {
+                        session
+                            .cursors
+                            .lock()
+                            .insert(name.clone(), tomb.gap_to);
+                        // On the first read of a box, a below-floor cursor is the
+                        // connect-time `from_seq_too_old` variant (API §7.5);
+                        // afterward, report the engine's cap/ttl/mixed reason.
+                        let reason = if first_read.contains(name) {
+                            TombstoneReason::FromSeqTooOld
+                        } else {
+                            tomb.reason
+                        };
+                        let id = encode_session_id(&session);
+                        let data = serde_json::json!({
+                            "box": name,
+                            "reason": reason,
+                            "gap_from": tomb.gap_from,
+                            "gap_to": tomb.gap_to,
+                            "earliest_seq": tomb.earliest_seq,
+                            "head_seq": tomb.head_seq,
+                        });
+                        yield Ok(Event::default()
+                            .id(id)
+                            .event("tombstone")
+                            .data(data.to_string()));
+                        was_caught_up.insert(name.clone(), false);
+                    }
+                    first_read.remove(name);
+
+                    // Advance the authoritative cursor past everything examined.
+                    let to_seq = d.next_from_seq;
+                    if !d.records.is_empty() {
+                        let records: Vec<serde_json::Value> = d
+                            .records
+                            .iter()
+                            .map(|r| record_frame(r, session.req.include_data))
+                            .collect();
+                        session.cursors.lock().insert(name.clone(), to_seq);
+                        let id = encode_session_id(&session);
+                        let payload = serde_json::json!({
+                            "box": name,
+                            "records": records,
+                            "from_seq": from_seq,
+                            "to_seq": to_seq,
+                            "head_seq": d.head_seq,
+                        });
+                        yield Ok(Event::default()
+                            .id(id)
+                            .event("record")
+                            .data(payload.to_string()));
+                        was_caught_up.insert(name.clone(), false);
+                    } else if d.tombstone.is_none() {
+                        // No records and no tombstone, but the cursor may still
+                        // have advanced past filtered records; persist it.
+                        session.cursors.lock().insert(name.clone(), to_seq);
+                    }
+
+                    if d.caught_up {
+                        // Emit `caught-up` once per backlog→tailing transition.
+                        if !was_caught_up.get(name).copied().unwrap_or(false) {
+                            let id = encode_session_id(&session);
+                            let data = serde_json::json!({
+                                "box": name, "head_seq": d.head_seq
+                            });
+                            yield Ok(Event::default()
+                                .id(id)
+                                .event("caught-up")
+                                .data(data.to_string()));
+                            was_caught_up.insert(name.clone(), true);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // If every box is terminal (deleted), end the stream.
+            if box_names.iter().all(|n| deleted.contains(n)) {
+                break;
+            }
+
+            // Drained pass: park until any watched box appends or the heartbeat
+            // window elapses, then re-check. Tokio `Notify` wakeups give the
+            // ~1-5 ms push target without busy polling (API §7.6); the axum
+            // `KeepAlive` layer emits the `: hb` comment on its own cadence.
+            let notifies: Vec<_> = live.iter().map(|b| Box::pin(b.notify.notified())).collect();
+            if notifies.is_empty() {
+                // No live boxes to wait on; just honor the heartbeat tick.
+                tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
+            } else {
+                let wake = futures::future::select_all(notifies);
+                tokio::select! {
+                    _ = wake => {}
+                    _ = tokio::time::sleep(Duration::from_millis(heartbeat_ms)) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Project a read record onto the SSE `record`-frame JSON, honoring
+/// `include_data` (lightweight metadata-only tailing; API §7.5).
+fn record_frame(r: &RecordOut, include_data: bool) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("$seq".into(), serde_json::json!(r.seq));
+    obj.insert("$ts".into(), serde_json::json!(r.ts));
+    if let Some(node) = &r.node {
+        obj.insert("$node".into(), serde_json::json!(node));
+    }
+    if let Some(tag) = &r.tag {
+        obj.insert("$tag".into(), serde_json::json!(tag));
+    }
+    if include_data {
+        obj.insert("data".into(), r.data.clone());
+    }
+    if let Some(meta) = &r.meta {
+        obj.insert("meta".into(), meta.clone());
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Encode the session's current per-box cursor map as a base64url JSON id
+/// (API §7.4). Used as both the SSE `id:` and the `Last-Event-ID` resume token.
+fn encode_session_id(session: &Session) -> String {
+    let map = session.cursors.lock().clone();
+    let json = serde_json::to_vec(&map).unwrap_or_default();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+/// Decode a `Last-Event-ID` / `cursor` composite id back to a `box → seq` map.
+fn decode_cursor_id(id: &str) -> Option<BTreeMap<String, u64>> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(id)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Reject a stream GET whose `Accept` is not `text/event-stream` (API §7,
+/// `406 not_acceptable`).
+fn require_event_stream_accept(headers: &HeaderMap) -> Result<()> {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // An absent/`*/*` Accept is tolerated for curl-style clients.
+    if accept.is_empty() || accept.contains("text/event-stream") || accept.contains("*/*") {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorCode::NotAcceptable,
+            "Accept must be text/event-stream",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composite_id_round_trips() {
+        let mut cursors = BTreeMap::new();
+        cursors.insert("jobs".to_string(), 5210u64);
+        cursors.insert("events".to_string(), 88130u64);
+        let session = Session {
+            req: WatchCreateRequest {
+                node: None,
+                boxes: HashMap::new(),
+                limit: 256,
+                max_batch_bytes: 262_144,
+                heartbeat_ms: 15_000,
+                include_meta: true,
+                include_tags: false,
+                include_data: true,
+                consistency: Consistency::Eventual,
+            },
+            cursors: Mutex::new(cursors),
+        };
+        let id = encode_session_id(&session);
+        let decoded = decode_cursor_id(&id).expect("decodes");
+        assert_eq!(decoded.get("jobs"), Some(&5210));
+        assert_eq!(decoded.get("events"), Some(&88130));
+    }
+
+    #[test]
+    fn accept_guard_rejects_non_sse() {
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT, "application/json".parse().unwrap());
+        assert_eq!(
+            require_event_stream_accept(&h).unwrap_err().code,
+            ErrorCode::NotAcceptable
+        );
+        h.insert(header::ACCEPT, "text/event-stream".parse().unwrap());
+        assert!(require_event_stream_accept(&h).is_ok());
+    }
+}

@@ -158,6 +158,35 @@ curl -X POST localhost:4000/v0/boxes/jobs/delete \
 
 ---
 
+## Phase 2 — running it
+
+The current build is the **phase-2 in-memory server**: the complete `/v0` API,
+correct semantics, but all state lives in RAM. **A restart loses all data** (this
+is expected and documented; durability lands in phase 4).
+
+```bash
+# build the single binary
+cargo build --release
+
+# run it (defaults to 0.0.0.0:4000, auth disabled in dev mode)
+./target/release/streams
+```
+
+Configuration is read from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `STREAMS_PORT` | `4000` | Listen port (`STREAMS_HOST` may set a full `host:port`). |
+| `STREAMS_API_KEYS` | _(unset)_ | Comma-separated bearer keys. Unset ⇒ **auth disabled** (dev mode). |
+| `STREAMS_DATA_DIR` | _(unset)_ | Accepted placeholder; unused in phase 2 (in-memory), wired in phase 4. |
+| `RUST_LOG` | `info` | Tracing filter. |
+
+`durable: true` is accepted but is a no-op fast path in phase 2 (`fsync_ms` is
+reported as `0.0`). The server shuts down gracefully on `SIGINT`/`SIGTERM`. The
+quickstart commands above work verbatim against this build.
+
+---
+
 ## Use-case recipes
 
 ### Job queue (Bull-style)
