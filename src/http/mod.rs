@@ -51,10 +51,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
                 .post(boxes::write),
         )
         .route("/boxes/{box}/diff", post(boxes::diff))
-        .route(
-            "/boxes/{box}/delete",
-            post(delete::add_filters).get(delete::list_filters),
-        )
+        .route("/boxes/{box}/delete", post(delete::delete))
         // Routers
         .route("/routers", get(routers::list_routers))
         .route(

@@ -170,19 +170,25 @@ async fn quickstart_end_to_end() {
     assert_eq!(body["caught_up"], true, "cursor advanced to caught_up, not an empty loop");
     assert_eq!(body["next_from_seq"], 2);
 
-    // -- §6 Cancel a job by exact tag, then a tenant by prefix glob ----------
+    // -- §6 Delete a job by exact tag, then a tenant by prefix glob ----------
+    // Permanent, point-in-time, silent deletion (no persistent filter).
     let (status, body) = req_json(
         &app,
         "POST",
         "/v0/boxes/jobs/delete",
-        Some(json!({ "filters": [["tag", "Eq", "tenant42:job-9001"]] })),
+        Some(json!({ "match": ["tag", "Eq", "tenant42:job-9001"] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["box"], "jobs");
-    assert_eq!(body["filters_total"], 1);
+    assert_eq!(body["deleted"], 1, "exactly one record removed");
+    assert_eq!(
+        body["earliest_seq"], 2,
+        "deleting the FRONT record (seq 1) advances earliest to the next live seq (2)"
+    );
+    assert_eq!(body["count"], 1, "count drops, net of deletion");
 
-    // diff again as a fresh reader: job-9001 is suppressed, NO tombstone.
+    // diff again as a fresh reader: job-9001 is gone, NO tombstone (silent).
     let (status, body) = req_json(
         &app,
         "POST",
@@ -192,24 +198,26 @@ async fn quickstart_end_to_end() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let records = body["records"].as_array().unwrap();
-    assert_eq!(records.len(), 1, "tag-deleted record is suppressed");
+    assert_eq!(records.len(), 1, "deleted record is removed from reads");
     assert_eq!(records[0]["$seq"], 2);
     assert_eq!(
         body["tombstone"],
         Value::Null,
-        "content-based removal (tag-delete) never emits a tombstone"
+        "permanent deletion never emits a tombstone (silent)"
     );
     assert_eq!(body["caught_up"], true);
 
-    // prefix glob suppresses the whole tenant -> the next reader sees nothing.
-    let (status, _) = req_json(
+    // prefix glob delete of the whole tenant -> the next reader sees nothing.
+    let (status, body) = req_json(
         &app,
         "POST",
         "/v0/boxes/jobs/delete",
-        Some(json!({ "filters": [["tag", "Glob", "tenant42:*"]] })),
+        Some(json!({ "match": ["tag", "Glob", "tenant42:*"] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deleted"], 1, "remaining tenant42:* record removed");
+    assert_eq!(body["count"], 0);
     let (_, body) = req_json(
         &app,
         "POST",
@@ -220,9 +228,10 @@ async fn quickstart_end_to_end() {
     assert_eq!(
         body["records"].as_array().unwrap().len(),
         0,
-        "prefix glob suppresses the whole tenant"
+        "prefix glob deletes the whole tenant"
     );
     assert_eq!(body["caught_up"], true);
+    assert_eq!(body["tombstone"], Value::Null, "still silent");
 
     // -- §5-style router fan-out: src -> dst preserves $node ------------------
     // Fresh boxes so tag-deletes above don't interfere.

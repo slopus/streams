@@ -130,9 +130,6 @@ pub struct RecordOut {
     /// `"tombstone"` for tombstone frames; omitted for plain records.
     #[serde(rename = "$type", skip_serializing_if = "Option::is_none")]
     pub type_: Option<String>,
-    /// Present only on `include_deleted` reads of tag-deleted records.
-    #[serde(rename = "$deleted", skip_serializing_if = "Option::is_none")]
-    pub deleted: Option<bool>,
     pub data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -276,8 +273,6 @@ pub struct DiffRequest {
     #[serde(default = "default_include_meta")]
     pub include_meta: bool,
     #[serde(default)]
-    pub include_deleted: bool,
-    #[serde(default)]
     pub wait_ms: u32,
 }
 
@@ -293,7 +288,6 @@ impl Default for DiffRequest {
             node: None,
             include_tags: false,
             include_meta: default_include_meta(),
-            include_deleted: false,
             wait_ms: 0,
         }
     }
@@ -338,13 +332,14 @@ pub struct DiffResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Tag-delete filters (API §5)
+// Tag predicate (router forward filter §6 + delete `match` §5)
 // ---------------------------------------------------------------------------
 
-/// A single tag-delete filter tuple `["tag", "Eq"|"Glob", value]`.
+/// A single tag predicate tuple `["tag", "Eq"|"Glob", value]`.
 ///
 /// Also accepts the bare-string shorthand: `"tenant:*"` (trailing `*` ⇒ Glob,
-/// otherwise Eq). The tuple form is canonical and used on serialize.
+/// otherwise Eq). The tuple form is canonical and used on serialize. Used both
+/// as a router forward filter (§6) and as a delete `match` predicate (§5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
     pub op: FilterOp,
@@ -461,29 +456,33 @@ impl Filter {
     }
 }
 
-/// Request body for `POST /v0/boxes/:box/delete`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeleteFiltersRequest {
-    pub filters: Vec<Filter>,
+/// Request body for `POST /v0/boxes/:box/delete` (API §5). Permanent,
+/// point-in-time deletion by seq range and/or tag match. At least one of
+/// `before_seq` / `match` is required (else `400 invalid_request`); supplying
+/// both ANDs them.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeleteRequest {
+    /// Delete every record with `$seq < before_seq` (snapshot / compaction).
+    #[serde(default)]
+    pub before_seq: Option<u64>,
+    /// Tag predicate: `["tag","Eq",v]`, `["tag","Glob","p*"]`, or the
+    /// bare-string shorthand `"v"` == `["tag","Eq","v"]`.
+    #[serde(default, rename = "match")]
+    pub match_: Option<Filter>,
 }
 
-/// Response for `POST /v0/boxes/:box/delete`.
+/// Response for `POST /v0/boxes/:box/delete` (API §5).
 #[derive(Debug, Clone, Serialize)]
-pub struct DeleteFiltersResponse {
+pub struct DeleteResponse {
     #[serde(rename = "box")]
     pub box_name: String,
-    pub filters_added: Vec<Filter>,
-    pub filters_total: usize,
-    pub matched_estimate: u64,
-    pub performance: Performance,
-}
-
-/// Response for `GET /v0/boxes/:box/delete`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ListFiltersResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
-    pub filters: Vec<Filter>,
+    /// Count of records removed by this call.
+    pub deleted: u64,
+    /// New first live seq (advanced past any deleted prefix).
+    pub earliest_seq: u64,
+    pub head_seq: u64,
+    pub count: u64,
+    pub bytes: u64,
     pub performance: Performance,
 }
 
@@ -724,7 +723,6 @@ pub enum ErrorCode {
     InvalidRequest,
     BatchTooLarge,
     RecordTooLarge,
-    TooManyFilters,
     Unauthorized,
     BoxNotFound,
     RouterNotFound,
@@ -748,7 +746,7 @@ impl ErrorCode {
     pub fn status(self) -> u16 {
         use ErrorCode::*;
         match self {
-            InvalidRequest | BatchTooLarge | RecordTooLarge | TooManyFilters => 400,
+            InvalidRequest | BatchTooLarge | RecordTooLarge => 400,
             Unauthorized => 401,
             BoxNotFound | RouterNotFound | NotFound => 404,
             MethodNotAllowed => 405,
@@ -770,7 +768,6 @@ impl ErrorCode {
             InvalidRequest => "invalid_request",
             BatchTooLarge => "batch_too_large",
             RecordTooLarge => "record_too_large",
-            TooManyFilters => "too_many_filters",
             Unauthorized => "unauthorized",
             BoxNotFound => "box_not_found",
             RouterNotFound => "router_not_found",

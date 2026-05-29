@@ -34,9 +34,6 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// Max list page size.
 pub const MAX_PAGE_SIZE: usize = 1000;
 
-/// Max active delete filters per box (`STREAMS_MAX_DELETE_FILTERS`).
-pub const MAX_DELETE_FILTERS: usize = 4096;
-
 /// Max boxes per watch subscription (`STREAMS_MAX_WATCH_BOXES`).
 pub const MAX_WATCH_BOXES: usize = 256;
 /// Watch session TTL after no active GET (ms).

@@ -59,7 +59,7 @@ server echoes them as `$node`/`$tag` to signal they are now server-canonical and
 | `$seq` | `u64` | Server-assigned sequence id. |
 | `$ts` | `i64` (ms) | Server commit time. |
 | `$node` | `string` | Origin node id supplied by the writer (loop prevention). Omitted if absent. |
-| `$tag` | `string` | Tag supplied by the writer (tag-deletion matching). Omitted if absent. |
+| `$tag` | `string` | Tag supplied by the writer (deletion-match key). Omitted if absent. |
 | `$type` | `string` | `"record"` (default, omitted on plain records) or `"tombstone"`. Used in SSE framing. |
 
 `data`/`meta` keep the same key in both directions (pure passthrough). `$node`/`$tag`/
@@ -97,7 +97,7 @@ top-level `error` key is the only success/failure discriminator.
 |---|---|---|
 | `200` | OK (read, idempotent write/create/delete) | — |
 | `201` | Created (box/router created on this call) | — |
-| `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large`, `too_many_filters` |
+| `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large` |
 | `401` | Missing/invalid bearer token | `unauthorized` |
 | `404` | Box/router does not exist (and was not auto-created) | `box_not_found`, `router_not_found` |
 | `405` | Wrong method for path | `method_not_allowed` |
@@ -194,10 +194,15 @@ optional on create; omitted fields take the documented default.
 | `idempotency_window_ms` | `u64` | `120000` | How long `(box, idempotency_key)` dedupe state is retained (§0.8). |
 | `dedupe_node` | `bool` | `true` | Whether node loop-prevention filtering is enabled on reads of this box (§4.5/§7.1). Essentially always `true`; exposed so a box can opt out of node filtering entirely. |
 
-**Caps and `earliest_seq`:** eviction is *segment-granular and lazy* (whole segments
-dropped, may transiently exceed cap), so the true retained floor is reported as
-`earliest_seq` in box state and **must be read from the server** — never computed by the
-client from `head_seq - cap_records`.
+**Caps, deletes, and `earliest_seq`:** `earliest_seq` is the seq of the **first
+currently-live record** (not evicted, not TTL-expired, not deleted; `head_seq + 1` when
+the box is empty). Eviction is *segment-granular and lazy* (whole segments dropped, may
+transiently exceed cap) and deletes advance `earliest_seq` past removed records, so the
+true retained floor **must be read from the server** — never computed by the client from
+`head_seq - cap_records`. A separate `evict_floor` (not in box state) tracks only
+**involuntary** cap/TTL loss and is the sole tombstone trigger (§3.3): `evict_floor <=
+earliest_seq` always, and a purely-deleted gap (below `earliest_seq` but at/above
+`evict_floor`) reads silently with `tombstone: null`.
 
 ---
 
@@ -273,7 +278,7 @@ clock**.
 | Field | Meaning |
 |---|---|
 | `head_seq` | Highest assigned seq (log end). `0` for a fresh empty box. |
-| `earliest_seq` | Lowest retained, non-expired, deliverable seq (log start). If the box is empty, `earliest_seq = head_seq + 1`. A consumer whose `from_seq + 1 < earliest_seq` has fallen off the start and will receive a tombstone. |
+| `earliest_seq` | Seq of the first currently-live record — not evicted, not TTL-expired, **not deleted** (log start). If the box is empty, `earliest_seq = head_seq + 1`. A consumer whose `from_seq + 1 < earliest_seq` has fallen below the floor; it receives a tombstone only if `from_seq + 1 < evict_floor` (involuntary cap/TTL loss), otherwise the cursor advances silently past deleted seqs. |
 | `next_seq` | Seq the next append will receive (`head_seq + 1`). A handy "tail" cursor: read from `next_seq - 1` to get only new records. |
 | `count`, `bytes` | Currently retained records and payload bytes (approximate under lazy eviction). |
 | `effective_priority` | The priority the scheduler is using right now (manual, or auto-derived). |
@@ -307,8 +312,8 @@ Enumerate boxes with summary state. Opaque-cursor paginated.
 
 ### 1.4 Delete a box — `DELETE /v0/boxes/:box`
 
-Permanently remove a box and all its records, dedupe state, delete-filters, and routers
-referencing it. Idempotent. Irreversible.
+Permanently remove a box and all its records, dedupe state, the per-box tag index, and
+routers referencing it. Idempotent. Irreversible.
 
 **Query** — `if_empty` (bool, default `false`): if `true`, delete only when `count == 0`,
 else `409 box_not_empty`.
@@ -356,7 +361,7 @@ no separate configure call.
 |---|---|---|---|
 | `records` | array | yes | 1..=`MAX_BATCH_RECORDS`. Seqs assigned in array order, contiguously. |
 | `records[].data` | any JSON | yes | Opaque payload (may be `null`). |
-| `records[].tag` | string | no | Tag for read-time deletion. ≤ `MAX_TAG_BYTES`. |
+| `records[].tag` | string | no | Match key for deletion (§5). ≤ `MAX_TAG_BYTES`. |
 | `records[].node` | string | no | Per-record origin node; overrides batch-level `node`. ≤ `MAX_NODE_BYTES`. |
 | `records[].meta` | object | no | Small headers, returned verbatim. ≤ `MAX_META_BYTES`, ≤ 64 keys. |
 | `node` | string | no | Batch-level default origin node (the common one-writer case). |
@@ -413,8 +418,8 @@ prior in-window write; `seqs` are the original ones and no new append happened.
 ## 3. Read difference (getDifference) — `POST /v0/boxes/:box/diff`
 
 The core consume operation. Given a cursor `from_seq`, return the records after it, bounded
-to a batch, with a continuation cursor and any tombstone. Applies TTL, tag-deletion, and
-node loop-prevention filters at read time. Bumps auto-priority recency. `POST` (not `GET`)
+to a batch, with a continuation cursor and any tombstone. Skips TTL-expired, deleted, and
+own-node records at read time. Bumps auto-priority recency. `POST` (not `GET`)
 because the operation is described by the JSON body; it is read-only and safe to retry.
 
 **Request body**
@@ -426,7 +431,6 @@ because the operation is described by the JSON body; it is read-only and safe to
   "node": "worker-eu-1",
   "include_tags": false,
   "include_meta": true,
-  "include_deleted": false,
   "wait_ms": 0
 }
 ```
@@ -438,7 +442,6 @@ because the operation is described by the JSON body; it is read-only and safe to
 | `node` | string \| array | none | Node loop-prevention filter (§4.5): records whose `$node` ∈ this set are omitted (but still advance the cursor). |
 | `include_tags` | bool | `false` | Include `$tag` on each record. |
 | `include_meta` | bool | `true` | Include each record's `meta`. |
-| `include_deleted` | bool | `false` | If `true`, tag-deleted records are returned with `$deleted: true` instead of being filtered (audit/debug). |
 | `wait_ms` | `u32` | `0` | Long-poll: if nothing is available, block up to this many ms for new records. Clamped to `30000`. SSE is preferred for true streaming; this is the XREAD `BLOCK` analog. |
 
 **Response** (`200`)
@@ -464,7 +467,7 @@ because the operation is described by the JSON body; it is read-only and safe to
 
 | Field | Meaning |
 |---|---|
-| `records` | Up to `limit` records with `$seq > from_seq`, ascending, after TTL + tag-delete + node filtering. `$tag` only if `include_tags`; `meta` only if `include_meta`. |
+| `records` | Up to `limit` records with `$seq > from_seq`, ascending, after skipping TTL-expired, deleted, and own-node records. `$tag` only if `include_tags`; `meta` only if `include_meta`. |
 | `next_from_seq` | Pass back as `from_seq`. Equals the `$seq` of the last **examined** record (filtered records still advance it), so filtered records are never re-scanned. |
 | `head_seq` / `earliest_seq` | Log end / retained floor — for lag math and fall-off detection. |
 | `caught_up` | `true` when `next_from_seq == head_seq`. The reliable "no more right now" signal. |
@@ -480,19 +483,21 @@ heartbeat (the BullMQ stalled-job model) is not in `/v0`; it is a planned higher
 (ROADMAP) layered on tags + a side in-flight box, kept out of the core to preserve the
 stateless-log primitive.
 
-### 3.2 Filtered records still advance the cursor
+### 3.2 Skipped records still advance the cursor
 
-Node-filtered and tag-deleted records are **omitted from `records`** but `next_from_seq`
-advances **past** them. Otherwise a consumer reading a box full of its own (node-filtered)
-events would loop forever. So `records.length` may be less than the number of seqs
-traversed, and may be `0` while `next_from_seq` advanced. **`caught_up` is the reliable
-"no more" signal — never `records.length == 0`.**
+Node-filtered and deleted records (and TTL-expired ones) are **omitted from `records`**
+but `next_from_seq` advances **past** them. Otherwise a consumer reading a box full of its
+own (node-filtered) events would loop forever. So `records.length` may be less than the
+number of seqs traversed, and may be `0` while `next_from_seq` advanced. **`caught_up` is
+the reliable "no more" signal — never `records.length == 0`.**
 
 ### 3.3 Tombstone / gap markers (never silent loss)
 
-If `from_seq + 1 < earliest_seq` — the cursor fell below the retained floor because records
-were evicted (cap) or expired (TTL) — the response returns a `tombstone` and resumes from
-the floor:
+If `from_seq + 1 < evict_floor` — the cursor fell below the **involuntary** floor because
+records were evicted (cap) or expired (TTL) — the response returns a `tombstone` and
+resumes from `earliest_seq`. (A cursor below `earliest_seq` but at/above `evict_floor` fell
+into a purely-**deleted** gap: that is silent, `tombstone: null`, the cursor simply advances
+past the deleted seqs. `evict_floor <= earliest_seq` always.)
 
 ```json
 {
@@ -526,11 +531,12 @@ the floor:
 one contiguous range because `earliest_seq` is monotonic). The same shape is emitted by SSE
 as `event: tombstone` (§7).
 
-> **Deletion-marker honesty:** tag-deletions (§5) are read-time filters tied to the box's
-> lifetime, not separately TTL'd, so a lagging consumer cannot "miss a deletion" the way
-> Kafka compacted tombstones can. A tag-deleted record is filtered for every reader at every
-> read until the underlying record is itself evicted/expired (then it falls under the normal
-> cap/TTL tombstone, not a separate signal).
+> **Deletion is silent and permanent:** a delete (§5) removes records that exist at call
+> time, effective immediately for every reader, and **never** emits a tombstone — it is a
+> voluntary, content/seq-based removal, not capacity loss. The reader's cursor simply
+> advances past the deleted seqs. A lagging consumer cannot "miss a deletion" because the
+> record is gone for all readers at once; it only ever sees a tombstone for involuntary
+> cap/TTL loss (`reason ∈ cap|ttl|mixed`), tracked by `evict_floor`, never by deletes.
 
 **Errors** — `400 invalid_request` (type errors only; `wait_ms`/`limit` over max are
 clamped, not errored); `404 box_not_found` (diff never auto-creates); `429 throttled`.
@@ -555,71 +561,68 @@ shared topology, each sees only the *others'* records, with no echo and no infin
 
 ---
 
-## 5. Read-time deletion (mark deleted by tag)
+## 5. Deletion (permanent, point-in-time) — `POST /v0/boxes/:box/delete`
 
-### 5.1 Add delete filters — `POST /v0/boxes/:box/delete`
+Permanently remove records by **seq range** (`before_seq`) and/or by **tag** match
+(`match`). Deletion is:
 
-Mark records "deleted during reading" by **tag** match. This is **not** a physical delete:
-it installs an efficient read-time filter that drops matching records from all future reads
-and SSE, for all consumers. Used to cancel jobs (`tag` = job id) or bulk-cancel
-(`tenantX:*`).
+- **Permanent** — deleted records are gone for good; there is no un-delete in `/v0`.
+- **Effective immediately** — invisible to all reads at once (diff, box state `count`/
+  `bytes`, and SSE); the reader's cursor simply advances past the deleted seqs.
+- **Asynchronous (lazy reclaim)** — records are logically gone instantly; memory/disk is
+  reclaimed by a background reclaimer (free payload/tag immediately, pop physical slots
+  from the front as the prefix becomes fully dead).
+- **Silent** — a delete **never** produces a tombstone. Tombstones are reserved for
+  **involuntary** cap/TTL loss (§3.3).
+- **Point-in-time** — it is **not** a standing filter. It only removes records present at
+  call time; future records (even with a matching tag) are never affected.
 
-**Request body** — tuple-filter style (compact, copy-pasteable):
+A delete advances the box's `earliest_seq` (first live seq) but **not** its `evict_floor`,
+so reading across a purely-deleted gap is silent (§3.3).
+
+**Request body** — at least one of `before_seq` / `match` is **required** (else `400
+invalid_request`); supply both to AND them. A snapshot/compaction by seq:
 
 ```json
-{ "filters": [
-    ["tag", "Eq",   "tenant42:job-9001"],
-    ["tag", "Glob", "tenant42:*"]
-] }
+{ "before_seq": 480001 }
 ```
 
-| Op | Meaning |
+| Field | Type | Meaning |
+|---|---|---|
+| `before_seq` | `u64` | Delete every record with `$seq < before_seq` (snapshot / compaction by seq). |
+| `match` | predicate | `["tag","Eq","X"]` exact match, or `["tag","Glob","X*"]` **trailing-prefix only** (a literal prefix followed by a single `*`; full glob/regex is deliberately excluded so a delete is a point lookup or a bounded range scan over the per-box tag index). A bare string is shorthand for `Eq`: `"match": "tenant42:job-9001"` == `["tag","Eq","tenant42:job-9001"]`. |
+
+**Semantics by combination**
+
+| Body | Effect |
 |---|---|
-| `["tag","Eq","X"]` | Exact match: drop records whose `$tag == "X"`. |
-| `["tag","Glob","X*"]` | **Prefix wildcard only**: pattern is a literal prefix followed by a single trailing `*`. Drops records whose `$tag` starts with the prefix. Full glob/regex is deliberately excluded so read-time evaluation stays O(len(tag)) via a sorted prefix set — a documented hard limit. |
+| `before_seq` only | Delete every record with `$seq < before_seq` (SNAPSHOT / compaction). |
+| `match` only | Delete every **existing** record whose tag matches, bounded by the current head at call time (bound = `head_seq + 1`). Point-in-time: future records with that tag are **not** deleted (e.g. revoke a kicked user's chat: `match ["tag","Glob","chat-42:*"]`). |
+| `match` + `before_seq` | Delete records with `$seq < before_seq` **AND** tag matches (e.g. publish v2 of a message then delete its prior versions, keeping the new one: `match ["tag","Eq","msg-123"]`, `before_seq = <seq of v2>`). |
 
-A bare-string shorthand is accepted: `"filters": ["tenant42:job-9001", "tenant42:*"]` — a
-trailing `*` means prefix, otherwise exact. The tuple form is canonical.
-
-**Behavior**
-- Filters are stored on the box and evaluated at read time against `$tag`, for every record
-  on every read. Matching is exact-set + sorted-prefix-set lookup (efficient over many
-  records, no per-pattern scan). Persisted via a WAL control frame (survives restart).
-- Idempotent and additive; re-posting the same filter is a no-op. New future records that
-  match are also suppressed (so "cancel tenant X" cancels jobs enqueued a moment later by an
-  in-flight producer — a one-shot scan would race).
-- Records with **no tag** are never matched. Tag-deletion is a **distinct outcome from
-  consume/ack** (never advances any cursor; shows in metrics as `tag_deleted`, not
-  `consumed`).
-- Deletion is **monotonic in `/v0`**: there is no un-delete endpoint. A record once
-  tag-deleted stays filtered for the box's life; to "resurrect," write a new record. This
-  keeps the filter set append-only and cheap. (A future `/v1` may add rule removal; see
-  ROADMAP open questions.)
+Records with **no tag** are never matched by `match`. A tag delete uses the per-box tag
+index (exact = point lookup, prefix = range scan); it never scans the whole log.
 
 **Response** (`200`)
 
 ```json
 { "box": "jobs",
-  "filters_added": [["tag", "Glob", "tenant42:*"]],
-  "filters_total": 7,
-  "matched_estimate": 14,
+  "deleted": 14,
+  "earliest_seq": 480001,
+  "head_seq": 480234,
+  "count": 234,
+  "bytes": 478820,
   "performance": { "server_total_ms": 0.12 } }
 ```
 
-**Hard limit** — max active delete-filters per box `STREAMS_MAX_DELETE_FILTERS` default
-`4096` (prefix + exact combined); exceeding ⇒ `400 too_many_filters`. Lazy compaction folds
-exact filters covered by an existing prefix.
+| Field | Meaning |
+|---|---|
+| `deleted` | Count of records removed by this call. |
+| `earliest_seq` | New first live seq (advanced past any deleted prefix). |
+| `head_seq` / `count` / `bytes` | Box state after the delete (`count`/`bytes` already exclude the deleted records). |
 
-**Errors** — `400 invalid_request` (bad tuple, op not in `{Eq, Glob}`, `Glob` without a
-trailing `*`); `400 too_many_filters`; `404 box_not_found`.
-
-### 5.2 List active filters — `GET /v0/boxes/:box/delete`
-
-```json
-{ "box": "jobs",
-  "filters": [["tag","Eq","x"], ["tag","Glob","tenant42:*"]],
-  "performance": { "server_total_ms": 0.03 } }
-```
+**Errors** — `400 invalid_request` (neither `before_seq` nor `match` supplied; bad tuple;
+`match` op not in `{Eq, Glob}`; `Glob` without a trailing `*`); `404 box_not_found`.
 
 ---
 
@@ -649,7 +652,7 @@ Forwarding is **at-least-once, per-source FIFO** (a crash between "appended to d
 | `source` | string | yes | — | Source box; records here are forwarded. |
 | `dest` | string | yes | — | Destination box; must differ from `source`. |
 | `preserve_node` | bool | no | `true` | Keep original `$node` on forwarded records (required for loop prevention across the fan-out). `false` clears it. |
-| `preserve_tag` | bool | no | `true` | Keep `$tag` (so tag-deletion can apply at the dest too). |
+| `preserve_tag` | bool | no | `true` | Keep `$tag` (so a tag delete can be applied at the dest too). |
 | `create_dest` | bool | no | `true` | Auto-create `dest` if absent. `false` ⇒ `404` if missing. |
 | `filter` | tuple \| null | no | `null` | Optional forward-time filter (same tuple language as §5), e.g. `["tag","Glob","public:*"]`. `null` = forward all. |
 | `allow_cycle` | bool | no | `false` | If `false`, creating a router that would introduce a directed cycle is rejected `409 router_cycle` (DAG-by-default). If `true`, the route is permitted and runtime hop-cap loop-breaking applies instead (for intentional A↔B multi-master). |
@@ -966,8 +969,7 @@ streams_scheduler_throttle_total 0
 | `DELETE` | `/v0/boxes/:box` | Delete box (cascades routers) |
 | `POST` | `/v0/boxes/:box` | Append record(s); returns assigned seqs + head |
 | `POST` | `/v0/boxes/:box/diff` | Read difference from cursor (batched + tombstones) |
-| `POST` | `/v0/boxes/:box/delete` | Add read-time tag-delete filters (exact/prefix) |
-| `GET` | `/v0/boxes/:box/delete` | List active delete-filters |
+| `POST` | `/v0/boxes/:box/delete` | Permanently delete records by `before_seq` and/or tag `match` |
 | `PUT` | `/v0/routers/:router` | Create/configure router (idempotent upsert) |
 | `GET` | `/v0/routers/:router` | Get router |
 | `GET` | `/v0/routers` | List routers |

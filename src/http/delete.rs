@@ -1,4 +1,7 @@
-//! Tag-delete filter endpoints: POST/GET `/v0/boxes/:box/delete`.
+//! Deletion endpoint: POST `/v0/boxes/:box/delete` (API §5).
+//!
+//! Permanent, point-in-time, silent deletion by seq range (`before_seq`)
+//! and/or tag `match`. There is no persistent filter and no list endpoint.
 
 use super::{parse_json_body, AppState};
 use crate::error::Result;
@@ -10,22 +13,14 @@ use axum::{
     response::Json,
 };
 
-/// `POST /v0/boxes/:box/delete` — add read-time tag-delete filters. Accepts the
-/// canonical tuple form and the bare-string shorthand (both parse to [`Filter`]).
-pub async fn add_filters(
+/// `POST /v0/boxes/:box/delete` — permanently delete records by `before_seq`
+/// and/or tag `match`. At least one selector is required (else `400`).
+pub async fn delete(
     State(state): State<AppState>,
     Path(box_name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<DeleteFiltersResponse>> {
-    let req: DeleteFiltersRequest = parse_json_body(&headers, &body)?;
-    Ok(Json(state.engine.add_filters(&box_name, req.filters)?))
-}
-
-/// `GET /v0/boxes/:box/delete` — list active filters.
-pub async fn list_filters(
-    State(state): State<AppState>,
-    Path(box_name): Path<String>,
-) -> Result<Json<ListFiltersResponse>> {
-    Ok(Json(state.engine.list_filters(&box_name)?))
+) -> Result<Json<DeleteResponse>> {
+    let req: DeleteRequest = parse_json_body(&headers, &body)?;
+    Ok(Json(state.engine.delete(&box_name, req)?))
 }

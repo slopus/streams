@@ -6,20 +6,41 @@
 
 use crate::types::{Tombstone, TombstoneReason};
 
-/// The two loss floors tracked separately so a tombstone can report *why*
-/// (DESIGN §5.1). `earliest_seq = max(evict_floor, expiry_floor) + 1`.
+/// The loss floors tracked separately (DESIGN §5.1, the **dual watermark**).
+///
+/// `earliest_seq` (first live, reported) is driven by all three floors:
+/// `earliest_seq = max(evict_floor, expiry_floor, delete_floor) + 1`. But the
+/// tombstone trigger is **`evict_floor` only** — advanced solely by
+/// **involuntary** cap/TTL eviction of *live* records. A deletion advances
+/// `delete_floor` (and thus `earliest_seq`) but **never** `evict_floor`, so
+/// reading across a purely-deleted prefix gap is silent (`tombstone: null`).
+///
+/// Invariant: `evict_floor <= earliest_seq` always.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Floors {
-    /// Highest seq removed by cap eviction (`0` if none).
+    /// Highest seq removed by **involuntary** cap eviction (`0` if none). This
+    /// is the sole tombstone trigger.
     pub evict_floor: u64,
-    /// Highest seq that is TTL-expired (`0` if none).
+    /// Highest seq that is TTL-expired (`0` if none). Involuntary; also a
+    /// tombstone trigger (it reaches into the gap as `ttl`).
     pub expiry_floor: u64,
+    /// Highest seq removed by a **voluntary** prefix/snapshot delete (`0` if
+    /// none). Advances `earliest_seq` but never produces a tombstone.
+    pub delete_floor: u64,
 }
 
 impl Floors {
-    /// Combined logical earliest retained seq, clamped into
-    /// `[seq_base, head_seq + 1]`.
+    /// Combined logical earliest retained (first live) seq, clamped into
+    /// `[seq_base, head_seq + 1]`. Driven by all three floors.
     pub fn earliest_seq(&self, seq_base: u64, head_seq: u64) -> u64 {
+        let floor = self.evict_floor.max(self.expiry_floor).max(self.delete_floor);
+        let earliest = floor.saturating_add(1).max(seq_base);
+        earliest.min(head_seq.saturating_add(1))
+    }
+
+    /// The involuntary floor (cap/TTL only) used to decide whether a gap
+    /// produces a tombstone (DESIGN §5.4). `delete_floor` is excluded.
+    pub fn evict_earliest(&self, seq_base: u64, head_seq: u64) -> u64 {
         let floor = self.evict_floor.max(self.expiry_floor);
         let earliest = floor.saturating_add(1).max(seq_base);
         earliest.min(head_seq.saturating_add(1))

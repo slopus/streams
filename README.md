@@ -21,8 +21,8 @@ Five concepts. That's the whole product.
 - **Box** — a named, append-only log of records ordered by a monotonic `seq`. Think
   inbox/outbox. A box is created lazily on first write (or explicitly with config).
 - **Record** — one immutable event in a box. The server assigns it a `$seq` (u64) and
-  `$ts` (ms). It carries an opaque `data` payload, and optionally a `tag` (for
-  read-time deletion), a `node` (origin id, for loop prevention), and small `meta`.
+  `$ts` (ms). It carries an opaque `data` payload, and optionally a `tag` (a match key
+  for deletion), a `node` (origin id, for loop prevention), and small `meta`.
 - **seq** — the cursor. Reads are "give me everything after `from_seq`." There is no
   opaque cursor token for box reads: the monotonic `seq` *is* the cursor. The client
   owns its position; advancing it is the ack.
@@ -32,10 +32,18 @@ Five concepts. That's the whole product.
 - **Tombstone** — the explicit "you missed data" signal. If records you wanted were
   evicted (cap) or expired (TTL) before you read them, the read returns an in-band
   tombstone with the exact `[gap_from, gap_to]` range — at HTTP 200, never silently.
+- **Delete** — a permanent, asynchronous, point-in-time removal of records, by `seq`
+  range and/or by `tag` match. A delete is **silent** (never a tombstone) and takes
+  effect immediately on all reads; the physical memory/disk is reclaimed lazily in the
+  background. It only removes records that exist at call time — it is not a standing
+  filter, so future records are never affected.
 
-The load-bearing invariant: **capacity-driven loss you didn't ask for always produces
-a tombstone; content-based removal you did ask for (tag-deletion, your own node's
-events) is silently filtered.** Mixing those would make the gap alarm useless.
+The load-bearing invariant: **involuntary capacity-driven loss you didn't ask for
+(cap eviction, TTL expiry) always produces a tombstone; voluntary removal you did ask
+for (permanent delete, your own node's events) is silently filtered.** Mixing those
+would make the gap alarm useless. A delete advances the box's `earliest_seq` (first
+live seq) but never its `evict_floor` (the cap/TTL tombstone trigger), so reading
+across a purely-deleted gap is silent while reading below an evicted floor tombstones.
 
 ---
 
@@ -142,18 +150,45 @@ data: {"box":"jobs","head_seq":2}
 : hb 1748470015000
 ```
 
-### 6. Cancel jobs by tag (read-time deletion)
+### 6. Delete records (permanent, point-in-time, by seq and/or tag)
 
 ```bash
-# cancel one job
+# cancel one job (exact tag match — removes records present right now)
 curl -X POST localhost:4000/v0/boxes/jobs/delete \
   -H 'content-type: application/json' \
-  -d '{ "filters": [["tag", "Eq", "tenant42:job-9001"]] }'
+  -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
 
-# cancel an entire tenant (prefix wildcard)
+# cancel an entire tenant (trailing-prefix match)
 curl -X POST localhost:4000/v0/boxes/jobs/delete \
   -H 'content-type: application/json' \
-  -d '{ "filters": [["tag", "Glob", "tenant42:*"]] }'
+  -d '{ "match": ["tag", "Glob", "tenant42:*"] }'
+```
+
+```json
+{ "box": "jobs", "deleted": 1, "earliest_seq": 3, "head_seq": 2, "count": 0, "bytes": 0,
+  "performance": { "server_total_ms": 0.12 } }
+```
+
+(Both records carried `tenant42:` tags, so after the two deletes the box is empty:
+`count` 0 and `earliest_seq` = `head_seq + 1` = 3. `deleted` is the count removed by
+*this* call.)
+
+The delete is **permanent** (no un-delete), **silent** (no tombstone), takes effect
+**immediately** on all reads, and is **point-in-time**: a `match`-only delete is
+bounded by the current head, so a job enqueued a moment later by an in-flight producer
+is *not* deleted. Three patterns:
+
+```bash
+# Snapshot / compaction: drop everything before a seq (e.g. after a checkpoint)
+curl -X POST localhost:4000/v0/boxes/jobs/delete -d '{ "before_seq": 480000 }'
+
+# Message update: publish v2, then delete the prior versions but keep the new one
+curl -X POST localhost:4000/v0/boxes/chat/delete \
+  -d '{ "match": ["tag", "Eq", "msg-123"], "before_seq": 5012 }'   # 5012 = seq of v2
+
+# Chat revoke: a kicked user's whole sub-stream (prefix), point-in-time
+curl -X POST localhost:4000/v0/boxes/chat/delete \
+  -d '{ "match": ["tag", "Glob", "chat-42:*"] }'
 ```
 
 ---
@@ -197,8 +232,9 @@ curl -X PUT localhost:4000/v0/boxes/jobs -d '{ "durable": true, "cap_records": 0
 Producers `POST /v0/boxes/jobs`. Each worker calls
 `POST /v0/boxes/jobs/diff {from_seq, node:"worker-N", limit:50}`, processes the batch,
 then persists `next_from_seq` as its ack (cursor-advance = ack-all). Cancel a job with a
-tag delete; cancel a tenant with a `tag*` prefix delete. Durable + unbounded cap means
-nothing is lost; replay is just reading from an earlier `from_seq`.
+`match ["tag","Eq",jobid]` delete; cancel a tenant with a `match ["tag","Glob","tenant*"]`
+delete (both permanent and point-in-time). Durable + unbounded cap means nothing is lost
+to eviction; replay is just reading from an earlier `from_seq`.
 
 ### Pub/sub (Redis-style, weak guarantees)
 
@@ -230,8 +266,10 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
 - **Batched diff reads** — bounded batches, a plain `seq` cursor, in-band tombstones.
 - **Explicit gap detection** — cap eviction and TTL expiry crossing a cursor always
   yield a tombstone with the exact missed range and a `reason`.
-- **Read-time tag deletion** — cancel records by exact tag or `tag*` prefix; an
-  efficient read-time filter, not a physical delete.
+- **Permanent deletion** — remove records by `seq` range (`before_seq`) and/or by tag
+  (exact or `tag*` prefix), backed by a per-box tag index for efficiency. Permanent,
+  silent (never a tombstone), effective immediately on reads, point-in-time (never
+  affects future records), with lazy background physical reclaim.
 - **Node loop-prevention** — a node never receives back events it produced, making
   N-way multi-master fan-out safe by construction.
 - **Routers** — server-side `source → dest` forwarding, at-least-once, per-source FIFO,
@@ -262,8 +300,9 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for acceptance criteria per phase.
 ## Documentation
 
 - [docs/API.md](docs/API.md) — complete `/v0` HTTP API reference (the contract).
-- [docs/DESIGN.md](docs/DESIGN.md) — data model & semantics: seq, watermarks, tombstones,
-  tag-deletion, node loop-prevention, routers, priority.
+- [docs/DESIGN.md](docs/DESIGN.md) — data model & semantics: seq, dual watermark
+  (`evict_floor`/`earliest_seq`), tombstones, permanent deletion, node loop-prevention,
+  routers, priority.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — storage, WAL, group commit, segments,
   recovery, scheduler, concurrency, crate choices, latency budget.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build phases, acceptance criteria, benchmark plan.

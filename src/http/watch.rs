@@ -179,7 +179,7 @@ pub async fn stream_watch(
 }
 
 /// Build the SSE event stream for a resolved session. Reuses the engine's diff
-/// primitive per box (TTL + tag-delete + node filter + tombstone), emits
+/// primitive per box (TTL + deleted skip + node filter + tombstone), emits
 /// `record`/`tombstone`/`caught-up`/`box-deleted` frames with composite `id:`
 /// cursors, and parks on each box's `Notify` between flushes (no busy poll).
 fn build_stream(
@@ -245,7 +245,6 @@ fn build_stream(
                         node: session.req.node.clone(),
                         include_tags: session.req.include_tags,
                         include_meta: session.req.include_meta,
-                        include_deleted: false,
                         wait_ms: 0,
                     };
                     let Ok(d) = engine.diff(name, req) else {

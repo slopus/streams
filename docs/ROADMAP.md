@@ -14,8 +14,8 @@ Produce the complete, internally consistent specification the implementation mus
 **Deliverables**
 - `README.md` — pitch, mental model, quickstart, use-case recipes, feature list, phases, doc links.
 - `docs/API.md` — the complete `/v0` HTTP reference (the contract).
-- `docs/DESIGN.md` — data model & semantics (seq, watermarks, tombstones, tag-deletion, node
-  loop-prevention, routers, priority).
+- `docs/DESIGN.md` — data model & semantics (seq, dual watermark, tombstones, permanent deletion,
+  node loop-prevention, routers, priority).
 - `docs/ARCHITECTURE.md` — storage, WAL, group commit, segments, recovery, scheduler, concurrency,
   crates, latency budget.
 - `docs/ROADMAP.md` — this file.
@@ -25,8 +25,10 @@ Produce the complete, internally consistent specification the implementation mus
       error set.
 - [ ] Field names, config keys, defaults, and status codes are **identical** across all four docs
       (one vocabulary: `cap_records`/`cap_bytes`/`discard`/`durable`/`priority`+`auto_priority`,
-      `from_seq`/`next_from_seq`/`head_seq`/`earliest_seq`, tombstone `reason ∈ {cap, ttl, mixed,
-      recreated, from_seq_too_old}`, `meta` for record headers, `$`-prefixed server fields).
+      `from_seq`/`next_from_seq`/`head_seq`/`earliest_seq`/`evict_floor`, deletion via
+      `before_seq`/`match` (`Eq`/`Glob`), deletion described as permanent/async/silent/point-in-time,
+      tombstone `reason ∈ {cap, ttl, mixed, recreated, from_seq_too_old}`, `meta` for record headers,
+      `$`-prefixed server fields).
 - [ ] The three use-case recipes (job queue / pub/sub / strong delivery) are expressible purely with
       documented endpoints.
 - [ ] The seven safety invariants (DESIGN §9) are stated and traceable to specific mechanisms.
@@ -39,12 +41,16 @@ A correct, **complete** implementation of the entire `/v0` API with all data in 
 persistent, not yet scalable — but every endpoint, every semantic, and every error path works.
 
 **Scope**
-- Full HTTP surface (axum/hyper): boxes CRUD, write, diff, tag-delete, routers CRUD, SSE
-  (POST-create + GET-stream), health/ready/metrics.
-- In-memory `BoxIndex` (base+offset vector), `head_seq`/`earliest_seq`/`epoch` atomics.
-- Cap (`cap_records`/`cap_bytes`) + TTL eviction with watermark advance and in-band tombstones.
+- Full HTTP surface (axum/hyper): boxes CRUD, write, diff, delete (`before_seq`/`match`), routers
+  CRUD, SSE (POST-create + GET-stream), health/ready/metrics.
+- In-memory `BoxIndex` (base+offset vector) + per-box tag index, dual floor
+  (`earliest_seq`/`evict_floor`) + `epoch` atomics.
+- Cap (`cap_records`/`cap_bytes`) + TTL eviction advancing `evict_floor` with in-band tombstones.
 - `discard: "old" | "reject"` full-box policy (`422 box_full`).
-- Read-time tag-delete filters (exact + prefix), node loop-prevention, cursor-advance reads.
+- Permanent deletion via `POST .../delete` (`before_seq` snapshot, tag `match` exact + `tag*` prefix,
+  combined): point-in-time, silent (no tombstone), effective immediately on reads, `count`/`bytes`/
+  `earliest_seq` updated synchronously, lazy front-reclaim of dead slots. Node loop-prevention,
+  cursor-advance reads.
 - Routers: at-least-once forwarding, per-source FIFO, DAG cycle check (`409`), `allow_cycle` hop cap.
 - Multiplexed SSE: named events (`record`, `tombstone`, `caught-up`, `box-deleted`, `error`),
   composite `id:` cursors, heartbeats, `retry:`, resume via `Last-Event-ID`.
@@ -58,12 +64,18 @@ a no-op fast path in phase 2 (documented).
 **Acceptance criteria**
 - [ ] A conformance test suite drives every endpoint and asserts the documented JSON shapes and
       status codes.
-- [ ] Tombstone behavior verified: a consumer whose `from_seq` falls below `earliest_seq` after cap
-      eviction and after TTL expiry receives the correct `reason`, `gap_from`, `gap_to`.
+- [ ] Tombstone behavior verified: a consumer whose `from_seq + 1` falls below `evict_floor` after
+      cap eviction and after TTL expiry receives the correct `reason`, `gap_from`, `gap_to`; a
+      consumer whose cursor fell into a purely-**deleted** gap (below `earliest_seq` but at/above
+      `evict_floor`) receives **no** tombstone (`tombstone: null`) and the cursor advances silently.
 - [ ] Node loop-prevention verified: a node never receives its own records via `diff` or `watch`, and
       the cursor advances past them (`caught_up` reached, not an infinite empty loop).
-- [ ] Tag-delete verified: exact and `tag*` prefix suppress matching records on all subsequent reads;
-      future matching records are also suppressed; no tombstone is emitted for tag-deletes.
+- [ ] Deletion verified: `before_seq` (snapshot), tag `match` exact, and `tag*` prefix remove the
+      matching records present at call time from all subsequent reads and SSE; `count`/`bytes`/
+      `earliest_seq` update immediately; the delete is **point-in-time** (a later record with the
+      same tag is NOT deleted); it is **permanent** (no un-delete) and **silent** (no tombstone for
+      the deleted seqs); cap/TTL eviction STILL emits a tombstone (deletion never touches
+      `evict_floor`).
 - [ ] Router fan-out verified: a write to `src` appears in all `dst` boxes with `$node` preserved; a
       cycle-creating router is rejected `409`; an `allow_cycle` mirror terminates via the hop cap.
 - [ ] SSE verified: multi-box stream delivers `record`/`tombstone`/`caught-up`/heartbeat frames; a
@@ -77,10 +89,13 @@ a no-op fast path in phase 2 (documented).
 Lock in correctness and record initial performance numbers against the phase-2 server.
 
 **Scope**
-- Unit tests for every module (index, eviction, filters, scheduler, SSE framing, cursor math).
-- Property/fuzz tests for the seq/watermark/tombstone invariants (e.g. "a consumer reading from any
-  `from_seq` either sees a contiguous-after-filter stream or exactly one tombstone, never silent
-  loss").
+- Unit tests for every module (index, eviction, deletion + tag index, scheduler, SSE framing,
+  cursor math).
+- Property/fuzz tests for the seq/dual-watermark/tombstone invariants over randomized
+  write/evict/expire/delete/read sequences (e.g. "a consumer reading from any `from_seq` either sees
+  a strictly-increasing stream with the deleted/expired/own-node seqs silently skipped, or exactly
+  one tombstone iff its cursor fell below `evict_floor` — never silent involuntary loss, and never a
+  tombstone for a purely-deleted gap").
 - Integration tests for the use-case recipes end to end.
 - A criterion-based benchmark suite (see Benchmark plan below).
 - `docs/BENCHMARKS.md` recording the **initial baseline numbers** (in-memory phase-2), with hardware
@@ -88,7 +103,7 @@ Lock in correctness and record initial performance numbers against the phase-2 s
 
 **Acceptance criteria**
 - [ ] Line/branch coverage target met on the core engine modules (goal: ≥ 90% on
-      index/eviction/filters/scheduler).
+      index/eviction/deletion/scheduler).
 - [ ] Invariant property tests pass over randomized write/evict/expire/delete/read sequences.
 - [ ] The benchmark suite runs reproducibly and `docs/BENCHMARKS.md` contains baseline figures for
       every metric listed below.
@@ -105,10 +120,13 @@ Add persistence and scale underneath the unchanged API, staying a single restart
   fsync, preallocation, rotation.
 - Compactor: WAL→segment checkpointing; segment `.data`/`.idx`; mmap serving of sealed segments,
   buffered `pread` of the active one, WAL-direct serving of the newest records.
-- Segment-granular lazy eviction + persisted `EvictWatermark`.
+- Segment-granular lazy cap/TTL eviction + persisted `EvictWatermark` (advances `evict_floor`).
+- Async physical reclaim of deleted records (background reclaimer, ARCHITECTURE §3.5): whole-segment
+  drop when fully deleted, partial-segment **rewrite** to reclaim surviving records; `Delete` control
+  frames replay deterministically (idempotent reclaim across crashes).
 - Metadata store: WAL control frames + atomic bincode snapshots; interned `box_id`s.
-- Restart recovery: snapshot load → segment `.idx` bulk load → WAL replay from last checkpoint → CRC
-  torn-tail truncation → idempotent segment reclaim.
+- Restart recovery: snapshot load → segment `.idx` bulk load + tag-index rebuild → WAL replay from
+  last checkpoint (incl. `Delete` frames) → CRC torn-tail truncation → idempotent segment reclaim.
 - Full priority scheduler: banded DWRR + aging; governor-driven elastic throttling
   (coalesce → widen group commit → defer low priority → `429`).
 - Slow-consumer isolation for SSE (bounded channels, lagged-degrade-to-tombstone).
@@ -118,12 +136,15 @@ Add persistence and scale underneath the unchanged API, staying a single restart
       any instant and is present after restart; no acked durable write is ever lost.
 - [ ] **Crash consistency:** a kill during a write leaves the WAL recoverable — recovery truncates the
       torn tail (CRC/length), and no partial frame is ever interpreted as data.
-- [ ] **Recovery correctness:** after restart, `head_seq`/`earliest_seq`/`count`, config, routers, and
-      tag-delete filters match the pre-crash state (modulo un-fsynced non-durable tail).
+- [ ] **Recovery correctness:** after restart, `head_seq`/`earliest_seq`/`evict_floor`/`count`,
+      config, routers, and the set of deleted records match the pre-crash state (modulo un-fsynced
+      non-durable tail); previously-deleted records stay gone after replay of their `Delete` frames.
 - [ ] **No silent loss across restart:** a consumer whose cursor fell below the recovered
-      `earliest_seq` receives a tombstone, never silent skip.
-- [ ] **Eviction is segment-granular:** physical occupancy may transiently exceed cap by ≤ one
-      segment; `earliest_seq`/`count` always report the logical floor.
+      `evict_floor` receives a tombstone, never silent skip; a cursor in a purely-deleted gap stays
+      silent.
+- [ ] **Eviction is segment-granular; deletion reclaim is async:** physical occupancy may transiently
+      exceed cap by ≤ one segment and may transiently retain not-yet-reclaimed deleted records;
+      `earliest_seq`/`count`/`bytes` always report the live logical floor regardless.
 - [ ] **Latency target met:** non-durable / `eventual` SSE delivery p99 ≤ 5 ms at a defined sustained
       load (see benchmark plan); durable write-ack p99 within budget with adaptive group commit.
 - [ ] **Elastic throttling:** under induced CPU pressure, high-priority boxes keep their latency while
@@ -145,7 +166,7 @@ flags (`--release`), and methodology.
 |---|---|---|
 | **Write throughput** | records/s and MB/s appended | sustained `POST` batches at varied batch sizes (1, 10, 100, 1000) and payload sizes (64 B, 1 KiB, 64 KiB); durable vs non-durable. |
 | **Append latency p50/p99/p999** | end-to-end ack latency | single-record and batched writes, durable (fsync-gated, group-committed) vs non-durable; report the group-commit batch-size distribution. |
-| **getDifference throughput** | records/s served | replay reads at varied `limit` (1, 256, 1000) from cold (mmap fault) and warm (page cache) segments; with and without tag/node filters active. |
+| **getDifference throughput** | records/s served | replay reads at varied `limit` (1, 256, 1000) from cold (mmap fault) and warm (page cache) segments; with and without deleted/node-skipped records in the scanned range. |
 | **getDifference latency p50/p99** | per-call latency | tail reads (caught-up, near head) vs deep replay (cold segments). |
 | **SSE fan-out latency** | write→deliver p50/p99 | 1 writer, N watchers (1, 10, 100, 1000) on one box; measure per-watcher delivery latency; verify the 1–5 ms target for `eventual`. |
 | **SSE fan-out scale** | max watchers / connection churn | connection setup cost, heartbeat overhead, memory per idle connection. |
@@ -168,9 +189,10 @@ recovery costs.
 - **Cursor epoch encoding:** recommended yes — include an opaque `epoch` so delete+recreate is
   detected exactly rather than heuristically (DESIGN §5.5). Whether to expose the epoch in
   `next_from_seq`/SSE `id:` or keep it server-side is an implementation detail to settle in phase 4.
-- **Tag-delete un-delete:** `/v0` is monotonic (no un-delete). Since records are never physically
-  removed, a `/v1` could add lossless rule removal — defer the decision until a concrete operational
-  need appears.
+- **Delete un-delete:** **Resolved — deletion is permanent by design.** Records are physically
+  reclaimed (asynchronously), so there is no un-delete in `/v0` and none is planned; to restore a
+  value, write a new record. (This supersedes the earlier read-time-filter model, where removal was
+  a reversible filter.)
 - **Per-message explicit ack / lease / heartbeat (BullMQ stalled-job mode):** deliberately out of the
   core; a planned higher-level mode layered on tags + a side in-flight box. Decide its API shape
   (and capped-redelivery → dead-letter policy) after the core ships.

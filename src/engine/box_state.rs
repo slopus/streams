@@ -1,17 +1,22 @@
 //! Per-box in-memory state: the base+offset [`BoxIndex`], the watermark
-//! atomics, retained payload bytes, the tag-delete filter set, recency clocks,
-//! and the `Notify` used to wake SSE/diff long-pollers (ARCHITECTURE §1).
+//! atomics, retained payload bytes, the per-box tag index, recency clocks, and
+//! the `Notify` used to wake SSE/diff long-pollers (ARCHITECTURE §1).
 //!
 //! Phase 2 stores payload bytes directly on the heap (`StoredRecord`); phase 4
 //! re-points `RecordLoc` at mmap'd segments. The serving/indexing logic here is
 //! written once and reused.
+//!
+//! Deletion (DESIGN §7) is permanent, point-in-time, and silent. A record
+//! deleted in the *middle* of the log keeps its slot as a lightweight
+//! tombstone (`deleted` flag set; payload/tag freed; bytes/count adjusted) to
+//! preserve O(1) seq→slot indexing; only fully-dead *front* slots are
+//! physically popped (lazy reclaim), advancing `base_seq`.
 
 use crate::engine::eviction::Floors;
-use crate::engine::filters::FilterSet;
-use crate::types::BoxConfig;
+use crate::types::{BoxConfig, Filter};
 use parking_lot::RwLock;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tokio::sync::Notify;
 
@@ -26,6 +31,11 @@ pub struct DedupeEntry {
 
 /// One stored record. In phase 2 the payload lives inline on the heap; the
 /// `ts`/`tag`/`node` are kept for the read pipeline and TTL math.
+///
+/// A record deleted in the middle of the log keeps its slot as a lightweight
+/// tombstone: `deleted` is set and `data`/`meta`/`tag` are freed (replaced with
+/// `Null`/`None`) so the slot costs almost nothing while preserving O(1)
+/// indexing. Such a slot is never delivered.
 #[derive(Debug, Clone)]
 pub struct StoredRecord {
     pub ts: i64,
@@ -33,17 +43,32 @@ pub struct StoredRecord {
     pub tag: Option<String>,
     pub data: Value,
     pub meta: Option<Value>,
-    /// Accounted payload size (`data` + `meta` + framing estimate).
+    /// Accounted payload size (`data` + `meta` + framing estimate). Zeroed once
+    /// the slot is deleted (its bytes already subtracted from the box total).
     pub bytes: u64,
+    /// Set when this record has been deleted (permanent, silent). The slot is
+    /// retained only as a hole for O(1) indexing; its payload is freed.
+    pub deleted: bool,
 }
 
 /// The seq→record index: a contiguous deque offset by `base_seq`
 /// (ARCHITECTURE §1.1). `index i` corresponds to `seq = base_seq + i`.
+///
+/// Carries the per-box **tag index** (`tag → ascending live seqs`) so a tag
+/// delete is a point lookup (exact) or a bounded range scan (prefix) rather
+/// than a full log scan (DESIGN §7.2), and a `delete_below` marker (the max
+/// `before_seq` ever applied) so snapshot/prefix deletes are O(1) to apply: a
+/// read starts at `max(from_seq + 1, base_seq)` and then skips any remaining
+/// deleted slots.
 #[derive(Debug, Default)]
 pub struct BoxIndex {
     /// Seq of `records[0]`; the earliest physically present seq.
     pub base_seq: u64,
     pub records: VecDeque<StoredRecord>,
+    /// `tag → ascending live seqs` for efficient match-deletes (DESIGN §7.2).
+    pub tag_index: BTreeMap<String, Vec<u64>>,
+    /// Max `before_seq` applied by a delete; every seq `< delete_below` is dead.
+    pub delete_below: u64,
 }
 
 impl BoxIndex {
@@ -51,6 +76,8 @@ impl BoxIndex {
         BoxIndex {
             base_seq,
             records: VecDeque::new(),
+            tag_index: BTreeMap::new(),
+            delete_below: 0,
         }
     }
 
@@ -62,11 +89,120 @@ impl BoxIndex {
         self.records.get((seq - self.base_seq) as usize)
     }
 
-    /// Drop the oldest `n` records, advancing `base_seq`.
-    pub fn drain_front(&mut self, n: usize) {
+    /// Index of `seq` in `records`, if physically present.
+    fn slot_idx(&self, seq: u64) -> Option<usize> {
+        if seq < self.base_seq {
+            return None;
+        }
+        let i = (seq - self.base_seq) as usize;
+        if i < self.records.len() {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a seq is dead: physically gone, deleted, or below `delete_below`.
+    pub fn is_dead(&self, seq: u64) -> bool {
+        if seq < self.delete_below {
+            return true;
+        }
+        match self.slot_idx(seq) {
+            Some(i) => self.records[i].deleted,
+            None => seq < self.base_seq, // popped front ⇒ dead; future ⇒ alive.
+        }
+    }
+
+    /// Live seqs (ascending) whose tag matches `filter`, bounded by `bound`
+    /// (exclusive upper bound — the point-in-time head). Exact = point lookup;
+    /// prefix = a range scan over `[prefix, next-key)` of the tag index. Never
+    /// scans the whole log (DESIGN §7.2). Already-deleted slots are absent from
+    /// the tag index, so all returned seqs are live.
+    pub fn matching_live_seqs(&self, filter: &Filter, bound: u64) -> Vec<u64> {
+        use crate::types::FilterOp;
+        let mut out = Vec::new();
+        match filter.op {
+            FilterOp::Eq => {
+                if let Some(seqs) = self.tag_index.get(&filter.value) {
+                    out.extend(seqs.iter().copied().filter(|&s| s < bound));
+                }
+            }
+            FilterOp::Glob => {
+                let prefix = filter.value.as_str();
+                // Range scan from `prefix` to the first key that no longer
+                // starts with it. `BTreeMap<String,_>` is byte-ordered, so all
+                // keys with `prefix` form one contiguous run starting at the
+                // `range(prefix..)` lower bound (DESIGN §7.2).
+                for (tag, seqs) in self.tag_index.range(prefix.to_string()..) {
+                    if !tag.starts_with(prefix) {
+                        break;
+                    }
+                    out.extend(seqs.iter().copied().filter(|&s| s < bound));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Record a freshly-appended tagged record in the tag index.
+    pub fn index_tag(&mut self, seq: u64, tag: &str) {
+        // Appends are monotonic in seq, so push_back keeps the vec ascending.
+        self.tag_index.entry(tag.to_string()).or_default().push(seq);
+    }
+
+    /// Remove `seq` from `tag`'s posting list (on delete/reclaim).
+    fn unindex_tag(&mut self, tag: &str, seq: u64) {
+        if let Some(v) = self.tag_index.get_mut(tag) {
+            if let Ok(pos) = v.binary_search(&seq) {
+                v.remove(pos);
+            }
+            if v.is_empty() {
+                self.tag_index.remove(tag);
+            }
+        }
+    }
+
+    /// Drop the oldest `n` records, advancing `base_seq` and pruning their tag
+    /// postings. Used by both cap/TTL front-eviction and lazy delete reclaim.
+    /// Returns the number of popped slots that were still **live** (not already
+    /// deleted) — i.e. the involuntary-eviction count to subtract from
+    /// `live_count`.
+    pub fn drain_front(&mut self, n: usize) -> u64 {
         let n = n.min(self.records.len());
+        let mut live_popped = 0u64;
+        for i in 0..n {
+            let seq = self.base_seq + i as u64;
+            if !self.records[i].deleted {
+                live_popped += 1;
+            }
+            if let Some(tag) = self.records[i].tag.clone() {
+                self.unindex_tag(&tag, seq);
+            }
+        }
         self.records.drain(..n);
         self.base_seq += n as u64;
+        live_popped
+    }
+
+    /// Mark the slot at `seq` deleted (if live), freeing its payload/tag and
+    /// pruning its tag posting. Returns `Some(bytes_freed)` if it transitioned a
+    /// live slot to deleted, or `None` if the slot was absent or already dead.
+    fn mark_deleted(&mut self, seq: u64) -> Option<u64> {
+        let i = self.slot_idx(seq)?;
+        if self.records[i].deleted {
+            return None;
+        }
+        let freed = self.records[i].bytes;
+        if let Some(tag) = self.records[i].tag.take() {
+            self.unindex_tag(&tag, seq);
+        }
+        let rec = &mut self.records[i];
+        rec.deleted = true;
+        rec.bytes = 0;
+        rec.data = Value::Null;
+        rec.meta = None;
+        Some(freed)
     }
 }
 
@@ -76,11 +212,9 @@ pub struct BoxState {
     pub name: String,
     /// Live config (read-mostly; mutated under `index` write lock on `PUT`).
     pub config: RwLock<BoxConfig>,
-    /// The seq→record index.
+    /// The seq→record index (carries the per-box tag index + `delete_below`).
     pub index: RwLock<BoxIndex>,
-    /// Tag-delete rule set (DESIGN §7).
-    pub filters: RwLock<FilterSet>,
-    /// Eviction/expiry floors driving `earliest_seq`.
+    /// Eviction/expiry/delete floors driving `earliest_seq` (DESIGN §5.1).
     pub floors: RwLock<Floors>,
     /// `(idempotency_key → assigned seqs)` dedupe state (API §0.8). Entries are
     /// reclaimed lazily once older than the box's `idempotency_window_ms`.
@@ -94,6 +228,9 @@ pub struct BoxState {
     pub epoch: AtomicU64,
     /// Retained payload bytes (approximate under lazy eviction).
     pub bytes_retained: AtomicU64,
+    /// Count of currently-live (deliverable) records: incremented on append,
+    /// decremented on delete and on live cap/TTL eviction. Net of deletions.
+    pub live_count: AtomicU64,
 
     /// Recency clocks (ms; `0`/`MIN` sentinel for never).
     pub last_write_ms: AtomicI64,
@@ -115,13 +252,13 @@ impl BoxState {
             name,
             config: RwLock::new(config),
             index: RwLock::new(BoxIndex::new(seq_base)),
-            filters: RwLock::new(FilterSet::new()),
             floors: RwLock::new(Floors::default()),
             dedupe: RwLock::new(HashMap::new()),
             head_seq: AtomicU64::new(seq_base.saturating_sub(1)),
             seq_base,
             epoch: AtomicU64::new(epoch),
             bytes_retained: AtomicU64::new(0),
+            live_count: AtomicU64::new(0),
             last_write_ms: AtomicI64::new(TS_NEVER),
             last_read_ms: AtomicI64::new(TS_NEVER),
             last_consumed_ms: AtomicI64::new(TS_NEVER),
@@ -142,11 +279,28 @@ impl BoxState {
         self.head_seq().saturating_add(1)
     }
 
-    /// Logical earliest retained, deliverable seq (DESIGN §5.1). For an empty
-    /// box this is `head_seq + 1`.
+    /// Logical earliest retained, deliverable (first live) seq (DESIGN §5.1):
+    /// the seq of the first currently-live record, or `head_seq + 1` when the
+    /// box is empty. Driven by cap/TTL **and** deletes.
+    ///
+    /// A `match`-only delete that removes the front of the log advances
+    /// `base_seq` (via lazy front reclaim) without advancing any floor, so the
+    /// floors alone under-report `earliest_seq`. Fold in `base_seq` — the first
+    /// physically-present (hence first live, since reclaim pops leading holes)
+    /// seq — so the reported value tracks all forms of front removal.
     pub fn earliest_seq(&self) -> u64 {
+        let head = self.head_seq();
+        let floor_earliest = self.floors.read().earliest_seq(self.seq_base, head);
+        let base_seq = self.index.read().base_seq;
+        floor_earliest.max(base_seq).min(head.saturating_add(1))
+    }
+
+    /// The **involuntary** earliest seq (cap/TTL only) — the tombstone trigger
+    /// boundary (DESIGN §5.4). Excludes deletions, so a purely-deleted prefix
+    /// gap reads silently.
+    pub fn evict_earliest_seq(&self) -> u64 {
         let floors = self.floors.read();
-        floors.earliest_seq(self.seq_base, self.head_seq())
+        floors.evict_earliest(self.seq_base, self.head_seq())
     }
 
     /// Read a recency clock, mapping the sentinel to `None`.
@@ -172,9 +326,14 @@ impl BoxState {
 
         let start = self.head_seq().saturating_add(1);
         let mut added_bytes: u64 = 0;
+        let mut seq = start;
         for rec in records {
             added_bytes = added_bytes.saturating_add(rec.bytes);
+            if let Some(tag) = &rec.tag {
+                index.index_tag(seq, tag);
+            }
             index.records.push_back(rec);
+            seq += 1;
         }
         // Publish the new head_seq after the records are in the index so a
         // concurrent reader that observes the higher head also finds the slots.
@@ -183,6 +342,7 @@ impl BoxState {
         drop(index);
 
         self.bytes_retained.fetch_add(added_bytes, Ordering::Relaxed);
+        self.live_count.fetch_add(n, Ordering::Relaxed);
         self.last_write_ms.store(now_ms, Ordering::Relaxed);
         // Wake long-pollers (diff `wait_ms`) and SSE streams.
         self.notify.notify_waiters();
@@ -207,7 +367,7 @@ impl BoxState {
             return; // empty box, nothing retained.
         }
 
-        let mut index = self.index.write();
+        let index = self.index.read();
         let mut floors = self.floors.write();
 
         // --- TTL: advance expiry_floor past every expired record. -----------
@@ -270,39 +430,168 @@ impl BoxState {
             }
         }
 
-        // --- Drain physically-present records below the logical floor. ------
-        let earliest = floors.earliest_seq(self.seq_base, head);
+        drop(floors);
+        drop(index);
+        // --- Lazy front reclaim: pop the dead prefix (evicted/expired/deleted)
+        // physically, advancing base_seq. Deleted holes carry 0 bytes (already
+        // subtracted on delete), so this never double-counts. -----------------
+        self.reclaim_front(head);
+    }
+
+    /// Physically pop the fully-dead front prefix (below `earliest_seq` or a run
+    /// of already-deleted slots at the front), advancing `base_seq` and pruning
+    /// their tag postings. Lazy reclaim shared by cap/TTL eviction and deletes
+    /// (DESIGN §7, ARCHITECTURE §1.1). `head` is the box head at call time.
+    fn reclaim_front(&self, head: u64) {
+        let earliest = {
+            let floors = self.floors.read();
+            floors.earliest_seq(self.seq_base, head)
+        };
+        let mut index = self.index.write();
         let base = index.base_seq;
-        if earliest > base {
-            let drop_n = (earliest - base) as usize;
-            let drop_n = drop_n.min(index.records.len());
-            let mut freed: u64 = 0;
-            for rec in index.records.iter().take(drop_n) {
-                freed = freed.saturating_add(rec.bytes);
-            }
-            index.drain_front(drop_n);
-            if freed > 0 {
-                // saturating: bytes_retained is the authoritative retained sum.
-                let prev = self.bytes_retained.load(Ordering::Relaxed);
-                self.bytes_retained
-                    .store(prev.saturating_sub(freed), Ordering::Relaxed);
-            }
+
+        // Pop everything strictly below the logical floor, plus any further run
+        // of already-deleted slots that now sits at the front.
+        let mut drop_n = if earliest > base {
+            ((earliest - base) as usize).min(index.records.len())
+        } else {
+            0
+        };
+        while drop_n < index.records.len() && index.records[drop_n].deleted {
+            drop_n += 1;
+        }
+        if drop_n == 0 {
+            return;
+        }
+        let mut freed: u64 = 0;
+        for rec in index.records.iter().take(drop_n) {
+            freed = freed.saturating_add(rec.bytes);
+        }
+        let live_popped = index.drain_front(drop_n);
+        drop(index);
+        if freed > 0 {
+            // saturating: bytes_retained is the authoritative retained sum.
+            let prev = self.bytes_retained.load(Ordering::Relaxed);
+            self.bytes_retained
+                .store(prev.saturating_sub(freed), Ordering::Relaxed);
+        }
+        if live_popped > 0 {
+            let prev = self.live_count.load(Ordering::Relaxed);
+            self.live_count
+                .store(prev.saturating_sub(live_popped), Ordering::Relaxed);
         }
     }
 
-    /// Current retained record count (logical floor; DESIGN §5.6).
+    /// Current retained, **live** record count — net of deletions (DESIGN §5.6,
+    /// §7). Maintained as a running counter so middle-of-log deletes (which keep
+    /// a hole slot) are excluded.
     pub fn count(&self) -> u64 {
-        let head = self.head_seq();
-        let earliest = self.earliest_seq();
-        if head == 0 || earliest > head {
-            0
-        } else {
-            head - earliest + 1
-        }
+        self.live_count.load(Ordering::Relaxed)
     }
 
     /// Current retained payload bytes (approximate under lazy eviction).
     pub fn bytes(&self) -> u64 {
         self.bytes_retained.load(Ordering::Relaxed)
+    }
+
+    /// Apply a permanent, point-in-time, silent delete (DESIGN §7, API §5).
+    ///
+    /// Deletes records selected by `before_seq` (every live record with
+    /// `seq < before_seq`) AND/OR `match` (every live record whose tag matches,
+    /// bounded by the head at call time). At least one selector is supplied by
+    /// the caller (the engine validates `>=1`). Returns the number of records
+    /// removed by this call.
+    ///
+    /// Mechanics:
+    /// - Frees each matched slot's payload/tag, subtracts its bytes, decrements
+    ///   `live_count`, and prunes the tag index (O(matched), never a full scan).
+    /// - Advances `delete_below` and `delete_floor` for the prefix removed by
+    ///   `before_seq` — this advances `earliest_seq` but **never** `evict_floor`
+    ///   (silent, no tombstone).
+    /// - Triggers lazy front reclaim of the now-dead prefix.
+    pub fn apply_delete(&self, before_seq: Option<u64>, match_: Option<&Filter>, now_ms: i64) -> u64 {
+        // Sync floors first so we operate on the current logical state.
+        self.enforce_retention(now_ms);
+
+        let head = self.head_seq();
+        let earliest = self.earliest_seq();
+        // Point-in-time bound: a bare `match` is bounded by the head at call
+        // time (head + 1); combined with `before_seq` we take the tighter bound.
+        let bound = match before_seq {
+            Some(b) => b.min(head.saturating_add(1)),
+            None => head.saturating_add(1),
+        };
+
+        let mut freed_bytes: u64 = 0;
+        let mut deleted: u64 = 0;
+        let mut index = self.index.write();
+
+        // --- Collect the seqs to delete. -----------------------------------
+        let mut victims: Vec<u64> = Vec::new();
+        match match_ {
+            // `match` (optionally ANDed with before_seq): use the tag index so
+            // we never scan the whole log (DESIGN §7.2).
+            Some(filter) => {
+                victims = index.matching_live_seqs(filter, bound);
+            }
+            // `before_seq` only: every live record below the bound.
+            None => {
+                let base = index.base_seq;
+                let lo = earliest.max(base);
+                let mut seq = lo;
+                while seq < bound {
+                    if index.get(seq).map(|r| !r.deleted).unwrap_or(false) {
+                        victims.push(seq);
+                    }
+                    seq += 1;
+                }
+            }
+        }
+
+        for seq in victims {
+            if let Some(f) = index.mark_deleted(seq) {
+                freed_bytes = freed_bytes.saturating_add(f);
+                deleted += 1;
+            }
+        }
+
+        // A `before_seq`-ONLY delete removed a contiguous prefix: advance the
+        // delete watermark so `earliest_seq` jumps past it (silent). When a
+        // `match` is also supplied, `before_seq` is merely the AND bound on the
+        // tag match — it does NOT delete the whole prefix, so the watermark
+        // must not advance (those non-matching priors stay live).
+        if match_.is_none() {
+            if let Some(b) = before_seq {
+                let effective = b.min(head.saturating_add(1));
+                if effective > index.delete_below {
+                    index.delete_below = effective; // every seq < effective dead.
+                }
+            }
+        }
+        let delete_below = index.delete_below;
+        drop(index);
+
+        if freed_bytes > 0 {
+            let prev = self.bytes_retained.load(Ordering::Relaxed);
+            self.bytes_retained
+                .store(prev.saturating_sub(freed_bytes), Ordering::Relaxed);
+        }
+        if deleted > 0 {
+            let prev = self.live_count.load(Ordering::Relaxed);
+            self.live_count
+                .store(prev.saturating_sub(deleted), Ordering::Relaxed);
+        }
+        // Advance the voluntary delete_floor (NOT evict_floor) for the prefix.
+        if delete_below > 0 {
+            let mut floors = self.floors.write();
+            let new_floor = delete_below.saturating_sub(1);
+            if new_floor > floors.delete_floor {
+                floors.delete_floor = new_floor;
+            }
+        }
+
+        // Lazy physical reclaim of the now-dead front prefix.
+        self.reclaim_front(head);
+        deleted
     }
 }

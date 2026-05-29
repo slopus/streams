@@ -14,11 +14,16 @@ are specified in [DESIGN.md](DESIGN.md); the wire contract is [API.md](API.md).
 
 ## 0. Design principles
 
-1. **Never silent loss.** Every eviction/TTL crossing that passes a consumer's cursor surfaces an
-   in-band tombstone carrying `[gap_from, gap_to]`. The storage layer's job is to make the
-   *earliest retained seq* always cheaply queryable.
-2. **Trim at segment granularity, lazily.** Eviction never rewrites data or deletes individual
-   records on the hot path; it advances a watermark and drops whole sealed segment files.
+1. **Never silent loss.** Every **involuntary** eviction/TTL crossing that passes a consumer's
+   cursor surfaces an in-band tombstone carrying `[gap_from, gap_to]`. The storage layer's job is
+   to make the two floors — `earliest_seq` (first live seq) and `evict_floor` (the tombstone
+   trigger, involuntary loss only) — always cheaply queryable. Voluntary deletion advances
+   `earliest_seq`, never `evict_floor`, so a deleted gap reads silently (DESIGN §5.1).
+2. **Trim at segment granularity, lazily.** Cap/TTL eviction never rewrites data or deletes
+   individual records on the hot path; it advances a watermark and drops whole sealed segment
+   files. **Deletion** (voluntary) frees a record's payload immediately but reclaims physical
+   storage lazily too — popping front slots in-memory (§1), and rewriting/dropping segments in
+   the background in phase 4 (§3.5).
 3. **The WAL is the durability boundary.** "Only data not yet in the WAL is lost." Everything
    downstream (in-memory index, segments) is a derivable cache of WAL + checkpoints.
 4. **Seqs are mostly-sequential u64** → represent the seq→location index as a base+offset vector,
@@ -30,35 +35,48 @@ are specified in [DESIGN.md](DESIGN.md); the wire contract is [API.md](API.md).
 
 ### 1.1 The core: a base+offset location vector
 
-Eviction only ever removes a contiguous prefix; writes never skip; tag-deletion and node-filtering
-are read-time filters, not holes. So the seq→location map is, in practice, a **contiguous
-integer-keyed array offset by the earliest retained seq**:
+Cap/TTL eviction only ever removes a contiguous prefix; writes never skip; node-filtering is a
+read-time filter, not a hole. A **deletion in the middle** of the log is the one source of holes,
+and it is handled by keeping the slot in place as a lightweight tombstone (so the array stays
+dense and O(1)-indexable) — see below. So the seq→location map is a **contiguous integer-keyed
+array offset by the earliest physical seq**:
 
 ```rust
 struct BoxIndex {
-    base_seq: u64,             // seq of locs[0]; == earliest_retained physical seq
+    base_seq: u64,             // seq of locs[0]; == earliest physical (not-yet-popped) seq
     locs: VecDeque<RecordLoc>, // index i  <=>  seq (base_seq + i)
+    delete_below: u64,         // max before_seq ever applied (O(1) snapshot/prefix delete)
+    tag_index: BTreeMap<Box<str>, Vec<u64>>, // tag -> ascending LIVE seqs (§1.4)
 }
 struct RecordLoc {
     location: u32,  // which segment file (or sentinel = WAL)
     offset: u32,    // byte offset within that file
     len: u32,       // framed length (read a record without touching neighbors)
     ts: u64,        // server commit ms — kept inline for TTL binary search
-    flags: u8,      // has_tag, has_node, in_wal_only (not yet checkpointed)
+    flags: u8,      // has_tag, has_node, in_wal_only (not yet checkpointed), deleted
 }
 ```
 
-**Lookup** `seq → loc` is `locs[seq - base_seq]` — O(1), no hashing, cache-friendly. **Eviction**
-of a prefix is `locs.drain(..n)` plus `base_seq += n`; we drop whole segments so this is bounded.
-`getDifference(from_seq)` becomes "slice `locs[from_seq - base_seq ..]`" — exactly the batched-diff
-primitive.
+**Lookup** `seq → loc` is `locs[seq - base_seq]` — O(1), no hashing, cache-friendly. **Cap/TTL
+eviction** of a prefix is `locs.drain(..n)` plus `base_seq += n`; we drop whole segments so this is
+bounded. `getDifference(from_seq)` becomes "slice `locs[from_seq - base_seq ..]`" then skip
+deleted/expired/foreign slots — exactly the batched-diff primitive.
 
 **Why a vector, not `HashMap<u64,Loc>` / `BTreeMap`:** the base+offset trick eliminates the key
 entirely (the key *is* the array position). A `HashMap` costs ~3–4× the per-entry memory and
-random access on the hot read path; a `BTreeMap` is log(n) + pointer-chasing. With 24-byte
+random access on the hot read path; a `BTreeMap` is log(n) + pointer-chasing. With small
 `RecordLoc` entries the index packs into contiguous cache lines, and index memory is bounded by
-`cap_records` regardless. (If a future feature ever introduced holes, a `tombstone_local` flag
-keeps the slot present so the vector stays dense — but no current feature does.)
+`cap_records` regardless.
+
+**Deletion & lazy front-reclaim (the one hole source).** A record deleted in the **middle** keeps
+its slot as a lightweight tombstone: the `deleted` flag is set, its payload/tag is freed
+immediately (subtract `bytes`, decrement `count`, prune its `tag_index` entry), but the slot stays
+so `seq - base_seq` indexing remains O(1). Physical slots are popped only from the **front**:
+when the prefix of `locs` is fully dead (deleted/evicted/expired), `drain` it and advance
+`base_seq` — the same path that serves cap/TTL front-eviction. So a delete is *logically*
+immediate (invisible to reads, `count`/`bytes` updated) while physical reclaim is lazy. `base_seq`
+is the earliest **physical** seq; `earliest_seq` (DESIGN §5.1) is the earliest **live** seq and may
+be greater (the front holds dead-but-not-yet-popped slots).
 
 ### 1.2 Per-box in-memory state
 
@@ -66,12 +84,12 @@ keeps the slot present so the vector stays dense — but no current feature does
 struct Box {
     config: BoxConfig,                  // ttl_ms, cap_records, cap_bytes, discard, durable,
                                         //   priority, auto_priority, ...
-    index: parking_lot::RwLock<BoxIndex>,
+    index: parking_lot::RwLock<BoxIndex>, // locs + delete_below + tag_index (§1.1, §1.4)
     head_seq: AtomicU64,                // last assigned seq (log end)
-    earliest_seq: AtomicU64,            // earliest retained, the watermark (DESIGN §5.1)
+    earliest_seq: AtomicU64,            // earliest LIVE seq, the read watermark (DESIGN §5.1)
+    evict_floor: AtomicU64,             // involuntary cap/TTL floor; sole tombstone trigger
     epoch: AtomicU64,                   // bumped on create; detects delete+recreate
-    bytes_retained: AtomicU64,          // for byte-cap eviction
-    delete_filters: arc_swap::ArcSwap<FilterSet>, // tag-delete rules, copy-on-write
+    bytes_retained: AtomicU64,          // live payload bytes (for byte-cap eviction + state)
     eff_priority: AtomicI64,            // effective priority, recomputed lazily
     last_consumed_ms: AtomicU64,        // for auto-priority by recency
     waiters: tokio::sync::Notify,       // wakes SSE/diff long-pollers on append
@@ -79,19 +97,52 @@ struct Box {
 }
 ```
 
-`head_seq`/`earliest_seq`/`epoch`/`eff_priority` are atomics so `GET /v0/boxes/:box` is lock-free
-and the diff path can detect eviction with a single atomic load before taking the index read lock.
-`Notify` is the wakeup primitive that lets SSE/diff hit 1–5 ms without polling. The global registry
-is `DashMap<BoxId, Arc<Box>>` for sharded concurrent access across many boxes.
+`head_seq`/`earliest_seq`/`evict_floor`/`epoch`/`eff_priority` are atomics so `GET /v0/boxes/:box`
+is lock-free and the diff path can decide tombstone-vs-silent with two atomic loads
+(`from_seq + 1 < evict_floor` ⇒ tombstone; below `earliest_seq` but not `evict_floor` ⇒ silent
+deleted gap) before taking the index read lock. **The dual floor is the on-disk/in-memory
+expression of DESIGN §5.1:** `evict_floor` advances only on involuntary cap/TTL eviction of live
+records; deletion advances `earliest_seq` only. Invariant `evict_floor <= earliest_seq` is held by
+construction. `Notify` is the wakeup primitive that lets SSE/diff hit 1–5 ms without polling. The
+global registry is `DashMap<BoxId, Arc<Box>>` for sharded concurrent access across many boxes.
 
-### 1.3 Phase-2 (simple) shape
+### 1.3 The per-box tag index (efficient match-deletes)
+
+A `match` delete (DESIGN §7) MUST be efficient over many records — it must not scan the whole log.
+Each box keeps, inside `BoxIndex`, a **tag index** mapping a tag to its live seqs in ascending
+order:
+
+```rust
+tag_index: BTreeMap<Box<str>, Vec<u64>>,   // tag -> ascending live seqs
+```
+
+- **Maintained on append:** a tagged record pushes its seq onto `tag_index[tag]` (always
+  appending, so the vec stays sorted).
+- **Maintained on delete & front-reclaim:** when a record is deleted (or its front slot is
+  popped), its seq is removed from `tag_index[tag]`; an emptied key is dropped.
+- **`match ["tag","Eq","X"]`** → point lookup `tag_index["X"]`, mark those slots deleted (and, for
+  a combined `before_seq`, only the seqs `< before_seq`).
+- **`match ["tag","Glob","X*"]`** → range scan over keys in `["X", next-key)` (the lexicographic
+  successor of the prefix), unioning their seq vectors.
+
+A `before_seq`-only (snapshot/prefix) delete is O(1): bump `BoxIndex.delete_below = max(delete_below,
+before_seq)`; reads start at `max(from_seq + 1, base_seq)` and skip any slot `< delete_below`, while
+the background reclaimer pops the now-dead front. The tag index is held under the same per-box
+index `RwLock` as `locs` (a delete is a rare, mutating operation; the hot read path doesn't touch
+it).
+
+### 1.4 Phase-2 (simple) shape
 
 Phase-2 is this exact structure minus segments and WAL: `RecordLoc.location` is unused and payload
 bytes live in a `VecDeque<Bytes>` parallel to `locs`. No persistence; restart = empty. Everything
-else — API, base+offset index, atomics, tombstone logic, tag filters, node filtering, priority,
-`Notify` wakeups — is **identical and fully exercised**. Phase 4 only re-points `RecordLoc` from
-heap `Bytes` to mmap'd segment bytes and inserts the WAL on the write path; the serving and indexing
-logic is written once.
+else — API, base+offset index, the dual floor (`earliest_seq`/`evict_floor`) + tombstone logic,
+the tag index + permanent-delete path with lazy front-reclaim, node filtering, priority, `Notify`
+wakeups — is **identical and fully exercised**. Deletion in phase 2 frees the payload `Bytes`
+immediately (drop the slot's `Bytes`, subtract `bytes`, decrement `count`, prune the tag index) and
+pops fully-dead front slots; middle-deleted slots stay as flagged tombstones. Phase 4 only
+re-points `RecordLoc` from heap `Bytes` to mmap'd segment bytes, inserts the WAL on the write path,
+and adds background segment rewrite/drop for physical reclaim (§3.5); the serving and indexing logic
+is written once.
 
 ---
 
@@ -106,7 +157,7 @@ multi-record writes produce many frames committed as one batch). Multi-byte inte
  off  size  field
    0    4   frame_len   u32   bytes of this frame EXCLUDING this field
    4    1   type        u8    1=Append 2=BoxCreate 3=BoxDelete 4=RouterCreate
-                                5=RouterDelete 6=DeleteFilter 7=EvictWatermark
+                                5=RouterDelete 6=Delete 7=EvictWatermark
                                 8=CheckpointMark 9=ConfigUpdate
    5    1   flags       u8    bit0=has_tag bit1=has_node bit2=durable
    6    4   box_id      u32   interned numeric box id (string<->id in meta store)
@@ -128,9 +179,11 @@ multi-record writes produce many frames committed as one batch). Multi-byte inte
   anchor (§4).
 - **`box_id` is an interned u32** (not the string name), keeping frames small; the name↔id mapping
   lives in the metadata store (§5).
-- **Control frames** (BoxCreate, DeleteFilter, EvictWatermark, ConfigUpdate, …) share the same WAL,
-  so config and data live on one ordered, crash-consistent timeline — there is exactly one truth:
-  WAL order.
+- **Control frames** (BoxCreate, Delete, EvictWatermark, ConfigUpdate, …) share the same WAL, so
+  config, deletes, and data live on one ordered, crash-consistent timeline — there is exactly one
+  truth: WAL order. A `Delete` frame records the operation (`before_seq` and/or `match`) so the
+  permanent removal is replayed deterministically on recovery (the deleted seqs are re-derived from
+  the rebuilt index + tag index, not stored individually).
 
 ### 2.2 Append path
 
@@ -231,17 +284,20 @@ target size (64–256 MB); the newest is "active" (still appended), older ones i
 
 ### 3.3 TTL / cap eviction — cheap, no rewrite
 
-Eviction never rewrites a segment. Two mechanisms:
-1. **Watermark advance (logical eviction).** `earliest_seq` is authoritative. For count cap, when
-   `head_seq - earliest_seq > cap_records`, advance `earliest_seq`. For TTL, advance past records
-   whose `ts < now - ttl_ms` (binary search on inline `ts`). Advancing is an `AtomicU64` store +
-   `VecDeque::drain` on the index front. A read with `from_seq + 1 < earliest_seq` returns a
-   tombstone (DESIGN §5.4).
+Cap/TTL eviction is **involuntary** loss and advances **`evict_floor`** (the tombstone trigger).
+It never rewrites a segment. Two mechanisms:
+1. **Watermark advance (logical eviction).** For count cap, when `head_seq - earliest_seq >
+   cap_records`, advance `evict_floor` past the oldest live records (which also advances
+   `earliest_seq`). For TTL, advance past records whose `ts < now - ttl_ms` (binary search on
+   inline `ts`). Advancing is an `AtomicU64` store + `VecDeque::drain` on the index front. Popping
+   **already-deleted** front slots is *not* eviction and does **not** advance `evict_floor` (only
+   `earliest_seq`/`base_seq`); evicting **live** records does. A read with `from_seq + 1 <
+   evict_floor` returns a tombstone (DESIGN §5.4).
 2. **Segment dropping (physical reclaim).** A whole **sealed** segment whose highest seq <
-   `earliest_seq` is entirely evicted → its `.data`+`.idx` files are deleted. Reclaim is
-   segment-granular and lazy (Redis `~` / Kafka), so the box may retain slightly more than cap (only
-   whole sealed segments drop) — the documented, accepted approximation. The active segment is never
-   dropped.
+   `earliest_seq` is entirely gone (evicted or deleted) → its `.data`+`.idx` files are deleted.
+   Reclaim is segment-granular and lazy (Redis `~` / Kafka), so the box may retain slightly more
+   than cap (only whole sealed segments drop) — the documented, accepted approximation. The active
+   segment is never dropped.
 
 The new watermark is persisted via an **`EvictWatermark`** control frame (folded into the next
 CheckpointMark), so eviction and the tombstone boundary survive restart. A crash between
@@ -255,14 +311,44 @@ write (`422 box_full`) never enters the log — never ack-then-drop (the NATS Di
 ### 3.4 Serving `getDifference`: mmap vs buffered
 
 - **Sealed (immutable) segments → mmap** (`memmap2`): map `.data` once, slice `[offset..offset+len]`
-  per record (zero-copy, page-cache-backed). A diff is: bound-check against `earliest_seq`
-  (tombstone?), slice the index, then per entry copy framed bytes out of the mmap into the response,
-  applying tag-delete + node filters during the copy, bounded by `limit`.
+  per record (zero-copy, page-cache-backed). A diff is: bound-check against `evict_floor`
+  (tombstone?) and `earliest_seq` (live floor), slice the index, then per entry copy framed bytes
+  out of the mmap into the response, skipping deleted/expired/own-node slots during the copy,
+  bounded by `limit`.
 - **Active segment → buffered `pread`** (the growing file is usually still in page cache from the
   write; mmap past EOF is UB and remapping per append is wasteful).
 - **Newest records (written, not yet checkpointed) → served directly from WAL bytes** via the same
   `RecordLoc` mechanism (`location = WAL`). So a consumer 1–5 ms behind head reads from the WAL/page
   cache, never waiting for checkpoint — essential to the latency target.
+
+### 3.5 Permanent deletion & the background reclaimer (async physical reclaim)
+
+Deletion (DESIGN §7) is **logically immediate but physically lazy**, so it never stalls the hot
+path. The two halves:
+
+1. **Logical removal (synchronous, on the delete call).** Under the per-box index lock: resolve the
+   target seqs (`before_seq` via `delete_below`; `match` via the tag index, §1.3), set each slot's
+   `deleted` flag, free its payload/tag, subtract `bytes`, decrement `count`, prune tag-index
+   entries, and advance `earliest_seq` if the front became dead. Write the `Delete` control frame
+   (§2.1) and ack. Reads see the effect at once. **`evict_floor` is untouched** (deletion is
+   voluntary), so no tombstone results.
+2. **Physical reclaim (asynchronous, background).** A **reclaimer** task (sharing the compactor's
+   schedule, or its own low-priority lane) reclaims storage for deleted records:
+   - **In-memory (phase 2):** the payload `Bytes` were already dropped at delete time; the reclaimer
+     just pops fully-dead front slots (`locs.drain` + `base_seq +=`), the same path as cap/TTL
+     front-eviction. Middle holes remain as flag-only tombstones until the front catches up.
+   - **On-disk (phase 4):** a **sealed** segment whose records are *all* deleted is dropped whole
+     (delete `.data`+`.idx`), exactly like cap eviction. A segment that is only **partially**
+     deleted is reclaimed by **background segment rewrite**: copy its surviving (live) records into
+     a new sealed segment, fsync, atomically swap the `.idx`/`.data` + rebuild that segment's index
+     range, then unlink the old files. Rewrite is off the hot path, rate-limited, and idempotent
+     across crashes (the `Delete` control frames replay deterministically, so a crash mid-rewrite
+     re-derives the same live set). Until a segment is rewritten/dropped, deleted records still
+     occupy disk but are invisible to every read — the documented async-reclaim tradeoff (the
+     analog of cap eviction's "may transiently exceed cap by one segment").
+
+The reclaimer never affects correctness or visibility — only when the freed bytes are returned to
+the OS.
 
 ---
 
@@ -272,19 +358,24 @@ Goal: rebuild all in-memory state, lose only data not yet in the WAL, tolerate a
 instant.
 
 ```
-1. Open data dir; load latest valid metadata snapshot (boxes, routers, filters, name<->id,
-   watermarks, CURRENT wal ptr, last_checkpoint_seq).
+1. Open data dir; load latest valid metadata snapshot (boxes, routers, name<->id,
+   watermarks (evict_floor + earliest_seq), delete_below per box, CURRENT wal ptr,
+   last_checkpoint_seq).
 2. Per box: bulk-load segment .idx files into BoxIndex (fixed-stride sequential read). Set
-   base_seq from the lowest surviving segment, earliest_seq from the persisted watermark,
-   head_seq from the highest segment seq.
+   base_seq from the lowest surviving segment, evict_floor/earliest_seq from the persisted
+   watermarks, head_seq from the highest segment seq. Rebuild the tag index from the
+   surviving tagged records.
 3. Replay the WAL from the frame after the last CheckpointMark. For each frame, in order:
      - frame_len fits remaining bytes? else torn tail -> STOP (truncate here).
      - crc32c valid? else torn/partial -> STOP (truncate here).
-     - apply: Append -> push RecordLoc (location=WAL), bump head_seq.
-              Control frames -> mutate config/filters/watermarks.
+     - apply: Append -> push RecordLoc (location=WAL), index tag, bump head_seq.
+              Delete -> re-apply before_seq/match: mark slots deleted, free payloads,
+                        prune tag index, advance earliest_seq (NOT evict_floor).
+              other Control frames -> mutate config/watermarks/routers.
 4. Truncate the WAL at the first bad/partial frame boundary (ftruncate) -> clean for new appends.
-5. Re-derive droppable segments (sealed, fully below earliest_seq) and delete them (idempotent).
-6. Resume: open the truncated/fresh active WAL, start the writer + compactor.
+5. Re-derive droppable/rewritable segments (sealed, fully or partially below the live set) and
+   reclaim them (idempotent — §3.5).
+6. Resume: open the truncated/fresh active WAL, start the writer + compactor + reclaimer.
 ```
 
 **Crash-consistency guarantees:**
@@ -316,9 +407,9 @@ replaying the WAL from time zero.
 struct Meta {
     boxes:   HashMap<String, BoxId>,    // name -> interned u32 id (stable across restart)
     box_cfg: HashMap<BoxId, BoxConfig>,
-    watermarks: HashMap<BoxId, u64>,    // persisted earliest_seq per box
+    watermarks: HashMap<BoxId, (u64, u64)>, // persisted (evict_floor, earliest_seq) per box
+    delete_below: HashMap<BoxId, u64>,  // persisted max before_seq applied (snapshot delete)
     routers: Vec<Router>,               // {name, source, dest, preserve_*, filter, allow_cycle}
-    filters: HashMap<BoxId, FilterSet>, // tag-delete rules
     epochs: HashMap<BoxId, u64>,        // delete+recreate detection
     next_box_id: u32,
     current_wal: String,
@@ -326,23 +417,18 @@ struct Meta {
 }
 ```
 
-**Tag-delete filters** (read-time deletion, must be efficient over many records):
+**Deletes are not standing state.** Unlike the old read-time filter set, a permanent delete (DESIGN
+§7) leaves **no** per-box rule structure to persist: it is a one-shot operation logged as a `Delete`
+control frame and reflected immediately in the index (slots flagged deleted, payloads freed) and in
+the two persisted watermarks + `delete_below`. The only deletion-related structure carried at
+runtime is the per-box **tag index** (§1.3) used to *find* matching seqs efficiently; it is derived
+from the live records and rebuilt on recovery, not snapshotted.
 
-```rust
-struct FilterSet {
-    exact:    HashSet<Box<str>>,  // Eq tags -> O(1) membership
-    prefixes: Vec<Box<str>>,      // Glob "tag*" prefixes, sorted for binary search
-}
-```
-
-Per-record evaluation during a read: `exact.contains(tag)` is O(1); prefix match is binary search
-O(log P) — a handful of comparisons per record inside the read loop. Held behind **`ArcSwap`**, so
-adding a rule publishes a new `Arc<FilterSet>` (copy-on-write) and the frequent read path is
-wait-free (`load()` the current Arc). A filter mutation is a durable **`DeleteFilter`** control frame
-before ack, so deletions survive restart; because deletions are read-time filters tied to box config
-(not GC'd tombstones), a lagging consumer cannot miss a deletion (the Kafka `delete.retention.ms`
-race is avoided). Node loop-prevention reuses the same read-loop slot (skip if `$node ∈ reader set`)
-— one pass for TTL + tag + node filtering.
+**The read loop is filter-free for deletion.** Because a deleted slot carries a `deleted` flag, the
+read loop just skips flagged slots — O(1) per slot, no set/prefix lookup per record. The same loop
+skips TTL-expired slots (involuntary → feeds `evict_floor`) and own-node records (skip if `$node ∈
+reader set`). One pass for TTL + deleted + node skipping; the tag index is consulted only at
+*delete* time, never on the read path.
 
 **Durability & recovery.** The snapshot is written atomically (`snapshot.<n+1>.tmp` → fsync → rename
 → fsync dir → delete old); atomic rename gives crash-atomic metadata swaps. On recovery, load the
@@ -537,8 +623,8 @@ The push chain on a non-durable write, unsaturated:
 2. **Watcher registry, not scan** (~µs): each box keeps its registered watchers; the `Notify` wakes
    only those connections. No periodic poll; idle boxes cost nothing.
 3. **Coalesced flush** (~tens of µs): each woken worker reads from its per-box cursor up to
-   `limit`/`max_batch_bytes`, applies node + tag filters, builds one frame, writes to the socket and
-   flushes (`X-Accel-Buffering: no` + `TCP_NODELAY` → no proxy/Nagle buffering).
+   `limit`/`max_batch_bytes`, skipping deleted/expired/own-node slots, builds one frame, writes to
+   the socket and flushes (`X-Accel-Buffering: no` + `TCP_NODELAY` → no proxy/Nagle buffering).
 4. **Routers add one hop** (~µs): a forwarded record triggers the dest box's `Notify` exactly like a
    direct write — one extra in-process append.
 5. **Backpressure cannot stall the writer**: the write path only *signals*; slow-consumer buffering
@@ -578,7 +664,7 @@ deliberate pacing of low-priority boxes under CPU pressure — both explicit and
 | `memmap2` | segment reads | mmap sealed immutable segments for zero-copy, page-cache-backed `getDifference`. |
 | `parking_lot` | locks | Faster, smaller `RwLock`/`Mutex` for the per-box index lock on the hot path. |
 | `dashmap` | box registry | Sharded concurrent `HashMap<BoxId, Arc<Box>>` — many boxes without a global lock. |
-| `arc-swap` | COW config/filters | Wait-free `load()` of the current `FilterSet` on the read path; rare writers publish a new `Arc`. |
+| `arc-swap` | COW config | Wait-free `load()` of a box's current config/router set on the hot path; rare writers publish a new `Arc`. |
 | `smallvec` | tiny allocations | Per-write seq batches / small node/tag buffers avoid heap allocation in the common single-record case. |
 | `rustix` (or `nix`) | raw fs syscalls | `fdatasync`, `fallocate`, `pread`, atomic `renameat` + dir fsync — durability primitives std doesn't expose. |
 | `ahash` | fast hashing | Backing hasher for `dashmap` / exact-tag `HashSet`. |
@@ -592,17 +678,22 @@ deliberate pacing of low-priority boxes under CPU pressure — both explicit and
 ## 11. Phase-2 → Phase-4 summary
 
 **Unchanged across phases** (write once in phase 2): the HTTP API surface, the base+offset
-`BoxIndex`, `head_seq`/`earliest_seq`/`epoch` atomics, tombstone/gap computation, the tag-delete
-`FilterSet` + node loop-prevention read loop, priority/recency tracking, `Notify`-based SSE/diff
-wakeups, the banded scheduler (in-memory it just has nothing to fsync).
+`BoxIndex`, the dual floor (`earliest_seq`/`evict_floor`) + `epoch` atomics, tombstone/gap
+computation, the per-box tag index + permanent-delete path (logical removal + lazy front-reclaim) +
+node loop-prevention read loop, priority/recency tracking, `Notify`-based SSE/diff wakeups, the
+banded scheduler (in-memory it just has nothing to fsync).
 
 **Added in phase 4:** the WAL (framing, single-writer group commit, per-box durable fsync), the
 compactor (WAL→segment checkpointing), segment files + `.idx` + mmap serving, segment-granular lazy
-eviction, metadata snapshots + control-frame replay, and restart recovery. Phase 4 only re-points
-`RecordLoc` from heap `Bytes` to `(location, offset, len)` and inserts the WAL on the append path —
-the serving and indexing logic is reused intact.
+cap/TTL eviction, the **background reclaimer** (async physical reclaim of deleted records via
+whole-segment drop and partial-segment rewrite, §3.5), metadata snapshots + control-frame replay
+(incl. `Delete` frames), and restart recovery. Phase 4 only re-points `RecordLoc` from heap `Bytes`
+to `(location, offset, len)`, inserts the WAL on the append path, and adds background segment
+rewrite/drop — the serving and indexing logic is reused intact.
 
-**The two highest-value invariants the storage layer enforces:** (1) *never silent loss* —
-`earliest_seq` is always durable and cheaply queryable, so any read crossing it yields an in-band
-tombstone; (2) *segment-granular, lazy eviction* — never rewrite or per-record delete on the hot
-path; advance a watermark and drop whole sealed segments.
+**The three highest-value invariants the storage layer enforces:** (1) *never silent involuntary
+loss* — `evict_floor` is always durable and cheaply queryable, so any read crossing it yields an
+in-band tombstone, while a purely-deleted gap (below `earliest_seq`, at/above `evict_floor`) reads
+silently; (2) *segment-granular, lazy cap/TTL eviction* — never rewrite on the hot path; advance a
+watermark and drop whole sealed segments; (3) *deletion is logically immediate, physically lazy* —
+free the payload and advance `earliest_seq` synchronously, reclaim disk/memory in the background.

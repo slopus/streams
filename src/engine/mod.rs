@@ -597,6 +597,10 @@ impl Engine {
 
         let head = b.head_seq();
         let earliest = b.earliest_seq();
+        // The involuntary (cap/TTL-only) floor: the SOLE tombstone trigger
+        // (DESIGN §5.4). A purely-deleted prefix gap sits below `earliest` but
+        // at/above `evict_earliest`, so it reads silently (`tombstone: null`).
+        let evict_earliest = b.evict_earliest_seq();
         let from_seq = req.from_seq;
 
         let cfg = b.config.read();
@@ -607,19 +611,13 @@ impl Engine {
 
         // --- Tombstone / recreate detection (DESIGN §5.4/§5.5). -------------
         let mut tombstone: Option<Tombstone> = None;
-        // A cursor that fell below the retained floor: `from_seq + 1 < earliest`.
+        // A cursor that fell below the INVOLUNTARY floor: `from_seq + 1 <
+        // evict_earliest`. Deletions never trigger a tombstone.
         let mut cursor = from_seq;
         if from_seq > head {
             // From the future relative to this box instance ⇒ delete+recreate
             // (or a stale cursor). Emit a `recreated` tombstone and resume from
             // earliest (DESIGN §5.5).
-            let ts = eviction::build_tombstone(
-                head, // gap_from = head + 1 (seq_base..head, possibly empty)
-                earliest,
-                head,
-                TombstoneReason::Recreated,
-            );
-            // For recreate the gap range is [seq_base, head]; recompute.
             tombstone = Some(Tombstone {
                 gap_from: b.seq_base,
                 gap_to: head,
@@ -628,12 +626,20 @@ impl Engine {
                 earliest_seq: earliest,
                 head_seq: head,
             });
-            let _ = ts;
             cursor = earliest.saturating_sub(1);
-        } else if from_seq.saturating_add(1) < earliest {
+        } else if from_seq.saturating_add(1) < evict_earliest {
+            // Involuntary cap/TTL loss reached the cursor: emit a tombstone whose
+            // gap ends at the involuntary floor (`evict_earliest - 1`).
             let reason = b.floors.read().reason_for_gap(from_seq.saturating_add(1));
-            tombstone = Some(eviction::build_tombstone(from_seq, earliest, head, reason));
-            cursor = earliest.saturating_sub(1);
+            tombstone = Some(eviction::build_tombstone(
+                from_seq,
+                evict_earliest,
+                head,
+                reason,
+            ));
+            // Resume at `earliest` (which also accounts for deletions) so any
+            // purely-deleted records between the floors are skipped silently.
+            cursor = earliest.saturating_sub(1).max(from_seq);
         }
 
         // --- Walk records, applying the read pipeline (DESIGN §7.3). --------
@@ -642,34 +648,30 @@ impl Engine {
         let mut next_from_seq = cursor;
         {
             let index = b.index.read();
-            let filters = b.filters.read();
             let mut seq = cursor.saturating_add(1);
             while seq <= head && records.len() < limit {
                 let Some(rec) = index.get(seq) else {
-                    // Below base_seq (shouldn't happen after floor sync) — skip.
+                    // Below base_seq (reclaimed) — skip; cursor still advances.
                     next_from_seq = seq;
                     seq += 1;
                     continue;
                 };
                 scanned += 1;
                 let decision = filters::evaluate(
-                    &filters,
                     node_filter,
                     ttl_ms,
                     now,
                     rec.ts,
-                    rec.tag.as_deref(),
+                    rec.deleted,
                     rec.node.as_deref(),
                 );
                 match decision {
                     filters::ReadDecision::Deliver => {
-                        records.push(record_out(seq, rec, &req, false));
+                        records.push(record_out(seq, rec, &req));
                     }
-                    filters::ReadDecision::TagDeleted => {
-                        if req.include_deleted {
-                            records.push(record_out(seq, rec, &req, true));
-                        }
-                        // else: silently skipped, cursor still advances.
+                    filters::ReadDecision::Deleted => {
+                        // Permanently deleted: silently skipped (DESIGN §7); the
+                        // cursor still advances past the dead seq.
                     }
                     filters::ReadDecision::NodeFiltered => {
                         // Silently skipped; cursor advances (DESIGN §6).
@@ -704,78 +706,31 @@ impl Engine {
     }
 
     // -----------------------------------------------------------------------
-    // Tag-delete (API §5)
+    // Deletion (permanent, point-in-time, silent — API §5, DESIGN §7)
     // -----------------------------------------------------------------------
 
-    /// `POST /v0/boxes/:box/delete` — add tag-delete filters.
-    pub fn add_filters(
-        &self,
-        name: &str,
-        filters: Vec<Filter>,
-    ) -> Result<DeleteFiltersResponse> {
+    /// `POST /v0/boxes/:box/delete` — permanently delete records by seq range
+    /// (`before_seq`) and/or tag `match`. At least one selector is required.
+    pub fn delete(&self, name: &str, req: DeleteRequest) -> Result<DeleteResponse> {
         let start = Instant::now();
+        // At least one of before_seq / match is required (API §5).
+        if req.before_seq.is_none() && req.match_.is_none() {
+            return Err(Error::invalid_request(
+                "delete requires at least one of `before_seq` or `match`",
+            ));
+        }
         let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
         let now = self.clock.now_ms();
 
-        let mut set = b.filters.write();
-        // Enforce the per-box hard cap (API §5.1).
-        let projected = set.len() + filters.len();
-        if projected > config::MAX_DELETE_FILTERS {
-            return Err(Error::new(
-                ErrorCode::TooManyFilters,
-                format!(
-                    "would exceed max {} delete filters",
-                    config::MAX_DELETE_FILTERS
-                ),
-            ));
-        }
+        let deleted = b.apply_delete(req.before_seq, req.match_.as_ref(), now);
 
-        let mut added = Vec::new();
-        for f in &filters {
-            if set.add(f) {
-                added.push(f.clone());
-            }
-        }
-        let total = set.len();
-        drop(set);
-
-        // Best-effort estimate: how many currently-retained records the newly
-        // added filters now match (informational; API §5.1).
-        let matched_estimate = if added.is_empty() {
-            0
-        } else {
-            b.enforce_retention(now);
-            let index = b.index.read();
-            let added_set: Vec<&Filter> = added.iter().collect();
-            index
-                .records
-                .iter()
-                .filter(|r| {
-                    r.tag
-                        .as_deref()
-                        .map(|t| added_set.iter().any(|f| f.matches(t)))
-                        .unwrap_or(false)
-                })
-                .count() as u64
-        };
-
-        Ok(DeleteFiltersResponse {
+        Ok(DeleteResponse {
             box_name: name.to_string(),
-            filters_added: added,
-            filters_total: total,
-            matched_estimate,
-            performance: Performance::with_total(elapsed_ms(start)),
-        })
-    }
-
-    /// `GET /v0/boxes/:box/delete` — list active filters.
-    pub fn list_filters(&self, name: &str) -> Result<ListFiltersResponse> {
-        let start = Instant::now();
-        let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
-        let filters = b.filters.read().to_filters();
-        Ok(ListFiltersResponse {
-            box_name: name.to_string(),
-            filters,
+            deleted,
+            earliest_seq: b.earliest_seq(),
+            head_seq: b.head_seq(),
+            count: b.count(),
+            bytes: b.bytes(),
             performance: Performance::with_total(elapsed_ms(start)),
         })
     }
@@ -1068,19 +1023,19 @@ fn build_stored_owned(
         data,
         meta,
         bytes,
+        deleted: false,
     })
 }
 
 /// Project a stored record onto the wire `RecordOut`, respecting the diff
-/// request's `include_tags`/`include_meta`/`include_deleted` flags.
-fn record_out(seq: u64, rec: &StoredRecord, req: &DiffRequest, deleted: bool) -> RecordOut {
+/// request's `include_tags`/`include_meta` flags.
+fn record_out(seq: u64, rec: &StoredRecord, req: &DiffRequest) -> RecordOut {
     RecordOut {
         seq,
         ts: rec.ts,
         node: rec.node.clone(),
         tag: if req.include_tags { rec.tag.clone() } else { None },
         type_: None,
-        deleted: if deleted { Some(true) } else { None },
         data: rec.data.clone(),
         meta: if req.include_meta { rec.meta.clone() } else { None },
     }
@@ -1288,8 +1243,42 @@ mod tests {
         assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![4]);
     }
 
+    /// Build a delete request from optional before_seq + match shorthand.
+    fn delete_req(before_seq: Option<u64>, match_: Option<&str>) -> DeleteRequest {
+        DeleteRequest {
+            before_seq,
+            match_: match_.map(Filter::from_shorthand),
+        }
+    }
+
+    // (a) before_seq / snapshot delete: records below skipped silently,
+    // tombstone null, earliest advances, count drops.
     #[test]
-    fn tag_delete_exact_and_prefix_suppress() {
+    fn delete_before_seq_snapshot_is_silent() {
+        let (engine, _clock) = engine_with_clock();
+        for i in 1..=5 {
+            engine
+                .write("snap", write_req(vec![rec(json!({"i": i}), None, None)]), true)
+                .unwrap();
+        }
+        // Delete everything below seq 3 (snapshot/compaction).
+        let resp = engine.delete("snap", delete_req(Some(3), None)).unwrap();
+        assert_eq!(resp.deleted, 2); // seqs 1,2 removed.
+        assert_eq!(resp.earliest_seq, 3);
+        assert_eq!(resp.count, 3);
+
+        let d = engine.diff("snap", diff_from(0)).unwrap();
+        let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![3, 4, 5]); // 1,2 gone.
+        assert!(d.tombstone.is_none(), "deletion is silent");
+        assert_eq!(d.earliest_seq, 3);
+        assert!(d.caught_up);
+    }
+
+    // (b) match Eq + match Glob prefix delete of EXISTING records: gone from
+    // reads, silent, count drops.
+    #[test]
+    fn delete_match_exact_and_prefix_is_silent() {
         let (engine, _clock) = engine_with_clock();
         engine
             .write(
@@ -1304,69 +1293,163 @@ mod tests {
             )
             .unwrap();
 
-        // Exact delete of job-1.
-        engine
-            .add_filters("jobs", vec![Filter::from_shorthand("tenant42:job-1")])
+        // Exact match delete of job-1.
+        let r1 = engine
+            .delete("jobs", delete_req(None, Some("tenant42:job-1")))
             .unwrap();
+        assert_eq!(r1.deleted, 1);
+        assert_eq!(r1.count, 3);
         let d = engine.diff("jobs", diff_from(0)).unwrap();
         let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
-        assert_eq!(seqs, vec![2, 3, 4]); // 1 suppressed, cursor still at head.
-        assert!(d.tombstone.is_none()); // tag-delete is silent.
+        assert_eq!(seqs, vec![2, 3, 4]); // 1 removed (middle hole), cursor at head.
+        assert!(d.tombstone.is_none(), "delete is silent");
         assert!(d.caught_up);
         assert_eq!(d.next_from_seq, 4);
 
-        // Prefix delete of all tenant42:* → suppresses 2 as well.
-        let resp = engine
-            .add_filters("jobs", vec![Filter::from_shorthand("tenant42:*")])
+        // Prefix glob delete of all tenant42:* → removes 2 as well.
+        let r2 = engine
+            .delete("jobs", delete_req(None, Some("tenant42:*")))
             .unwrap();
-        assert!(resp.filters_added.iter().any(|f| f.op == FilterOp::Glob));
+        assert_eq!(r2.deleted, 1); // only seq 2 still matched (1 already gone).
+        assert_eq!(r2.count, 2);
         let d2 = engine.diff("jobs", diff_from(0)).unwrap();
         let seqs2: Vec<u64> = d2.records.iter().map(|r| r.seq).collect();
         assert_eq!(seqs2, vec![3, 4]); // tenant42:* gone; untagged stays.
         assert!(d2.tombstone.is_none());
         assert!(d2.caught_up);
-
-        // include_deleted surfaces them with $deleted.
-        let d3 = engine
-            .diff(
-                "jobs",
-                DiffRequest {
-                    from_seq: 0,
-                    include_deleted: true,
-                    ..DiffRequest::default()
-                },
-            )
-            .unwrap();
-        let deleted: Vec<u64> = d3
-            .records
-            .iter()
-            .filter(|r| r.deleted == Some(true))
-            .map(|r| r.seq)
-            .collect();
-        assert_eq!(deleted, vec![1, 2]);
-
-        // Listing returns the canonical tuples.
-        let listed = engine.list_filters("jobs").unwrap();
-        assert_eq!(listed.filters.len(), 2);
     }
 
+    // (c) point-in-time: a same-tag record written AFTER the delete is NOT
+    // deleted (deletion is not a standing filter).
     #[test]
-    fn future_matching_records_also_suppressed() {
+    fn delete_is_point_in_time() {
         let (engine, _clock) = engine_with_clock();
         engine
             .write("jobs", write_req(vec![rec(json!({}), Some("a:1"), None)]), true)
             .unwrap();
-        engine
-            .add_filters("jobs", vec![Filter::from_shorthand("a:*")])
-            .unwrap();
-        // A record written AFTER the filter still gets suppressed.
+        // Delete all existing a:* (just seq 1).
+        let r = engine.delete("jobs", delete_req(None, Some("a:*"))).unwrap();
+        assert_eq!(r.deleted, 1);
+        // A record written AFTER the delete with a matching tag survives.
         engine
             .write("jobs", write_req(vec![rec(json!({}), Some("a:2"), None)]), true)
             .unwrap();
         let d = engine.diff("jobs", diff_from(0)).unwrap();
-        assert!(d.records.is_empty());
+        let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![2], "future matching record is not deleted");
+        assert!(d.tombstone.is_none());
         assert!(d.caught_up);
         assert_eq!(d.next_from_seq, 2);
+    }
+
+    // (d) match + before_seq: deletes prior versions, keeps the newer same-tag
+    // record (publish v2 then delete priors of msg-123).
+    #[test]
+    fn delete_match_and_before_seq_keeps_newer() {
+        let (engine, _clock) = engine_with_clock();
+        // Three versions of msg-123 (seqs 1,2,3) interleaved with another tag.
+        engine
+            .write(
+                "msgs",
+                write_req(vec![
+                    rec(json!({"v": 1}), Some("msg-123"), None), // seq 1
+                    rec(json!({"x": 1}), Some("msg-999"), None), // seq 2
+                    rec(json!({"v": 2}), Some("msg-123"), None), // seq 3
+                ]),
+                true,
+            )
+            .unwrap();
+        // Delete prior versions of msg-123 (seq < 3 AND tag == msg-123) ⇒ seq 1.
+        let r = engine
+            .delete("msgs", DeleteRequest {
+                before_seq: Some(3),
+                match_: Some(Filter::from_shorthand("msg-123")),
+            })
+            .unwrap();
+        assert_eq!(r.deleted, 1, "only the prior msg-123 (seq 1) is removed");
+        let d = engine
+            .diff("msgs", DiffRequest { from_seq: 0, include_tags: true, ..DiffRequest::default() })
+            .unwrap();
+        let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
+        // seq 1 gone; seq 2 (other tag) kept; seq 3 (newer msg-123) kept.
+        assert_eq!(seqs, vec![2, 3]);
+        assert!(d.tombstone.is_none());
+    }
+
+    // (e) DUAL WATERMARK: a deletion is silent while a cap eviction on the same
+    // box still yields reason=cap.
+    #[test]
+    fn delete_silent_but_cap_still_tombstones() {
+        let (engine, _clock) = engine_with_clock();
+        let cfg = BoxConfig {
+            cap_records: 4,
+            ..BoxConfig::default()
+        };
+        engine.put_box("dual", cfg).unwrap();
+        // Write 4 (seqs 1..=4), all within cap. Delete seq 2 (a middle hole).
+        for i in 1..=4 {
+            engine
+                .write("dual", write_req(vec![rec(json!({"i": i}), None, None)]), true)
+                .unwrap();
+        }
+        engine.delete("dual", delete_req(Some(3), None)).unwrap(); // removes 1,2.
+        // Reading from 0 across the purely-deleted prefix is SILENT.
+        let d = engine.diff("dual", diff_from(0)).unwrap();
+        assert!(d.tombstone.is_none(), "delete gap is silent");
+        assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4]);
+
+        // Now overflow the cap so seqs are involuntarily evicted → reason=cap.
+        for i in 5..=10 {
+            engine
+                .write("dual", write_req(vec![rec(json!({"i": i}), None, None)]), true)
+                .unwrap();
+        }
+        // head=10, cap=4 ⇒ evict_floor reaches 6, earliest=7.
+        let d2 = engine.diff("dual", diff_from(0)).unwrap();
+        let tomb = d2.tombstone.expect("cap eviction still tombstones");
+        assert_eq!(tomb.reason, TombstoneReason::Cap);
+    }
+
+    // (f) tag index efficiency path: exact + prefix matching resolve via the
+    // per-box tag index (verified by correctness of the matched sets).
+    #[test]
+    fn tag_index_exact_and_prefix_paths() {
+        let (engine, _clock) = engine_with_clock();
+        engine
+            .write(
+                "tix",
+                write_req(vec![
+                    rec(json!({}), Some("chat-42:a"), None),  // seq 1
+                    rec(json!({}), Some("chat-42:b"), None),  // seq 2
+                    rec(json!({}), Some("chat-420:c"), None), // seq 3 (not chat-42:*)
+                    rec(json!({}), Some("zzz"), None),        // seq 4
+                ]),
+                true,
+            )
+            .unwrap();
+        // Exact: deletes only the one exact tag.
+        let e = engine.delete("tix", delete_req(None, Some("chat-42:a"))).unwrap();
+        assert_eq!(e.deleted, 1);
+        // Prefix chat-42:* matches seq 2 only now (seq 1 gone, seq 3 is chat-420).
+        let p = engine.delete("tix", delete_req(None, Some("chat-42:*"))).unwrap();
+        assert_eq!(p.deleted, 1, "prefix range scan must not match chat-420:c");
+        let d = engine
+            .diff("tix", DiffRequest { from_seq: 0, include_tags: true, ..DiffRequest::default() })
+            .unwrap();
+        let tags: Vec<&str> = d.records.iter().filter_map(|r| r.tag.as_deref()).collect();
+        assert_eq!(tags, vec!["chat-420:c", "zzz"]);
+    }
+
+    #[test]
+    fn delete_requires_a_selector() {
+        let (engine, _clock) = engine_with_clock();
+        engine
+            .write("b", write_req(vec![rec(json!({}), None, None)]), true)
+            .unwrap();
+        let err = engine
+            .delete("b", DeleteRequest::default())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -1740,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn router_get_missing_is_404_and_list_filters() {
+    fn router_get_missing_is_404_and_list_routers() {
         let (engine, _clock) = engine_with_clock();
         let err = engine.get_router("nope").unwrap_err();
         assert_eq!(err.code, ErrorCode::RouterNotFound);

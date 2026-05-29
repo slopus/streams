@@ -16,7 +16,8 @@ and `i64` are the literal Rust types.
 ## 1. Record
 
 A record is one immutable event in a box. Once assigned a `seq`, a record's fields never change.
-"Deletion" (§7) and eviction (§5) do not mutate records; they affect visibility only.
+Deletion (§7) and eviction (§5) never mutate a record's fields; a record is either present (and
+unchanged) or removed (gone). Deletion is permanent removal, not a mutation.
 
 ### 1.1 Fields
 
@@ -25,7 +26,7 @@ A record is one immutable event in a box. Once assigned a `seq`, a record's fiel
 | Sequence | — / `$seq` | u64 | server | n/a | Per-box monotonic id, assigned at commit (§4). |
 | Timestamp | — / `$ts` | u64 ms | server | n/a | Server wall-clock at commit; used for TTL (§5.2). |
 | Origin node | `node` / `$node` | string | client | optional | Loop-prevention key (§6). |
-| Tag | `tag` / `$tag` | string | client | optional | Read-time deletion match key (§7). |
+| Tag | `tag` / `$tag` | string | client | optional | Deletion match key (§7). |
 | Meta | `meta` / `meta` | object<string,string> | client | optional | Small opaque metadata/headers. |
 | Data | `data` / `data` | arbitrary JSON | client | required | Opaque payload; the product treats it as bytes. |
 
@@ -45,7 +46,7 @@ not `null`); `data` is always present (may be JSON `null`). A read-returned reco
 | Limit | Default | Justification |
 |---|---|---|
 | `data`+`meta` (canonical bytes) | 1 MiB | Fat job payloads / batched events, yet small enough that one record can't blow a WAL frame or group-commit budget. |
-| `tag` length | 256 bytes | Bounds the per-entry cost of the deletion-filter structure (§7) and keeps prefix matching cheap. |
+| `tag` length | 256 bytes | Bounds the per-entry cost of the tag index (§7) and keeps prefix matching cheap. |
 | `node` length | 128 bytes | Node ids are identifiers, not data. |
 | `meta` total | 16 KiB, ≤ 64 keys | "Small metadata." |
 | Records per write request | 10 000 | Bounds a single append's latency and WAL frame size. |
@@ -72,7 +73,7 @@ watermarks.
     `config` or defaults.
   - Write with `create: false` to a missing box → `404 box_not_found`.
   - Explicit `PUT /v0/boxes/:box` creates-or-updates per the upsert rules (API §1.1).
-- **Deleting** a box tears down all records, the delete-filter set, dedupe state, and any routers
+- **Deleting** a box tears down all records, the tag index, dedupe state, and any routers
   with it as `source` or `dest`. Irreversible. A later lazy-create makes a **new, empty** box
   whose `seq` restarts at the base; stale consumers detect this exactly like full eviction
   (§5.5).
@@ -166,13 +167,13 @@ ARCHITECTURE §4–5.
 - `seq` is **strictly increasing and contiguous at assignment** — no gaps in the assigned
   sequence. A single write request is **atomic**: all N records commit (contiguous seqs) or none.
 - **"Mostly sequential" refers to what a consumer reading the retained window observes:** after
-  eviction/TTL/tag-deletion/node-filtering the seqs a consumer sees can have holes (4097, 4098,
+  eviction/TTL/deletion/node-filtering the seqs a consumer sees can have holes (4097, 4098,
   4101, …). The underlying assignment never skips; visibility does. A consumer MUST NOT assume
   received seqs are contiguous, but MAY assume they are strictly increasing, and that any missing
-  seq below `head_seq` was either evicted/expired (tombstone if it crossed the cursor — §5) or
-  tag-deleted/node-filtered (silently skipped — §6, §7). **The distinction between "you missed
-  data" (tombstone) and "data was intentionally filtered for you" (silent) is the core safety
-  property.**
+  seq below `head_seq` was either involuntarily evicted/expired (tombstone if it crossed the
+  cursor — §5) or voluntarily deleted/node-filtered (silently skipped — §6, §7). **The distinction
+  between "you missed data" (involuntary, tombstone) and "data was intentionally removed for you"
+  (voluntary, silent) is the core safety property.**
 
 ### 4.2 Restart / recreate
 
@@ -196,23 +197,40 @@ ARCHITECTURE §4–5.
 
 ## 5. Watermarks, eviction, TTL, tombstones
 
-### 5.1 The earliest-seq watermark
+### 5.1 The dual watermark — `evict_floor` and `earliest_seq`
 
-Let the **retained set** R = seqs physically present (not eviction-reclaimed) AND not
-TTL-expired. Then `earliest_seq = min(R)` if R is non-empty, else `head_seq + 1`. It is
-**monotonically non-decreasing** over a box instance's life (only moves forward as records
-evict/expire); it resets only on delete+recreate (§5.5).
+Each box distinguishes **two floors** so the tombstone (involuntary loss) is decoupled from
+voluntary deletion:
 
-A consumer cursor `from_seq` is **valid** iff `from_seq + 1 >= earliest_seq`. If
-`from_seq + 1 < earliest_seq`, the consumer has fallen off the start and MUST be told (tombstone,
-§5.4).
+- **`earliest_seq`** — the seq of the **first currently-live record**: not eviction-reclaimed,
+  not TTL-expired, and **not deleted**. Reported in box state and `diff`. If no live record
+  exists it is `head_seq + 1`. It is **monotonically non-decreasing** over a box instance's
+  life (eviction, TTL, and **deletion** all advance it); it resets only on delete+recreate
+  (§5.5).
+- **`evict_floor`** — advanced **only** by **involuntary** loss of live records: cap eviction
+  and TTL expiry. It is the **sole tombstone trigger** (§5.4). Voluntary deletion (§7) advances
+  `earliest_seq` but **never** `evict_floor`.
 
-Two floors govern the two loss mechanisms, tracked separately so the tombstone can report *why*:
-- `evict_floor`: highest seq removed by **cap** eviction.
-- `expiry_floor`: as a function of time, the highest seq that is **TTL-expired**; moves
+**Invariant: `evict_floor <= earliest_seq`, always.** Consequences:
+- Reading below `earliest_seq` but at/above `evict_floor` means the gap is **purely deleted**
+  (voluntary) ⇒ the read is **silent** (`tombstone: null`); the cursor advances past the
+  deleted seqs.
+- Reading below `evict_floor` means live records were lost to cap/TTL (involuntary) ⇒ a
+  **tombstone** is emitted.
+
+A consumer cursor `from_seq` is below the live floor iff `from_seq + 1 < earliest_seq`; it
+gets a tombstone only iff `from_seq + 1 < evict_floor` (§5.4).
+
+`evict_floor` is itself driven by two involuntary sub-floors, tracked so the tombstone can
+report *why*:
+- cap eviction — the highest seq removed by **cap** eviction of live records.
+- TTL expiry — as a function of time, the highest seq that is **TTL-expired**; moves
   continuously with wall-clock even with no writes.
 
-`earliest_seq = max(evict_floor, expiry_floor) + 1`, clamped into `[seq_base, head_seq + 1]`.
+`evict_floor = max(cap-evicted seq, TTL-expired seq) + 1`. When the front of the log is mixed,
+popping **already-deleted** slots (voluntary) does **not** advance `evict_floor`; evicting
+**live** records (cap/TTL, involuntary) **does**. Both floors are clamped into
+`[seq_base, head_seq + 1]`.
 
 ### 5.2 TTL expiry
 
@@ -224,7 +242,8 @@ Two floors govern the two loss mechanisms, tracked separately so the tombstone c
   "expired."
 - Because `$ts` is commit-assigned and `seq` is commit-ordered, `$ts` is **non-decreasing in
   `seq`** within a box. So "all seqs ≤ X are expired" is a binary-searchable predicate (Redis
-  time-id lesson) — `expiry_floor` is O(log n) over segments, not O(n).
+  time-id lesson) — finding the TTL sub-floor of `evict_floor` is O(log n) over segments, not
+  O(n).
 
 ### 5.3 Eviction by cap & full policy
 
@@ -245,8 +264,11 @@ a gap below where you're reading; you missed `[gap_from, gap_to]` and here is wh
 single mechanism for *all* non-silent loss.
 
 **When emitted.** A `diff` or SSE delivery for cursor `from_seq` MUST emit a tombstone (before
-any subsequent records) iff `from_seq + 1 < earliest_seq`. After emitting it the read continues
-from `earliest_seq` (cursor advanced to `earliest_seq - 1`).
+any subsequent records) iff `from_seq + 1 < evict_floor` — i.e. live records below the cursor
+were lost **involuntarily** to cap/TTL. After emitting it the read continues from `earliest_seq`
+(cursor advanced to `earliest_seq - 1`). A cursor that fell below `earliest_seq` but stays at or
+above `evict_floor` fell into a **purely-deleted** gap (voluntary, §7): **no** tombstone, the
+cursor simply advances past the deleted seqs.
 
 **Shape** (a pseudo-record; carries a resumable position so SSE `id:` works on it too):
 
@@ -257,8 +279,10 @@ from `earliest_seq` (cursor advanced to `earliest_seq - 1`).
   "earliest_seq": 479101, "head_seq": 480234 }
 ```
 
-- `gap_from = from_seq + 1` (what they asked for next), `gap_to = earliest_seq - 1` (last lost
-  seq); the lost range is inclusive both ends.
+- `gap_from = from_seq + 1` (what they asked for next), `gap_to = earliest_seq - 1` (last seq
+  before the first live record); the reported range is inclusive both ends. (Some seqs in the
+  range may have been deleted rather than evicted; the consumer cannot tell and does not need to
+  — the tombstone fires because *some* live data below the cursor was lost involuntarily.)
 - `$seq` of the tombstone equals `earliest_seq` (first live seq after the gap), so it slots into
   the monotonic id stream as a valid resume point.
 - `reason` ∈ `"cap"` (evicted for capacity), `"ttl"` (TTL-expired), `"mixed"` (both contributed),
@@ -273,21 +297,22 @@ always one contiguous range because `earliest_seq` is monotonic).
 **In SSE:** a framed `event: tombstone` with `id:` encoding the post-gap cursor (so reconnect
 resumes correctly). The consumer handles `record` and `tombstone` uniformly.
 
-**The three loss/removal kinds — a hard contract:**
+**The loss/removal kinds — a hard contract:**
 
 | Kind | Detectable? | Mechanism | Consumer sees |
 |---|---|---|---|
-| **Eviction by cap** | YES, never silent | `evict_floor` advanced; crossing a cursor ⇒ tombstone `reason:"cap"` | gap range + tombstone |
-| **Expiry by TTL** | YES, never silent | `expiry_floor` advanced by clock; crossing a cursor ⇒ tombstone `reason:"ttl"` | gap range + tombstone |
-| **Explicit tag-deletion** | NO, intentionally silent | read-time filter drops matching records (§7) | matching seqs simply absent; no tombstone |
-| **Node loop-prevention** | NO, intentionally silent | reader's own-node records dropped (§6) | own seqs absent; no tombstone |
+| **Eviction by cap** (involuntary) | YES, never silent | `evict_floor` advanced; crossing a cursor ⇒ tombstone `reason:"cap"` | gap range + tombstone |
+| **Expiry by TTL** (involuntary) | YES, never silent | `evict_floor` advanced by clock; crossing a cursor ⇒ tombstone `reason:"ttl"` | gap range + tombstone |
+| **Permanent deletion** (voluntary) | NO, intentionally silent | records removed by `before_seq`/tag `match` (§7); advances `earliest_seq`, not `evict_floor` | deleted seqs simply absent; no tombstone |
+| **Node loop-prevention** (voluntary) | NO, intentionally silent | reader's own-node records dropped (§6) | own seqs absent; no tombstone |
 
-The principle: **loss the consumer did not ask for ⇒ tombstone; removal the system/operator
-deliberately requested for this consumer ⇒ silent skip.** Tag-deletion and node-filtering are
-intentional, content-based drops, so they don't trip the gap alarm; a consumer that wants to
-detect them compares received seqs against `head_seq`/`earliest_seq`. Cap/TTL are capacity-driven
-drops the consumer never consented to, so they always alarm. Mixing these would make the gap
-signal useless.
+The principle: **involuntary loss the consumer did not ask for ⇒ tombstone; voluntary removal
+deliberately requested ⇒ silent skip.** Permanent deletion and node-filtering are intentional
+drops, so they don't trip the gap alarm; a consumer that wants to detect them compares received
+seqs against `head_seq`/`earliest_seq`. Cap/TTL are capacity-driven drops the consumer never
+consented to, so they always alarm. The dual watermark (§5.1) keeps these separate:
+`evict_floor` only ever moves on involuntary loss, so a purely-deleted gap reads silently and
+mixing the two signals is structurally impossible.
 
 ### 5.5 Delete+recreate / seq rewind
 
@@ -332,66 +357,83 @@ never receives back events it produced.
 
 ---
 
-## 7. Read-time deletion filters (tag-deletion)
+## 7. Deletion (permanent, point-in-time)
 
-### 7.1 Model & lifecycle — a persistent delete-rule set per box
+### 7.1 Model — permanent, async, immediate, silent, point-in-time
 
-A tag-delete request adds a **rule** (`Eq "x"` or `Glob "x*"`) to the box; every read evaluates
-records against the active rule set and drops matches. This (not a one-shot scan) is the model
-because:
-- The spec's framing is "a filter applied at read time," and a delete must also suppress *future*
-  matching records (e.g. "cancel all jobs for tenant X" should cancel jobs enqueued a moment
-  later by an in-flight producer, which a one-shot scan would race).
-- It composes cleanly with the append log: no record is mutated, eviction is unaffected, and the
-  rule set is small (bounded by number of delete operations, not records).
-- Honest semantics (Kafka tombstone lesson): a rule is "drop matching tags at read time," not
-  "physically gone" — exactly the spec's "mark deleted during reading."
+`POST /v0/boxes/:box/delete` removes records by **seq range** (`before_seq`) and/or by **tag**
+`match`. It is a one-shot operation against the records present at call time, **not** a standing
+filter. Five properties define it:
 
-Each rule: `{ op: "Eq" | "Glob", tag, rule_seq, created_ts }`.
-- `Eq` matches `$tag == tag` exactly. `Glob` matches the wildcard-prefix form: the rule's `tag`
-  ends in `*` and a record matches iff `$tag` has the literal prefix preceding the `*`. **Only a
-  trailing `*` is supported** (the spec's "tag" and "tag*" forms); no general globbing — keeps
-  matching a prefix test.
-- Rules **do not expire** with TTL and are **not subject to cap eviction**; they live for the
-  box's lifetime or until the box is deleted. This avoids Kafka's `delete.retention.ms` race where
-  a lagging consumer misses a delete: a rule is evaluated at every read regardless of lag, so no
-  consumer can "read past" a delete.
-- Adding a rule is a committed, WAL-logged mutation (durable rules survive restart). It is
-  idempotent and additive.
-- **Deletion is monotonic in `/v0`: there is no un-delete.** A record once tag-deleted stays
-  filtered for the box's life; to resurrect, write a new record. This keeps the filter set
-  append-only and cheap. (A `/v1` may add rule removal — records are never physically removed, so
-  removal would be lossless undo; it is deferred deliberately. See ROADMAP open questions.)
+- **PERMANENT.** Deleted records are gone for good; there is no un-delete in `/v0` (this resolves
+  the old open question — see ROADMAP). To "resurrect," write a new record.
+- **EFFECTIVE IMMEDIATELY.** The delete is invisible to **all** reads at once — `diff`, box state
+  `count`/`bytes`, and SSE. A reader's cursor simply advances past the deleted seqs.
+- **ASYNCHRONOUS / lazy physical reclaim.** Records are *logically* gone instantly; memory/disk is
+  reclaimed by a background reclaimer. In the in-memory phase the payload/tag is freed immediately
+  (subtract `bytes`, decrement `count`) and physical slots are popped only from the **front** as
+  the prefix becomes fully dead (ARCHITECTURE §1, §3).
+- **SILENT.** A delete **never** produces a tombstone. Tombstones stay reserved for **involuntary**
+  cap/TTL loss (§5.4). A delete advances `earliest_seq` but **not** `evict_floor` (§5.1), so reading
+  across a purely-deleted gap returns `tombstone: null`.
+- **POINT-IN-TIME.** A `match`-only delete is bounded by the **current head** at call time
+  (bound = `head_seq + 1`); future records with that tag are **not** deleted (e.g. "revoke a kicked
+  user's chat" via `match ["tag","Glob","chat-42:*"]` cancels only what exists now, not a message
+  sent a moment later by an in-flight producer).
 
-### 7.2 Matching data structure (efficient over many records)
+**Request grammar.** At least one of `before_seq` / `match` is required (else `400
+invalid_request`):
+- `before_seq` (u64): delete records with `$seq < before_seq`.
+- `match`: `["tag","Eq","X"]` exact, or `["tag","Glob","X*"]` **trailing-prefix only** (the rule's
+  pattern ends in a single `*`; a record matches iff `$tag` has the literal prefix preceding it).
+  No general globbing — this keeps a tag delete a point lookup or a bounded prefix range scan over
+  the tag index (§7.2), never a regex. Bare string `"X"` is shorthand for `["tag","Eq","X"]`.
 
-The active rule set per box is two structures evaluated per candidate record:
-- **Exact set:** a hash set of `Eq` tags → O(1) per record.
-- **Prefix set:** the `Glob` prefixes in a sorted array (or trie). A record matches iff any stored
-  prefix is a prefix of `$tag`; binary search is O(log P) (trie is O(len(tag))). Since `$tag` ≤
-  256 bytes, this is a small bounded cost.
+**Semantics by combination:**
+- `before_seq` only → delete every record with `$seq < before_seq` (SNAPSHOT / compaction by seq).
+- `match` only → delete every **existing** record whose tag matches, bounded by `head_seq + 1`
+  at call time.
+- `match` + `before_seq` → delete records with `$seq < before_seq` **AND** tag matches (e.g.
+  publish v2 of a message then delete its prior versions, keeping the new one: `match
+  ["tag","Eq","msg-123"]`, `before_seq = <seq of v2>`).
 
-A record passes the delete filter iff it is in neither structure. Both structures are tiny
-relative to record count and evaluated as a single pass alongside TTL/node filtering, so
-tag-deletion adds bounded per-record overhead and never scans the box. The set is held behind a
-copy-on-write `ArcSwap` so the (frequent) read path is wait-free.
+Records with **no tag** are never matched by a `match`. A delete is committed and WAL-logged
+(survives restart). The response returns `deleted` (count removed) plus the post-delete
+`earliest_seq`/`head_seq`/`count`/`bytes` (API §5).
+
+### 7.2 The per-box tag index (efficient match-deletes)
+
+A `match` delete MUST NOT scan the whole log. Each box keeps a **tag index** mapping tag → its
+live seqs in ascending order — conceptually a `BTreeMap<String, Vec<u64>>`:
+- **Exact** `Eq "X"` → point lookup of `index["X"]`.
+- **Prefix** `Glob "X*"` → range scan over keys in `["X", next-key)`.
+
+The index is populated on **append** (for tagged records) and pruned on **delete** and on
+**front reclaim**, so a tag delete touches only the matching seqs (then drops their payloads and
+prunes their index entries). Since `$tag` ≤ 256 bytes the per-key cost is bounded.
+
+A `before_seq` (snapshot/prefix) delete is applied in O(1) via a `delete_below` marker (the max
+`before_seq` ever applied); reads start at `max(from_seq + 1, base_seq)` and skip any remaining
+deleted/expired/foreign slots.
 
 ### 7.3 Composition with reads / SSE / eviction (the read pipeline)
 
-Per candidate record, for both `diff` and SSE:
+Per candidate seq from the cursor, in order, for both `diff` and SSE (ARCHITECTURE §-read-path):
 
-1. **Retention/TTL gate** — record in retained set R? If the cursor fell below `earliest_seq`,
-   emit tombstone (§5.4). *Capacity loss, non-silent.*
-2. **Tag-delete filter** — drop if it matches a rule (§7). *Intentional, silent.*
-3. **Node filter** — drop if `$node` ∈ reader node set (§6). *Intentional, silent.*
-4. Deliver the surviving record (respecting batch `limit` / SSE flow).
+1. **Live-floor gate** — skip if before the earliest live record. If `from_seq + 1 < evict_floor`
+   (involuntary cap/TTL loss), emit a tombstone (§5.4); a purely-deleted gap is skipped silently.
+2. **TTL** — skip if TTL-expired (*involuntary* → contributes to a tombstone via `evict_floor`).
+3. **Deleted** — skip if the slot is deleted (*voluntary* → silent).
+4. **Node filter** — skip if `$node` ∈ reader node set (§6) (*voluntary* → silent).
+5. Deliver the surviving record (respecting batch `limit` / SSE flow).
 
-Eviction/TTL are computed on the *unfiltered* log (tag-deleted and node records still count toward
-cap/age and still age out normally) — deletion filters change *visibility*, not *retention*. A
-tag-deleted record that later evicts contributes to a `cap` gap like any other; since it was
-already invisible to readers, the tombstone's range still uses raw seq math (the consumer can't
-tell and doesn't need to). Tag-deletion never propagates through routers: `dst` has its own rule
-set (§8.3).
+Skipped seqs (any reason) **still advance** `next_from_seq`. The tombstone is computed **solely**
+from `from_seq` vs `evict_floor`, independent of deletions.
+
+Cap/TTL eviction is computed against the live records that remain after deletion — a deleted
+record no longer counts toward `cap`/`age` (its payload is already freed). Deletion never
+propagates through routers: a delete on `src` removes records from `src`, but a copy may already
+have been forwarded to `dst`; to remove it in `dst` too, issue a delete on `dst` (§8.3).
 
 ---
 
@@ -432,10 +474,9 @@ to `dst`. `{ name, source, dest, preserve_node, preserve_tag, filter, allow_cycl
   `preserve_tag`), `meta`, and `data` verbatim.
 - `$seq` and `$ts` are reassigned by `dst`. Original src seq/ts are optionally preserved in
   reserved meta `$src_box` / `$src_seq` for traceability (off by default to keep payloads lean).
-- Tag-delete rules and node filters are **per-box** and do not propagate through routers: `dst`
-  has its own rule set. A delete on `src` suppresses reads of `src`, but the record may already
-  have been forwarded to `dst`; to cancel in `dst` too, add a rule on `dst`. Honest and
-  predictable.
+- Deletes and node filters are **per-box** and do not propagate through routers. A delete on
+  `src` removes records from `src`, but a copy may already have been forwarded to `dst`; to remove
+  it in `dst` too, issue a delete on `dst`. Honest and predictable.
 
 ### 8.4 dst cap / ttl behavior
 
@@ -489,14 +530,20 @@ A forward into `dst` is an ordinary append obeying `dst`'s config:
 
 1. **`seq` is strictly increasing and gap-free at assignment**; visibility holes are normal and
    are categorized for the consumer.
-2. **No silent capacity loss.** Any cap-eviction or TTL-expiry crossing a consumer's cursor
-   produces an in-band tombstone with an authoritative `[gap_from, gap_to]` and a best-effort
-   `reason`. Identical contract in `diff` and SSE.
-3. **Intentional, content-based removal is silent.** Tag-deletion and own-node filtering drop
-   records without tombstones; consumers detect them (if they care) via `head_seq`/`earliest_seq`
-   arithmetic, never confusing them with data loss.
-4. **`earliest_seq` is the single source of truth** for "what can I still read"; cap arithmetic is
-   never authoritative (lazy, segment-granular eviction may exceed cap transiently).
+2. **No silent capacity loss.** Any cap-eviction or TTL-expiry of live records crossing a
+   consumer's cursor (i.e. `from_seq + 1 < evict_floor`) produces an in-band tombstone with an
+   authoritative `[gap_from, gap_to]` and a best-effort `reason`. Identical contract in `diff` and
+   SSE.
+3. **Voluntary removal is silent and, for deletion, permanent.** Permanent deletion (by
+   `before_seq`/tag `match`) and own-node filtering drop records without tombstones; they advance
+   `earliest_seq` but never `evict_floor`. Consumers detect them (if they care) via
+   `head_seq`/`earliest_seq` arithmetic, never confusing them with data loss. Deletion is
+   permanent, effective immediately, asynchronously reclaimed, and point-in-time (never a standing
+   filter).
+4. **The dual watermark separates the two.** `earliest_seq` (first live seq) is the single source
+   of truth for "what can I still read"; `evict_floor` (involuntary cap/TTL only, `evict_floor <=
+   earliest_seq`) is the single tombstone trigger. Cap arithmetic is never authoritative (lazy,
+   segment-granular eviction may exceed cap transiently).
 5. **`$node` is immutable and preserved through routers**, making N-way multi-master fan-out safe
    by construction.
 6. **Routers are at-least-once, per-source FIFO, DAG-by-default** (with an explicit hop-capped
