@@ -697,3 +697,53 @@ in-band tombstone, while a purely-deleted gap (below `earliest_seq`, at/above `e
 silently; (2) *segment-granular, lazy cap/TTL eviction* — never rewrite on the hot path; advance a
 watermark and drop whole sealed segments; (3) *deletion is logically immediate, physically lazy* —
 free the payload and advance `earliest_seq` synchronously, reclaim disk/memory in the background.
+
+---
+
+## 12. Queue layer (materialized lease view, reclaim freelist, claim cursor)
+
+A **queue** box (DESIGN §10) reuses every structure above for its **jobs log** (the box's own
+`BoxIndex` + WAL + segments) and adds a thin lease layer on top — purely additive, no change to
+the §1–§11 storage path. A queue holds **two logs**: the jobs log (the box) and a companion
+**leases log** of lifecycle events, both WAL-framed. The live who-holds-what state is the
+**materialized projection** of the leases log (event-sourced, DESIGN §10.1), held in memory:
+
+```rust
+struct QueueState {
+    leases:        HashMap<u64, Lease>,    // seq -> active lease (the materialized view)
+    deliveries:    HashMap<u64, u32>,      // seq -> delivery count (dead-letter trigger)
+    reclaim:       BinaryHeap<Reverse<u64>>, // freelist: expired-lease / nacked seqs, drained first
+    delayed:       BinaryHeap<(u64, u64)>, // (ready_at_ms, seq) for delayed nacks
+    claim_cursor:  u64,                    // next never-yet-leased seq (fresh-job hand-out)
+    dead_lettered: u64,                    // cumulative DLQ count (observability)
+}
+struct Lease { node: Box<str>, lease_id: u64, deadline_ms: u64, by_work_conn: Option<ConnId> }
+```
+
+- **Materialized lease view** (`leases`): rebuilt by replaying the leases log on restart; since
+  that log is non-durable by default (`leases_durable:false`), a crash typically replays *no*
+  active leases, so every in-flight job is immediately claimable — the self-healing
+  visibility-timeout (DESIGN §10.6). `acked` events remove the seq (it is also deleted from the
+  jobs log via §3.5); `released`/expiry remove the lease and push the seq to `reclaim`.
+- **Reclaim freelist** (`reclaim`): a min-heap of seqs whose lease expired or whose nack
+  `delay_ms` has elapsed. A claim pass **drains this first** (reclaimed work jumps ahead of
+  never-delivered work, bounding redelivery latency) before advancing `claim_cursor`. Lease
+  expiry is **lazy** — no per-job timers; a claim pass sweeps `delayed` (whose `ready_at` ≤ now,
+  via the Clock) and any `leases` past `deadline_ms` into `reclaim`.
+- **Claim cursor** (`claim_cursor`): a monotonic pointer over the jobs log handing out the next
+  never-yet-leased seq once the freelist is empty — the fresh-job source.
+
+**Coalescing claim pass.** With `claim_jitter_ms > 0`, claimers (poll claims and `/work` SSE
+streams alike) are gathered into a cohort over a Clock-driven window, then served in **one
+batched coordinator pass under the queue lock** that divides the available set (`reclaim` ++
+fresh-from-cursor) **evenly** across the cohort (round-robin proportional to each `max`). One
+critical section per cohort replaces N per-claim atomic races on the queue head — fewer
+contended atomics, predictable fairness (DESIGN §10.3). `claim_jitter_ms = 0` serves each claim
+immediately. All windows/deadlines use the **Clock trait** so `TestClock` drives lease expiry,
+the jitter window, and delayed nacks deterministically — no wall-clock sleep is load-bearing.
+
+The queue state lives under the box's existing per-box lock (DESIGN §10 transitions are rare
+relative to the read hot path); ack reuses the permanent-delete path (§3.5), so an acked job's
+storage is reclaimed exactly like any deleted record. Dead-lettering (DESIGN §10.7) is an
+internal append into the `dead_letter` box plus a permanent delete from the jobs log — no new
+storage mechanism.

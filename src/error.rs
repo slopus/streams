@@ -51,6 +51,14 @@ impl Error {
         .with_detail(serde_json::json!({ "box": box_name }))
     }
 
+    pub fn not_a_queue(box_name: &str) -> Self {
+        Error::new(
+            ErrorCode::NotAQueue,
+            format!("box {box_name:?} is not a queue"),
+        )
+        .with_detail(serde_json::json!({ "box": box_name }))
+    }
+
     pub fn router_not_found(router: &str) -> Self {
         Error::new(
             ErrorCode::RouterNotFound,

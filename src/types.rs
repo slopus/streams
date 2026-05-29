@@ -17,6 +17,11 @@ use serde_json::Value;
 /// documented default (via `#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoxConfig {
+    /// Box kind: `"log"` (default, plain append-only log) or `"queue"` (enables
+    /// the lease-based claim/ack/nack/extend/work endpoints, API §10). Immutable
+    /// after create (a `PUT` changing it ⇒ `409 box_exists_incompatible`).
+    #[serde(default = "default_box_type")]
+    pub r#type: BoxType,
     #[serde(default = "default_ttl_ms")]
     pub ttl_ms: u64,
     #[serde(default = "default_cap_records")]
@@ -37,6 +42,49 @@ pub struct BoxConfig {
     pub idempotency_window_ms: u64,
     #[serde(default = "default_dedupe_node")]
     pub dedupe_node: bool,
+
+    // --- Queue-only config (meaningful only when `type:"queue"`; accepted but
+    // inert on a "log" box). DESIGN §10, API §0.10/§10. ---
+    /// Default lease (visibility-timeout) duration for a claim, ms. Clamped
+    /// `[100, 86400000]`.
+    #[serde(default = "default_lease_ms")]
+    pub lease_ms: u64,
+    /// Coalescing-window width, ms. `0` = greedy (serve each claim immediately);
+    /// `>0` = gather the cohort and divide jobs evenly (API §10.2). Clamped
+    /// `[0, 5000]`.
+    #[serde(default = "default_claim_jitter_ms")]
+    pub claim_jitter_ms: u64,
+    /// After this many deliveries without an ack, dead-letter the job (§10.6).
+    /// `0` = unlimited redelivery (never dead-letter on delivery count).
+    #[serde(default = "default_max_deliveries")]
+    pub max_deliveries: u64,
+    /// Box to move a job to after it exceeds `max_deliveries` (§10.6). `null` =
+    /// no dead-letter box (the job keeps being reclaimed).
+    #[serde(default = "default_dead_letter")]
+    pub dead_letter: Option<String>,
+    /// Durability of the *leases* log (§10.1). Defaults `false` (self-healing:
+    /// all in-flight jobs become claimable on restart).
+    #[serde(default = "default_leases_durable")]
+    pub leases_durable: bool,
+}
+
+fn default_box_type() -> BoxType {
+    BoxType::Log
+}
+fn default_lease_ms() -> u64 {
+    30_000
+}
+fn default_claim_jitter_ms() -> u64 {
+    0
+}
+fn default_max_deliveries() -> u64 {
+    0
+}
+fn default_dead_letter() -> Option<String> {
+    None
+}
+fn default_leases_durable() -> bool {
+    false
 }
 
 fn default_ttl_ms() -> u64 {
@@ -73,6 +121,7 @@ fn default_dedupe_node() -> bool {
 impl Default for BoxConfig {
     fn default() -> Self {
         BoxConfig {
+            r#type: default_box_type(),
             ttl_ms: default_ttl_ms(),
             cap_records: default_cap_records(),
             cap_bytes: default_cap_bytes(),
@@ -83,8 +132,30 @@ impl Default for BoxConfig {
             auto_create: default_auto_create(),
             idempotency_window_ms: default_idempotency_window_ms(),
             dedupe_node: default_dedupe_node(),
+            lease_ms: default_lease_ms(),
+            claim_jitter_ms: default_claim_jitter_ms(),
+            max_deliveries: default_max_deliveries(),
+            dead_letter: default_dead_letter(),
+            leases_durable: default_leases_durable(),
         }
     }
+}
+
+impl BoxConfig {
+    /// Whether this box is a queue (enables the §10 lease lifecycle).
+    pub fn is_queue(&self) -> bool {
+        self.r#type == BoxType::Queue
+    }
+}
+
+/// The kind of a box: a plain append-only log, or a lease-based job queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoxType {
+    /// Plain append-only log (default). Rejects the §10 queue endpoints.
+    Log,
+    /// Lease-based job queue (enables claim/ack/nack/extend/work, §10).
+    Queue,
 }
 
 /// Full-box overflow policy.
@@ -154,6 +225,8 @@ pub struct BoxCreateResponse {
 pub struct BoxStateResponse {
     #[serde(rename = "box")]
     pub box_name: String,
+    /// Box kind (`"queue"` for a queue, `"log"` otherwise) — API §10.7.
+    pub r#type: BoxType,
     pub head_seq: u64,
     pub earliest_seq: u64,
     pub next_seq: u64,
@@ -163,6 +236,10 @@ pub struct BoxStateResponse {
     pub effective_priority: i64,
     pub last_write_ts: Option<i64>,
     pub last_read_ts: Option<i64>,
+    /// Queue counters (`ready`/`in_flight`/`dead_lettered`) — present only for a
+    /// queue box (API §10.7); omitted on a plain log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueState>,
     pub performance: Performance,
 }
 
@@ -487,6 +564,123 @@ pub struct DeleteResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Queues (API §10)
+// ---------------------------------------------------------------------------
+
+/// The `queue` sub-object on `GET /v0/boxes/:q` for a queue box (API §10.7).
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueState {
+    /// Claimable jobs right now (not acked, no active lease; includes
+    /// reclaim-freelist seqs whose lease expired or whose nack delay elapsed).
+    pub ready: u64,
+    /// Jobs with an active (un-expired) lease — currently held by some worker.
+    pub in_flight: u64,
+    /// Cumulative jobs moved to the `dead_letter` box over this box instance's
+    /// life (resets on delete+recreate).
+    pub dead_lettered: u64,
+}
+
+/// Request body for `POST /v0/boxes/:q/claim` (API §10.2).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClaimRequest {
+    pub node: String,
+    /// Max jobs to lease this call (default 1, clamped to `MAX_CLAIM`).
+    #[serde(default)]
+    pub max: u32,
+    /// Lease duration override for this call (default = box `lease_ms`).
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+/// One leased job in a claim response (API §10.2).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimedJob {
+    #[serde(rename = "$seq")]
+    pub seq: u64,
+    pub lease_id: String,
+    pub deadline: i64,
+    #[serde(rename = "$ts")]
+    pub ts: i64,
+    #[serde(rename = "$tag", skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub deliveries: u64,
+    pub data: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// Response for `POST /v0/boxes/:q/claim`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimResponse {
+    #[serde(rename = "box")]
+    pub box_name: String,
+    pub claimed: Vec<ClaimedJob>,
+    pub count: u64,
+    pub ready: u64,
+    pub performance: Performance,
+}
+
+/// Request body for `POST /v0/boxes/:q/ack` (API §10.4).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AckRequest {
+    pub node: String,
+    pub seqs: Vec<u64>,
+}
+
+/// Response for `POST /v0/boxes/:q/ack`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AckResponse {
+    #[serde(rename = "box")]
+    pub box_name: String,
+    pub acked: u64,
+    pub skipped: Vec<u64>,
+    pub ready: u64,
+    pub in_flight: u64,
+    pub performance: Performance,
+}
+
+/// Request body for `POST /v0/boxes/:q/nack` (API §10.5).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NackRequest {
+    pub node: String,
+    pub seqs: Vec<u64>,
+    #[serde(default)]
+    pub delay_ms: u64,
+}
+
+/// Response for `POST /v0/boxes/:q/nack`.
+#[derive(Debug, Clone, Serialize)]
+pub struct NackResponse {
+    #[serde(rename = "box")]
+    pub box_name: String,
+    pub nacked: u64,
+    pub skipped: Vec<u64>,
+    pub ready: u64,
+    pub in_flight: u64,
+    pub performance: Performance,
+}
+
+/// Request body for `POST /v0/boxes/:q/extend` (API §10.6).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExtendRequest {
+    pub node: String,
+    pub seqs: Vec<u64>,
+    pub lease_ms: u64,
+}
+
+/// Response for `POST /v0/boxes/:q/extend`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtendResponse {
+    #[serde(rename = "box")]
+    pub box_name: String,
+    pub extended: u64,
+    pub skipped: Vec<u64>,
+    /// New absolute deadline (ms) per extended seq, keyed by seq as a string.
+    pub deadlines: std::collections::HashMap<String, i64>,
+    pub performance: Performance,
+}
+
+// ---------------------------------------------------------------------------
 // Routers (API §6)
 // ---------------------------------------------------------------------------
 
@@ -732,6 +926,7 @@ pub enum ErrorCode {
     RouterCycle,
     BoxExistsIncompatible,
     BoxNotEmpty,
+    NotAQueue,
     PayloadTooLarge,
     UnsupportedMediaType,
     BoxFull,
@@ -751,7 +946,7 @@ impl ErrorCode {
             BoxNotFound | RouterNotFound | NotFound => 404,
             MethodNotAllowed => 405,
             NotAcceptable => 406,
-            RouterCycle | BoxExistsIncompatible | BoxNotEmpty => 409,
+            RouterCycle | BoxExistsIncompatible | BoxNotEmpty | NotAQueue => 409,
             PayloadTooLarge => 413,
             UnsupportedMediaType => 415,
             BoxFull => 422,
@@ -777,6 +972,7 @@ impl ErrorCode {
             RouterCycle => "router_cycle",
             BoxExistsIncompatible => "box_exists_incompatible",
             BoxNotEmpty => "box_not_empty",
+            NotAQueue => "not_a_queue",
             PayloadTooLarge => "payload_too_large",
             UnsupportedMediaType => "unsupported_media_type",
             BoxFull => "box_full",

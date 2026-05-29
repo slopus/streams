@@ -5,6 +5,7 @@
 pub mod boxes;
 pub mod delete;
 pub mod health;
+pub mod queue;
 pub mod routers;
 pub mod watch;
 
@@ -19,6 +20,7 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
+use queue::ClaimCoordinator;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +32,8 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     /// In-memory watch-session registry (API §7.1).
     pub sessions: Arc<SessionStore>,
+    /// Per-box coalescing-window claim coordinator + `/work` conn ids (API §10).
+    pub coordinator: Arc<ClaimCoordinator>,
 }
 
 /// Build the full `/v0` axum router with middleware applied.
@@ -38,6 +42,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
     let state = AppState {
         engine,
         sessions: Arc::new(SessionStore::new()),
+        coordinator: Arc::new(ClaimCoordinator::new()),
     };
 
     let v0 = Router::new()
@@ -52,6 +57,12 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/boxes/{box}/diff", post(boxes::diff))
         .route("/boxes/{box}/delete", post(delete::delete))
+        // Queue lifecycle (API §10)
+        .route("/boxes/{box}/claim", post(queue::claim))
+        .route("/boxes/{box}/ack", post(queue::ack))
+        .route("/boxes/{box}/nack", post(queue::nack))
+        .route("/boxes/{box}/extend", post(queue::extend))
+        .route("/boxes/{box}/work", get(queue::work))
         // Routers
         .route("/routers", get(routers::list_routers))
         .route(

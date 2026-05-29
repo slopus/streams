@@ -47,6 +47,25 @@ pub const SSE_RETRY_MS: u64 = 2_000;
 /// Max router forwarding hops when `allow_cycle` is set (`$ttl_hops`).
 pub const MAX_ROUTER_HOPS: u8 = 8;
 
+// ---------------------------------------------------------------------------
+// Queue limits (API §10)
+// ---------------------------------------------------------------------------
+
+/// Max jobs leased/acked/nacked per claim or ack/nack call (`STREAMS_MAX_CLAIM`).
+pub const MAX_CLAIM: u32 = 1000;
+/// Lease duration clamp bounds (ms): `[100, 86400000]` (API §10.2/§10.6).
+pub const MIN_LEASE_MS: u64 = 100;
+pub const MAX_LEASE_MS: u64 = 86_400_000;
+/// Coalescing-window (`claim_jitter_ms`) clamp upper bound (ms) (API §0.10).
+pub const MAX_CLAIM_JITTER_MS: u64 = 5_000;
+/// Nack `delay_ms` clamp upper bound (ms) (API §10.5).
+pub const MAX_NACK_DELAY_MS: u64 = 86_400_000;
+/// `/work` SSE refill re-check fallback interval (ms): the stream parks on the
+/// box `Notify` for low-latency wakeups, but also re-checks on this cadence so an
+/// out-of-band ack (which frees an in-flight slot without touching the box
+/// `Notify`) is reflected promptly (API §10.8).
+pub const WORK_POLL_MS: u64 = 250;
+
 /// Default data directory for the WAL/segments when `STREAMS_DATA_DIR` is unset
 /// (phase 4 durability layer; see [`crate::storage`]).
 pub const DEFAULT_DATA_DIR: &str = "./streams-data";

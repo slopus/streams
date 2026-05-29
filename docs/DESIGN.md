@@ -551,3 +551,160 @@ A forward into `dst` is an ordinary append obeying `dst`'s config:
    backpressure rather than silently dropping.
 7. **Durability is per-box and explicit**; only data not yet in the (fsynced, for durable boxes)
    WAL is lost on crash, and such loss appears to consumers as ordinary eviction-style gaps.
+
+---
+
+## 10. Queues (lease-based job delivery)
+
+A **queue** is a *type* of box (`type:"queue"`, API §0.10). It is purely **additive**: a
+queue is an ordinary box (everything in §1–§9 still holds — seq assignment, the dual
+watermark, tombstones, node filtering, routers, durability) with a lease lifecycle layered
+on top. A `"log"` box (the default) behaves exactly as before and rejects the queue
+endpoints with `409 not_a_queue` (API §10). This section is normative for the queue layer
+only; it changes **no** existing semantics.
+
+### 10.1 The two internal logs (event-sourced lease state)
+
+A queue is **two logs**:
+
+1. **The jobs log** — the box itself. You `POST` records into it (API §2); each record is a
+   job, identified by its `$seq`. Durability follows the box's `durable` config. This is the
+   queue's source of truth for *what work exists*.
+2. **The leases log** — an append-only log of **lifecycle events** describing *who holds
+   what*: `claimed`, `released`, `extended`, `acked` (one event per lifecycle transition,
+   each naming the job `$seq`, the holder `node`, a `lease_id`, a `deadline`, and the event
+   `$ts`). The **pending lease state is the materialized projection of this log** — it is
+   event-sourced, not a separately-mutated table. Rebuilding the projection by replaying the
+   leases log yields the exact current who-holds-what.
+
+The leases log is built on the **same box machinery** (it is an internal companion log of
+the queue box), so it inherits WAL framing, group commit, and crash recovery for free. Its
+**materialized projection** (the live lease table + reclaim freelist + claim cursor) is held
+in memory and rebuilt on restart (ARCHITECTURE §12).
+
+**Durability nuance (a deliberate perf win).** The **jobs log** is durable per the box's
+`durable` config — *we must not lose jobs*. The **leases log defaults non-durable**
+(`leases_durable:false`) because **losing leases on a crash is self-healing**: on restart, a
+job with no replayed active lease is simply claimable again, which is exactly correct
+visibility-timeout behaviour (§10.6). So the cheap path (don't fsync lease events) costs
+nothing in correctness. **Ack durability == jobs-log durability**: an acked job is deleted
+from the jobs log via the §7 permanent delete, and an acked+deleted job stays gone across a
+crash iff that delete was durable (i.e. iff `durable:true`).
+
+### 10.2 Lease lifecycle
+
+A job moves through these states (all transitions are leases-log events; all time decisions
+use the Clock, never wall-clock sleeps):
+
+```
+        produce (append to jobs log)
+              |
+              v
+        ┌──────────┐  claim (claimed event, +1 delivery)   ┌───────────┐
+        │  READY   │ ──────────────────────────────────►   │ IN_FLIGHT │
+        │(claimable)│ ◄──────────────────────────────────  │ (leased)  │
+        └──────────┘   nack (released, immediate/delayed)   └───────────┘
+              ▲         lease expiry (deadline passed, lazy)      │  │
+              │                                                   │  │ extend
+              │                                                   │  │ (extended,
+              │                              ack (acked event +   │  │  new deadline)
+              │                              permanent delete)    │  ▼
+              │                                                   ▼
+              │                                              ┌─────────┐
+              └──── (delivery > max_deliveries) ───────────► │  DONE   │
+                    dead-letter: move to dead_letter box     │(deleted)│
+                    + permanent delete                       └─────────┘
+```
+
+- **READY → IN_FLIGHT** — a `claim` (API §10.2) leases the job to a `node`: appends a
+  `claimed` event, sets `deadline = now + lease_ms`, increments the job's **delivery
+  counter**.
+- **IN_FLIGHT → DONE** — an `ack` (§10.4) appends an `acked` event and **permanently deletes
+  the job from the jobs log** (delete *is* the ack, reusing §7). Acks are matched on
+  `node` + seq; an ack from a worker that no longer holds the lease is silently skipped
+  (idempotent).
+- **IN_FLIGHT → READY** — either a `nack` (§10.5, voluntary early release, optionally delayed
+  by `delay_ms`) or **lease expiry** (§10.6, the deadline passed). Both append a `released`
+  event (expiry is recorded lazily, on the reclaiming claim pass) and return the job to the
+  claimable set.
+- **IN_FLIGHT → IN_FLIGHT** — an `extend` (§10.6 heartbeat) appends an `extended` event
+  setting a new `deadline = now + lease_ms`; the delivery counter is **not** touched.
+- **READY → DONE (dead-letter)** — when a job would be delivered past `max_deliveries`, it is
+  moved to the `dead_letter` box and permanently deleted instead of re-delivered (§10.7).
+
+### 10.3 The coalescing-window claim + even distribution
+
+`claim_jitter_ms` is a **fairness/coalescing window**, *not* a backoff. Its meaning:
+
+- **`claim_jitter_ms = 0` (default, greedy).** A claim is served immediately, lowest latency.
+  First-arrival drains the head of the available set.
+- **`claim_jitter_ms > 0` (coalescing).** A claim **waits up to that window** (Clock-driven).
+  The server gathers **every** claimer that arrived during the window into a **cohort**, then
+  in **one batched coordinator pass** (a single critical section over the queue) **divides
+  the available jobs evenly across the whole cohort** — round-robin, proportional to each
+  claimer's `max`. This is *not* first-arrival-drains-the-head: ten workers each asking for
+  `max:10` against 50 available jobs get ~5 each, not 10/10/10/10/10/0/0/0/0/0.
+
+The single-pass cohort design is also a **scalability win**: instead of N independent
+per-claim atomic races over the head of the queue, one coordinator pass assigns the whole
+cohort under one lock — fewer contended atomics, more predictable fairness. The `/work` SSE
+streams (§10.8 of the API) participate in the same cohort, so polling claimers and pushed
+workers are balanced together.
+
+**The available set for a pass** is, in order: (1) the **reclaim freelist** — seqs whose
+lease expired or whose nack `delay_ms` elapsed — **drained first** (so reclaimed work is
+prioritised over never-delivered work, bounding redelivery latency); then (2) **fresh jobs**
+handed out by a monotonic **claim cursor** over the jobs log (the next never-yet-leased seq).
+
+### 10.4 At-least-once + idempotent consumers
+
+The queue is **at-least-once**, matching routers (§8.2) and the BullMQ lesson:
+
+- A **slow-but-alive** worker whose lease expires while it is still processing will have its
+  job reclaimed and possibly delivered to another worker; if the slow worker later acks past
+  its deadline, that ack is skipped but the job was already processed twice. **Duplicates are
+  inherent**; consumers MUST be idempotent (e.g. dedupe on `$seq` or a job-level key in
+  `data`/`meta`).
+- **Per-job FIFO is not guaranteed across parallel workers**: claim order is roughly seq
+  order, but reclaimed (freelist) seqs are served ahead of fresh ones, and parallel workers
+  process at different rates. A single worker (`max:1`, one connection) sees near-FIFO; a
+  fleet does not.
+- **Exactly-once is not offered** — same rationale as routers (§8.2): it would require
+  distributed-style dedup the single-process design avoids.
+
+### 10.5 Reads, watch, and routers still work
+
+A queue box is still a box. `GET /v0/boxes/:q` returns the normal state **plus** a `queue`
+sub-object (`ready`/`in_flight`/`dead_lettered`). `diff` (§3) and SSE `watch` (§7) read the
+**jobs log** read-only — useful for monitoring/auditing the backlog — and never claim, ack,
+or touch leases. Routers (§8) may forward into or out of a queue's jobs log like any box
+(a router into a queue is a producer; the dead-letter move is an internal append, not a
+router). Node loop-prevention, tombstones, TTL, and caps apply to the jobs log unchanged
+(e.g. `discard:"reject"` makes a full durable queue refuse new jobs rather than drop them).
+
+### 10.6 Lease expiry is the visibility timeout (lazy, self-healing)
+
+There are **no per-job timers**. A lease carries an absolute `deadline`; a job is reclaimable
+once `now > deadline`. Reclaim is **lazy**: the next claim pass scans for expired leases,
+moves those seqs onto the reclaim freelist (recording `released` events), and drains the
+freelist first. This is the visibility-timeout primitive (SQS/BullMQ semantics) with zero
+timer overhead.
+
+Because the live lease state is a **purely derived projection** of a non-durable leases log,
+a crash that loses un-fsynced lease events is **self-healing**: on restart the projection is
+rebuilt from whatever lease events survived (possibly none), so any job without a replayed
+active lease is immediately claimable — identical to every lease having expired. No job is
+lost (the jobs log is durable per config); at worst an in-flight job is redelivered, which
+at-least-once already permits.
+
+### 10.7 Dead-lettering
+
+Each job carries a **delivery counter** (incremented on every claim, including reclaims). When
+a job is about to be delivered for the `(max_deliveries + 1)`-th time and the box has a
+non-null `dead_letter`, the server instead **moves** the job to the `dead_letter` box —
+appending its record there (preserving `$tag`/`meta`/`data`, stamping `meta.$dead_letter_*`
+provenance) and permanently deleting it from the jobs log (the §7 delete path). With
+`max_deliveries = 0` or `dead_letter = null`, jobs are reclaimed indefinitely. Dead-lettering
+increments the `dead_lettered` observability counter. The dead-letter box is an ordinary box
+(log or queue), so a poison job can be inspected via `diff`/`watch` or re-driven by reading it
+and re-producing into the source queue.

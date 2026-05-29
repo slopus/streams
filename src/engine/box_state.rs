@@ -13,6 +13,7 @@
 //! physically popped (lazy reclaim), advancing `base_seq`.
 
 use crate::engine::eviction::Floors;
+use crate::engine::queue::QueueProjection;
 use crate::types::{BoxConfig, Filter};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -188,6 +189,12 @@ impl BoxIndex {
     /// Mark the slot at `seq` deleted (if live), freeing its payload/tag and
     /// pruning its tag posting. Returns `Some(bytes_freed)` if it transitioned a
     /// live slot to deleted, or `None` if the slot was absent or already dead.
+    /// Public wrapper around [`Self::mark_deleted`] for the queue ack /
+    /// dead-letter delete path (DESIGN §10).
+    pub fn mark_deleted_pub(&mut self, seq: u64) -> Option<u64> {
+        self.mark_deleted(seq)
+    }
+
     fn mark_deleted(&mut self, seq: u64) -> Option<u64> {
         let i = self.slot_idx(seq)?;
         if self.records[i].deleted {
@@ -244,6 +251,12 @@ pub struct BoxState {
     /// Wakes SSE/diff long-pollers on append (ARCHITECTURE §1.2).
     pub notify: Notify,
 
+    /// The materialized lease projection for a queue box (DESIGN §10,
+    /// ARCHITECTURE §12). `None` on a plain `"log"` box. Lives under its own
+    /// mutex (queue lifecycle transitions are rare relative to the read path);
+    /// the single batched cohort claim pass holds it for one critical section.
+    pub queue: Option<Mutex<QueueProjection>>,
+
     /// Serializes the **seq-assignment + WAL-enqueue** critical section on the
     /// write path so a box's WAL frames are appended to the single ordered writer
     /// in the *same order* their seqs were assigned. Without this, two concurrent
@@ -262,6 +275,14 @@ pub const TS_NEVER: i64 = i64::MIN;
 impl BoxState {
     /// Create a fresh box with the given config, interned id, and epoch.
     pub fn new(name: String, box_id: u32, config: BoxConfig, seq_base: u64, epoch: u64) -> Self {
+        // A queue box carries a materialized lease projection (DESIGN §10); a
+        // plain log does not. The claim cursor starts at `seq_base` (the first
+        // job seq this box instance will assign).
+        let queue = if config.is_queue() {
+            Some(Mutex::new(QueueProjection::new(seq_base)))
+        } else {
+            None
+        };
         BoxState {
             name,
             box_id,
@@ -278,8 +299,14 @@ impl BoxState {
             last_read_ms: AtomicI64::new(TS_NEVER),
             last_consumed_ms: AtomicI64::new(TS_NEVER),
             notify: Notify::new(),
+            queue,
             append_lock: Mutex::new(()),
         }
+    }
+
+    /// Whether this box is a queue (carries a lease projection).
+    pub fn is_queue(&self) -> bool {
+        self.queue.is_some()
     }
 
     pub fn head_seq(&self) -> u64 {
@@ -608,6 +635,39 @@ impl BoxState {
 
         // Lazy physical reclaim of the now-dead front prefix.
         self.reclaim_front(head);
+        deleted
+    }
+
+    /// Permanently delete an explicit set of seqs (the queue ack / dead-letter
+    /// path, DESIGN §10.4): mark each live slot deleted, free its payload/tag,
+    /// adjust `bytes`/`count`, prune the tag index, then lazily reclaim the
+    /// now-dead front. Silent (never advances `evict_floor`). Returns the count
+    /// actually removed (a seq that is absent / already dead is skipped).
+    pub fn delete_seqs(&self, seqs: &[u64], now_ms: i64) -> u64 {
+        let head = self.head_seq();
+        let mut freed_bytes: u64 = 0;
+        let mut deleted: u64 = 0;
+        {
+            let mut index = self.index.write();
+            for &seq in seqs {
+                if let Some(f) = index.mark_deleted_pub(seq) {
+                    freed_bytes = freed_bytes.saturating_add(f);
+                    deleted += 1;
+                }
+            }
+        }
+        if freed_bytes > 0 {
+            let prev = self.bytes_retained.load(Ordering::Relaxed);
+            self.bytes_retained
+                .store(prev.saturating_sub(freed_bytes), Ordering::Relaxed);
+        }
+        if deleted > 0 {
+            let prev = self.live_count.load(Ordering::Relaxed);
+            self.live_count
+                .store(prev.saturating_sub(deleted), Ordering::Relaxed);
+        }
+        self.reclaim_front(head);
+        let _ = now_ms;
         deleted
     }
 }

@@ -45,7 +45,7 @@ use reqwest::blocking::Client;
 pub use reqwest::StatusCode;
 use serde_json::Value;
 
-use streams::clock::{SharedClock, SystemClock};
+use streams::clock::{SharedClock, SystemClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::http;
@@ -54,12 +54,19 @@ use streams::http;
 pub struct Harness {
     base_url: String,
     client: Client,
-    /// Kept alive so the background runtime/thread lives as long as the harness.
-    _shutdown: tokio::sync::oneshot::Sender<()>,
-    _thread: thread::JoinHandle<()>,
+    /// Signals graceful shutdown; taken in `Drop` so we can join the server
+    /// thread (which flushes + joins the WAL writer) BEFORE the harness goes
+    /// away — essential for restart tests where the WAL must hit disk.
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
     /// Unique per-harness data dir for the WAL; removed on drop so tests stay
     /// isolated and leave no on-disk residue.
     _data_dir: tempfile::TempDir,
+    /// `Some` when this harness was booted with an injected [`TestClock`]
+    /// ([`Harness::start_with_test_clock`]) so timing-dependent flows (lease
+    /// expiry / visibility timeout, delayed nacks) can be driven deterministically
+    /// over the real bound server — no wall-clock sleeps for correctness.
+    clock: Option<TestClock>,
 }
 
 impl Harness {
@@ -70,11 +77,63 @@ impl Harness {
         Harness::start_with(ServerConfig::default())
     }
 
+    /// Like [`start`](Self::start) but with an injected [`TestClock`] (returned
+    /// alongside via [`Harness::clock`]) so a black-box test can advance the
+    /// server's notion of time deterministically — used for lease-expiry /
+    /// visibility-timeout and delayed-nack flows that would otherwise need real
+    /// sleeps. The server runs on this exact clock, so a `clock.advance(ms)`
+    /// followed by a claim observes the post-advance lease state with no race.
+    pub fn start_with_test_clock() -> Harness {
+        let clock = TestClock::new(1_000_000_000);
+        Harness::boot(
+            ServerConfig::default(),
+            Arc::new(clock.clone()),
+            Some(clock),
+            None,
+        )
+    }
+
     /// Like [`start`](Self::start) but with a caller-supplied [`ServerConfig`]
     /// (e.g. to enable bearer auth via `api_keys`). Each harness gets a UNIQUE
     /// temp data dir for the WAL (via `tempfile::tempdir`), so the durable write
     /// path is exercised while tests stay isolated and leave nothing behind.
-    pub fn start_with(mut config: ServerConfig) -> Harness {
+    pub fn start_with(config: ServerConfig) -> Harness {
+        let clock: SharedClock = Arc::new(SystemClock);
+        Harness::boot(config, clock, None, None)
+    }
+
+    /// Boot a server whose WAL lives in `data_dir` (owned by the *caller*, not the
+    /// harness) so the on-disk state SURVIVES this harness being dropped. Used to
+    /// simulate a process restart: boot, drop, then re-boot a second harness on
+    /// the same dir and assert recovery. The data dir is NOT removed on drop.
+    pub fn start_persistent(data_dir: &std::path::Path) -> Harness {
+        let config = ServerConfig {
+            data_dir: Some(data_dir.to_string_lossy().into_owned()),
+            ..ServerConfig::default()
+        };
+        let clock: SharedClock = Arc::new(SystemClock);
+        Harness::boot(config, clock, None, Some(data_dir.to_path_buf()))
+    }
+
+    /// The injected [`TestClock`], present only for a harness booted via
+    /// [`Harness::start_with_test_clock`]. Advance it to move the server's clock
+    /// forward (e.g. past a lease deadline) deterministically.
+    pub fn clock(&self) -> &TestClock {
+        self.clock
+            .as_ref()
+            .expect("clock() requires Harness::start_with_test_clock")
+    }
+
+    /// Shared boot path: bind an ephemeral port, spawn the server on a dedicated
+    /// runtime/thread with `clock`, and wait for health. When `external_dir` is
+    /// `Some`, the WAL lives there and outlives this harness (restart tests);
+    /// otherwise a fresh per-harness tempdir is created and removed on drop.
+    fn boot(
+        mut config: ServerConfig,
+        clock: SharedClock,
+        test_clock: Option<TestClock>,
+        external_dir: Option<std::path::PathBuf>,
+    ) -> Harness {
         // Reserve an ephemeral port on the std listener, then hand the address to
         // the async runtime (which re-binds it). Closing this std listener first
         // avoids the address being held while tokio binds.
@@ -83,10 +142,14 @@ impl Harness {
         let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
         drop(std_listener);
 
-        // Unique per-harness data dir; kept alive (and auto-removed) by the
-        // `_data_dir` field on the returned `Harness`.
+        // Per-harness data dir. For a restart test the caller owns the dir (it
+        // must survive this harness being dropped), so we keep `_data_dir` as a
+        // throwaway tempdir but point the config at the external path.
         let data_dir = tempfile::tempdir().expect("create temp data dir");
-        config.data_dir = Some(data_dir.path().to_string_lossy().into_owned());
+        match &external_dir {
+            Some(p) => config.data_dir = Some(p.to_string_lossy().into_owned()),
+            None => config.data_dir = Some(data_dir.path().to_string_lossy().into_owned()),
+        }
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -99,7 +162,6 @@ impl Harness {
                     .build()
                     .expect("build harness runtime");
                 rt.block_on(async move {
-                    let clock: SharedClock = Arc::new(SystemClock);
                     let engine =
                         Engine::with_data_dir(config, clock).expect("open durable engine");
                     let app = http::build_router(engine);
@@ -130,12 +192,26 @@ impl Harness {
         let h = Harness {
             base_url,
             client,
-            _shutdown: shutdown_tx,
-            _thread: thread,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
             _data_dir: data_dir,
+            clock: test_clock,
         };
         h.wait_healthy(Duration::from_secs(5));
         h
+    }
+
+    /// Gracefully shut the server down and join its thread, draining + fsyncing
+    /// the WAL writer (via the engine's `Drop`). Idempotent. Called automatically
+    /// on drop; a restart test can call it explicitly to be sure the on-disk WAL
+    /// is complete before re-booting on the same data dir.
+    pub fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 
     /// The server base URL, e.g. `http://127.0.0.1:53124` (no trailing slash).
@@ -260,6 +336,14 @@ impl Harness {
         }
         drain_frames(&mut buf, &mut frames);
         frames
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        // Signal shutdown and join the server thread so the WAL writer flushes
+        // and joins before the (possibly shared) data dir is reused or removed.
+        self.shutdown();
     }
 }
 

@@ -243,11 +243,18 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             box_id,
             before_seq,
             match_,
+            seqs,
             ts,
         } => {
             if let Some(b) = engine.get_box_by_id(box_id) {
-                let filter = match_.map(|m| matchsel_to_filter(&m));
-                b.apply_delete(before_seq, filter.as_ref(), ts as i64);
+                if !seqs.is_empty() {
+                    // Explicit seq set (queue ack / dead-letter delete): remove
+                    // exactly these seqs (deterministic replay, DESIGN §10.4).
+                    b.delete_seqs(&seqs, ts as i64);
+                } else {
+                    let filter = match_.map(|m| matchsel_to_filter(&m));
+                    b.apply_delete(before_seq, filter.as_ref(), ts as i64);
+                }
             }
         }
         WalRecord::BoxConfig {
@@ -278,6 +285,27 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
                 let mut floors = b.floors.write();
                 if evict_floor > floors.evict_floor {
                     floors.evict_floor = evict_floor;
+                }
+            }
+        }
+        WalRecord::Lease {
+            box_id,
+            seq,
+            event,
+            node,
+            lease_id,
+            deadline,
+            deliveries,
+            ..
+        } => {
+            // Replay a durable leases-log event into the box's lease projection
+            // (DESIGN §10.1). Only durable lease frames survive a crash; with the
+            // default non-durable leases log nothing replays here and every
+            // in-flight job is claimable again (self-healing, DESIGN §10.6).
+            if let Some(b) = engine.get_box_by_id(box_id) {
+                if let Some(q) = &b.queue {
+                    let mut q = q.lock();
+                    q.apply_lease_event(event, seq, node, lease_id, deadline as i64, deliveries);
                 }
             }
         }

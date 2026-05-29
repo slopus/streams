@@ -44,6 +44,7 @@ fn assert_error_code(body: &Value, expected_code: &str) {
 /// by create/state responses.
 fn default_config() -> Value {
     json!({
+        "type": "log",
         "ttl_ms": 0,
         "cap_records": 0,
         "cap_bytes": 0,
@@ -53,7 +54,12 @@ fn default_config() -> Value {
         "auto_priority": true,
         "auto_create": true,
         "idempotency_window_ms": 120000,
-        "dedupe_node": true
+        "dedupe_node": true,
+        "lease_ms": 30000,
+        "claim_jitter_ms": 0,
+        "max_deliveries": 0,
+        "dead_letter": null,
+        "leases_durable": false
     })
 }
 

@@ -342,6 +342,7 @@ async fn run_conformance(cmd: ConformanceCmd) -> ExitCode {
     conformance_cap_tombstone(&c, &mut rep, &ns).await;
     conformance_node_loop(&c, &mut rep, &ns).await;
     conformance_routers(&c, &mut rep, &ns).await;
+    conformance_queue(&c, &mut rep, &ns).await;
     conformance_sse(&c, &mut rep, &ns).await;
     if cmd.token.is_some() {
         conformance_auth(&cmd.base_url, &c, &mut rep, &ns).await;
@@ -1074,6 +1075,246 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
             format!("body {}", r.body)
         });
     }
+}
+
+/// Queue layer (API §10): create a queue, produce jobs, then assert the
+/// claim/ack/nack/extend shapes + status codes, `409 not_a_queue` on a log box,
+/// and that `/work` SSE delivers a `job` frame. Timing-dependent semantics
+/// (lease expiry / dead-letter) are covered deterministically by the engine +
+/// integration tests under a TestClock; here we assert the wire contract.
+async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
+    let q = format!("{ns}-q");
+    let path = format!("/v0/boxes/{q}");
+
+    // PUT type:"queue" -> 201, config echoes type + queue tuning fields.
+    let put = c
+        .put(
+            &path,
+            &json!({ "type": "queue", "lease_ms": 30000, "max_deliveries": 5 }),
+        )
+        .await;
+    rep.status("PUT type:queue create -> 201", &put, 201);
+    if let Ok(r) = &put {
+        rep.check(
+            "queue create: config.type=queue, lease_ms/max_deliveries echoed",
+            r.body.get("config").and_then(|c| c.get("type")).and_then(|v| v.as_str()) == Some("queue")
+                && u64_of(r.body.get("config").unwrap_or(&Value::Null), "lease_ms") == Some(30000)
+                && u64_of(r.body.get("config").unwrap_or(&Value::Null), "max_deliveries") == Some(5),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // Produce 5 jobs (a normal append into the jobs log).
+    let records: Vec<Value> = (0..5).map(|i| json!({ "data": { "i": i } })).collect();
+    let w = c.post(&path, &json!({ "records": records })).await;
+    rep.status("queue produce 5 jobs -> 200", &w, 200);
+
+    // GET state: type=queue + queue{ready,in_flight,dead_lettered}.
+    let st = c.get(&path).await;
+    rep.status("GET queue state -> 200", &st, 200);
+    if let Ok(r) = &st {
+        let qs = r.body.get("queue");
+        rep.check(
+            "queue state: type=queue, queue{ready=5,in_flight=0,dead_lettered=0}",
+            r.body.get("type").and_then(|v| v.as_str()) == Some("queue")
+                && qs.and_then(|x| x.get("ready")).and_then(|v| v.as_u64()) == Some(5)
+                && qs.and_then(|x| x.get("in_flight")).and_then(|v| v.as_u64()) == Some(0)
+                && qs.and_then(|x| x.get("dead_lettered")).and_then(|v| v.as_u64()) == Some(0),
+            || format!("body {}", r.body),
+        );
+    }
+
+    // POST /claim {node, max:2} -> 200 with claimed[] (ascending $seq + lease_id /
+    // deadline / deliveries), count=2, ready=3.
+    let claim = c.post(&format!("{path}/claim"), &json!({ "node": "w1", "max": 2 })).await;
+    rep.status("POST /claim -> 200", &claim, 200);
+    let mut claimed_seqs: Vec<u64> = Vec::new();
+    if let Ok(r) = &claim {
+        let arr = r.body.get("claimed").and_then(|v| v.as_array());
+        claimed_seqs = arr
+            .map(|a| a.iter().filter_map(|j| j.get("$seq").and_then(|s| s.as_u64())).collect())
+            .unwrap_or_default();
+        let shapes_ok = arr
+            .map(|a| {
+                a.iter().all(|j| {
+                    j.get("lease_id").and_then(|v| v.as_str()).map(|s| s.starts_with("lease_")).unwrap_or(false)
+                        && j.get("deadline").and_then(|v| v.as_i64()).map(|d| d > 0).unwrap_or(false)
+                        && j.get("deliveries").and_then(|v| v.as_u64()) == Some(1)
+                        && j.get("data").is_some()
+                })
+            })
+            .unwrap_or(false);
+        rep.check(
+            "claim: count=2, ascending $seq [1,2], lease_id/deadline/deliveries present, ready=3",
+            u64_of(&r.body, "count") == Some(2)
+                && claimed_seqs == vec![1, 2]
+                && u64_of(&r.body, "ready") == Some(3)
+                && shapes_ok,
+            || format!("body {}", r.body),
+        );
+    }
+
+    // POST /extend {node, seqs:[seq0], lease_ms} -> 200, extended=1, deadlines map.
+    if let Some(&seq0) = claimed_seqs.first() {
+        let ext = c
+            .post(&format!("{path}/extend"), &json!({ "node": "w1", "seqs": [seq0], "lease_ms": 60000 }))
+            .await;
+        rep.status("POST /extend -> 200", &ext, 200);
+        if let Ok(r) = &ext {
+            let dl_ok = r
+                .body
+                .get("deadlines")
+                .and_then(|m| m.get(seq0.to_string()))
+                .and_then(|v| v.as_i64())
+                .map(|d| d > 0)
+                .unwrap_or(false);
+            rep.check(
+                "extend: extended=1, deadlines[seq] present and > 0",
+                u64_of(&r.body, "extended") == Some(1) && dl_ok,
+                || format!("body {}", r.body),
+            );
+        }
+    }
+
+    // POST /nack {node, seqs:[seq1]} -> 200, nacked=1 (released for immediate reclaim).
+    if claimed_seqs.len() >= 2 {
+        let seq1 = claimed_seqs[1];
+        let nack = c
+            .post(&format!("{path}/nack"), &json!({ "node": "w1", "seqs": [seq1], "delay_ms": 0 }))
+            .await;
+        rep.status("POST /nack -> 200", &nack, 200);
+        if let Ok(r) = &nack {
+            rep.check(
+                "nack: nacked=1, in_flight=1 (seq0 still held), seq1 back to ready",
+                u64_of(&r.body, "nacked") == Some(1)
+                    && u64_of(&r.body, "in_flight") == Some(1),
+                || format!("body {}", r.body),
+            );
+        }
+    }
+
+    // POST /ack {node, seqs:[seq0]} -> 200, acked=1 (ack-is-delete), skipped=[].
+    if let Some(&seq0) = claimed_seqs.first() {
+        let ack = c
+            .post(&format!("{path}/ack"), &json!({ "node": "w1", "seqs": [seq0] }))
+            .await;
+        rep.status("POST /ack -> 200", &ack, 200);
+        if let Ok(r) = &ack {
+            let skipped_empty = r
+                .body
+                .get("skipped")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(false);
+            rep.check(
+                "ack: acked=1, skipped=[] (ack-is-delete)",
+                u64_of(&r.body, "acked") == Some(1) && skipped_empty,
+                || format!("body {}", r.body),
+            );
+        }
+        // Acking a seq this node no longer holds is silently skipped (idempotent).
+        let ack2 = c
+            .post(&format!("{path}/ack"), &json!({ "node": "w1", "seqs": [seq0] }))
+            .await;
+        if let Ok(r) = &ack2 {
+            rep.check(
+                "ack idempotent: re-ack acked=0, seq skipped",
+                u64_of(&r.body, "acked") == Some(0)
+                    && r.body
+                        .get("skipped")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_u64()).any(|s| s == seq0))
+                        .unwrap_or(false),
+                || format!("body {}", r.body),
+            );
+        }
+    }
+
+    // claim with an empty node -> 400 invalid_request.
+    let badnode = c.post(&format!("{path}/claim"), &json!({ "node": "", "max": 1 })).await;
+    rep.error_code("claim empty node -> 400 invalid_request", &badnode, 400, "invalid_request");
+
+    // 409 not_a_queue: every queue endpoint on a plain LOG box.
+    let logb = format!("{ns}-qlog");
+    let logpath = format!("/v0/boxes/{logb}");
+    let _ = c.put(&logpath, &json!({})).await; // default type=log.
+    for ep in ["claim", "ack", "nack", "extend"] {
+        let r = c
+            .post(
+                &format!("{logpath}/{ep}"),
+                &json!({ "node": "w1", "seqs": [1], "lease_ms": 1000 }),
+            )
+            .await;
+        rep.error_code(
+            &format!("queue /{ep} on a log box -> 409 not_a_queue"),
+            &r,
+            409,
+            "not_a_queue",
+        );
+    }
+    // /work on a log box -> 409 not_a_queue (validated before the stream opens).
+    let worklog = c
+        .send(
+            c.http
+                .get(c.url(&format!("{logpath}/work?node=w1")))
+                .header("accept", "text/event-stream"),
+        )
+        .await;
+    rep.error_code("GET /work on a log box -> 409 not_a_queue", &worklog, 409, "not_a_queue");
+
+    // queue op on an ABSENT box -> 404 box_not_found (not 409).
+    let missing = c
+        .post(&format!("/v0/boxes/{ns}-qmiss/claim"), &json!({ "node": "w1" }))
+        .await;
+    rep.error_code("claim on absent box -> 404 box_not_found", &missing, 404, "box_not_found");
+
+    // /work with a non-SSE Accept -> 406 not_acceptable.
+    let na = c
+        .send(c.http.get(c.url(&format!("{path}/work?node=w1"))).header("accept", "application/json"))
+        .await;
+    rep.error_code("GET /work Accept!=event-stream -> 406 not_acceptable", &na, 406, "not_acceptable");
+
+    // /work SSE delivers a job frame. Produce a couple of fresh jobs on a clean
+    // queue so the stream has work to push, then collect the first job frame.
+    let wq = format!("{ns}-qwork");
+    let wpath = format!("/v0/boxes/{wq}");
+    let _ = c.put(&wpath, &json!({ "type": "queue", "lease_ms": 30000 })).await;
+    let _ = c
+        .post(&wpath, &json!({ "records": [{ "data": { "j": 1 } }, { "data": { "j": 2 } }] }))
+        .await;
+    let frames = collect_sse(
+        c,
+        &format!("{wpath}/work?node=worker-1&max=2"),
+        None,
+        1,
+        Duration::from_secs(5),
+        || None,
+        &wpath,
+    )
+    .await;
+    let job = frames.iter().find(|f| f.event == "job");
+    rep.check(
+        "/work SSE delivers an `event: job` frame with box/$seq/lease_id/deliveries",
+        job.map(|f| {
+            let d: Value = serde_json::from_str(&f.data).unwrap_or(Value::Null);
+            d.get("box").and_then(|v| v.as_str()) == Some(wq.as_str())
+                && d.get("$seq").and_then(|v| v.as_u64()).map(|s| s >= 1).unwrap_or(false)
+                && d.get("lease_id").and_then(|v| v.as_str()).map(|s| s.starts_with("lease_")).unwrap_or(false)
+                && d.get("deliveries").and_then(|v| v.as_u64()) == Some(1)
+                && !f.id.is_empty()
+        })
+        .unwrap_or(false),
+        || format!("frames: {:?}", frames.iter().map(|f| (&f.event, &f.data)).collect::<Vec<_>>()),
+    );
+
+    // type is immutable: re-PUT the queue as a log -> 409 box_exists_incompatible.
+    let immut = c.put(&path, &json!({ "type": "log" })).await;
+    rep.error_code(
+        "PUT changing type queue->log -> 409 box_exists_incompatible",
+        &immut,
+        409,
+        "box_exists_incompatible",
+    );
 }
 
 async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {

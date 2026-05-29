@@ -8,6 +8,7 @@
 pub mod box_state;
 pub mod eviction;
 pub mod filters;
+pub mod queue;
 pub mod router;
 
 use crate::clock::SharedClock;
@@ -328,6 +329,29 @@ impl Engine {
         let _ = self.wal_commit(record, durable);
     }
 
+    /// Log a `Delete` control frame for a queue ack / dead-letter removal so the
+    /// permanent delete replays deterministically (durability == the box's
+    /// `durable`: ack durability == jobs-log durability, DESIGN §10.1/§10.4).
+    pub(crate) fn wal_log_delete_seqs(&self, box_id: u32, seqs: Vec<u64>, now: i64, durable: bool) {
+        self.wal_log(
+            WalRecord::Delete {
+                box_id,
+                before_seq: None,
+                match_: None,
+                seqs,
+                ts: now.max(0) as u64,
+            },
+            durable,
+        );
+    }
+
+    /// Append one leases-log lifecycle event (DESIGN §10.1). Only called when the
+    /// queue's leases log is durable; logged durably so a replayed lease frame
+    /// reconstructs the projection exactly.
+    pub(crate) fn wal_log_lease(&self, record: WalRecord) {
+        self.wal_log(record, true);
+    }
+
     /// Enqueue one WAL `Append` frame per record in a write batch to the single
     /// ordered writer, returning the **last** frame's commit token (the ordered
     /// writer guarantees every prior frame in the batch commits no later) plus
@@ -404,6 +428,36 @@ impl Engine {
             )));
         }
         validate_config(&config)?;
+
+        // A queue's dead-letter box must differ from itself (API §0.10).
+        if config.is_queue() {
+            if let Some(dl) = &config.dead_letter {
+                if dl == name {
+                    return Err(Error::invalid_request(
+                        "dead_letter must name a different box",
+                    ));
+                }
+            }
+        }
+
+        // `type` is immutable once a box exists (API §0.10): a `PUT` that would
+        // change it is rejected with `409 box_exists_incompatible`.
+        if let Some(existing) = self.get_box(name) {
+            let cur_type = existing.config.read().r#type;
+            if cur_type != config.r#type {
+                return Err(Error::new(
+                    ErrorCode::BoxExistsIncompatible,
+                    format!(
+                        "box {name:?} already exists as type {cur_type:?}; type is immutable"
+                    ),
+                )
+                .with_detail(serde_json::json!({
+                    "box": name,
+                    "existing_type": cur_type,
+                    "requested_type": config.r#type,
+                })));
+            }
+        }
 
         let (created, box_id) = self.apply_put_box(name, config.clone(), None, None);
 
@@ -580,8 +634,17 @@ impl Engine {
         let config = b.config.read().clone();
         let effective_priority = self.effective_priority(&b);
 
+        // A queue box exposes its lease counters (§10.7) alongside the normal
+        // state; a plain log omits the `queue` sub-object.
+        let queue = if b.is_queue() {
+            Some(self.queue_counters(&b, now))
+        } else {
+            None
+        };
+
         Ok(BoxStateResponse {
             box_name: name.to_string(),
+            r#type: config.r#type,
             head_seq: head,
             earliest_seq: earliest,
             next_seq: head.saturating_add(1),
@@ -591,6 +654,7 @@ impl Engine {
             effective_priority,
             last_write_ts: BoxState::read_ts(&b.last_write_ms),
             last_read_ts: BoxState::read_ts(&b.last_read_ms),
+            queue,
             performance: Performance::with_total(elapsed_ms(start)),
         })
     }
@@ -1228,6 +1292,7 @@ impl Engine {
                 box_id,
                 before_seq: req.before_seq,
                 match_: req.match_.as_ref().map(filter_to_matchsel),
+                seqs: Vec::new(),
                 ts: now.max(0) as u64,
             },
             true,
@@ -1551,7 +1616,7 @@ fn decode_record_payload(blob: &[u8]) -> (serde_json::Value, Option<serde_json::
 
 /// Estimate the accounted byte size of a record's payload (`data` + `meta` +
 /// framing). Phase 2 uses the serialized JSON length as a stable proxy.
-fn payload_bytes(data: &serde_json::Value, meta: &Option<serde_json::Value>) -> u64 {
+pub(crate) fn payload_bytes(data: &serde_json::Value, meta: &Option<serde_json::Value>) -> u64 {
     let mut n = serde_json::to_vec(data).map(|v| v.len()).unwrap_or(0);
     if let Some(m) = meta {
         n += serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0);

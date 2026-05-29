@@ -89,6 +89,7 @@ const T_DELETE: u8 = 6;
 const T_EVICT_WATERMARK: u8 = 7;
 const T_CHECKPOINT_MARK: u8 = 8;
 const T_CONFIG_UPDATE: u8 = 9;
+const T_LEASE: u8 = 10;
 
 // Flag bits.
 const FLAG_HAS_TAG: u8 = 1 << 0;
@@ -166,6 +167,10 @@ pub enum WalRecord {
         before_seq: Option<u64>,
         /// `match` selector, if supplied.
         match_: Option<MatchSel>,
+        /// Explicit seq set (the queue ack / dead-letter path, DESIGN §10.4):
+        /// delete exactly these seqs. Empty for the API §5 selector-based delete.
+        /// Replays deterministically (the exact seqs are logged, not re-derived).
+        seqs: Vec<u64>,
         ts: u64,
     },
     /// Box created or its config updated. `tombstone == false` for create/update;
@@ -193,6 +198,36 @@ pub enum WalRecord {
         last_checkpoint_seq: u64,
         ts: u64,
     },
+    /// A leases-log lifecycle event for a queue box (DESIGN §10.1): the pending
+    /// who-holds-what state is the materialized projection of these events. Only
+    /// written when the queue's `leases_durable:true`; otherwise the projection
+    /// is purely in-memory and self-heals on restart (DESIGN §10.6).
+    Lease {
+        box_id: u32,
+        /// The job seq this event concerns.
+        seq: u64,
+        /// Event kind: 0=claimed 1=released 2=extended 3=acked (see [`LeaseEvent`]).
+        event: u8,
+        /// The holder node.
+        node: String,
+        /// Opaque lease identity for the delivery.
+        lease_id: u64,
+        /// Absolute deadline ms (for claimed/extended; `0` otherwise).
+        deadline: u64,
+        /// Delivery counter after this event (for claimed).
+        deliveries: u64,
+        ts: u64,
+    },
+}
+
+/// The kind of a leases-log lifecycle event (the `event` byte of
+/// [`WalRecord::Lease`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseEvent {
+    Claimed = 0,
+    Released = 1,
+    Extended = 2,
+    Acked = 3,
 }
 
 impl WalRecord {
@@ -206,6 +241,7 @@ impl WalRecord {
             WalRecord::RouterDelete { .. } => T_ROUTER_DELETE,
             WalRecord::EvictWatermark { .. } => T_EVICT_WATERMARK,
             WalRecord::CheckpointMark { .. } => T_CHECKPOINT_MARK,
+            WalRecord::Lease { .. } => T_LEASE,
         }
     }
 
@@ -217,16 +253,19 @@ impl WalRecord {
             WalRecord::Delete { box_id, .. } => *box_id,
             WalRecord::BoxConfig { box_id, .. } => *box_id,
             WalRecord::EvictWatermark { box_id, .. } => *box_id,
+            WalRecord::Lease { box_id, .. } => *box_id,
             WalRecord::RouterCreate { .. }
             | WalRecord::RouterDelete { .. }
             | WalRecord::CheckpointMark { .. } => 0,
         }
     }
 
-    /// The seq this record carries (`0` for non-`Append` control frames).
+    /// The seq this record carries (`0` for control frames that target no
+    /// specific record). `Append` and `Lease` both name a job seq.
     pub fn seq(&self) -> u64 {
         match self {
             WalRecord::Append { seq, .. } => *seq,
+            WalRecord::Lease { seq, .. } => *seq,
             _ => 0,
         }
     }
@@ -378,11 +417,12 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
         WalRecord::Delete {
             before_seq,
             match_,
+            seqs,
             ts: rts,
             ..
         } => {
             ts = *rts;
-            // body: [has_before:u8][before:u64?] [match]
+            // body: [has_before:u8][before:u64?] [match] [n_seqs:u32][seq:u64 ...]
             match before_seq {
                 Some(b) => {
                     data_buf.push(1);
@@ -391,6 +431,10 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
                 None => data_buf.push(0),
             }
             write_match(&mut data_buf, match_);
+            data_buf.extend_from_slice(&(seqs.len() as u32).to_le_bytes());
+            for s in seqs {
+                data_buf.extend_from_slice(&s.to_le_bytes());
+            }
             data = &data_buf;
         }
         WalRecord::BoxConfig { op, ts: rts, .. } => {
@@ -436,6 +480,24 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
         } => {
             ts = *rts;
             data_buf.extend_from_slice(&last_checkpoint_seq.to_le_bytes());
+            data = &data_buf;
+        }
+        WalRecord::Lease {
+            event,
+            node: n,
+            lease_id,
+            deadline,
+            deliveries,
+            ts: rts,
+            ..
+        } => {
+            ts = *rts;
+            // body: [event:u8][lease_id:u64][deadline:u64][deliveries:u64][lp node]
+            data_buf.push(*event);
+            data_buf.extend_from_slice(&lease_id.to_le_bytes());
+            data_buf.extend_from_slice(&deadline.to_le_bytes());
+            data_buf.extend_from_slice(&deliveries.to_le_bytes());
+            write_lp_bytes(&mut data_buf, n.as_bytes());
             data = &data_buf;
         }
     }
@@ -562,10 +624,30 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
                 Some(m) => m,
                 None => return DecodeStep::Torn,
             };
+            // Explicit seq set (queue ack / dead-letter). Absent in older frames
+            // ⇒ treat as empty (the prefix read consumed exactly the selectors).
+            let seqs = if pos < data.len() {
+                if pos + 4 > data.len() {
+                    return DecodeStep::Torn;
+                }
+                let n = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    match read_u64(data, &mut pos) {
+                        Some(s) => v.push(s),
+                        None => return DecodeStep::Torn,
+                    }
+                }
+                v
+            } else {
+                Vec::new()
+            };
             WalRecord::Delete {
                 box_id,
                 before_seq,
                 match_,
+                seqs,
                 ts,
             }
         }
@@ -659,6 +741,29 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
                     ts,
                 },
                 None => return DecodeStep::Torn,
+            }
+        }
+        T_LEASE => {
+            let mut pos = 0usize;
+            let event = read_u8(data, &mut pos);
+            let lease_id = read_u64(data, &mut pos);
+            let deadline = read_u64(data, &mut pos);
+            let deliveries = read_u64(data, &mut pos);
+            let node = read_lp_str(data, &mut pos);
+            match (event, lease_id, deadline, deliveries, node) {
+                (Some(event), Some(lease_id), Some(deadline), Some(deliveries), Some(node)) => {
+                    WalRecord::Lease {
+                        box_id,
+                        seq,
+                        event,
+                        node,
+                        lease_id,
+                        deadline,
+                        deliveries,
+                        ts,
+                    }
+                }
+                _ => return DecodeStep::Torn,
             }
         }
         _ => return DecodeStep::Torn, // unknown type ⇒ treat as torn.
@@ -1323,9 +1428,54 @@ mod tests {
                 box_id: 9,
                 before_seq: Some(50),
                 match_: None,
+                seqs: Vec::new(),
                 ts: 123,
             },
             true,
+        );
+    }
+
+    #[test]
+    fn roundtrip_delete_explicit_seqs() {
+        roundtrip(
+            WalRecord::Delete {
+                box_id: 9,
+                before_seq: None,
+                match_: None,
+                seqs: vec![480101, 480104, 480200],
+                ts: 7,
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn roundtrip_lease_events() {
+        roundtrip(
+            WalRecord::Lease {
+                box_id: 3,
+                seq: 480101,
+                event: 0, // claimed
+                node: "worker-eu-1".into(),
+                lease_id: 0x7f3a9c,
+                deadline: 1_748_450_039_000,
+                deliveries: 1,
+                ts: 1_748_450_001_000,
+            },
+            true,
+        );
+        roundtrip(
+            WalRecord::Lease {
+                box_id: 3,
+                seq: 480104,
+                event: 3, // acked
+                node: "worker-eu-1".into(),
+                lease_id: 0x7f3a9d,
+                deadline: 0,
+                deliveries: 0,
+                ts: 1_748_450_002_000,
+            },
+            false,
         );
     }
 
@@ -1336,6 +1486,7 @@ mod tests {
                 box_id: 9,
                 before_seq: None,
                 match_: Some(MatchSel::Eq("exact-tag".into())),
+                seqs: Vec::new(),
                 ts: 1,
             },
             false,
@@ -1345,6 +1496,7 @@ mod tests {
                 box_id: 9,
                 before_seq: Some(10),
                 match_: Some(MatchSel::Glob("tenant:".into())),
+                seqs: Vec::new(),
                 ts: 2,
             },
             true,
@@ -1437,6 +1589,7 @@ mod tests {
                 box_id: 1,
                 before_seq: Some(2),
                 match_: None,
+                seqs: Vec::new(),
                 ts: 3,
             },
         ];

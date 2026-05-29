@@ -19,6 +19,6 @@ pub use snapshot::{
     SnapshotError, SnapshotRecord, SnapshotRouter,
 };
 pub use wal::{
-    BoxConfigOp, CommitToken, MatchSel, RouterOp, Wal, WalConfig, WalError, WalFrame, WalReader,
-    WalRecord, WalWriter, FRAME_CRC_LEN, FRAME_HEADER_LEN,
+    BoxConfigOp, CommitToken, LeaseEvent, MatchSel, RouterOp, Wal, WalConfig, WalError, WalFrame,
+    WalReader, WalRecord, WalWriter, FRAME_CRC_LEN, FRAME_HEADER_LEN,
 };
