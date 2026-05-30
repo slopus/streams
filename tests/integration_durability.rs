@@ -1723,3 +1723,168 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
     assert_eq!(engine.box_state("d", false).unwrap().head_seq, 1);
     assert_eq!(engine.diff("d", diff_from(0)).unwrap().records[0].data, json!({ "n": 1 }));
 }
+
+// ===========================================================================
+// Durability commit classes (memory / disk / fsync) — Stage 2.
+//
+// A box's `durability` selects where its records land and when an ack returns:
+//   - memory: never written to the WAL; pure RAM; records lost on restart while
+//     the box CONFIG survives (the box reappears EMPTY, head_seq resets to 0).
+//   - disk:   group-committed WAL (today's durable:false); survives a clean
+//     restart minus the un-fsynced tail.
+//   - fsync:  fsync-gated ack (today's durable:true); survives any crash.
+// ===========================================================================
+
+/// A box of the given durability class (queue/log defaults otherwise).
+fn class_box(class: Durability) -> BoxConfig {
+    BoxConfig {
+        durability: Some(class),
+        ..BoxConfig::default()
+    }
+}
+
+/// A `memory`-class box LOSES its records across a restart while its CONFIG
+/// survives: the box reappears EMPTY, `head_seq` resets to 0, and no WAL/segment
+/// trace of the records remains. Writes report `wal_append_ms`/`fsync_ms == 0`.
+#[test]
+fn memory_box_loses_records_but_config_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = engine_at(dir.path());
+        // A memory box with a non-default field so we can prove the CONFIG persists.
+        engine
+            .put_box(
+                "cache",
+                BoxConfig { durability: Some(Durability::Memory), cap_records: 99, ..BoxConfig::default() },
+            )
+            .unwrap();
+        for i in 1..=5 {
+            let resp = engine.write("cache", one(json!({ "i": i }), None), true).unwrap();
+            // The memory class never touches the WAL: zero append/fsync time.
+            assert_eq!(resp.performance.wal_append_ms, Some(0.0), "memory write skips WAL append");
+            assert_eq!(resp.performance.fsync_ms, Some(0.0), "memory write never fsyncs");
+        }
+        // In-memory the records ARE present (pure RAM, this process's lifetime).
+        let st = engine.box_state("cache", false).unwrap();
+        assert_eq!(st.head_seq, 5);
+        assert_eq!(st.count, 5);
+        // Snapshot now: a memory box must be captured EMPTY (no record persists).
+        assert!(engine.write_snapshot().unwrap());
+    }
+
+    // Restart: the box config survives, but the records do NOT, and head resets.
+    let engine = engine_at(dir.path());
+    let st = engine.box_state("cache", false).unwrap();
+    assert_eq!(st.head_seq, 0, "memory box head_seq resets to 0 on restart");
+    assert_eq!(st.count, 0, "memory box reappears EMPTY (records lost)");
+    assert_eq!(st.config.durability, Some(Durability::Memory), "config (durability) survives");
+    assert_eq!(st.config.cap_records, 99, "config (cap_records) survives");
+    assert!(!st.config.durable, "memory ⇒ durable:false (back-compat: class != fsync)");
+    let d = engine.diff("cache", diff_from(0)).unwrap();
+    assert!(d.records.is_empty(), "no records resurrected from WAL/snapshot");
+    assert!(d.tombstone.is_none(), "an empty fresh box has nothing to tombstone");
+
+    // The box is fully functional post-restart: a fresh write starts at seq 1.
+    engine.write("cache", one(json!({ "i": 100 }), None), true).unwrap();
+    assert_eq!(engine.box_state("cache", false).unwrap().head_seq, 1);
+}
+
+/// A `disk`-class box (today's durable:false) survives a CLEAN restart (the WAL
+/// writer drains + fsyncs on a clean teardown). It reports `fsync_ms == 0` (no
+/// per-write fsync), and resolves to `durable:false` for back-compat.
+#[test]
+fn disk_box_survives_clean_restart_and_is_not_fsync_gated() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = engine_at(dir.path());
+        engine.put_box("evts", class_box(Durability::Disk)).unwrap();
+        for i in 1..=4 {
+            let resp = engine.write("evts", one(json!({ "i": i }), None), true).unwrap();
+            // Disk is group-committed: the ack is not fsync-gated.
+            assert_eq!(resp.performance.fsync_ms, Some(0.0), "disk write is not fsync-gated");
+        }
+        let st = engine.box_state("evts", false).unwrap();
+        assert_eq!(st.config.durability, Some(Durability::Disk));
+        assert!(!st.config.durable, "disk ⇒ durable:false");
+    }
+    // Clean teardown drained + fsynced the WAL ⇒ the disk records are recovered.
+    let engine = engine_at(dir.path());
+    let st = engine.box_state("evts", false).unwrap();
+    assert_eq!(st.head_seq, 4, "disk writes survive a clean restart");
+    assert_eq!(st.count, 4);
+    assert_eq!(st.config.durability, Some(Durability::Disk), "class persisted");
+}
+
+/// `durability_class` resolution (API §0.10): explicit `durability` wins; absent
+/// it derives from `durable` (true⇒fsync, false⇒disk); and the response always
+/// reports the resolved class with `durable == (class == fsync)`.
+#[test]
+fn durability_resolution_and_back_compat_reporting() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_at(dir.path());
+
+    // Legacy durable:true (no `durability`) ⇒ resolves to fsync.
+    engine.put_box("a", BoxConfig { durable: true, ..BoxConfig::default() }).unwrap();
+    let a = engine.box_state("a", false).unwrap().config;
+    assert_eq!(a.durability, Some(Durability::Fsync));
+    assert!(a.durable);
+
+    // Legacy durable:false (no `durability`) ⇒ resolves to disk.
+    engine.put_box("b", BoxConfig::default()).unwrap();
+    let b = engine.box_state("b", false).unwrap().config;
+    assert_eq!(b.durability, Some(Durability::Disk));
+    assert!(!b.durable);
+
+    // Explicit `durability` WINS over a conflicting `durable` bool.
+    engine
+        .put_box("c", BoxConfig { durable: true, durability: Some(Durability::Disk), ..BoxConfig::default() })
+        .unwrap();
+    let c = engine.box_state("c", false).unwrap().config;
+    assert_eq!(c.durability, Some(Durability::Disk), "explicit durability wins");
+    assert!(!c.durable, "durable normalized to match the resolved class");
+
+    // Explicit memory ⇒ durable:false; is_durable()==false.
+    engine.put_box("d", class_box(Durability::Memory)).unwrap();
+    let d = engine.box_state("d", false).unwrap().config;
+    assert_eq!(d.durability, Some(Durability::Memory));
+    assert!(!d.durable);
+}
+
+/// A router forwarding into a `memory` destination does NOT persist the copy: the
+/// forwarded record is live in RAM this process's lifetime, but after a restart
+/// the memory dest reappears EMPTY while the (durable) source still has its record.
+#[test]
+fn router_into_memory_dest_does_not_persist_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = engine_at(dir.path());
+        // A durable source; a memory destination box.
+        engine.put_box("src", durable_box()).unwrap();
+        engine.put_box("mem_dst", class_box(Durability::Memory)).unwrap();
+        engine
+            .put_router(
+                "src->mem_dst",
+                RouterCreateRequest {
+                    source: "src".into(),
+                    dest: "mem_dst".into(),
+                    preserve_node: true,
+                    preserve_tag: true,
+                    create_dest: false, // dest already exists as a memory box.
+                    filter: None,
+                    allow_cycle: false,
+                },
+            )
+            .unwrap();
+        engine.write("src", one(json!({ "x": 1 }), None), true).unwrap();
+        // The forward landed in RAM: the memory dest has the copy right now.
+        assert_eq!(engine.diff("mem_dst", diff_from(0)).unwrap().records.len(), 1);
+        assert!(engine.write_snapshot().unwrap());
+    }
+    // Restart: the durable source keeps its record; the memory dest is EMPTY.
+    let engine = engine_at(dir.path());
+    assert_eq!(engine.box_state("src", false).unwrap().head_seq, 1, "durable source survives");
+    let dst = engine.box_state("mem_dst", false).unwrap();
+    assert_eq!(dst.head_seq, 0, "memory dest head resets");
+    assert_eq!(dst.count, 0, "forwarded copy into a memory dest does not persist");
+    assert!(engine.diff("mem_dst", diff_from(0)).unwrap().records.is_empty());
+}

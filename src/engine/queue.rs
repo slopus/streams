@@ -611,14 +611,13 @@ impl Engine {
         }
 
         // Delete the acked jobs from the jobs log (the §7 permanent delete). Ack
-        // durability == jobs-log durability: a durable box fsyncs the delete.
+        // durability == jobs-log durability: a durable box fsyncs the delete
+        // BEFORE the ack returns (codex P0). On a durable WAL failure we propagate
+        // the error rather than reporting a phantom ack — the lease is already
+        // dropped, so the job simply resurfaces as claimable (at-least-once).
+        let mut fsync_ms = 0.0;
         for &(seq, lease_id) in &acked_seqs {
-            // `before_seq = seq + 1` AND no match would delete the whole prefix;
-            // instead delete exactly this seq via a tag-free point delete: use the
-            // delete-by-seq-range bounded to this single seq is not exact, so we
-            // mark it deleted directly on the index (the same path apply_delete
-            // uses) and log a Delete frame for replay determinism.
-            self.delete_one_seq(&b, seq, now);
+            fsync_ms += self.delete_one_seq(&b, seq, now)?;
             self.log_lease_event(
                 box_id,
                 seq,
@@ -633,13 +632,17 @@ impl Engine {
         }
 
         let (ready, in_flight) = self.queue_ready_inflight(&b, now);
+        let mut perf = Performance::with_total(elapsed_ms(start));
+        if fsync_ms > 0.0 {
+            perf.fsync_ms = Some(fsync_ms);
+        }
         Ok(AckResponse {
             box_name: name.to_string(),
             acked: acked_seqs.len() as u64,
             skipped,
             ready,
             in_flight,
-            performance: Performance::with_total(elapsed_ms(start)),
+            performance: perf,
         })
     }
 
@@ -785,16 +788,38 @@ impl Engine {
     /// delete path). Reuses [`BoxState::apply_delete`] with a bounded `before_seq`
     /// AND-ed against the seq's tag so exactly this seq is removed; falls back to
     /// a direct index mark when the record is untagged.
-    fn delete_one_seq(&self, b: &BoxState, seq: u64, now: i64) {
+    fn delete_one_seq(&self, b: &BoxState, seq: u64, now: i64) -> Result<f64> {
         let box_id = b.box_id;
-        let durable = b.config.read().durable;
-        // Logical removal of exactly this seq from the jobs log.
+        let class = b.config.read().durability_class();
+        if class == crate::types::Durability::Fsync {
+            // Durable jobs log (codex P0): log the explicit-seq Delete frame and
+            // WAIT on its fsync BEFORE the in-memory removal, propagating any
+            // failure. This makes ack durability real — a 200 ack means the delete
+            // is durably synced. The explicit-seq frame replays deterministically,
+            // so a crash after the fsync (before/after the in-memory delete)
+            // converges to the job being gone. On a WAL failure nothing is deleted
+            // (the job stays claimable) and the caller surfaces the error.
+            let (_a, fsync_ms) = self.wal_commit(
+                WalRecord::Delete {
+                    box_id,
+                    before_seq: None,
+                    match_: None,
+                    seqs: vec![seq],
+                    ts: now.max(0) as u64,
+                },
+                true,
+            )?;
+            b.delete_seqs(&[seq], now);
+            return Ok(fsync_ms);
+        }
+        // Disk / memory class: the in-memory removal first, then a best-effort
+        // frame (its loss self-heals — the job resurfaces as claimable, DESIGN
+        // §10.6, at-least-once). A `memory`-class queue never logs (RAM-only).
         b.delete_seqs(&[seq], now);
-        // Log an explicit-seq Delete control frame so the removal replays
-        // deterministically (the exact seq is logged, not re-derived). Ack
-        // durability == jobs-log durability (DESIGN §10.1): a durable queue
-        // fsyncs the delete before the ack returns.
-        self.wal_log_delete_seqs(box_id, vec![seq], now, durable);
+        if class != crate::types::Durability::Memory {
+            self.wal_log_delete_seqs(box_id, vec![seq], now, false);
+        }
+        Ok(0.0)
     }
 
     /// Move jobs to the dead-letter box (append + permanent delete), stamping
@@ -899,9 +924,18 @@ impl Engine {
             }
             dl.enforce_retention(now);
         }
-        // Permanently delete the dead-lettered jobs from the source jobs log.
+        // Permanently delete the dead-lettered jobs from the source jobs log. The
+        // DL copy is already durably appended; a failure to durably log the source
+        // delete here is self-healing (the job resurfaces as claimable and is
+        // re-dead-lettered — at-least-once), so we log a warning and move on rather
+        // than fail the whole claim pass.
         for &seq in seqs {
-            self.delete_one_seq(src, seq, now);
+            if let Err(e) = self.delete_one_seq(src, seq, now) {
+                tracing::warn!(
+                    src = %src.name, seq, error = %e,
+                    "dead-letter: durable source delete failed; job stays claimable (self-heals)"
+                );
+            }
         }
     }
 

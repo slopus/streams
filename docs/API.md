@@ -204,6 +204,7 @@ optional on create; omitted fields take the documented default.
   "cap_bytes": 0,
   "discard": "old",
   "durable": false,
+  "durability": "disk",
   "priority": null,
   "auto_priority": true,
   "auto_create": true,
@@ -224,7 +225,8 @@ optional on create; omitted fields take the documented default.
 | `cap_records` | `u64` | `0` (off) | Max retained record count. On overflow the box evicts per `discard`. `0` = unbounded. |
 | `cap_bytes` | `u64` | `0` (off) | Max retained payload bytes (`data` + `meta` + framing). `0` = unbounded. Whichever of `cap_records`/`cap_bytes` is hit first triggers eviction. |
 | `discard` | `"old" \| "reject"` | `"old"` | Full-box policy. `old` = evict oldest (pub/sub friendly). `reject` = refuse the write with `422 box_full` so durable queues fail loudly rather than dropping unconsumed work. |
-| `durable` | `bool` | `false` | If `true`, a write is not acked until its WAL entry is `fsync`'d. If `false`, the fast path acks after the in-memory + WAL-buffer append (group-committed later); only data not yet flushed is lost on crash. |
+| `durable` | `bool` | `false` | **Back-compat alias** for `durability` (below). On create: `durable:true` ⇒ class `fsync`, `durable:false` ⇒ class `disk` (only consulted when `durability` is absent). On every response it is reported as `durable == (durability == "fsync")`, so a legacy client reading `durable` still sees the right boolean. Prefer `durability` for new clients. |
+| `durability` | `"memory" \| "disk" \| "fsync"` | _(resolved from `durable`)_ | The **durability commit class** — where a write lands and when it is acked (the durability/perf tradeoff). **`memory`**: never written to the WAL; pure RAM; fastest; **records are lost on restart** (the box reappears EMPTY, `head_seq` resets to `0`) though the box CONFIG persists; reports `wal_append_ms`/`fsync_ms` as `0`. **`disk`**: written to the WAL and **group-committed** (no per-write `fsync`); acked on frame enqueue (the ack is **not** `fsync`-gated — group-committed shortly after by the single writer); survives a crash **minus the un-fsynced tail**; reports `fsync_ms` as `0` (the fast path). **`fsync`**: the ack is **`fsync`-gated** (held until the WAL frame is durably synced, real `fsync_ms`); survives any crash. **Resolution:** an explicit `durability` always wins; otherwise it is derived from `durable` (`true`⇒`fsync`, `false`⇒`disk`) — so `memory` is reachable only by setting `durability:"memory"` explicitly. The resolved class is always reported in box-state/box-create responses. Router-forwarded / dead-lettered copies honor the **destination** box's class (a `memory` dest persists no copy). |
 | `priority` | `i32 \| null` | `null` | Manual delivery priority (higher served first under pressure), clamped `[-1000, 1000]`. `null` ⇒ use auto-priority. |
 | `auto_priority` | `bool` | `true` | If `priority` is `null`, derive effective priority from recency of the last read/SSE/state call on this box. A manual `priority` always overrides. |
 | `auto_create` | `bool` | `true` | Whether a write to this box name may lazily create it. The per-write `create` flag can override downward. |
@@ -291,7 +293,7 @@ A queue (with `discard:"reject"` so unconsumed work fails loudly rather than dro
   "box": "jobs",
   "created": true,
   "config": { "type": "log", "ttl_ms": 60000, "cap_records": 1000000, "cap_bytes": 0,
-              "discard": "old", "durable": true, "priority": 10,
+              "discard": "old", "durable": true, "durability": "fsync", "priority": 10,
               "auto_priority": true, "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true,
               "lease_ms": 30000, "claim_jitter_ms": 0, "max_deliveries": 0,

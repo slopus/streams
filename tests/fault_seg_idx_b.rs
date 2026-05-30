@@ -29,6 +29,7 @@
 //!       lost); a re-`put` over the crashed image re-materializes idempotently.
 
 #![cfg(feature = "test-fs")]
+#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

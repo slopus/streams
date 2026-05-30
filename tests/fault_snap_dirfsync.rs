@@ -29,6 +29,7 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
+#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
 
 use std::collections::BTreeMap;
 use std::io;
@@ -392,15 +393,26 @@ fn f_snap_eio_dirfsync() {
         drop(engine);
     }
 
-    // Phase 2: reopen through a FaultFs that EIOs the FIRST sync_dir (fail-once).
-    // The engine's recovery + WAL-dir create do not sync_dir during open (the WAL
-    // dir is created via create_dir_all, no sync_dir there), so the first sync_dir
-    // the fault sees is the snapshot writer's post-rename meta-dir fsync.
+    // Phase 2: reopen through a FaultFs targeting the snapshot writer's
+    // post-rename meta-dir fsync.
     //
-    // Drive more durable appends so a second snapshot is worth taking, then call
-    // write_snapshot: its dir fsync EIOs ⇒ the call returns Err. The rename already
-    // happened in memory but is NOT hardened; the previous snapshot is untouched.
-    let faulty = FaultFs::new(disk.arc(), FaultOp::SyncDir, FaultKind::Eio, 0, true);
+    // NOTE: the WAL open path now fsyncs the `wal/` directory (and its parent) so a
+    // newly-created/rotated WAL file's directory entry is durable BEFORE any
+    // acknowledged frame lands in it (the dir-fsync durability fix). Those sync_dir
+    // calls happen during `open_engine_fs`, so the snapshot's meta-dir fsync is no
+    // longer the FIRST sync_dir. We therefore probe how many sync_dir calls a fresh
+    // engine open issues (a non-firing FaultFs), then aim the EIO at the next one —
+    // which is the snapshot writer's post-rename meta-dir fsync. The rename happened
+    // in memory but is NOT hardened; the previous snapshot is untouched.
+    let n_open_syncdirs = {
+        let probe = FaultFs::new(disk.arc(), FaultOp::SyncDir, FaultKind::Eio, u64::MAX, true);
+        let engine = open_engine_fs(probe.arc());
+        // A read-only recovery check; no appends (appends never sync_dir).
+        let _ = dump_records(&engine, "p");
+        drop(engine);
+        probe.calls_seen()
+    };
+    let faulty = FaultFs::new(disk.arc(), FaultOp::SyncDir, FaultKind::Eio, n_open_syncdirs, true);
     {
         let engine = open_engine_fs(faulty.arc());
         let recs = dump_records(&engine, "p").expect("p recovered from snapshot #1");

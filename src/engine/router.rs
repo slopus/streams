@@ -82,6 +82,21 @@ impl RouterGraph {
         existed
     }
 
+    /// Names of all routers referencing `box_name` as source or dest, WITHOUT
+    /// removing them (sorted). Used to pre-compute a box-delete cascade so its WAL
+    /// tombstones can be durably logged *before* the in-memory removal (codex P0:
+    /// a delete must not become a false idempotent success on a WAL failure).
+    pub fn routers_touching_box(&self, box_name: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .routers
+            .values()
+            .filter(|r| r.source == box_name || r.dest == box_name)
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Remove and return the names of all routers referencing `box_name` as
     /// source or dest (box-delete cascade, API §1.4).
     pub fn remove_touching_box(&mut self, box_name: &str) -> Vec<String> {

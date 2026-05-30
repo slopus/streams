@@ -51,6 +51,39 @@ across a purely-deleted gap is silent while reading below an evicted floor tombs
 
 ---
 
+## Goals & constraints
+
+What streams **aims** for — the design targets the implementation is built and tuned against:
+
+- **Throughput: ~1,000,000 events/sec (batched).** Writes are batched (a single `POST`
+  carries up to thousands of records) and the WAL is a single sequential writer with
+  **adaptive group commit** — one `fsync` amortized across a whole batch of concurrent
+  durable writers — so the per-event cost approaches the cost of a sequential disk append.
+  Reads are `seq`-indexed (`O(1)` slot lookup) and SSE broadcasts serialize each record
+  **once**, shared ref-counted across all watchers (a 1→N fan-out pays serialization once).
+- **Latency: ~1 ms delivery / response.** On local NVMe, a `disk` write acks as soon as its
+  WAL frame is enqueued (group-committed shortly after by the single writer — no per-write
+  fsync, the ack is not fsync-gated) and an `fsync` write acks after one group `fsync`; both
+  target single-digit-millisecond p99. Under CPU pressure, delivery degrades in **latency,
+  never in correctness** (the elastic scheduler), and a long-poll/SSE consumer is woken on
+  append rather than polling.
+
+The central tradeoff is the **three durability commit classes**, chosen per box, so each box
+buys exactly the guarantee it needs without taxing the others:
+
+- **`memory`** — RAM-only, never touches the WAL. Fastest; **data is lost on restart** (the
+  box reappears empty, config preserved). For caches / scratch / ephemeral fan-out.
+- **`disk`** — WAL + **group commit**, no per-write fsync. Survives a crash minus the
+  un-fsynced tail. The pub/sub default.
+- **`fsync`** — **fsync-gated** ack. Survives any crash; an acked write is always recovered.
+  For queues / ledgers / anything that must not lose acknowledged work.
+
+These are **not** global modes: a `memory` cache box, a `disk` pub/sub feed, and an `fsync`
+job queue coexist in one process, and routers bridge them (forwarding honors the destination
+box's class).
+
+---
+
 ## Quickstart
 
 Assume the binary is running on `localhost:4000` with auth disabled (dev mode).
@@ -66,7 +99,7 @@ curl -X PUT localhost:4000/v0/boxes/jobs \
 ```json
 { "box": "jobs", "created": true,
   "config": { "ttl_ms": 0, "cap_records": 1000000, "cap_bytes": 0,
-              "discard": "old", "durable": true, "priority": null,
+              "discard": "old", "durable": true, "durability": "fsync", "priority": null,
               "auto_priority": true, "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true },
   "performance": { "server_total_ms": 0.22 } }
@@ -229,14 +262,25 @@ Configuration is read from the environment:
 | `STREAMS_COLD_DIR` | _(unset)_ | Optional cold-tier directory. Set ⇒ sealed segments past the hot-retention bound relocate here off the hot path; unset ⇒ tiering disabled (everything stays hot). |
 | `RUST_LOG` | `info` | Tracing filter. |
 
-Durability is **per box**: `durable: true` makes a write block on `fsync` before
-it is acknowledged (the reported `fsync_ms` is real), and that write is recovered
-by WAL replay after a crash. `durable: false` boxes take a group-committed fast
-path and report `fsync_ms` as `0.0` — they trade recovery for latency. Either way,
-**an acknowledged write is published; a write that fails to commit publishes
-nothing visible** (no readable-but-not-durable state). The server shuts down
-gracefully on `SIGINT`/`SIGTERM`, writing a final snapshot so a clean restart
-starts from a current checkpoint. The quickstart commands above work verbatim.
+Durability is **per box**, in three commit classes (`durability`, §0.10) — the
+durability/performance tradeoff:
+
+| Class | Where it lands | Ack timing | Survives a crash? |
+|---|---|---|---|
+| `memory` | never written to the WAL (pure RAM) | immediate (skips the WAL; `fsync_ms` 0) | **no** — records lost on restart; the box reappears EMPTY (config persists, `head_seq` resets to 0). Lowest latency. |
+| `disk` | WAL, **group-committed** (no per-write fsync) | on WAL-frame enqueue, not fsync-gated (`fsync_ms` 0) | yes, **minus the un-fsynced tail** (the not-yet-group-committed frames). |
+| `fsync` | WAL, **fsync-gated** | after the group `fsync` (real `fsync_ms`) | **yes, any crash** — an acked write is recovered by WAL replay. |
+
+The legacy `durable` bool is a back-compat alias: `durable:true` ⇒ `fsync`,
+`durable:false` ⇒ `disk` (set `durability:"memory"` explicitly for the RAM-only
+class). The resolved `durability` is reported on every box-state response, and
+`durable` is normalized to `durable == (class == "fsync")`. Router-forwarded and
+dead-lettered copies honor the **destination** box's class (a `memory` dest
+persists no copy). Regardless of class, **an acknowledged write is published; a
+write that fails to commit publishes nothing visible** (no readable-but-not-durable
+state). The server shuts down gracefully on `SIGINT`/`SIGTERM`, writing a final
+snapshot so a clean restart starts from a current checkpoint. The quickstart
+commands above work verbatim.
 
 ### Security
 
@@ -310,20 +354,44 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
 - **Node loop-prevention** — a node never receives back events it produced, making
   N-way multi-master fan-out safe by construction.
 - **Routers** — server-side `source → dest` forwarding, at-least-once, per-source FIFO,
-  cycle-rejecting by default. Forwarded copies are **durable by construction** (they go
-  through the same WAL append path as user writes, so they recover on restart).
+  cycle-rejecting by default. A forwarded copy goes through the same write path as a user write,
+  so it **honors the destination box's durability class** (`fsync`/`disk` recover on restart; a
+  `memory` dest persists no copy).
 - **Lease-based queues** — set `type: "queue"` to layer claim/ack/nack/extend (and a
   `/work` auto-claim SSE stream) on the same log: visibility-timeout leases,
   coalesced fair fan-out, redelivery, and optional dead-lettering (see API §10).
 - **Multiplexed SSE** — watch many boxes over one resumable connection with composite
   cursors, named events, heartbeats, and tombstones.
-- **Per-box durability** — `fsync`-on-commit for durable boxes (WAL-first: an
-  acknowledged write is committed; nothing visible is ever un-durable), group-committed
-  fast path for the rest. Crash-recovery via snapshot + WAL replay on start.
+- **Per-box durability, three commit classes** — `memory` (RAM-only, lost on restart),
+  `disk` (group-committed WAL, survives a crash minus the un-fsynced tail), and `fsync`
+  (fsync-gated ack, survives any crash). WAL-first: an acknowledged write is committed and
+  nothing visible is ever un-durable. Crash-recovery via snapshot + WAL replay on start.
 - **Priority + elastic throttling** — manual or recency-based auto priority; under CPU
   pressure delivery degrades in latency, never in correctness.
 - **Single static binary** — WAL + segments on local NVMe, restartable at any instant;
   only data not yet in the WAL is lost.
+
+### Status — what's implemented vs planned
+
+Honest about maturity (the `/v0` contract is fully implemented; some operational edges are
+partial or planned):
+
+- **Implemented:** the full `/v0` API (boxes, batched diff reads, permanent deletes,
+  routers, multiplexed SSE, lease-based queues); the WAL with adaptive group commit; the
+  three durability commit classes (`memory`/`disk`/`fsync`); segments + snapshots +
+  crash-recovery replay (including the directory-fsync hardening so a rotated/first WAL
+  file's entry is durable before an ack); per-box tag index; node loop-prevention; bearer
+  auth + loopback-default bind.
+- **Partial:** router forwarding is **synchronous on the append path** and at-least-once via
+  the source log, but a *failed* durable forward into a slow/erroring destination is treated
+  as backpressure (left in the source) with **no background retry driver** yet — recovery does
+  not re-drive un-forwarded source records, so a persistently-failing destination can lag.
+  The cap-vs-TTL tombstone **reason** is best-effort across a restart (the gap *range* is
+  always authoritative). The throughput/latency targets above are design goals validated by
+  the in-memory baseline benchmarks, not yet a tuned production SLO on durable boxes.
+- **Planned:** TLS termination (run behind a reverse proxy today), per-key scopes / tenant
+  isolation, and a durable router-backlog worker that retries failed forwards from a
+  persisted cursor. See `docs/API.md` §0.2 / §0.11 and `docs/ROADMAP.md`.
 
 ---
 

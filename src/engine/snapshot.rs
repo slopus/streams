@@ -36,25 +36,42 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     // 1) Flush barrier: write a durable CheckpointMark and wait for its fsync so
     //    the writer's published position covers every prior committed frame.
     //    (Replay treats CheckpointMark as a no-op, so logging it is harmless.)
-    let _ = writer.append(
-        crate::storage::WalRecord::CheckpointMark {
-            last_checkpoint_seq: 0,
-            ts: now,
-        },
-        true,
-    );
+    //    PROPAGATE a barrier failure (codex P0): if the CheckpointMark cannot be
+    //    durably synced, the published position does NOT cover prior frames, so a
+    //    snapshot taken against it could exclude an acked write — abandon the
+    //    snapshot rather than record a checkpoint that races ahead of durability.
+    if writer
+        .append(
+            crate::storage::WalRecord::CheckpointMark {
+                last_checkpoint_seq: 0,
+                ts: now,
+            },
+            true,
+        )
+        .is_err()
+    {
+        return None;
+    }
 
     // 2) Record the checkpoint position FIRST (before materializing state), so a
     //    racing write lands at/after this offset and is replayed.
     let (wal_idx, wal_offset) = writer.position();
 
-    // 3) Materialize every box's live state + the router set.
+    // 3) Materialize every box's live state + the router set. Each box is captured
+    //    under its own `append_lock` (codex P0): a durable write may have its WAL
+    //    frame *before* the checkpoint offset yet still be staged-but-unpublished
+    //    when we read the index. Holding the lock serializes against the write
+    //    path's stage→enqueue→fsync→publish critical section, so we observe a
+    //    consistent `(head_seq, index)` and never exclude a frame the checkpoint
+    //    already covers. `capture_box` additionally snapshots only `seq <=
+    //    head_seq`, so a concurrently-staged (invisible) tail is never persisted.
     let mut boxes = Vec::with_capacity(engine.boxes.len());
     let mut max_seq = 0u64;
     for entry in engine.boxes.iter() {
         let b = entry.value();
         // Enforce retention so the captured floors/records are current.
         b.enforce_retention(engine.clock.now_ms());
+        let _append_guard = b.append_lock.lock();
         let snap_box = capture_box(b);
         max_seq = max_seq.max(snap_box.head_seq);
         boxes.push(snap_box);
@@ -83,9 +100,39 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
 }
 
 /// Materialize one box into a [`SnapshotBox`] (its live record set + floors).
+///
+/// Caller holds the box's `append_lock`, so `head_seq` and the index are
+/// consistent and any staged-but-unpublished tail is excluded by the `seq <=
+/// head` clamp.
 fn capture_box(b: &BoxState) -> SnapshotBox {
-    let config_json = serde_json::to_vec(&*b.config.read()).unwrap_or_default();
+    let config = b.config.read().clone();
+    let config_json = serde_json::to_vec(&config).unwrap_or_default();
+
+    // A `memory`-class box is captured EMPTY: its records are RAM-only and must
+    // NEVER persist, so the snapshot carries only the config (the box reappears on
+    // restart, empty) with head_seq/base/floors reset to a fresh box. Recovery
+    // then rebuilds it empty from this config and `head_seq` resets to 0.
+    if config.is_memory() {
+        return SnapshotBox {
+            name: b.name.clone(),
+            box_id: b.box_id,
+            epoch: b.epoch(),
+            config_json,
+            base_seq: b.seq_base,
+            head_seq: b.seq_base.saturating_sub(1),
+            evict_floor: 0,
+            expiry_floor: 0,
+            delete_floor: 0,
+            delete_below: 0,
+            bytes_retained: 0,
+            live_count: 0,
+            records: Vec::new(),
+        };
+    }
+
     let floors = *b.floors.read();
+    // The published head: never persist a staged-but-unpublished (invisible) tail.
+    let head_seq = b.head_seq();
 
     // The live record set: every physically-present, non-deleted record. Deleted
     // middle-holes and front-reclaimed prefixes are simply absent — the compacted
@@ -109,8 +156,17 @@ fn capture_box(b: &BoxState) -> SnapshotBox {
             if rec.deleted {
                 continue;
             }
+            let seq = base + i as u64;
+            // Never persist a staged-but-unpublished tail (`seq > head`): the
+            // append lock is held, but a record can sit in the deque before
+            // `head_seq` is advanced (the WAL-first reservation). Such a record is
+            // not yet acknowledged/visible; its WAL frame (if any) lands at/after
+            // the checkpoint and replays, so the snapshot must exclude it.
+            if seq > head_seq {
+                break;
+            }
             slots.push(CapSlot {
-                seq: base + i as u64,
+                seq,
                 ts: rec.ts,
                 node: rec.node.clone(),
                 tag: rec.tag.clone(),
@@ -151,7 +207,7 @@ fn capture_box(b: &BoxState) -> SnapshotBox {
         epoch: b.epoch(),
         config_json,
         base_seq,
-        head_seq: b.head_seq(),
+        head_seq,
         evict_floor: floors.evict_floor,
         expiry_floor: floors.expiry_floor,
         delete_floor: floors.delete_floor,
@@ -199,14 +255,18 @@ pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
     for sb in snapshot.boxes {
         let config: BoxConfig = serde_json::from_slice(&sb.config_json).unwrap_or_default();
         let box_id = sb.box_id;
+        let is_memory = config.is_memory();
         let mut state = restore_box(sb, config);
         // Attach a HOT segment writer for a durable engine so post-restore
         // appends materialize into segments (Phase 6 Stage 2). `attach_segwriter`
         // pre-seeds the writer's active segment with the restored live records so
         // its sealed/active state is consistent with the index. Idempotent `put`s
-        // make re-materializing a previously-sealed range safe.
-        if let Some(writer) = engine.build_segment_writer(box_id) {
-            state.attach_segwriter(writer);
+        // make re-materializing a previously-sealed range safe. A `memory`-class
+        // box gets NO writer — it was captured empty and stays RAM-only.
+        if !is_memory {
+            if let Some(writer) = engine.build_segment_writer(box_id) {
+                state.attach_segwriter(writer);
+            }
         }
         let bx = Arc::new(state);
         engine.boxes.insert(bx.name.clone(), bx);

@@ -28,6 +28,7 @@
 //! minute. Self-verify: `cargo test --features test-fs --test fault_seg_write_a`.
 
 #![cfg(feature = "test-fs")]
+#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

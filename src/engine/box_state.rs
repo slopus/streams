@@ -511,6 +511,16 @@ impl BoxState {
         floors.evict_earliest(self.seq_base, self.head_seq())
     }
 
+    /// The current **involuntary** loss floor `max(evict_floor, expiry_floor)` —
+    /// the highest seq lost to cap/TTL eviction. Used by the engine to detect when
+    /// a retention pass advanced the involuntary floor so it can durably log a
+    /// monotone `EvictWatermark` (so a relaxed cap / backward clock never
+    /// resurrects an evicted record after restart — codex P0 #2).
+    pub fn involuntary_floor(&self) -> u64 {
+        let floors = self.floors.read();
+        floors.evict_floor.max(floors.expiry_floor)
+    }
+
     /// Read a recency clock, mapping the sentinel to `None`.
     pub fn read_ts(value: &AtomicI64) -> Option<i64> {
         match value.load(Ordering::Relaxed) {

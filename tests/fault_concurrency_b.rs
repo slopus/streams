@@ -56,6 +56,7 @@
 //! The stress tests below assert the identical invariants in the meantime.
 
 #![cfg(feature = "test-fs")]
+#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

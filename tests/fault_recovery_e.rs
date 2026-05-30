@@ -28,6 +28,7 @@
 //! crashes are driven by the harness-level `FakeDisk.crash()` injector.
 
 #![cfg(feature = "test-fs")]
+#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -546,14 +547,24 @@ fn f_rec_delete_before_append_order() {
         let engine2 = open_engine(&disk);
         let d2 = dump_box(&engine2, "q");
         assert_eq!(d1, d2, "recovery idempotent at crash_point {crash_point}");
-        // The deleted seq 1 must never resurface, regardless of which appends
-        // survived.
+        // Once the durable Delete frame has committed, seq 1 must stay gone — and
+        // by WAL ordering, if ANY later append (seq >= 4, which the Delete frame
+        // precedes in the log) is recovered, the Delete must have been durable too,
+        // so seq 1 must be absent. (With the WAL file's directory entry now hardened
+        // from creation — the dir-fsync durability fix — a very early crash can
+        // recover a pure prefix [1..] in which the Delete had not yet committed; seq
+        // 1 is then legitimately still live, not resurrected. The dense-prefix model
+        // check above already validates that prefix.)
         if let Some(d) = &d2 {
-            assert!(
-                !d.records.contains_key(&1),
-                "deleted seq 1 resurrected at crash_point {crash_point}: {:?}",
-                d.records.keys().collect::<Vec<_>>()
-            );
+            let delete_committed = d.records.keys().any(|&s| s >= 4);
+            if delete_committed {
+                assert!(
+                    !d.records.contains_key(&1),
+                    "deleted seq 1 resurrected after the Delete committed at crash_point \
+                     {crash_point}: {:?}",
+                    d.records.keys().collect::<Vec<_>>()
+                );
+            }
         }
         drop(engine2);
     }

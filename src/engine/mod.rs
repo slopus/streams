@@ -540,6 +540,34 @@ impl Engine {
         );
     }
 
+    /// Durably log a monotone `EvictWatermark` for a box whose involuntary
+    /// (cap/TTL) loss floor advanced, so the floor survives restart and a relaxed
+    /// cap / backward clock can never resurrect an evicted record (codex P0 #2).
+    /// `involuntary_floor` is `max(evict_floor, expiry_floor)` — the highest seq
+    /// lost to cap/TTL — and is written into the frame's `evict_floor`; recovery
+    /// restores it monotonically (only ever advances).
+    ///
+    /// Best-effort by design: a lost watermark frame is re-derived on the next
+    /// retention pass for cap (a pure function of `head - cap_records`); only the
+    /// backward-clock / relaxed-cap edge truly needs the durable floor, and a lost
+    /// frame there merely delays floor restoration to the next eviction — never a
+    /// silent *resurrection past* a floor that WAS durably logged. Logged durably
+    /// (fsync) so the floor is hardened alongside the writes that caused it.
+    fn log_evict_watermark(&self, box_id: u32, involuntary_floor: u64, now: i64) {
+        if self.wal.is_none() || involuntary_floor == 0 {
+            return;
+        }
+        self.wal_log_best_effort(
+            WalRecord::EvictWatermark {
+                box_id,
+                evict_floor: involuntary_floor,
+                earliest_seq: involuntary_floor.saturating_add(1),
+                ts: now.max(0) as u64,
+            },
+            true,
+        );
+    }
+
     /// Append one leases-log lifecycle event (DESIGN §10.1). Only called when the
     /// queue's leases log is durable; logged durably so a replayed lease frame
     /// reconstructs the projection exactly. Best-effort: a lost lease frame
@@ -614,24 +642,30 @@ impl Engine {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let durable = dest.config.read().durable;
+        let class = dest.config.read().durability_class();
+        let durable = class == Durability::Fsync;
         let box_id = dest.box_id;
         let snapshot = records.clone();
         let _guard = dest.append_lock.lock();
         let staged = dest.stage_append(records);
         let seqs = staged.seqs();
-        let (_wal_ms, token) = match self.wal_enqueue_batch(box_id, &seqs, &snapshot, now, durable) {
-            Ok(v) => v,
-            Err(e) => {
-                dest.rollback_staged(staged);
-                return Err(e);
-            }
-        };
-        if durable {
-            if let Some(token) = token {
-                if let Err(e) = token.wait() {
+        // A `memory`-class destination NEVER writes to the WAL: forwarded /
+        // dead-lettered copies into it are RAM-only and lost on restart, exactly
+        // like a direct write. Skip the enqueue + fsync entirely.
+        if class != Durability::Memory {
+            let (_wal_ms, token) = match self.wal_enqueue_batch(box_id, &seqs, &snapshot, now, durable) {
+                Ok(v) => v,
+                Err(e) => {
                     dest.rollback_staged(staged);
-                    return Err(Error::internal(format!("WAL fsync failed: {e}")));
+                    return Err(e);
+                }
+            };
+            if durable {
+                if let Some(token) = token {
+                    if let Err(e) = token.wait() {
+                        dest.rollback_staged(staged);
+                        return Err(Error::internal(format!("WAL fsync failed: {e}")));
+                    }
                 }
             }
         }
@@ -667,6 +701,11 @@ impl Engine {
             )));
         }
         validate_config(&config)?;
+        // Resolve + pin the durability class so the persisted config and every
+        // response carry the resolved `durability` (and `durable` stays consistent
+        // with it for back-compat). A later in-place PUT can still change it.
+        let mut config = config;
+        config.normalize_durability();
 
         // A queue's dead-letter box must differ from itself (API §0.10).
         if config.is_queue() {
@@ -770,14 +809,19 @@ impl Engine {
                         }
                     }
                 }
+                let is_memory = config.is_memory();
                 let mut state =
                     BoxState::new(name.to_string(), box_id, config, SEQ_BASE, forced_epoch.unwrap_or(1));
                 // Attach a HOT segment writer for a durable engine so committed
                 // records are materialized into segments (Phase 6 Stage 2). A
                 // pure in-memory engine attaches none → payloads stay resident and
-                // the read path is unchanged by construction.
-                if let Some(writer) = self.build_segment_writer(box_id) {
-                    state.attach_segwriter(writer);
+                // the read path is unchanged by construction. A `memory`-class box
+                // attaches none either — its records are RAM-only and must never
+                // touch the segment store (no on-disk trace to resurrect).
+                if !is_memory {
+                    if let Some(writer) = self.build_segment_writer(box_id) {
+                        state.attach_segwriter(writer);
+                    }
                 }
                 e.insert(Arc::new(state));
                 (true, box_id)
@@ -1009,15 +1053,14 @@ impl Engine {
         }
 
         let box_id = b.box_id;
-        self.boxes.remove(name);
-        let routers_removed = self.routers.lock().remove_touching_box(name);
-
-        // Log the box tombstone + each cascaded router removal so the delete and
-        // its cascade replay deterministically (durable control frames). PROPAGATE
-        // a WAL failure so a delete a crash would undo is never reported as success
-        // (bug #1). The in-memory removal already happened; on a WAL failure the
-        // client gets an error and retries — a deterministic retry re-derives the
-        // same tombstone (the box is gone), so the delete is idempotent.
+        // Pre-compute the cascade WITHOUT mutating, then durably log every
+        // tombstone BEFORE touching memory (codex P0): if the WAL append/fsync
+        // fails we return an error having removed NOTHING, so a retry still finds
+        // the box present and re-attempts the durable delete — it can never become
+        // a false idempotent success that a crash then resurrects. The control
+        // frames replay deterministically, so a crash after success cannot revive
+        // the box/routers and a crash before success leaves them fully intact.
+        let routers_removed = self.routers.lock().routers_touching_box(name);
         let now = self.clock.now_ms().max(0) as u64;
         self.wal_log(
             WalRecord::BoxConfig {
@@ -1040,6 +1083,10 @@ impl Engine {
                 true,
             )?;
         }
+
+        // Durably logged: NOW apply the in-memory removal + cascade.
+        self.boxes.remove(name);
+        self.routers.lock().remove_touching_box(name);
 
         Ok(BoxDeleteResponse {
             box_name: name.to_string(),
@@ -1170,7 +1217,8 @@ impl Engine {
         let discard = cfg.discard;
         let cap_records = cfg.cap_records;
         let cap_bytes = cfg.cap_bytes;
-        let durable = cfg.durable;
+        let class = cfg.durability_class();
+        let durable = class == Durability::Fsync;
         drop(cfg);
         let box_id = b.box_id;
 
@@ -1237,8 +1285,13 @@ impl Engine {
             let staged = b.stage_append(stored);
             let seqs = staged.seqs();
             // Enqueue the WAL frame(s) for the staged seqs (still under the lock,
-            // so a box's frames are enqueued in exactly their seq order).
-            let (wal_append_ms, commit_token) =
+            // so a box's frames are enqueued in exactly their seq order). The
+            // `memory` class NEVER writes to the WAL (pure RAM, lost on restart):
+            // skip the enqueue entirely (`wal_append_ms`/`fsync_ms == 0`) so its
+            // records leave no durable trace.
+            let (wal_append_ms, commit_token) = if class == Durability::Memory {
+                (0.0, None)
+            } else {
                 match self.wal_enqueue_batch(box_id, &seqs, &stored_snapshot, now, durable) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1246,7 +1299,8 @@ impl Engine {
                         b.rollback_staged(staged);
                         return Err(e);
                     }
-                };
+                }
+            };
 
             // Durability gate: for a `durable` box block on the last frame's commit
             // token (the single ordered writer guarantees every prior frame in the
@@ -1279,8 +1333,18 @@ impl Engine {
         };
 
         // Post-append eviction for discard:"old" (may surface as a tombstone to
-        // lagging consumers later).
+        // lagging consumers later). If this involuntary cap/TTL eviction advanced
+        // the loss floor on a non-`memory` box, durably log a monotone
+        // `EvictWatermark` so the floor survives restart (codex P0 #2) — a relaxed
+        // cap or backward clock can then never resurrect an evicted record.
+        let floor_before = b.involuntary_floor();
         b.enforce_retention(now);
+        if class != Durability::Memory {
+            let floor_after = b.involuntary_floor();
+            if floor_after > floor_before {
+                self.log_evict_watermark(box_id, floor_after, now);
+            }
+        }
 
         // Record dedupe state for retries, then release the per-key gate (a
         // parked same-key writer wakes and dedupes to the entry just inserted).
@@ -1840,12 +1904,18 @@ impl Engine {
     /// `DELETE /v0/routers/:router` — stops forwarding immediately. Idempotent.
     pub fn delete_router(&self, name: &str) -> Result<RouterDeleteResponse> {
         let start = Instant::now();
-        let deleted = self.routers.lock().remove(name);
-        if deleted {
+        // Probe existence WITHOUT removing, log the tombstone, THEN remove (codex
+        // P0): removing first and logging after means a WAL failure returns an
+        // error while the router is already gone, so a retry sees it absent and
+        // returns a false `deleted:false` success with NO tombstone logged — a
+        // crash would then resurrect it. Logging first keeps the router present
+        // until the tombstone is durable, so a retry re-attempts the durable delete.
+        let exists = self.routers.lock().get(name).is_some();
+        if exists {
             // Only log a real removal (idempotent no-op needn't be logged).
             // PROPAGATE a WAL failure so a router-delete a crash would undo is never
-            // reported as success (bug #1). On error the client retries; a
-            // deterministic retry re-derives the same tombstone (idempotent).
+            // reported as success (bug #1). On error the client retries; the router
+            // is still present, so the retry re-attempts the durable delete.
             self.wal_log(
                 WalRecord::RouterDelete {
                     name: name.to_string(),
@@ -1854,6 +1924,7 @@ impl Engine {
                 true,
             )?;
         }
+        let deleted = self.routers.lock().remove(name);
         Ok(RouterDeleteResponse {
             router: name.to_string(),
             deleted,
@@ -2910,6 +2981,54 @@ mod tests {
             .unwrap();
         assert_eq!(by_dest.routers.len(), 1);
         assert_eq!(by_dest.routers[0].router, "a->c");
+    }
+
+    #[test]
+    fn durability_class_resolves_and_normalizes() {
+        let (engine, _clock) = engine_with_clock();
+        // Explicit durability wins over a conflicting `durable` bool.
+        let cfg = BoxConfig {
+            durable: true,
+            durability: Some(Durability::Disk),
+            ..BoxConfig::default()
+        };
+        engine.put_box("a", cfg).unwrap();
+        let st = engine.box_state("a", false).unwrap();
+        assert_eq!(st.config.durability, Some(Durability::Disk), "explicit class wins");
+        assert!(!st.config.durable, "durable normalized to (class==fsync)");
+
+        // Legacy durable:true with no class ⇒ fsync.
+        engine
+            .put_box("b", BoxConfig { durable: true, ..BoxConfig::default() })
+            .unwrap();
+        assert_eq!(
+            engine.box_state("b", false).unwrap().config.durability,
+            Some(Durability::Fsync)
+        );
+        // Legacy default (durable:false) ⇒ disk.
+        engine.put_box("c", BoxConfig::default()).unwrap();
+        assert_eq!(
+            engine.box_state("c", false).unwrap().config.durability,
+            Some(Durability::Disk)
+        );
+    }
+
+    #[test]
+    fn memory_class_write_skips_wal_timings_and_serves_in_ram() {
+        let (engine, _clock) = engine_with_clock();
+        engine
+            .put_box("mem", BoxConfig { durability: Some(Durability::Memory), ..BoxConfig::default() })
+            .unwrap();
+        let resp = engine
+            .write("mem", write_req(vec![rec(json!({"x": 1}), None, None)]), true)
+            .unwrap();
+        // A pure in-memory engine reports 0 timings anyway, but the memory class
+        // explicitly skips the WAL path; the record is served from RAM.
+        assert_eq!(resp.performance.wal_append_ms, Some(0.0));
+        assert_eq!(resp.performance.fsync_ms, Some(0.0));
+        let d = engine.diff("mem", diff_from(0)).unwrap();
+        assert_eq!(d.records.len(), 1);
+        assert_eq!(d.records[0].data, json!({"x": 1}));
     }
 
     #[test]

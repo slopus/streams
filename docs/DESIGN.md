@@ -80,10 +80,36 @@ watermarks.
 
 ### 2.2 Config — see [API.md §0.10](API.md) for the canonical field table
 
-The config struct is `{ ttl_ms, cap_records, cap_bytes, discard, durable, priority,
+The config struct is `{ ttl_ms, cap_records, cap_bytes, discard, durable, durability, priority,
 auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Defaults: `ttl_ms=0`,
 `cap_records=0`, `cap_bytes=0` (all "off"/unbounded), `discard="old"`, `durable=false`,
-`priority=null` + `auto_priority=true`, `auto_create=true`, `dedupe_node=true`.
+`durability` resolved from `durable`, `priority=null` + `auto_priority=true`, `auto_create=true`,
+`dedupe_node=true`.
+
+**Durability commit class (`durability`).** A box has one of three commit classes — the
+durability/performance tradeoff — resolved once at create as `durability_class()`:
+
+- **`memory`** — records are **never written to the WAL**; pure RAM; the fastest path (it
+  skips WAL enqueue entirely, so `wal_append_ms`/`fsync_ms` are `0`). Records are **lost on
+  restart**: the box reappears EMPTY and `head_seq` resets to `0`, but the box CONFIG persists
+  (a control frame), so the empty box is rebuilt on recovery. The snapshot captures a memory
+  box EMPTY (no records, head/base/floors reset) so its data is never resurrected. A router /
+  dead-letter copy whose **destination** is a memory box likewise persists nothing.
+- **`disk`** — written to the WAL and **group-committed** (no per-write `fsync`); `fsync_ms` is
+  `0` (the fast path). The write is acked as soon as its frame is enqueued to the single WAL
+  writer (the ack is **not** fsync-gated — the engine drops the commit token); the writer
+  group-commits and `fdatasync`s the batch shortly after. Survives a crash **minus the
+  un-fsynced tail** (the frames enqueued but not yet group-fsynced). This is today's
+  `durable:false`.
+- **`fsync`** — the ack is **`fsync`-gated** (held until the WAL frame is durably synced; real
+  `fsync_ms`). Survives **any** crash. This is today's `durable:true`.
+
+**Resolution & back-compat.** An explicit `durability` always wins; absent it, the class is
+derived from the legacy `durable` bool (`true ⇒ fsync`, `false ⇒ disk`) — so `memory` is
+reachable only by setting `durability:"memory"`. The resolved class is reported on every
+box-state / box-create response, and `durable` is normalized to `durable == (class == fsync)`
+so a legacy client reading `durable` still sees the right boolean. `is_durable()` is
+`class == fsync`.
 
 **Defaults rationale.**
 - All caps/TTL off ⇒ an out-of-the-box box loses nothing. The safe default for a persistence
@@ -91,8 +117,10 @@ auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Defaults: `tt
   deliberate choice.
 - `discard="old"` matches the "append log" mental model and the pub/sub/recent-state cases;
   durable-queue users flip to `"reject"`. With both caps off, `discard` is inert.
-- `durable=false`: the 1–5 ms target on NVMe means fsync-by-default would make the common
-  pub/sub case pay for a guarantee it doesn't want. One bool away.
+- `durable=false` (class `disk`): the 1–5 ms target on NVMe means fsync-by-default would make
+  the common pub/sub case pay for a guarantee it doesn't want. One bool (or `durability`) away
+  from `fsync`. The third class, `memory`, drops the WAL entirely for RAM-only caches/scratch
+  boxes that explicitly want to lose their data on restart in exchange for the lowest latency.
 - `priority=null` + `auto_priority=true`: most users never think about priority; recency-based
   auto does the right thing. Power users pin an integer.
 
@@ -472,8 +500,10 @@ to `dst`. `{ name, source, dest, preserve_node, preserve_tag, filter, allow_cycl
   avoids). De-dup is the consumer's job; `$node` + an optional client dedup key in `meta` make
   idempotent consumption practical. **Consumers must be idempotent** (BullMQ at-least-once
   lesson).
-- Forwarding respects `dst.durable`: if `dst` is durable, the router advances its cursor only after
-  `dst` fsyncs the forwarded record.
+- Forwarding honors the **destination** box's durability commit class (§2.2): a `fsync` `dst`
+  advances the router cursor only after `dst` fsyncs the forwarded record; a `disk` `dst` writes
+  the forwarded copy to the WAL group-committed; a `memory` `dst` **skips the WAL entirely** (the
+  forwarded copy is RAM-only and persists nothing, exactly like a direct write to that box).
 
 ### 8.3 What carries through a forward
 

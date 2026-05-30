@@ -50,6 +50,7 @@ fn default_config() -> Value {
         "cap_bytes": 0,
         "discard": "old",
         "durable": false,
+        "durability": "disk",
         "priority": null,
         "auto_priority": true,
         "auto_create": true,

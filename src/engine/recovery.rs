@@ -334,6 +334,13 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             evict_floor,
             ..
         } => {
+            // Restore the involuntary loss floor monotonically (codex P0 #2): the
+            // `evict_floor` field carries `max(cap_floor, ttl_floor)` (the
+            // involuntary floor), so a relaxed cap or a backward clock can never
+            // resurrect a record below a durably-logged floor after restart. The
+            // floor only ever advances (`>`), never regresses, regardless of replay
+            // order. (The cap-vs-ttl reason fidelity after restart is best-effort —
+            // the gap *range* is authoritative — and is not encoded in this frame.)
             if let Some(b) = engine.get_box_by_id(box_id) {
                 let mut floors = b.floors.write();
                 if evict_floor > floors.evict_floor {

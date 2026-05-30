@@ -1077,6 +1077,14 @@ impl Wal {
     ) -> Result<Wal, WalError> {
         let wal_dir = cfg.dir.join("wal");
         fs.create_dir_all(&wal_dir)?;
+        // Harden the `wal/` directory entry itself by fsyncing its parent (codex
+        // P0): a crash after a durable ack must not lose the `wal/` directory entry
+        // (which would lose every file under it). Best-effort on a parent that may
+        // not exist yet on some fakes; the per-file `sync_dir(wal_dir)` below is the
+        // load-bearing one for the files themselves.
+        if let Some(parent) = wal_dir.parent() {
+            let _ = fs.sync_dir(parent);
+        }
 
         let metrics = Arc::new(WalMetrics::default());
         let (tx, rx) = mpsc::channel::<Submission>();
@@ -1152,6 +1160,10 @@ struct ActiveFile {
     /// On-disk path; retained for rotation/recovery (later stages).
     #[allow(dead_code)]
     path: PathBuf,
+    /// Numeric index of this file (`wal-<idx>.log`). The authoritative basis for
+    /// the next rotation target (`idx + 1`), so rotation never reuses a lower
+    /// index after recovery resumed at a higher one (codex P0).
+    idx: u64,
     /// Bytes of real (written) frame data — the logical append position.
     len: u64,
     /// Preallocated capacity; the file rotates when `len` would exceed it.
@@ -1174,9 +1186,15 @@ impl ActiveFile {
         // overwrite within the reservation rather than growing metadata).
         file.set_len(capacity)?;
         file.sync_all()?;
+        // Fsync the parent dir so the new file's directory entry is itself durable
+        // BEFORE any frame written to it can be acknowledged (codex P0): a crash
+        // after a durable ack must never lose the directory entry of the file the
+        // ack's frame lives in (a rotated WAL file, or the first file).
+        fs.sync_dir(wal_dir)?;
         Ok(ActiveFile {
             file,
             path,
+            idx: first_seq,
             len: 0,
             capacity,
         })
@@ -1201,9 +1219,14 @@ impl ActiveFile {
             file.set_len(want)?;
         }
         file.sync_all()?;
+        // Harden the directory entry (codex P0): when this opens (or creates) the
+        // active file on a fresh/recovered dir, fsync the parent so the file's
+        // directory entry is durable before any acknowledged frame lands in it.
+        fs.sync_dir(wal_dir)?;
         Ok(ActiveFile {
             file,
             path,
+            idx: first_seq,
             len: valid_len,
             capacity: want,
         })
@@ -1352,11 +1375,14 @@ impl WriterTask {
         // Rotate if this batch would exceed the active file's preallocation.
         let needed = self.file.len + batch_bytes.len() as u64;
         if needed > self.file.capacity {
-            // Seal the current file (fsync) and open the next, named by the next
-            // sequential index. (Naming by first-frame-seq lands with the
-            // checkpoint/segment work in a later stage.)
+            // Seal the current file (fsync) and open the next, named `active + 1`
+            // — NOT derived from the rotation counter (codex P0): after recovery
+            // resumes at `wal-<active_idx>.log`, the next rotation must be
+            // `active_idx + 1` so it never truncates a lower-indexed file still
+            // required for replay ordering. `rotations` stays a pure observability
+            // counter.
             let _ = self.file.fdatasync();
-            let next_idx = self.metrics.rotations.load(Ordering::Relaxed) + 2;
+            let next_idx = self.file.idx + 1;
             if let Ok(next) = ActiveFile::create(&self.fs, &self.wal_dir, next_idx, self.cfg.file_size)
             {
                 self.file = next;

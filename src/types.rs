@@ -32,6 +32,14 @@ pub struct BoxConfig {
     pub discard: Discard,
     #[serde(default = "default_durable")]
     pub durable: bool,
+    /// Durability commit class (additive, back-compat). When present this is the
+    /// authoritative durability selector; when absent it is resolved from
+    /// `durable` (`true ⇒ fsync`, `false ⇒ disk`). See [`BoxConfig::durability_class`].
+    /// Reported (resolved) in box-state/box-create responses; omitted on the wire
+    /// only when never set *and* on a create request (absence = "resolve from
+    /// `durable`"). On a response it is always the resolved class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability: Option<Durability>,
     #[serde(default = "default_priority")]
     pub priority: Option<i32>,
     #[serde(default = "default_auto_priority")]
@@ -127,6 +135,7 @@ impl Default for BoxConfig {
             cap_bytes: default_cap_bytes(),
             discard: default_discard(),
             durable: default_durable(),
+            durability: None,
             priority: default_priority(),
             auto_priority: default_auto_priority(),
             auto_create: default_auto_create(),
@@ -146,6 +155,68 @@ impl BoxConfig {
     pub fn is_queue(&self) -> bool {
         self.r#type == BoxType::Queue
     }
+
+    /// Resolve the single authoritative durability commit class for this box
+    /// (API §0.10). An explicit `durability` always wins; otherwise it is derived
+    /// from the legacy `durable` bool: `durable:true ⇒ fsync`, `durable:false ⇒
+    /// disk`. (`memory` is reachable only via an explicit `durability:"memory"`.)
+    pub fn durability_class(&self) -> Durability {
+        match self.durability {
+            Some(d) => d,
+            None => {
+                if self.durable {
+                    Durability::Fsync
+                } else {
+                    Durability::Disk
+                }
+            }
+        }
+    }
+
+    /// Whether an acknowledged write to this box is fsync-gated (the strongest
+    /// class). `true` iff the resolved class is `fsync`; kept as the back-compat
+    /// meaning of the old `durable` bool.
+    pub fn is_durable(&self) -> bool {
+        self.durability_class() == Durability::Fsync
+    }
+
+    /// Whether this box's records are RAM-only (never written to the WAL, lost on
+    /// restart — the `memory` class). The box CONFIG still persists, but its
+    /// records do not and `head_seq` resets to 0 on restart.
+    pub fn is_memory(&self) -> bool {
+        self.durability_class() == Durability::Memory
+    }
+
+    /// Normalize the config so the resolved `durability` is reported and the
+    /// legacy `durable` bool stays consistent with it (`durable == (class ==
+    /// fsync)`). Called on create/update so responses always carry the resolved
+    /// class and `durable` matches it for back-compat.
+    pub fn normalize_durability(&mut self) {
+        let class = self.durability_class();
+        self.durability = Some(class);
+        self.durable = class == Durability::Fsync;
+    }
+}
+
+/// The durability commit class of a box (API §0.10). Selects where a write lands
+/// and when it is acknowledged — the durability/performance tradeoff:
+///
+/// - `memory` — never written to the WAL; pure RAM. Fastest; data is lost on
+///   restart (the box reappears EMPTY, its config persists). Skips the WAL append
+///   entirely (`wal_append_ms`/`fsync_ms == 0`).
+/// - `disk` — written to the WAL and group-committed (no per-write fsync).
+///   Survives a crash minus the un-fsynced tail. (The legacy `durable:false`.)
+/// - `fsync` — fsync-gated ack: the response is held until the WAL frame is
+///   durably synced, so the write survives any crash. (The legacy `durable:true`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// RAM-only; lost on restart; no WAL frames.
+    Memory,
+    /// Group-committed WAL; survives a crash minus the un-fsynced tail.
+    Disk,
+    /// Fsync-gated ack; survives any crash.
+    Fsync,
 }
 
 /// The kind of a box: a plain append-only log, or a lease-based job queue.
