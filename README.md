@@ -8,9 +8,13 @@ machine, backed by a write-ahead log on local NVMe. It is the persistence layer 
 job queues, pub/sub, and durable event streams, with a design that makes data loss
 **always explicit, never silent**.
 
-> Status: **design phase**. This repository currently contains the complete API and
-> architecture specification (see [docs/](docs/)). The implementation follows the
-> [roadmap](docs/ROADMAP.md) in four phases.
+> Status: **implemented and durable.** The full `/v0` API is built and tested
+> (boxes, diff reads, deletes, routers, multiplexed SSE, and lease-based queues),
+> backed by a write-ahead log with group commit, segments, snapshots, and
+> crash-recovery replay on a single restartable process. A `durable` box's writes
+> are **fsync-gated** — an acknowledged write is committed, and a restart replays
+> the WAL to recover it. See [docs/](docs/) for the specification and the
+> [roadmap](docs/ROADMAP.md) for how it was built.
 
 ---
 
@@ -130,10 +134,13 @@ curl -X POST localhost:4000/v0/watch \
   -H 'content-type: application/json' \
   -d '{ "node": "worker-eu-1",
         "boxes": { "jobs": { "from_seq": 0 }, "events": { "tail": true } } }'
-# -> { "wid": "wid_8f3ac21be9", "stream_url": "/v0/watch/wid_8f3ac21be9", ... }
+# -> { "wid": "wid_BuRguGorNdVFWNQULz-rrw", "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw", ... }
+# The wid is an unguessable random capability: possessing it authorizes the GET
+# stream (so EventSource needs no api key in the URL). When auth is on, the wid
+# is bound to the key that created it.
 
 # Step 2: open the stream (EventSource-compatible)
-curl -N localhost:4000/v0/watch/wid_8f3ac21be9
+curl -N localhost:4000/v0/watch/wid_BuRguGorNdVFWNQULz-rrw
 ```
 
 ```
@@ -193,17 +200,20 @@ curl -X POST localhost:4000/v0/boxes/chat/delete \
 
 ---
 
-## Phase 2 — running it
+## Running it
 
-The current build is the **phase-2 in-memory server**: the complete `/v0` API,
-correct semantics, but all state lives in RAM. **A restart loses all data** (this
-is expected and documented; durability lands in phase 4).
+The build is a **durable single binary**: the complete `/v0` API backed by a
+write-ahead log on local disk. On start it opens the data directory, loads the
+latest snapshot, and **replays the WAL forward** (truncating any torn tail) before
+serving — so an acknowledged durable write survives a restart. The readiness gate
+(`GET /v0/ready`) returns `503` during replay and `200` once recovery completes.
 
 ```bash
 # build the single binary
 cargo build --release
 
-# run it (defaults to 0.0.0.0:4000, auth disabled in dev mode)
+# run it (defaults to 127.0.0.1:4000 loopback, auth disabled in dev mode;
+# WAL + segments + snapshots live under ./streams-data)
 ./target/release/streams
 ```
 
@@ -211,14 +221,36 @@ Configuration is read from the environment:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `STREAMS_PORT` | `4000` | Listen port (`STREAMS_HOST` may set a full `host:port`). |
-| `STREAMS_API_KEYS` | _(unset)_ | Comma-separated bearer keys. Unset ⇒ **auth disabled** (dev mode). |
-| `STREAMS_DATA_DIR` | _(unset)_ | Accepted placeholder; unused in phase 2 (in-memory), wired in phase 4. |
+| `STREAMS_HOST` | `127.0.0.1` | Bind host (loopback-only by default; may also be a full `host:port`). |
+| `STREAMS_PORT` | `4000` | Listen port. |
+| `STREAMS_API_KEYS` | _(unset)_ | Comma-separated bearer keys (constant-time compared). Unset ⇒ **auth disabled** (dev mode). |
+| `STREAMS_ALLOW_INSECURE_NO_AUTH` | `0` | Required to start on a **non-loopback** bind with **no** keys — otherwise the server refuses to start (it would be an open, unauthenticated event store). |
+| `STREAMS_DATA_DIR` | `./streams-data` | Directory for the WAL, segments, and snapshots. Replayed on start; a missing/empty dir is a fresh start. |
+| `STREAMS_COLD_DIR` | _(unset)_ | Optional cold-tier directory. Set ⇒ sealed segments past the hot-retention bound relocate here off the hot path; unset ⇒ tiering disabled (everything stays hot). |
 | `RUST_LOG` | `info` | Tracing filter. |
 
-`durable: true` is accepted but is a no-op fast path in phase 2 (`fsync_ms` is
-reported as `0.0`). The server shuts down gracefully on `SIGINT`/`SIGTERM`. The
-quickstart commands above work verbatim against this build.
+Durability is **per box**: `durable: true` makes a write block on `fsync` before
+it is acknowledged (the reported `fsync_ms` is real), and that write is recovered
+by WAL replay after a crash. `durable: false` boxes take a group-committed fast
+path and report `fsync_ms` as `0.0` — they trade recovery for latency. Either way,
+**an acknowledged write is published; a write that fails to commit publishes
+nothing visible** (no readable-but-not-durable state). The server shuts down
+gracefully on `SIGINT`/`SIGTERM`, writing a final snapshot so a clean restart
+starts from a current checkpoint. The quickstart commands above work verbatim.
+
+### Security
+
+- **Default bind is loopback** (`127.0.0.1:4000`), so an unconfigured server is never
+  accidentally a public, unauthenticated event store. Binding a **non-loopback** address with
+  **no** `STREAMS_API_KEYS` makes the server **refuse to start** unless you set
+  `STREAMS_ALLOW_INSECURE_NO_AUTH=1` (it logs the reason loudly).
+- **Bearer keys** are constant-time compared. A valid key has full access (no scopes yet).
+- **Watch streams** are gated by an **unguessable `wid` capability** minted by the
+  authenticated `POST /v0/watch`; the GET stream needs no api key in the URL. The dev-only
+  `?token=` query fallback exists but leaks via logs — prefer the `Authorization` header.
+- **streams speaks plain HTTP** (no built-in TLS). For any non-loopback exposure, run it
+  behind a **TLS-terminating reverse proxy** (or bind loopback). TLS and per-key scopes /
+  tenant isolation are **planned** — see `docs/API.md` §0.2 / §0.11.
 
 ---
 
@@ -235,6 +267,11 @@ then persists `next_from_seq` as its ack (cursor-advance = ack-all). Cancel a jo
 `match ["tag","Eq",jobid]` delete; cancel a tenant with a `match ["tag","Glob","tenant*"]`
 delete (both permanent and point-in-time). Durable + unbounded cap means nothing is lost
 to eviction; replay is just reading from an earlier `from_seq`.
+
+For competing workers that need leases and redelivery rather than a shared cursor,
+create the box with `"type": "queue"` instead and use claim/ack/nack/extend (or the
+`/work` auto-claim SSE stream): jobs are leased with a visibility timeout, redelivered
+if not acked, and optionally dead-lettered. See [docs/API.md](docs/API.md) §10.
 
 ### Pub/sub (Redis-style, weak guarantees)
 
@@ -273,11 +310,16 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
 - **Node loop-prevention** — a node never receives back events it produced, making
   N-way multi-master fan-out safe by construction.
 - **Routers** — server-side `source → dest` forwarding, at-least-once, per-source FIFO,
-  cycle-rejecting by default.
+  cycle-rejecting by default. Forwarded copies are **durable by construction** (they go
+  through the same WAL append path as user writes, so they recover on restart).
+- **Lease-based queues** — set `type: "queue"` to layer claim/ack/nack/extend (and a
+  `/work` auto-claim SSE stream) on the same log: visibility-timeout leases,
+  coalesced fair fan-out, redelivery, and optional dead-lettering (see API §10).
 - **Multiplexed SSE** — watch many boxes over one resumable connection with composite
   cursors, named events, heartbeats, and tombstones.
-- **Per-box durability** — `fsync`-on-commit for durable boxes, group-committed fast
-  path for the rest.
+- **Per-box durability** — `fsync`-on-commit for durable boxes (WAL-first: an
+  acknowledged write is committed; nothing visible is ever un-durable), group-committed
+  fast path for the rest. Crash-recovery via snapshot + WAL replay on start.
 - **Priority + elastic throttling** — manual or recency-based auto priority; under CPU
   pressure delivery degrades in latency, never in correctness.
 - **Single static binary** — WAL + segments on local NVMe, restartable at any instant;
@@ -285,15 +327,22 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
 
 ---
 
-## Build phases
+## How it was built
 
-1. **Define API + docs** — this repository. The contract the implementation must satisfy.
-2. **In-memory server** — the complete, correct API with no WAL; not yet scalable or persistent.
-3. **Tests + benchmarks** — maximum-coverage unit tests and a baseline benchmark suite.
-4. **Make it scalable** — WAL, group commit, segments, recovery, priority scheduler,
-   elastic throttling — while staying a single restartable process.
+The API and its semantics were fixed first and never changed; persistence and
+scalability were added *underneath* that contract.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for acceptance criteria per phase.
+1. **Define API + docs** — the contract the implementation satisfies (`docs/`). ✅
+2. **In-memory server** — the complete, correct `/v0` API. ✅
+3. **Tests + benchmarks** — maximum-coverage tests and a baseline benchmark suite. ✅
+4. **Make it durable + scalable** — WAL, group commit, segments, snapshots, crash
+   recovery, priority scheduler, elastic throttling — all on one restartable
+   process. ✅
+5. **Lease-based queues** — claim/ack/nack/extend + `/work` stream on the same log. ✅
+6. **Tiered storage** — optional hot→cold segment relocation off the hot path. ✅
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the original phase plan and acceptance
+criteria.
 
 ---
 

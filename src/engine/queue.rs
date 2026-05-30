@@ -883,7 +883,20 @@ impl Engine {
             });
         }
         if !records.is_empty() {
-            dl.append(records, now);
+            // Dead-lettered copies go through the SAME WAL-first durable append
+            // path as user writes (ARCHITECTURE §2.2): a dead-letter record into a
+            // durable DL box is durable by construction and recovers via WAL
+            // replay, instead of living only in memory and vanishing on restart.
+            if let Err(e) = self.durable_append(&dl, records, now) {
+                tracing::warn!(
+                    src = %src.name, dead_letter = %dl_box, error = %e,
+                    "dead-letter: durable DL append failed; leaving jobs in source"
+                );
+                // The DL append failed and published nothing: do NOT delete the
+                // jobs from the source (they remain claimable / reclaimable), so a
+                // failed dead-letter never silently drops a job.
+                return;
+            }
             dl.enforce_retention(now);
         }
         // Permanently delete the dead-lettered jobs from the source jobs log.

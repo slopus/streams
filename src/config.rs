@@ -201,10 +201,17 @@ fn env_u64(key: &str, slot: &mut u64) {
 /// Runtime server configuration, assembled at startup from environment.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Bind address, e.g. `0.0.0.0:4000`.
+    /// Bind address. Defaults to `127.0.0.1:4000` (loopback) so an unconfigured
+    /// server is never accidentally a public, unauthenticated event store; bind a
+    /// non-loopback address explicitly (and set keys, or
+    /// `STREAMS_ALLOW_INSECURE_NO_AUTH=1`) to expose it.
     pub bind_addr: String,
     /// Accepted bearer API keys. Empty ⇒ auth disabled (dev mode).
     pub api_keys: Vec<String>,
+    /// Escape hatch (`STREAMS_ALLOW_INSECURE_NO_AUTH=1`): permit binding a
+    /// NON-loopback address with NO api keys configured. Off by default so the
+    /// insecure combination refuses to start (see [`ServerConfig::startup_guard`]).
+    pub allow_insecure_no_auth: bool,
     /// Whether health/ready/metrics probes require auth (`STREAMS_PROBE_AUTH`).
     pub probe_auth: bool,
     /// Max total request body before parse (`413`).
@@ -231,8 +238,9 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            bind_addr: "0.0.0.0:4000".to_string(),
+            bind_addr: "127.0.0.1:4000".to_string(),
             api_keys: Vec::new(),
+            allow_insecure_no_auth: false,
             probe_auth: false,
             max_body_bytes: MAX_BODY_BYTES,
             data_dir: None,
@@ -256,7 +264,8 @@ impl ServerConfig {
                 cfg.bind_addr = format!("{host}:{port}");
             }
         } else if let Ok(port) = std::env::var("STREAMS_PORT") {
-            cfg.bind_addr = format!("0.0.0.0:{port}");
+            // Port-only: keep the loopback default host (see `bind_addr` doc).
+            cfg.bind_addr = format!("127.0.0.1:{port}");
         }
 
         if let Ok(keys) = std::env::var("STREAMS_API_KEYS") {
@@ -269,6 +278,10 @@ impl ServerConfig {
         }
 
         cfg.probe_auth = std::env::var("STREAMS_PROBE_AUTH")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        cfg.allow_insecure_no_auth = std::env::var("STREAMS_ALLOW_INSECURE_NO_AUTH")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
@@ -304,6 +317,69 @@ impl ServerConfig {
     /// Whether bearer auth is enforced.
     pub fn auth_enabled(&self) -> bool {
         !self.api_keys.is_empty()
+    }
+
+    /// Constant-time check that `provided` matches one of the configured api keys.
+    ///
+    /// Compares against EVERY key with no early-exit so the running time does not
+    /// reveal which key (or how many bytes of a key) matched — defeating a timing
+    /// side-channel that a naive `==` / `.any(==)` would leak. `subtle`'s
+    /// `ConstantTimeEq` does the per-byte comparison without branching on contents;
+    /// only the (public) key/candidate lengths affect timing.
+    pub fn key_matches(&self, provided: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        let mut hit = subtle::Choice::from(0u8);
+        let pb = provided.as_bytes();
+        for k in &self.api_keys {
+            // `ct_eq` on unequal lengths is constant-time false; fold every key in
+            // (no `break`) so a match's position is not timing-observable.
+            hit |= k.as_bytes().ct_eq(pb);
+        }
+        hit.into()
+    }
+
+    /// Whether [`bind_addr`](Self::bind_addr) resolves to a loopback-only host.
+    ///
+    /// Parses the host:port and checks every resolved address is loopback. A host
+    /// that fails to resolve, or any non-loopback address among the resolved set,
+    /// is treated as NON-loopback (fail closed). The unspecified addresses
+    /// `0.0.0.0` / `[::]` are explicitly non-loopback (they bind every interface).
+    pub fn bind_is_loopback(&self) -> bool {
+        use std::net::ToSocketAddrs;
+        match self.bind_addr.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut any = false;
+                for a in addrs {
+                    any = true;
+                    if a.ip().is_unspecified() || !a.ip().is_loopback() {
+                        return false;
+                    }
+                }
+                // No addresses resolved ⇒ fail closed (treat as non-loopback).
+                any
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Refuse an insecure public exposure: a NON-loopback bind with NO api keys
+    /// configured turns the server into an accidental public, unauthenticated
+    /// event store. Returns `Err(message)` unless `STREAMS_ALLOW_INSECURE_NO_AUTH=1`
+    /// is set (the documented escape hatch). Loopback with no keys stays
+    /// dev-friendly (returns `Ok`).
+    ///
+    /// Called once at startup, BEFORE binding the listener.
+    pub fn startup_guard(&self) -> std::result::Result<(), String> {
+        if self.auth_enabled() || self.bind_is_loopback() || self.allow_insecure_no_auth {
+            return Ok(());
+        }
+        Err(format!(
+            "REFUSING TO START: bind address `{}` is non-loopback but no API keys are set \
+             (STREAMS_API_KEYS is empty) — this would expose an unauthenticated event store \
+             to the network. Set STREAMS_API_KEYS, bind a loopback address (127.0.0.1), or, \
+             to override deliberately, set STREAMS_ALLOW_INSECURE_NO_AUTH=1.",
+            self.bind_addr
+        ))
     }
 }
 
@@ -343,4 +419,60 @@ pub fn is_valid_router_name(name: &str) -> bool {
             || b == b'-'
             || b == b'>'
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(bind: &str, keys: &[&str], allow_insecure: bool) -> ServerConfig {
+        ServerConfig {
+            bind_addr: bind.to_string(),
+            api_keys: keys.iter().map(|s| s.to_string()).collect(),
+            allow_insecure_no_auth: allow_insecure,
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn default_bind_is_loopback() {
+        assert_eq!(ServerConfig::default().bind_addr, "127.0.0.1:4000");
+        assert!(ServerConfig::default().bind_is_loopback());
+    }
+
+    #[test]
+    fn loopback_detection() {
+        assert!(cfg("127.0.0.1:4000", &[], false).bind_is_loopback());
+        assert!(cfg("[::1]:4000", &[], false).bind_is_loopback());
+        // Unspecified addresses bind every interface ⇒ NOT loopback.
+        assert!(!cfg("0.0.0.0:4000", &[], false).bind_is_loopback());
+        assert!(!cfg("[::]:4000", &[], false).bind_is_loopback());
+        // A bind that cannot be parsed/resolved fails closed (non-loopback).
+        assert!(!cfg("not-an-addr", &[], false).bind_is_loopback());
+    }
+
+    #[test]
+    fn startup_guard_refuses_public_no_auth() {
+        // Non-loopback + no keys + no override ⇒ refuse.
+        assert!(cfg("0.0.0.0:4000", &[], false).startup_guard().is_err());
+        // ...unless the escape hatch is set.
+        assert!(cfg("0.0.0.0:4000", &[], true).startup_guard().is_ok());
+        // Non-loopback WITH keys ⇒ ok.
+        assert!(cfg("0.0.0.0:4000", &["k"], false).startup_guard().is_ok());
+        // Loopback with no keys ⇒ dev-friendly ok.
+        assert!(cfg("127.0.0.1:4000", &[], false).startup_guard().is_ok());
+    }
+
+    #[test]
+    fn key_matches_is_correct() {
+        let c = cfg("127.0.0.1:4000", &["alpha", "bravo"], false);
+        assert!(c.key_matches("alpha"));
+        assert!(c.key_matches("bravo"));
+        assert!(!c.key_matches("charlie"));
+        assert!(!c.key_matches("alph")); // prefix must not match
+        assert!(!c.key_matches("alphax")); // superstring must not match
+        assert!(!c.key_matches("")); // empty must not match a non-empty key
+        // No keys configured ⇒ nothing matches (auth is disabled separately).
+        assert!(!cfg("127.0.0.1:4000", &[], false).key_matches("alpha"));
+    }
 }

@@ -1,14 +1,17 @@
 //! streams — a persistent event engine (single binary).
 //!
-//! Phase 2 entrypoint: load config, init tracing, build the in-memory engine,
-//! start the tokio + axum server, and shut down gracefully on a signal.
+//! Entrypoint: load config, enforce the no-auth startup guard, init tracing,
+//! build the durable engine (open the data dir, load the latest snapshot, replay
+//! the WAL forward before serving), start the tokio + axum server with the
+//! background snapshotter/relocator, and shut down gracefully on a signal
+//! (writing a final snapshot).
 
 use std::sync::Arc;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::http;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,10 +19,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::from_env();
 
+    // Fail closed BEFORE binding: a non-loopback bind with no api keys is an
+    // accidental public, unauthenticated event store. `startup_guard` permits it
+    // only with STREAMS_ALLOW_INSECURE_NO_AUTH=1 (logged loudly below).
+    if let Err(msg) = config.startup_guard() {
+        error!("{msg}");
+        return Err(msg.into());
+    }
+
     if config.auth_enabled() {
-        info!(keys = config.api_keys.len(), "bearer auth enabled");
+        info!(
+            keys = config.api_keys.len(),
+            bind = %config.bind_addr,
+            "bearer auth enabled (constant-time key comparison)"
+        );
+    } else if config.bind_is_loopback() {
+        warn!(
+            bind = %config.bind_addr,
+            "STREAMS_API_KEYS not set: AUTH IS DISABLED (single-tenant dev mode, loopback-only)"
+        );
     } else {
-        warn!("STREAMS_API_KEYS not set: AUTH IS DISABLED (single-tenant dev mode)");
+        // Reached only via the explicit STREAMS_ALLOW_INSECURE_NO_AUTH escape hatch.
+        warn!(
+            bind = %config.bind_addr,
+            "INSECURE: AUTH IS DISABLED on a NON-LOOPBACK bind (STREAMS_ALLOW_INSECURE_NO_AUTH=1) \
+             — this server is reachable on the network with NO authentication"
+        );
     }
 
     let data_dir = config

@@ -1617,3 +1617,109 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
     assert_eq!(tomb.reason, TombstoneReason::Cap);
     assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), (9..=14).collect::<Vec<_>>());
 }
+
+// ===========================================================================
+// Phase-7 Stage-1: the three critical durability fixes.
+// ===========================================================================
+
+/// Bug #3 (forwarded copies were in-memory-only): a routed copy into a DURABLE
+/// destination box now goes through the same WAL-first durable append path as a
+/// user write, so it is durable BY CONSTRUCTION and survives a restart via WAL
+/// replay — it no longer vanishes on a no-snapshot crash. Recovery replays the
+/// dest's own Append frame (it does NOT re-derive the forward), so the copy is
+/// present exactly once.
+#[test]
+fn forwarded_copy_into_durable_dest_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = engine_at(dir.path());
+        // Both source and dest durable; preserve $node/$tag across the forward.
+        engine.put_box("src", durable_box()).unwrap();
+        engine.put_box("dst", durable_box()).unwrap();
+        engine
+            .put_router(
+                "src->dst",
+                RouterCreateRequest {
+                    source: "src".into(),
+                    dest: "dst".into(),
+                    preserve_node: true,
+                    preserve_tag: true,
+                    create_dest: false,
+                    filter: None,
+                    allow_cycle: false,
+                },
+            )
+            .unwrap();
+        // A durable write to src is forwarded (durably) into dst.
+        engine
+            .write(
+                "src",
+                WriteRequest {
+                    records: vec![RecordIn {
+                        data: json!({ "fwd": 1 }),
+                        tag: Some("ftag".into()),
+                        node: Some("writerA".into()),
+                        meta: None,
+                    }],
+                    node: None,
+                    idempotency_key: None,
+                    create: None,
+                    config: None,
+                    disable_backpressure: false,
+                },
+                true,
+            )
+            .unwrap();
+        // The forwarded copy is visible in dst before restart.
+        let pre = engine.diff("dst", diff_from(0)).unwrap();
+        assert_eq!(pre.records.len(), 1, "forwarded copy present pre-restart");
+        assert_eq!(pre.records[0].data, json!({ "fwd": 1 }));
+        // Drop → WAL drains + fsyncs (the forwarded Append frame is on disk).
+    }
+
+    // Reopen: the forwarded copy is recovered from the WAL (durable by
+    // construction), present exactly once with $node/$tag preserved.
+    let engine = engine_at(dir.path());
+    let st = engine.box_state("dst", false).unwrap();
+    assert_eq!(st.head_seq, 1, "forwarded durable copy recovered");
+    assert_eq!(st.count, 1);
+    let d = engine.diff("dst", diff_from(0)).unwrap();
+    assert_eq!(d.records.len(), 1, "forwarded copy present exactly once after restart");
+    assert_eq!(d.records[0].data, json!({ "fwd": 1 }));
+    assert_eq!(d.records[0].tag.as_deref(), Some("ftag"), "$tag preserved");
+    assert_eq!(d.records[0].node.as_deref(), Some("writerA"), "$node preserved");
+
+    // And forwarding still works for a NEW write after restart.
+    engine
+        .write("src", one(json!({ "fwd": 2 }), Some("ftag2")), true)
+        .unwrap();
+    let d2 = engine.diff("dst", diff_from(0)).unwrap();
+    assert_eq!(
+        d2.records.iter().map(|r| r.data.clone()).collect::<Vec<_>>(),
+        vec![json!({ "fwd": 1 }), json!({ "fwd": 2 })],
+        "post-restart forward appends after the recovered copy (no duplicate)"
+    );
+}
+
+/// Bug #2 (visible-before-durable): a durable write that the engine acknowledges
+/// is always already on disk — the headline WAL-first guarantee, asserted as a
+/// regression for the reservation reorder (stage → WAL → fsync → publish). A
+/// reader never sees a record that has not become durable. (The fsync-failure
+/// roll-back path is exercised implicitly; here we assert the happy-path
+/// invariant that an acked durable write is recovered, with a real fsync_ms.)
+#[test]
+fn acked_durable_write_is_recovered_and_fsync_gated() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = engine_at(dir.path());
+        engine.put_box("d", durable_box()).unwrap();
+        let resp = engine.write("d", one(json!({ "n": 1 }), None), true).unwrap();
+        // The ack came back only after the fsync (WAL-first publish).
+        assert!(resp.performance.fsync_ms.unwrap_or(0.0) > 0.0);
+        // And it is immediately visible to a reader (published post-fsync).
+        assert_eq!(engine.diff("d", diff_from(0)).unwrap().records.len(), 1);
+    }
+    let engine = engine_at(dir.path());
+    assert_eq!(engine.box_state("d", false).unwrap().head_seq, 1);
+    assert_eq!(engine.diff("d", diff_from(0)).unwrap().records[0].data, json!({ "n": 1 }));
+}

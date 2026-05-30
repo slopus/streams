@@ -26,9 +26,39 @@ Authorization: Bearer <API_KEY>
 ```
 
 Plain bearer token. Keys are supplied at startup (`STREAMS_API_KEYS`, comma-separated). A
-missing/unknown key returns `401`. If the server starts with **no** keys configured, auth
-is disabled (single-tenant dev mode) and the header is ignored — logged loudly at boot.
-There are no scopes in `/v0`; a valid key has full access.
+missing/unknown key returns `401`. The key check is **constant-time** (the candidate is
+compared against every configured key with no early-exit), so it does not leak which key —
+or how many leading bytes — matched via a timing side-channel.
+
+If the server starts with **no** keys configured, auth is disabled (single-tenant dev mode)
+and the header is ignored — logged loudly at boot. There are no scopes in `/v0`; a valid key
+has full access. (Scopes / multi-tenant isolation are **planned**, not yet implemented — see
+§0.11.)
+
+**Bind & the no-auth refusal.** The default bind is **`127.0.0.1:4000` (loopback only)** so an
+unconfigured server is never an accidental public, unauthenticated event store. If the
+configured bind is **non-loopback** (e.g. `0.0.0.0`) **and** no api keys are set, the server
+**refuses to start** (and logs loudly) unless you explicitly set
+`STREAMS_ALLOW_INSECURE_NO_AUTH=1`. Loopback with no keys stays dev-friendly. Configure the
+bind via `STREAMS_HOST`/`STREAMS_PORT`.
+
+> streams speaks **plain HTTP** — it does not terminate TLS. For any non-loopback exposure,
+> run it behind a TLS-terminating reverse proxy (or bind loopback and tunnel). A built-in TLS
+> story is **planned** (§0.11). Bearer keys are secrets: a token sent over plain HTTP, or in a
+> URL query string, can be observed in transit or in logs — see the watch `?token=` note in §7.1.
+
+### 0.11 Planned security work (not yet implemented)
+
+These are documented as the intended direction so clients can anticipate them; none are in
+`/v0` yet, and their absence is by design for the single-machine dev/loopback default:
+
+- **TLS:** streams speaks plain HTTP today. Until native TLS lands, terminate TLS at a reverse
+  proxy or bind loopback. No wire-contract change is anticipated when TLS is added (it is a
+  transport concern).
+- **Scopes / tenant isolation:** today any valid key has full access to every box/router. A
+  future revision will bind keys to scopes (e.g. per-box / per-prefix read/write) and tenant
+  namespaces. Box names already support a `tenant:` prefix convention (§3) to ease the later
+  migration; it is **not** an isolation boundary today.
 
 ### 0.3 Content types & encoding
 
@@ -782,8 +812,21 @@ open, while the client can still read the error body), and the **GET** is a tiny
 last-delivered cursor per box (so GET reconnects resume exactly) and is GC'd after
 `session_ttl_ms` (default 300000) of no active GET.
 
-Auth is `Authorization: Bearer` on both calls; for browser `EventSource` the GET also
-accepts `?token=<key>`.
+**Auth & the `wid` capability.** The **POST** is authenticated normally
+(`Authorization: Bearer`). The returned `wid` is an **unguessable random bearer capability**
+(≥128 bits of entropy, base64url, e.g. `wid_BuRguGorNdVFWNQULz-rrw`) — it is not a guessable
+counter. **Possessing the `wid` authorizes the GET stream**, so a browser `EventSource` (which
+cannot send custom headers) opens the stream with just the secret URL and **no api key in the
+query string**. When auth is enabled the `wid` is **bound to the principal that created it**:
+if the GET *does* present a bearer (header, or the dev-only `?token=` fallback below), it must
+match the creating key (defense in depth); presenting none is fine — the `wid` alone suffices.
+
+> **`?token=<key>` is a documented dev-only fallback** for environments where you cannot set
+> the `wid` capability flow (the `wid` is the preferred mechanism). A query string leaks via
+> server logs, browser history, and proxies, so **prefer the `Authorization: Bearer` header**,
+> and never put a long-lived api key in a URL in production. The parameter is parsed with a
+> real `x-www-form-urlencoded` decoder (percent-escapes and `+` are decoded; a duplicated
+> `token=` takes the first occurrence).
 
 ### 7.2 POST /v0/watch — create session
 
@@ -823,8 +866,8 @@ accepts `?token=<key>`.
 
 ```json
 {
-  "wid": "wid_8f3ac21be9",
-  "stream_url": "/v0/watch/wid_8f3ac21be9",
+  "wid": "wid_BuRguGorNdVFWNQULz-rrw",
+  "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw",
   "session_ttl_ms": 300000,
   "boxes": {
     "jobs":   { "from_seq": 4096,  "head_seq": 5210,  "earliest_seq": 3001 },
@@ -844,7 +887,7 @@ whether a cursor has already fallen off the start (it gets a tombstone on connec
 ### 7.3 GET /v0/watch/:wid — open the stream
 
 ```
-GET /v0/watch/wid_8f3ac21be9 HTTP/1.1
+GET /v0/watch/wid_BuRguGorNdVFWNQULz-rrw HTTP/1.1
 Accept: text/event-stream
 Last-Event-ID: eyJqb2JzIjo1MjEwLCJldmVudHMiOjg4MTMwfQ
 ```
@@ -961,8 +1004,10 @@ data: {"code":429,"error":"watch throttled under CPU pressure","retry_after_ms":
   client resumes with no loss beyond the box's own cap/TTL.
 
 **Errors at establishment** — `200` (stream opened); `400 invalid_request` (bad/expired wid
-or boxes); `404 not_found` (wid GC'd → POST again); `406 not_acceptable` (Accept not
-`text/event-stream`); `429 throttled`.
+or boxes); `401 unauthorized` (a bearer/`?token=` *was* presented but does not match the key
+that created the `wid`; omitting the bearer entirely is fine — the `wid` is the capability —
+see §7.1); `404 not_found` (wid GC'd or unknown → POST again); `406 not_acceptable` (Accept
+not `text/event-stream`); `429 throttled`.
 
 ---
 
@@ -1308,7 +1353,7 @@ Accept: text/event-stream
 | `node` | yes | — | The worker identity these jobs are leased to (as in §10.2). |
 | `max` | no | `1` | Target in-flight depth: the server keeps at most this many jobs leased to this connection at once (the backpressure bound). Clamped to `STREAMS_MAX_CLAIM`. |
 | `lease_ms` | no | box `lease_ms` | Lease duration for jobs pushed on this stream. |
-| `token` | no | — | Bearer key alternative for browser `EventSource` (as in §7.1). |
+| `token` | no | — | Dev-only `?token=<key>` fallback for browser `EventSource` (as in §7.1); prefer the `Authorization: Bearer` header — a query string leaks via logs/history/proxies. |
 
 Response headers are the SSE set from §7.3 (`Content-Type: text/event-stream`,
 `Cache-Control: no-store`, `X-Accel-Buffering: no`). A `retry: 2000` and an initial

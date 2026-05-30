@@ -180,8 +180,8 @@ impl BoxIndex {
         self.tag_index.entry(tag.to_string()).or_default().push(seq);
     }
 
-    /// Remove `seq` from `tag`'s posting list (on delete/reclaim).
-    fn unindex_tag(&mut self, tag: &str, seq: u64) {
+    /// Remove `seq` from `tag`'s posting list (on delete/reclaim/rollback).
+    pub fn unindex_tag(&mut self, tag: &str, seq: u64) {
         if let Some(v) = self.tag_index.get_mut(tag) {
             if let Ok(pos) = v.binary_search(&seq) {
                 v.remove(pos);
@@ -238,6 +238,50 @@ impl BoxIndex {
         rec.data = Value::Null;
         rec.meta = None;
         Some(freed)
+    }
+}
+
+/// A staged-but-not-yet-published append batch (the WAL-first reservation,
+/// ARCHITECTURE §2.2). Returned by [`BoxState::stage_append`]; consumed by
+/// [`BoxState::publish_staged`] (on a successful WAL commit) or
+/// [`BoxState::rollback_staged`] (on a WAL/fsync failure). The records are
+/// already in the index deque (the contiguous tail past `pre_len`) but invisible
+/// (`head_seq` unchanged) until published.
+#[derive(Debug)]
+pub struct StagedAppend {
+    /// First seq assigned to the batch (`head_seq + 1` at stage time).
+    start: u64,
+    /// Number of records in the batch.
+    count: u64,
+    /// Total accounted bytes of the batch (added to `bytes_retained` on publish).
+    added_bytes: u64,
+    /// Index-deque length before staging (the rollback truncation target).
+    pre_len: usize,
+}
+
+impl StagedAppend {
+    /// An empty stage (no records) — publish/rollback are no-ops.
+    fn empty() -> Self {
+        StagedAppend {
+            start: 0,
+            count: 0,
+            added_bytes: 0,
+            pre_len: 0,
+        }
+    }
+
+    /// Whether this stage carries no records.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The seqs this batch reserved (`start..=start+count-1`).
+    pub fn seqs(&self) -> Vec<u64> {
+        if self.count == 0 {
+            Vec::new()
+        } else {
+            (self.start..=self.start + self.count - 1).collect()
+        }
     }
 }
 
@@ -432,19 +476,45 @@ impl BoxState {
         }
     }
 
-    /// Append `records` with seqs assigned in order. Returns the assigned seqs.
-    /// Caller has already validated and (for `discard:"reject"`) admitted.
+    /// Append `records` with seqs assigned in order, publishing them visible
+    /// **immediately** (no WAL durability gate). Returns the assigned seqs.
     ///
-    /// Assigns contiguous seqs starting at `head_seq + 1`, pushes records into
-    /// the index, bumps `head_seq`, accounts retained bytes, sets the write
-    /// recency clock, and wakes any SSE/diff long-pollers via [`Notify`].
+    /// This is the in-memory / recovery / derived-append convenience: it stages
+    /// the records into the index and publishes them in one shot. The durable
+    /// write path does NOT use this — it must hold nothing visible until the WAL
+    /// frame is fsynced (the WAL-first reservation rule, ARCHITECTURE §2.2). For
+    /// that, use [`Self::stage_append`] + [`Self::publish_staged`] /
+    /// [`Self::rollback_staged`].
     pub fn append(&self, records: Vec<StoredRecord>, now_ms: i64) -> Vec<u64> {
-        if records.is_empty() {
+        let staged = self.stage_append(records);
+        if staged.is_empty() {
             return Vec::new();
+        }
+        let seqs = staged.seqs();
+        self.publish_staged(staged, now_ms);
+        seqs
+    }
+
+    /// **Stage** `records` into the index without publishing them: contiguous
+    /// seqs are assigned starting at `head_seq + 1` and the records are pushed
+    /// into the index deque + tag index, but `head_seq` is **not** advanced and
+    /// no waiter is notified — so a concurrent reader (which gates on `head_seq`)
+    /// observes NOTHING yet (the WAL-first reservation rule, ARCHITECTURE §2.2).
+    ///
+    /// The caller MUST hold the box's `append_lock` across stage → WAL append →
+    /// fsync → publish/rollback, so the staged records are always the contiguous
+    /// tail of the deque (making [`Self::rollback_staged`] a tail truncation) and
+    /// WAL frames are enqueued in seq order. On a durable write: stage, enqueue +
+    /// fsync the WAL frame, then [`Self::publish_staged`] on success or
+    /// [`Self::rollback_staged`] on a WAL/fsync failure (publish nothing visible,
+    /// not acknowledged ⇒ not committed).
+    pub fn stage_append(&self, records: Vec<StoredRecord>) -> StagedAppend {
+        if records.is_empty() {
+            return StagedAppend::empty();
         }
         let n = records.len() as u64;
         let mut index = self.index.write();
-
+        let pre_len = index.records.len();
         let start = self.head_seq().saturating_add(1);
         let mut added_bytes: u64 = 0;
         let mut seq = start;
@@ -456,14 +526,32 @@ impl BoxState {
             index.records.push_back(rec);
             seq += 1;
         }
+        StagedAppend {
+            start,
+            count: n,
+            added_bytes,
+            pre_len,
+        }
+    }
+
+    /// **Publish** a previously [`stage`](Self::stage_append)d batch: advance
+    /// `head_seq` (making the records visible), account retained bytes/live
+    /// count, set the write-recency clock, materialize the records into the HOT
+    /// segment writer, and wake SSE/diff long-pollers. Called only AFTER the
+    /// batch's WAL frame is durably committed (for a durable box), so an
+    /// acknowledged write is always already durable.
+    pub fn publish_staged(&self, staged: StagedAppend, now_ms: i64) {
+        if staged.is_empty() {
+            return;
+        }
+        let new_head = staged.start + staged.count - 1;
         // Publish the new head_seq after the records are in the index so a
         // concurrent reader that observes the higher head also finds the slots.
-        let new_head = start + n - 1;
         self.head_seq.store(new_head, Ordering::Release);
-        drop(index);
 
-        self.bytes_retained.fetch_add(added_bytes, Ordering::Relaxed);
-        self.live_count.fetch_add(n, Ordering::Relaxed);
+        self.bytes_retained
+            .fetch_add(staged.added_bytes, Ordering::Relaxed);
+        self.live_count.fetch_add(staged.count, Ordering::Relaxed);
         self.last_write_ms.store(now_ms, Ordering::Relaxed);
 
         // Materialize the freshly-committed records into the HOT segment writer
@@ -473,12 +561,35 @@ impl BoxState {
         // the new records, and frees the resident payloads of any seqs the seal
         // boundary just crossed (memory bounding). A box with no writer skips all
         // of this — the unchanged default path.
-        self.materialize_segment(start, new_head);
+        self.materialize_segment(staged.start, new_head);
 
         // Wake long-pollers (diff `wait_ms`) and SSE streams.
         self.notify.notify_waiters();
+    }
 
-        (start..=new_head).collect()
+    /// **Roll back** a staged batch whose WAL append/fsync FAILED: pop the staged
+    /// records (the contiguous tail of the deque — the caller holds `append_lock`,
+    /// so nothing was appended after them) and prune their tag postings. `head_seq`
+    /// was never advanced, so the records were never visible; this leaves the box
+    /// exactly as it was before [`Self::stage_append`]. The acknowledgement never
+    /// happens (the caller returns an error), so the contract holds: not
+    /// acknowledged ⇒ not committed, and nothing visible-but-not-durable remains.
+    pub fn rollback_staged(&self, staged: StagedAppend) {
+        if staged.is_empty() {
+            return;
+        }
+        let mut index = self.index.write();
+        // The staged records are the tail past `pre_len`; truncate back to it,
+        // pruning each popped record's tag posting (reusing `unindex_tag`).
+        while index.records.len() > staged.pre_len {
+            let idx = index.records.len() - 1;
+            let seq = index.base_seq + idx as u64;
+            let tag = index.records[idx].tag.clone();
+            index.records.pop_back();
+            if let Some(tag) = tag {
+                index.unindex_tag(&tag, seq);
+            }
+        }
     }
 
     /// Feed the records `[start, end]` to the HOT segment writer and free the

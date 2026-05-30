@@ -26,7 +26,6 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,13 +71,42 @@ pub struct Session {
     pub req: WatchCreateRequest,
     /// Authoritative `box → last-delivered seq` cursor map.
     pub cursors: Mutex<BTreeMap<String, u64>>,
+    /// The principal (api key) that created this session, when auth is enabled.
+    /// `None` in dev mode (no keys). The GET stream is authorized by *possessing*
+    /// the unguessable `wid` (a bearer capability); a presented bearer, if any,
+    /// must also match this binding (defense in depth). See [`Session::authorize`].
+    pub principal: Option<String>,
+}
+
+impl Session {
+    /// Authorize a GET-stream request against this session's principal binding.
+    ///
+    /// The `wid` itself is the capability: holding the unguessable random `wid`
+    /// authorizes the stream (API §7.1). When the session is bound to a principal
+    /// (auth enabled), a presented bearer token — if any — must match that
+    /// principal in constant time; presenting *no* bearer is allowed (the wid
+    /// alone suffices, which is the `EventSource` case). An unbound session (dev
+    /// mode) is always allowed.
+    pub fn authorize(&self, presented_bearer: Option<&str>) -> bool {
+        match (&self.principal, presented_bearer) {
+            // Unbound (dev mode): the wid alone authorizes.
+            (None, _) => true,
+            // Bound, no bearer presented: the wid capability is sufficient.
+            (Some(_), None) => true,
+            // Bound, bearer presented: it must match the creating principal.
+            (Some(p), Some(b)) => {
+                use subtle::ConstantTimeEq;
+                let m: bool = p.as_bytes().ct_eq(b.as_bytes()).into();
+                m
+            }
+        }
+    }
 }
 
 /// In-memory registry of watch sessions, keyed by `wid`. Phase 2 keeps them in
 /// a `DashMap`; phase 4 may persist. GC of idle sessions is best-effort.
 pub struct SessionStore {
     sessions: DashMap<String, Arc<Session>>,
-    next_id: AtomicU64,
 }
 
 impl Default for SessionStore {
@@ -91,18 +119,23 @@ impl SessionStore {
     pub fn new() -> Self {
         SessionStore {
             sessions: DashMap::new(),
-            next_id: AtomicU64::new(1),
         }
     }
 
-    fn alloc_wid(&self) -> String {
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        // Opaque-ish, monotonic; hex keeps it in the path charset.
-        format!("wid_{n:010x}")
+    /// Mint an UNGUESSABLE watch capability: `wid_` + base64url of 16 random
+    /// bytes (128 bits) from the OS CSPRNG. The `wid_` prefix keeps the documented
+    /// shape and the path charset; the random suffix makes the `wid` a true bearer
+    /// capability that cannot be enumerated (the old monotonic `wid_{n:010x}` was
+    /// trivially guessable). Collisions are cryptographically negligible.
+    fn alloc_wid() -> String {
+        let mut bytes = [0u8; 16];
+        rand::fill(&mut bytes);
+        let suffix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        format!("wid_{suffix}")
     }
 
     fn insert(&self, session: Session) -> String {
-        let wid = self.alloc_wid();
+        let wid = Self::alloc_wid();
         self.sessions.insert(wid.clone(), Arc::new(session));
         wid
     }
@@ -121,6 +154,7 @@ impl SessionStore {
 pub async fn create_watch(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
+    extensions: axum::http::Extensions,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<WatchCreateResponse>> {
@@ -150,9 +184,17 @@ pub async fn create_watch(
         cursors.insert(name.clone(), st.from_seq);
     }
 
+    // Bind the session to the authenticated creator (when auth is enabled) so the
+    // capability `wid` cannot be replayed under a different principal. The
+    // `Principal` is stashed by the auth middleware; absent in dev mode.
+    let principal = extensions
+        .get::<super::Principal>()
+        .map(|p| p.0.clone());
+
     let wid = state.sessions.insert(Session {
         req: req.clone(),
         cursors: Mutex::new(cursors),
+        principal,
     });
 
     Ok(Json(WatchCreateResponse {
@@ -172,6 +214,7 @@ pub async fn create_watch(
 pub async fn stream_watch(
     State(state): State<AppState>,
     Path(wid): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
     require_event_stream_accept(&headers)?;
@@ -180,6 +223,18 @@ pub async fn stream_watch(
         .sessions
         .get(&wid)
         .ok_or_else(|| Error::new(ErrorCode::NotFound, "watch session not found (re-POST)"))?;
+
+    // Authorize: holding the unguessable `wid` is the capability. When the session
+    // is bound to a principal (auth enabled), a *presented* bearer (header, or the
+    // dev-only `?token=` fallback) must match the creating principal; presenting
+    // none is allowed (the wid alone authorizes, the `EventSource` case).
+    let presented_bearer = bearer_from_request(&headers, &params);
+    if !session.authorize(presented_bearer.as_deref()) {
+        return Err(Error::new(
+            ErrorCode::Unauthorized,
+            "watch token does not match the session's principal",
+        ));
+    }
 
     // `Last-Event-ID` (or the `cursor` query) may rewind the session cursors to
     // an exact prior map — never advance past the authoritative server state.
@@ -460,6 +515,19 @@ fn decode_cursor_id(id: &str) -> Option<BTreeMap<String, u64>> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Extract a presented bearer for the stream GET: the `Authorization: Bearer`
+/// header (preferred), falling back to the dev-only `?token=` query parameter
+/// (already URL-decoded by axum's `Query` extractor). Returns `None` when neither
+/// is present.
+fn bearer_from_request(headers: &HeaderMap, params: &HashMap<String, String>) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.trim().to_string())
+        .or_else(|| params.get("token").cloned())
+}
+
 /// Reject a stream GET whose `Accept` is not `text/event-stream` (API §7,
 /// `406 not_acceptable`).
 fn require_event_stream_accept(headers: &HeaderMap) -> Result<()> {
@@ -500,11 +568,62 @@ mod tests {
                 consistency: Consistency::Eventual,
             },
             cursors: Mutex::new(cursors),
+            principal: None,
         };
         let id = encode_session_id(&session);
         let decoded = decode_cursor_id(&id).expect("decodes");
         assert_eq!(decoded.get("jobs"), Some(&5210));
         assert_eq!(decoded.get("events"), Some(&88130));
+    }
+
+    fn empty_session(principal: Option<String>) -> Session {
+        Session {
+            req: WatchCreateRequest {
+                node: None,
+                boxes: HashMap::new(),
+                limit: 256,
+                max_batch_bytes: 262_144,
+                heartbeat_ms: 15_000,
+                include_meta: true,
+                include_tags: false,
+                include_data: true,
+                consistency: Consistency::Eventual,
+            },
+            cursors: Mutex::new(BTreeMap::new()),
+            principal,
+        }
+    }
+
+    #[test]
+    fn session_authorize_capability_and_binding() {
+        // Unbound (dev mode): the wid alone authorizes, with or without a bearer.
+        let dev = empty_session(None);
+        assert!(dev.authorize(None));
+        assert!(dev.authorize(Some("anything")));
+
+        // Bound: no bearer presented ⇒ the wid capability suffices.
+        let bound = empty_session(Some("s3cr3t".to_string()));
+        assert!(bound.authorize(None));
+        // Bound + matching bearer ⇒ ok.
+        assert!(bound.authorize(Some("s3cr3t")));
+        // Bound + mismatched bearer ⇒ rejected (cannot replay under another key).
+        assert!(!bound.authorize(Some("wrong")));
+    }
+
+    #[test]
+    fn alloc_wid_is_prefixed_random_and_unique() {
+        let a = SessionStore::alloc_wid();
+        let b = SessionStore::alloc_wid();
+        assert!(a.starts_with("wid_"), "wid keeps the documented prefix: {a}");
+        assert_ne!(a, b, "wids must be unique/random, not monotonic");
+        // 16 random bytes ⇒ 22 base64url chars (no pad). Total len = 4 + 22 = 26.
+        assert_eq!(a.len(), 26, "wid carries >=128 bits of randomness: {a}");
+        // Path-safe (base64url + the `_` from the prefix), no `/` or `+` or `=`.
+        let suffix = a.strip_prefix("wid_").unwrap();
+        assert!(
+            suffix.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "suffix is base64url: {suffix}"
+        );
     }
 
     #[test]

@@ -95,11 +95,24 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .with_state(state)
 }
 
+/// The authenticated principal (the matched api key) for a request, stashed in
+/// request extensions by [`auth_middleware`] so a handler (e.g. `POST /v0/watch`)
+/// can bind a created resource to its creator. `None`/absent in dev mode.
+#[derive(Clone)]
+pub struct Principal(pub String);
+
 /// Bearer-auth middleware. Disabled when no keys are configured (dev mode).
 /// Probe endpoints skip auth unless `STREAMS_PROBE_AUTH` is set.
+///
+/// `GET /v0/watch/:wid` is special: the `wid` is an unguessable bearer capability
+/// (minted by the authenticated `POST /v0/watch`), so the stream GET is authorized
+/// by *possessing* the wid and is NOT gated here — the handler enforces the
+/// per-session principal binding. This lets browser `EventSource` (GET-only, no
+/// custom headers) open the stream with just the secret URL, without putting a
+/// long-lived api key in a logged query string.
 async fn auth_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let cfg = &state.engine.config;
@@ -113,13 +126,25 @@ async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // Bearer token from header, or `?token=` for EventSource GET.
+    // Capability-authorized: the SSE stream GET is gated by the wid, not by a
+    // bearer in the URL. Defer to the handler (which checks the wid binding).
+    if req.method() == axum::http::Method::GET && is_watch_stream_path(path) {
+        return next.run(req).await;
+    }
+
+    // Bearer token from header, or `?token=` for EventSource GET (dev-only
+    // fallback; the header is preferred since a query string leaks via logs).
     let provided = extract_bearer(req.headers())
         .map(str::to_string)
         .or_else(|| query_token(req.uri().query()));
 
     match provided {
-        Some(token) if cfg.api_keys.iter().any(|k| k == &token) => next.run(req).await,
+        Some(token) if cfg.key_matches(&token) => {
+            // Stash the authenticated principal so a handler can bind a created
+            // resource (e.g. a watch session) to its creator.
+            req.extensions_mut().insert(Principal(token));
+            next.run(req).await
+        }
         _ => Error::new(ErrorCode::Unauthorized, "missing or invalid bearer token")
             .into_response(),
     }
@@ -132,6 +157,16 @@ fn is_probe_path(path: &str) -> bool {
     )
 }
 
+/// True for the SSE stream path `GET /v0/watch/:wid` (exactly one path segment
+/// after `/v0/watch/`). The session-creating `POST /v0/watch` is NOT matched (it
+/// must be authenticated normally).
+fn is_watch_stream_path(path: &str) -> bool {
+    match path.strip_prefix("/v0/watch/") {
+        Some(rest) => !rest.is_empty() && !rest.contains('/'),
+        None => false,
+    }
+}
+
 fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -141,14 +176,17 @@ fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
+/// Extract the `?token=` query parameter using a real
+/// `application/x-www-form-urlencoded` parser: it URL-decodes percent-escapes and
+/// `+`, and on a duplicate `token=` it takes the FIRST occurrence (deterministic).
+/// This is a documented dev-only fallback for browser `EventSource`; prefer the
+/// `Authorization: Bearer` header since a query string leaks via logs/history/
+/// proxies.
 fn query_token(query: Option<&str>) -> Option<String> {
     let q = query?;
-    for pair in q.split('&') {
-        if let Some(v) = pair.strip_prefix("token=") {
-            return Some(v.to_string());
-        }
-    }
-    None
+    form_urlencoded::parse(q.as_bytes())
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -285,5 +323,40 @@ mod tests {
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         let r: Result<crate::types::DiffRequest, _> = parse_json_body(&headers, b"{bad");
         assert_eq!(r.unwrap_err().code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn query_token_basic_and_decoded() {
+        assert_eq!(query_token(None), None);
+        assert_eq!(query_token(Some("token=abc")), Some("abc".to_string()));
+        assert_eq!(query_token(Some("x=1&token=abc&y=2")), Some("abc".to_string()));
+        // Percent-escapes and `+` are decoded (a real form parser, not `strip_prefix`).
+        assert_eq!(
+            query_token(Some("token=a%2Bb%3Dc")),
+            Some("a+b=c".to_string())
+        );
+        assert_eq!(query_token(Some("token=a+b")), Some("a b".to_string()));
+        // No token param ⇒ None (even if another key has a `token`-ish prefix).
+        assert_eq!(query_token(Some("tokenx=abc")), None);
+    }
+
+    #[test]
+    fn query_token_takes_first_duplicate() {
+        // Deterministic: first occurrence wins on a duplicated param.
+        assert_eq!(
+            query_token(Some("token=first&token=second")),
+            Some("first".to_string())
+        );
+    }
+
+    #[test]
+    fn watch_stream_path_matches_only_the_get_stream() {
+        assert!(is_watch_stream_path("/v0/watch/wid_abc"));
+        // The POST create path (no trailing segment) is NOT the stream path.
+        assert!(!is_watch_stream_path("/v0/watch"));
+        assert!(!is_watch_stream_path("/v0/watch/"));
+        // Extra segments must not match (no path traversal past the wid).
+        assert!(!is_watch_stream_path("/v0/watch/wid/extra"));
+        assert!(!is_watch_stream_path("/v0/boxes/jobs"));
     }
 }

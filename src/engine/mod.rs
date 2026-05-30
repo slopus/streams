@@ -431,19 +431,41 @@ impl Engine {
         Ok((wal_append_ms, 0.0))
     }
 
-    /// Best-effort control-frame log (box config/delete, routers). Control frames
-    /// share the WAL's durability boundary (ARCHITECTURE §2.1) and are logged
-    /// durably so a crash right after the HTTP response cannot lose the mutation.
-    /// In pure in-memory mode this is a no-op.
-    fn wal_log(&self, record: WalRecord, durable: bool) {
+    /// Log a control frame (box config/delete, routers, deletes) and **propagate**
+    /// the WAL commit result. Control frames share the WAL's durability boundary
+    /// (ARCHITECTURE §2.1) and are logged durably so a crash right after the HTTP
+    /// response cannot lose the mutation. In pure in-memory mode this is a no-op
+    /// returning `Ok`.
+    ///
+    /// The caller MUST propagate an `Err` so a control-plane mutation whose WAL
+    /// append/fsync FAILED yields an error response instead of a silent success
+    /// that a crash would then lose (the durability contract: a 2xx control-plane
+    /// mutation is durably logged). Truly best-effort frames (whose loss is
+    /// self-healing) use [`Self::wal_log_best_effort`] instead.
+    fn wal_log(&self, record: WalRecord, durable: bool) -> Result<(f64, f64)> {
+        self.wal_commit(record, durable)
+    }
+
+    /// Best-effort control-frame log: the commit result is intentionally dropped.
+    /// Reserved for frames whose loss self-heals on restart (e.g. the non-durable
+    /// queue leases log, DESIGN §10.6) — NOT for a mutation a client was told
+    /// succeeded. Named explicitly so the swallow is a deliberate, documented
+    /// choice rather than an accident (contrast [`Self::wal_log`]).
+    fn wal_log_best_effort(&self, record: WalRecord, durable: bool) {
         let _ = self.wal_commit(record, durable);
     }
 
     /// Log a `Delete` control frame for a queue ack / dead-letter removal so the
     /// permanent delete replays deterministically (durability == the box's
     /// `durable`: ack durability == jobs-log durability, DESIGN §10.1/§10.4).
+    ///
+    /// Best-effort by the queue's self-healing contract (DESIGN §10.6): if this
+    /// frame is lost to a crash, the acked job simply resurfaces as claimable
+    /// (at-least-once redelivery), not a silent data loss — so the swallow is the
+    /// documented, correct choice for the leases projection, distinct from the
+    /// (propagated) API §5 `delete`.
     pub(crate) fn wal_log_delete_seqs(&self, box_id: u32, seqs: Vec<u64>, now: i64, durable: bool) {
-        self.wal_log(
+        self.wal_log_best_effort(
             WalRecord::Delete {
                 box_id,
                 before_seq: None,
@@ -457,9 +479,11 @@ impl Engine {
 
     /// Append one leases-log lifecycle event (DESIGN §10.1). Only called when the
     /// queue's leases log is durable; logged durably so a replayed lease frame
-    /// reconstructs the projection exactly.
+    /// reconstructs the projection exactly. Best-effort: a lost lease frame
+    /// self-heals on restart (the in-flight job becomes claimable again, the
+    /// self-healing visibility timeout, DESIGN §10.6).
     pub(crate) fn wal_log_lease(&self, record: WalRecord) {
-        self.wal_log(record, true);
+        self.wal_log_best_effort(record, true);
     }
 
     /// Enqueue one WAL `Append` frame per record in a write batch to the single
@@ -508,6 +532,48 @@ impl Engine {
             last_token = Some(token);
         }
         Ok((elapsed_ms(t0), last_token))
+    }
+
+    /// **WAL-first append** of `records` into `dest` (the shared durable-append
+    /// path used by user writes' derived appends: router forwarding and queue
+    /// dead-lettering). Stages the records, enqueues their WAL `Append` frame(s),
+    /// fsyncs if the box is durable, then publishes — exactly like a user write,
+    /// so a forwarded/dead-lettered copy into a durable box is durable BY
+    /// CONSTRUCTION and recovers naturally via WAL replay (ARCHITECTURE §2.2;
+    /// fixes the silent loss of routed copies on restart).
+    ///
+    /// Holds `dest.append_lock` across stage → enqueue → fsync → publish so the
+    /// box's WAL frames are enqueued in seq order and nothing visible is
+    /// non-durable. Returns the assigned seqs. On a WAL/fsync failure the staged
+    /// records are rolled back (nothing published) and the error is returned, so
+    /// a failed durable forward is never acknowledged as forwarded.
+    fn durable_append(&self, dest: &BoxState, records: Vec<StoredRecord>, now: i64) -> Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let durable = dest.config.read().durable;
+        let box_id = dest.box_id;
+        let snapshot = records.clone();
+        let _guard = dest.append_lock.lock();
+        let staged = dest.stage_append(records);
+        let seqs = staged.seqs();
+        let (_wal_ms, token) = match self.wal_enqueue_batch(box_id, &seqs, &snapshot, now, durable) {
+            Ok(v) => v,
+            Err(e) => {
+                dest.rollback_staged(staged);
+                return Err(e);
+            }
+        };
+        if durable {
+            if let Some(token) = token {
+                if let Err(e) = token.wait() {
+                    dest.rollback_staged(staged);
+                    return Err(Error::internal(format!("WAL fsync failed: {e}")));
+                }
+            }
+        }
+        dest.publish_staged(staged, now);
+        Ok(seqs)
     }
 
     /// Compute the effective priority of a box right now (DESIGN §3.1).
@@ -573,15 +639,32 @@ impl Engine {
 
         // Log the config mutation (create or update). Box config is durable as a
         // matter of policy (control frames share the WAL's durability boundary).
-        self.wal_log(WalRecord::BoxConfig {
-            box_id,
-            op: crate::storage::BoxConfigOp {
-                name: name.to_string(),
-                config: serde_json::to_vec(&config).unwrap_or_default(),
+        // PROPAGATE a WAL failure so a control-plane mutation a crash would lose is
+        // never reported as success (bug #1: the result was previously swallowed).
+        if let Err(e) = self.wal_log(
+            WalRecord::BoxConfig {
+                box_id,
+                op: crate::storage::BoxConfigOp {
+                    name: name.to_string(),
+                    config: serde_json::to_vec(&config).unwrap_or_default(),
+                },
+                tombstone: false,
+                ts: self.clock.now_ms().max(0) as u64,
             },
-            tombstone: false,
-            ts: self.clock.now_ms().max(0) as u64,
-        }, true);
+            true,
+        ) {
+            // A fresh CREATE that failed to durably log is rolled back so no
+            // phantom box survives the error (it would otherwise be a box the
+            // client was told did NOT get created). A config UPDATE leaves the
+            // in-memory config ahead of the WAL; the client got an error and must
+            // retry — the divergence is bounded to this box and self-corrects on
+            // the next durable PUT (documented tradeoff: rolling back an in-place
+            // config replace would need the prior config saved).
+            if created {
+                self.boxes.remove(name);
+            }
+            return Err(e);
+        }
 
         Ok((created, config))
     }
@@ -867,7 +950,11 @@ impl Engine {
         let routers_removed = self.routers.lock().remove_touching_box(name);
 
         // Log the box tombstone + each cascaded router removal so the delete and
-        // its cascade replay deterministically (durable control frames).
+        // its cascade replay deterministically (durable control frames). PROPAGATE
+        // a WAL failure so a delete a crash would undo is never reported as success
+        // (bug #1). The in-memory removal already happened; on a WAL failure the
+        // client gets an error and retries — a deterministic retry re-derives the
+        // same tombstone (the box is gone), so the delete is idempotent.
         let now = self.clock.now_ms().max(0) as u64;
         self.wal_log(
             WalRecord::BoxConfig {
@@ -880,7 +967,7 @@ impl Engine {
                 ts: now,
             },
             true,
-        );
+        )?;
         for r in &routers_removed {
             self.wal_log(
                 WalRecord::RouterDelete {
@@ -888,7 +975,7 @@ impl Engine {
                     ts: now,
                 },
                 true,
-            );
+            )?;
         }
 
         Ok(BoxDeleteResponse {
@@ -1044,45 +1131,67 @@ impl Engine {
             })));
         }
 
-        // --- Append atomically; assign contiguous seqs. --------------------
-        // Snapshot the resolved records for router forwarding before `append`
+        // --- WAL-FIRST append (ARCHITECTURE §2.2). -------------------------
+        // Snapshot the resolved records for router forwarding before staging
         // consumes the vec (forwarding reads the canonical $node/$tag).
         let stored_snapshot = stored.clone();
 
-        // The per-box append lock makes seq-assignment + WAL-enqueue one atomic
-        // unit (ARCHITECTURE §2.2): a box's WAL frames are enqueued to the single
-        // ordered writer in exactly their seq order, so recovery (which applies
-        // frames in WAL order, skipping `seq <= head`) never drops an acked write
-        // because a higher seq from a concurrent writer raced ahead of it. The
-        // commit token is waited on *after* the lock is released, so the fsync
-        // does not serialize other writers and durable group commit still
-        // coalesces across boxes (see `BoxState::append_lock`).
-        let (seqs, head, wal_append_ms, commit_token) = {
+        // The per-box append lock spans the WHOLE reservation: stage seqs →
+        // enqueue the WAL frame → fsync (durable) → publish/rollback. Staged
+        // records sit in the index deque but are INVISIBLE (head_seq unchanged)
+        // until the WAL frame is durably committed, so a reader never observes a
+        // record that has not (yet) become durable, and a crash after a failed
+        // fsync loses nothing that was acknowledged (not acked ⇒ not committed).
+        //
+        // Holding the lock across the fsync serializes a single box's durable
+        // writes, but the single ordered WAL writer still coalesces frames from
+        // *other* boxes into the same group commit, so cross-box durable
+        // throughput is unchanged. Within one box, durable writes already
+        // serialize on the index lock + seq assignment.
+        let (seqs, head, wal_append_ms, fsync_ms) = {
             let _guard = b.append_lock.lock();
-            let seqs = b.append(stored, now);
-            let head = b.head_seq();
-            let (wal_append_ms, token) =
-                self.wal_enqueue_batch(box_id, &seqs, &stored_snapshot, now, durable)?;
-            (seqs, head, wal_append_ms, token)
-        };
+            let staged = b.stage_append(stored);
+            let seqs = staged.seqs();
+            // Enqueue the WAL frame(s) for the staged seqs (still under the lock,
+            // so a box's frames are enqueued in exactly their seq order).
+            let (wal_append_ms, commit_token) =
+                match self.wal_enqueue_batch(box_id, &seqs, &stored_snapshot, now, durable) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // WAL append failed before commit: publish nothing.
+                        b.rollback_staged(staged);
+                        return Err(e);
+                    }
+                };
 
-        // --- WAL durability gate (ARCHITECTURE §2.2). ----------------------
-        // For a `durable` box block on the last frame's commit token (the single
-        // ordered writer guarantees all prior frames in the batch are fsynced by
-        // then) so the response is fsync-gated. A non-durable write's frames are
-        // buffered and group-committed shortly after; we don't wait.
-        let fsync_ms = if durable {
-            if let Some(token) = commit_token {
-                let t1 = Instant::now();
-                token
-                    .wait()
-                    .map_err(|e| Error::internal(format!("WAL fsync failed: {e}")))?;
-                elapsed_ms(t1)
+            // Durability gate: for a `durable` box block on the last frame's commit
+            // token (the single ordered writer guarantees every prior frame in the
+            // batch is fsynced by then) BEFORE publishing — so the response is
+            // fsync-gated and nothing visible is non-durable. A non-durable write's
+            // frames are buffered and group-committed shortly after; we don't wait.
+            let fsync_ms = if durable {
+                if let Some(token) = commit_token {
+                    let t1 = Instant::now();
+                    if let Err(e) = token.wait() {
+                        // fsync FAILED: roll the staged records back (they were
+                        // never visible) and return an error. Not acked ⇒ not
+                        // committed; no visible-but-not-durable state remains.
+                        b.rollback_staged(staged);
+                        return Err(Error::internal(format!("WAL fsync failed: {e}")));
+                    }
+                    elapsed_ms(t1)
+                } else {
+                    0.0
+                }
             } else {
                 0.0
-            }
-        } else {
-            0.0
+            };
+
+            // Durably committed (or non-durable buffered write): NOW publish the
+            // staged records, making them visible + notifying waiters.
+            b.publish_staged(staged, now);
+            let head = b.head_seq();
+            (seqs, head, wal_append_ms, fsync_ms)
         };
 
         // Post-append eviction for discard:"old" (may surface as a tombstone to
@@ -1226,7 +1335,23 @@ impl Engine {
             }
 
             let count = to_append.len() as u64;
-            dest.append(to_append, now);
+            // Forwarded copies go through the SAME WAL-first durable append path
+            // as user writes (ARCHITECTURE §2.2), so a routed copy into a durable
+            // destination box is durable by construction and recovers naturally via
+            // WAL replay — it no longer lives only in memory and vanishes on restart
+            // (the bug this fixes). A WAL/fsync failure publishes nothing and is
+            // treated as backpressure: don't advance the router cursor, so the
+            // source log (the durable at-least-once source of truth) re-drives it.
+            match self.durable_append(&dest, to_append, now) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        router = %r.name, dest = %r.dest, error = %e,
+                        "forward: durable dest append failed; leaving in source (backpressure)"
+                    );
+                    continue; // don't advance the cursor; recover via the source log.
+                }
+            }
             dest.enforce_retention(now);
 
             // Mark the dest dirty in the scheduler (delivery work; advisory).
@@ -1433,7 +1558,9 @@ impl Engine {
         // Log the delete so it replays deterministically on recovery (the deleted
         // seqs are re-derived from the rebuilt index + tag index, not stored;
         // ARCHITECTURE §2.1). Durable so a crash after the response can't revive
-        // deleted records.
+        // deleted records. PROPAGATE a WAL failure so a delete a crash would undo is
+        // never reported as success (bug #1). The selector replays deterministically,
+        // so a client retry after an error re-derives exactly the same deletion.
         self.wal_log(
             WalRecord::Delete {
                 box_id,
@@ -1443,7 +1570,7 @@ impl Engine {
                 ts: now.max(0) as u64,
             },
             true,
-        );
+        )?;
 
         Ok(DeleteResponse {
             box_name: name.to_string(),
@@ -1517,7 +1644,10 @@ impl Engine {
         };
 
         // Log the router upsert (durable control frame) so it replays on restart.
-        self.wal_log(
+        // PROPAGATE a WAL failure so a router a crash would lose is never reported
+        // as created (bug #1). A fresh CREATE that failed to durably log is removed
+        // again so no phantom router survives the error.
+        if let Err(e) = self.wal_log(
             WalRecord::RouterCreate {
                 op: RouterOp {
                     name: name.to_string(),
@@ -1532,7 +1662,12 @@ impl Engine {
                 ts: self.clock.now_ms().max(0) as u64,
             },
             true,
-        );
+        ) {
+            if created {
+                self.routers.lock().remove(name);
+            }
+            return Err(e);
+        }
 
         Ok((
             created,
@@ -1619,13 +1754,16 @@ impl Engine {
         let deleted = self.routers.lock().remove(name);
         if deleted {
             // Only log a real removal (idempotent no-op needn't be logged).
+            // PROPAGATE a WAL failure so a router-delete a crash would undo is never
+            // reported as success (bug #1). On error the client retries; a
+            // deterministic retry re-derives the same tombstone (idempotent).
             self.wal_log(
                 WalRecord::RouterDelete {
                     name: name.to_string(),
                     ts: self.clock.now_ms().max(0) as u64,
                 },
                 true,
-            );
+            )?;
         }
         Ok(RouterDeleteResponse {
             router: name.to_string(),
