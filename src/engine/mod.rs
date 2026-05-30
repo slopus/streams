@@ -56,6 +56,12 @@ pub struct Engine {
     /// The resolved data directory (durable mode only). Snapshots are written
     /// under `<data_dir>/meta`; `None` in pure in-memory mode.
     data_dir: Option<std::path::PathBuf>,
+    /// The filesystem seam snapshot writes route through when set — the crash
+    /// harness installs a [`FakeDisk`] here (via [`Engine::with_data_dir_fs`]) so
+    /// `write_snapshot` lands on the same fake the WAL does. `None` in production
+    /// (and pure in-memory mode): `write_snapshot` uses [`RealFs`] transparently,
+    /// so the production path is byte-for-byte unchanged.
+    recovery_fs: Option<Arc<dyn crate::storage::Fs>>,
     /// `bytes_written` (WAL) observed at the last snapshot, for the size-based
     /// snapshot trigger (ARCHITECTURE §3: snapshot on a size/time threshold).
     last_snapshot_bytes: AtomicU64,
@@ -95,6 +101,7 @@ impl Engine {
             wal: None,
             _wal_owner: None,
             data_dir: None,
+            recovery_fs: None,
             last_snapshot_bytes: AtomicU64::new(0),
             last_snapshot_ms: AtomicU64::new(0),
             // Pure in-memory: no WAL to replay ⇒ ready as soon as it is built.
@@ -114,6 +121,37 @@ impl Engine {
     /// survive restart), truncates any torn tail, then resumes the writer for new
     /// appends. A missing/empty data dir is a fresh start.
     pub fn with_data_dir(config: ServerConfig, clock: SharedClock) -> Result<Arc<Self>> {
+        Self::with_data_dir_inner(config, clock, None)
+    }
+
+    /// As [`Engine::with_data_dir`] but routing **every byte** of recovery I/O
+    /// (snapshot load, WAL replay reads, torn-tail truncation) and the resumed WAL
+    /// writer's appends/fsyncs through the injected `fs` instead of [`RealFs`].
+    ///
+    /// This is the in-process seam the crash-consistency harness uses: it builds a
+    /// real, fully-wired [`Engine`] whose WAL lives on a [`FakeDisk`], drives ops,
+    /// `crash()`es the disk, and recovers a *fresh* engine through the same fake to
+    /// diff the survived state against the model oracle. Test-only (`test-fs`); the
+    /// production path stays [`Engine::with_data_dir`] → [`RealFs`], byte-for-byte
+    /// unchanged.
+    #[cfg(any(test, feature = "test-fs"))]
+    pub fn with_data_dir_fs(
+        config: ServerConfig,
+        clock: SharedClock,
+        fs: Arc<dyn crate::storage::Fs>,
+    ) -> Result<Arc<Self>> {
+        Self::with_data_dir_inner(config, clock, Some(fs))
+    }
+
+    /// Shared body of [`Engine::with_data_dir`] / [`Engine::with_data_dir_fs`]:
+    /// build the engine shell, recover through `fs` (or [`RealFs`] when `None`),
+    /// install the resumed writer, and open the readiness gate. Production passes
+    /// `None` (transparent); the harness passes a fake.
+    fn with_data_dir_inner(
+        config: ServerConfig,
+        clock: SharedClock,
+        fs: Option<Arc<dyn crate::storage::Fs>>,
+    ) -> Result<Arc<Self>> {
         let data_dir = config
             .data_dir
             .clone()
@@ -126,6 +164,7 @@ impl Engine {
             wal: None,
             _wal_owner: None,
             data_dir: Some(std::path::PathBuf::from(&data_dir)),
+            recovery_fs: fs.clone(),
             last_snapshot_bytes: AtomicU64::new(0),
             last_snapshot_ms: AtomicU64::new(0),
             // Durable engine starts NOT ready: recovery (below) must finish before
@@ -143,9 +182,15 @@ impl Engine {
         // Recover from any existing WAL, then open the writer for new appends.
         // The engine stays `not ready` for the whole of this call; recovery
         // rebuilds the box indexes, watermarks, routers, deletes, and name<->id
-        // table BEFORE we mark ready and accept data-plane traffic.
-        let (handle, writer) = recovery::recover_and_open(&engine, std::path::Path::new(&data_dir))
-            .map_err(|e| Error::internal(format!("WAL recovery failed: {e}")))?;
+        // table BEFORE we mark ready and accept data-plane traffic. An injected
+        // `fs` (the crash harness) routes recovery + the resumed writer through a
+        // fake disk; `None` (production) uses `RealFs` transparently.
+        let dir_path = std::path::Path::new(&data_dir);
+        let (handle, writer) = match fs {
+            Some(fs) => recovery::recover_and_open_with(fs, &engine, dir_path),
+            None => recovery::recover_and_open(&engine, dir_path),
+        }
+        .map_err(|e| Error::internal(format!("WAL recovery failed: {e}")))?;
 
         // Install the writer + owner. `engine` is uniquely owned here (just built),
         // so `Arc::get_mut` succeeds.
@@ -236,13 +281,24 @@ impl Engine {
         if self.wal.is_none() {
             return Ok(false);
         }
-        let id = crate::storage::next_snapshot_id(dir);
+        let id = match &self.recovery_fs {
+            Some(fs) => crate::storage::next_snapshot_id_with(fs, dir),
+            None => crate::storage::next_snapshot_id(dir),
+        };
         let Some(snap) = snapshot::capture(self, id) else {
             return Ok(false);
         };
         let checkpoint = snap.checkpoint;
-        crate::storage::write_snapshot(dir, &snap)
-            .map_err(|e| Error::internal(format!("snapshot write failed: {e}")))?;
+        // Route the snapshot write through the injected fake disk (crash harness)
+        // when one is installed, so the snapshot lands on the same image the WAL
+        // does and a `crash()` exercises the real atomic-swap path. Production has
+        // no injected fs ⇒ the transparent `RealFs` write below.
+        match &self.recovery_fs {
+            Some(fs) => crate::storage::write_snapshot_with(fs, dir, &snap)
+                .map_err(|e| Error::internal(format!("snapshot write failed: {e}")))?,
+            None => crate::storage::write_snapshot(dir, &snap)
+                .map_err(|e| Error::internal(format!("snapshot write failed: {e}")))?,
+        }
 
         // The snapshot is durably in place: WAL files numbered strictly below the
         // checkpoint's active file are fully absorbed and can be dropped
@@ -361,6 +417,13 @@ impl Engine {
                     continue;
                 }
             }
+            // Named crash point: the cold copy is durably written (fsync'd) but the
+            // tier pointer has NOT been flipped and the hot copy is still present
+            // (F-COLD-CRASH-AFTER-COPY-BEFORE-FLIP). Both copies exist;
+            // `BoxTier::resolve` prefers HOT, the record stays readable, and the
+            // relocator re-runs the idempotent copy(no-op)+flip+drop — no loss.
+            // No-op without `--features failpoints`.
+            fail::fail_point!("cold::after_copy_before_flip");
             // 3. FLIP the durable tier pointer + DROP the hot copy (brief lock).
             sw.lock().confirm_relocated(id);
             relocated += 1;

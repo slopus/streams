@@ -24,10 +24,21 @@
 //! store is a future impl of the same trait. Stage 1 builds the trait, format,
 //! and config; wiring into the write/serve path lands in later stages.
 
+pub mod fs;
 pub mod segment;
 pub mod segstore;
 pub mod snapshot;
 pub mod wal;
+
+/// The hostile filesystem implementations (FakeDisk / FaultFs / MonitorFs) the
+/// crash-consistency harness injects through the `*_with` constructors. Test-only:
+/// gated behind `cfg(test)` (the lib's own unit tests) or the `test-fs` feature
+/// (the integration crash harness in `tests/`), so a release build never compiles
+/// them and production stays on [`RealFs`].
+#[cfg(any(test, feature = "test-fs"))]
+pub mod testfs;
+
+pub use fs::{File, Fs, OpenOpts, RealFs};
 
 pub use segment::{
     data_name, decode_data_frame, encode_data_frame, encode_idx_entry, idx_entry_at, idx_len,
@@ -38,8 +49,9 @@ pub use segstore::{
     BoxTier, LocalSegmentStore, SegmentId, SegmentPart, SegmentStore, StoreError, Tier,
 };
 pub use snapshot::{
-    load_latest, next_snapshot_id, write_snapshot, Checkpoint, Snapshot, SnapshotBox,
-    SnapshotError, SnapshotRecord, SnapshotRouter,
+    load_latest, load_latest_with, next_snapshot_id, next_snapshot_id_with, write_snapshot,
+    write_snapshot_with, Checkpoint, Snapshot, SnapshotBox, SnapshotError, SnapshotRecord,
+    SnapshotRouter,
 };
 pub use wal::{
     BoxConfigOp, CommitToken, LeaseEvent, MatchSel, RouterOp, Wal, WalConfig, WalError, WalFrame,

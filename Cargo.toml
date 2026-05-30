@@ -7,12 +7,31 @@ edition = "2021"
 members = ["probe"]
 resolver = "2"
 
+[features]
+# `failpoints` arms the fail-rs `fail_point!` macros sprinkled at the exact
+# persistence call sites (wal::after_write, wal::after_fdatasync, …). It is OFF
+# by default, so a release build compiles those macros to nothing and the
+# production binary is byte-for-byte unaffected. The crash harness turns it on
+# (`cargo test --features failpoints`) to drive a named crash/EIO precisely.
+failpoints = ["fail/failpoints"]
+# `test-fs` exposes the in-memory hostile filesystem implementations (FakeDisk,
+# FaultFs, MonitorFs) under `streams::storage::testfs` so the integration crash
+# harness in `tests/` can inject them through the `*_with` constructors. OFF by
+# default — they never compile into a release build. The lib's own unit tests get
+# them automatically via `cfg(test)`.
+test-fs = []
+
 [dependencies]
 async-stream = "0.3.6"
 axum = "0.8.9"
 base64 = "0.22.1"
 bytes = "1.11.1"
 dashmap = "6.2.1"
+# fail-rs: the named failpoint macros at the persistence call sites. The crate's
+# own `failpoints` feature (re-exported by our `failpoints` feature above) is what
+# actually arms them; with the feature off, `fail_point!` expands to nothing, so
+# the default/release build pays zero cost and keeps identical behavior.
+fail = "0.5"
 form_urlencoded = "1.2.2"
 futures = "0.3.32"
 hyper = { version = "1.10", features = ["server", "http1", "http2"] }
@@ -32,10 +51,12 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
+arbitrary = { version = "1", features = ["derive"] }
 criterion = "0.8.2"
 http-body-util = "0.1.3"
 proptest = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "blocking", "http2"] }
+serial_test = "3"
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 tower = { version = "0.5.3", features = ["util"] }

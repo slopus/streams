@@ -27,12 +27,13 @@
 //!    append can never be confused with a partial one.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::engine::{
     decode_record_payload, matchsel_to_filter, snapshot as engine_snapshot, wal_glue::WalHandle,
     Engine, ReplayRecord,
 };
-use crate::storage::{Wal, WalConfig, WalReader, WalRecord, WalWriter};
+use crate::storage::{Fs, OpenOpts, RealFs, Wal, WalConfig, WalReader, WalRecord, WalWriter};
 use crate::types::BoxConfig;
 
 /// The parsed numeric suffix + path of a `wal-<n>.log` file.
@@ -42,11 +43,9 @@ struct WalFile {
 }
 
 /// Enumerate `wal-<n>.log` files under `wal_dir`, ascending by numeric suffix.
-fn list_wal_files(wal_dir: &Path) -> std::io::Result<Vec<WalFile>> {
+fn list_wal_files(fs: &Arc<dyn Fs>, wal_dir: &Path) -> std::io::Result<Vec<WalFile>> {
     let mut files: Vec<WalFile> = Vec::new();
-    for entry in std::fs::read_dir(wal_dir)? {
-        let entry = entry?;
-        let path = entry.path();
+    for path in fs.read_dir(wal_dir)? {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
@@ -68,13 +67,25 @@ pub fn recover_and_open(
     engine: &Engine,
     data_dir: &Path,
 ) -> std::io::Result<(WalHandle, WalWriter)> {
+    recover_and_open_with(RealFs::arc(), engine, data_dir)
+}
+
+/// As [`recover_and_open`], routing every byte of recovery I/O (snapshot load,
+/// WAL replay reads, torn-tail truncation, the resumed writer) through `fs`.
+/// Production passes a [`RealFs`] (transparent); the crash harness passes the
+/// same fake the pre-crash run used so recovery sees exactly the survived image.
+pub fn recover_and_open_with(
+    fs: Arc<dyn Fs>,
+    engine: &Engine,
+    data_dir: &Path,
+) -> std::io::Result<(WalHandle, WalWriter)> {
     let wal_dir = data_dir.join("wal");
-    std::fs::create_dir_all(&wal_dir)?;
+    fs.create_dir_all(&wal_dir)?;
 
     // 1) Load + restore the latest valid snapshot. The checkpoint tells us where
     //    in the WAL to resume replay (file index + byte offset). With no valid
     //    snapshot, replay the whole WAL from frame zero.
-    let (ckpt_idx, ckpt_offset) = match crate::storage::load_latest(data_dir) {
+    let (ckpt_idx, ckpt_offset) = match crate::storage::load_latest_with(&fs, data_dir) {
         Ok(Some(snap)) => {
             tracing::info!(
                 snapshot_id = snap.id,
@@ -92,12 +103,12 @@ pub fn recover_and_open(
         }
     };
 
-    let files = list_wal_files(&wal_dir)?;
+    let files = list_wal_files(&fs, &wal_dir)?;
 
     // Pre-count the frames that will be replayed (post-checkpoint) so the
     // readiness gate can report `replay_progress` (API §8.2). This is a cheap
     // framing-only scan (no body decode); the apply pass below decodes + applies.
-    let total_frames = count_replay_frames(&files, ckpt_idx, ckpt_offset);
+    let total_frames = count_replay_frames(&fs, &files, ckpt_idx, ckpt_offset);
     engine.set_replay_total(total_frames);
 
     // 2) Replay frames after the checkpoint. Files numbered below `ckpt_idx` are
@@ -110,7 +121,7 @@ pub fn recover_and_open(
             continue; // absorbed by the snapshot.
         }
         let start_offset = if wf.idx == ckpt_idx { ckpt_offset } else { 0 };
-        let mut r = WalReader::open(&wf.path)?;
+        let mut r = WalReader::open_with(&fs, &wf.path)?;
         // Apply only frames whose *end* offset is strictly greater than the
         // checkpoint offset (the absorbed prefix of the checkpoint file is
         // skipped). `next()` then `valid_len()` reads the per-frame boundary
@@ -122,6 +133,12 @@ pub fn recover_and_open(
             if end > start_offset {
                 replay_frame(engine, frame.record);
                 engine.note_replayed_frame();
+                // Named crash point: a SECOND crash partway through WAL replay
+                // (F-REC-CRASH-DURING-REPLAY). Replay is idempotent (Append
+                // seq-skip, delete/evict monotone), so a re-run from the durable
+                // WAL converges to the same state; nothing is half-committed as
+                // final. No-op without `--features failpoints`.
+                fail::fail_point!("recovery::mid_replay");
             }
         }
         // The last (highest-index) file is the active one we resume appending to.
@@ -135,7 +152,13 @@ pub fn recover_and_open(
     //    fresh dir there is no active file yet.
     if !files.is_empty() {
         let active_path = wal_dir.join(format!("wal-{:016}.log", active_idx));
-        truncate_active(&active_path, active_valid_len)?;
+        // Named crash point: replay has finished but the active file's torn tail
+        // has NOT been truncated yet (F-REC-CRASH-BEFORE-TRUNCATE). The torn tail
+        // is still on disk; the next recovery re-replays the same valid prefix and
+        // truncates again (convergent), and the un-truncated tail is never misread
+        // (still Torn). No-op without `--features failpoints`.
+        fail::fail_point!("recovery::before_truncate");
+        truncate_active(&fs, &active_path, active_valid_len)?;
     } else {
         active_idx = active_idx.max(1);
         active_valid_len = 0;
@@ -149,9 +172,10 @@ pub fn recover_and_open(
     //    there are no segments (pure in-memory boxes carry no writer).
     engine.reclaim_segments_on_recovery();
 
-    // Open the writer positioned to append after the recovered/truncated tail.
+    // Open the writer positioned to append after the recovered/truncated tail,
+    // through the same FS seam recovery read from.
     let cfg = WalConfig::new(data_dir);
-    let wal = Wal::open_at(cfg, active_idx, active_valid_len)
+    let wal = Wal::open_at_with(fs.clone(), cfg, active_idx, active_valid_len)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let writer = wal.writer();
     Ok((WalHandle::new(wal), writer))
@@ -161,13 +185,14 @@ pub fn recover_and_open(
 /// fully absorbed by a durable snapshot's checkpoint (ARCHITECTURE §3.1). The
 /// active (checkpoint) file is retained so replay can resume from its offset.
 pub fn drop_absorbed_wal_files(data_dir: &Path, keep_from: u64) {
+    let fs = RealFs::arc();
     let wal_dir = data_dir.join("wal");
-    let Ok(files) = list_wal_files(&wal_dir) else {
+    let Ok(files) = list_wal_files(&fs, &wal_dir) else {
         return;
     };
     for wf in files {
         if wf.idx < keep_from {
-            let _ = std::fs::remove_file(&wf.path);
+            let _ = fs.remove_file(&wf.path);
         }
     }
 }
@@ -176,14 +201,19 @@ pub fn drop_absorbed_wal_files(data_dir: &Path, keep_from: u64) {
 /// decoding their bodies — a cheap framing scan to size the readiness gate's
 /// `replay_progress`. Mirrors the apply pass's file/offset selection exactly so
 /// the count matches the number of `note_replayed_frame` calls.
-fn count_replay_frames(files: &[WalFile], ckpt_idx: u64, ckpt_offset: u64) -> u64 {
+fn count_replay_frames(
+    fs: &Arc<dyn Fs>,
+    files: &[WalFile],
+    ckpt_idx: u64,
+    ckpt_offset: u64,
+) -> u64 {
     let mut n = 0u64;
     for wf in files {
         if wf.idx < ckpt_idx {
             continue;
         }
         let start_offset = if wf.idx == ckpt_idx { ckpt_offset } else { 0 };
-        let Ok(mut r) = WalReader::open(&wf.path) else {
+        let Ok(mut r) = WalReader::open_with(fs, &wf.path) else {
             continue;
         };
         while r.next().is_some() {
@@ -197,8 +227,8 @@ fn count_replay_frames(files: &[WalFile], ckpt_idx: u64, ckpt_offset: u64) -> u6
 
 /// Truncate `path` so trailing bytes past `valid_len` (a torn tail or
 /// preallocation zeros) cannot be misread as data, then fsync.
-fn truncate_active(path: &Path, valid_len: u64) -> std::io::Result<()> {
-    let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+fn truncate_active(fs: &Arc<dyn Fs>, path: &Path, valid_len: u64) -> std::io::Result<()> {
+    let mut f = fs.open(path, OpenOpts::rw_existing())?;
     f.set_len(valid_len)?;
     f.sync_all()?;
     Ok(())

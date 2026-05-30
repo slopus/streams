@@ -59,12 +59,14 @@
 //! the engine from `spawn_blocking` so a blocking durable wait never parks a
 //! reactor thread (ARCHITECTURE §8.5).
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+use super::fs::{File, Fs, OpenOpts, RealFs};
 
 // ---------------------------------------------------------------------------
 // Frame layout constants
@@ -802,11 +804,16 @@ impl WalReader {
         }
     }
 
-    /// Read an entire WAL file into a reader.
+    /// Read an entire WAL file into a reader from the real filesystem.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let mut f = std::fs::File::open(path)?;
+        Self::open_with(&RealFs::arc(), path)
+    }
+
+    /// Read an entire WAL file into a reader, routing the read through `fs`.
+    pub fn open_with(fs: &Arc<dyn Fs>, path: &Path) -> io::Result<Self> {
+        let f = fs.open(path, OpenOpts::read_only())?;
         let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
+        f.read_to_end_from(0, &mut buf)?;
         Ok(WalReader::new(buf))
     }
 
@@ -1051,22 +1058,39 @@ impl Wal {
     }
 
     /// Open the WAL with an explicit active-file first index and a pre-existing
-    /// valid length (recovery resumes appends after the truncated tail).
+    /// valid length (recovery resumes appends after the truncated tail), on the
+    /// real filesystem.
     pub fn open_at(cfg: WalConfig, first_idx: u64, existing_len: u64) -> Result<Wal, WalError> {
+        Wal::open_at_with(RealFs::arc(), cfg, first_idx, existing_len)
+    }
+
+    /// As [`Wal::open_at`], routing every byte of WAL I/O (file open, preallocation
+    /// `set_len`, batched `write_at`, group-commit `sync_data`, rotation) through
+    /// `fs`. Production passes a [`RealFs`] (transparent); the crash harness passes
+    /// a fake so a power loss after the Nth FS call / a torn last write / an EIO on
+    /// `sync_data` can be modelled.
+    pub fn open_at_with(
+        fs: Arc<dyn Fs>,
+        cfg: WalConfig,
+        first_idx: u64,
+        existing_len: u64,
+    ) -> Result<Wal, WalError> {
         let wal_dir = cfg.dir.join("wal");
-        std::fs::create_dir_all(&wal_dir)?;
+        fs.create_dir_all(&wal_dir)?;
 
         let metrics = Arc::new(WalMetrics::default());
         let (tx, rx) = mpsc::channel::<Submission>();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let file = ActiveFile::open_for_append(&wal_dir, first_idx, cfg.file_size, existing_len)?;
+        let file =
+            ActiveFile::open_for_append(&fs, &wal_dir, first_idx, cfg.file_size, existing_len)?;
         // Publish the initial append position so a snapshot taken before the
         // first write still records the right checkpoint (ARCHITECTURE §3).
         metrics.active_idx.store(first_idx, Ordering::Relaxed);
         metrics.active_len.store(existing_len, Ordering::Relaxed);
         let task = WriterTask {
             cfg: cfg.clone(),
+            fs,
             wal_dir,
             file,
             rx,
@@ -1121,9 +1145,10 @@ impl Drop for Wal {
     }
 }
 
-/// The active WAL file: an open, preallocated, append-positioned handle.
+/// The active WAL file: an open, preallocated, append-positioned handle routed
+/// through the [`Fs`] seam.
 struct ActiveFile {
-    file: std::fs::File,
+    file: Box<dyn File>,
     /// On-disk path; retained for rotation/recovery (later stages).
     #[allow(dead_code)]
     path: PathBuf,
@@ -1136,14 +1161,14 @@ struct ActiveFile {
 impl ActiveFile {
     /// Create + preallocate `wal-<first_seq>.log` of `capacity` bytes, truncating
     /// any existing file (used for a fresh rotation target).
-    fn create(wal_dir: &Path, first_seq: u64, capacity: u64) -> io::Result<ActiveFile> {
+    fn create(
+        fs: &Arc<dyn Fs>,
+        wal_dir: &Path,
+        first_seq: u64,
+        capacity: u64,
+    ) -> io::Result<ActiveFile> {
         let path = wal_dir.join(format!("wal-{:016}.log", first_seq));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
+        let mut file = fs.open(&path, OpenOpts::create_truncate())?;
         // Preallocate so appends don't extend the inode (best effort; set_len
         // reserves the logical size, the FS may keep it sparse — appends still
         // overwrite within the reservation rather than growing metadata).
@@ -1162,21 +1187,17 @@ impl ActiveFile {
     /// absent; preallocates to at least `capacity`. `valid_len == 0` and a fresh
     /// dir is the fresh-start case.
     fn open_for_append(
+        fs: &Arc<dyn Fs>,
         wal_dir: &Path,
         first_seq: u64,
         capacity: u64,
         valid_len: u64,
     ) -> io::Result<ActiveFile> {
         let path = wal_dir.join(format!("wal-{:016}.log", first_seq));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false) // keep the recovered prefix; we append after it.
-            .open(&path)?;
+        let mut file = fs.open(&path, OpenOpts::create_keep())?;
         // Ensure the reservation covers at least the recovered length + headroom.
         let want = capacity.max(valid_len);
-        if file.metadata()?.len() < want {
+        if file.metadata_len()? < want {
             file.set_len(want)?;
         }
         file.sync_all()?;
@@ -1188,16 +1209,26 @@ impl ActiveFile {
         })
     }
 
-    /// Write `bytes` at the current append position.
+    /// Write `bytes` at the current append position, looping over any short write
+    /// (`write_at` may report fewer bytes than offered, like `pwrite(2)`).
     fn write_all_at_tail(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(self.len))?;
-        self.file.write_all(bytes)?;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let n = self.file.write_at(self.len + written as u64, &bytes[written..])?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "wal write_at made no progress",
+                ));
+            }
+            written += n;
+        }
         self.len += bytes.len() as u64;
         Ok(())
     }
 
     fn fdatasync(&self) -> io::Result<()> {
-        // std exposes sync_data → fdatasync on unix (no inode-metadata flush).
+        // The seam's sync_data → fdatasync on unix (no inode-metadata flush).
         self.file.sync_data()
     }
 }
@@ -1206,6 +1237,9 @@ impl ActiveFile {
 /// batches, and group-commits.
 struct WriterTask {
     cfg: WalConfig,
+    /// The filesystem seam all WAL I/O routes through (rotation opens a new file
+    /// via this).
+    fs: Arc<dyn Fs>,
     wal_dir: PathBuf,
     file: ActiveFile,
     rx: mpsc::Receiver<Submission>,
@@ -1323,7 +1357,8 @@ impl WriterTask {
             // checkpoint/segment work in a later stage.)
             let _ = self.file.fdatasync();
             let next_idx = self.metrics.rotations.load(Ordering::Relaxed) + 2;
-            if let Ok(next) = ActiveFile::create(&self.wal_dir, next_idx, self.cfg.file_size) {
+            if let Ok(next) = ActiveFile::create(&self.fs, &self.wal_dir, next_idx, self.cfg.file_size)
+            {
                 self.file = next;
                 self.metrics.rotations.fetch_add(1, Ordering::Relaxed);
                 // Publish the new active file index + reset length so a snapshot
@@ -1340,6 +1375,12 @@ impl WriterTask {
             Self::signal(&states, CommitOutcome::Failed); // callers observe WriterGone.
             return;
         }
+        // Named crash point: the batch bytes are written (buffered) but NOT yet
+        // fsynced. A crash injected here drops the un-promoted pending bytes (the
+        // F-WAL-CRASH-AFTER-WRITE-PRE-FSYNC oracle: an unacked durable write may
+        // be lost; prior fsynced batches survive). Expands to nothing without
+        // `--features failpoints`.
+        fail::fail_point!("wal::after_write");
         self.metrics
             .bytes_written
             .fetch_add(batch_bytes.len() as u64, Ordering::Relaxed);
@@ -1359,6 +1400,12 @@ impl WriterTask {
                 return;
             }
             self.metrics.fsyncs.fetch_add(1, Ordering::Relaxed);
+            // Named crash point: the durable batch is fsynced (promoted) but the
+            // tokens have NOT yet been signalled. A crash here must keep the batch
+            // (the F-WAL-CRASH-AFTER-FSYNC oracle: acked ⇒ durable; the just-synced
+            // batch survives even though the ack was about to fire). No-op without
+            // `--features failpoints`.
+            fail::fail_point!("wal::after_fdatasync");
         }
 
         // Signal all tokens. Durable tokens release only after the fsync above;

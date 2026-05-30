@@ -32,10 +32,13 @@
 //! name, fsync the directory. The previous snapshot is removed only after the
 //! new one is durably in place.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+
+use super::fs::{Fs, OpenOpts, RealFs};
 
 /// Magic bytes prefixing every snapshot file (`"SNP1"`).
 const SNAPSHOT_MAGIC: [u8; 4] = *b"SNP1";
@@ -177,8 +180,20 @@ fn snapshot_name(id: u64) -> String {
 /// rename over the final name → fsync the directory. Then remove any older
 /// snapshot files (kept until this one is durably in place — crash-atomic swap).
 pub fn write_snapshot(data_dir: &Path, snapshot: &Snapshot) -> Result<(), SnapshotError> {
+    write_snapshot_with(&RealFs::arc(), data_dir, snapshot)
+}
+
+/// As [`write_snapshot`], routing every byte through the injected `fs`. Production
+/// passes a [`RealFs`] (transparent); the crash harness passes a fake so a power
+/// loss anywhere in tmp-write → fsync → rename → dir-fsync → prune-old can be
+/// modelled.
+pub fn write_snapshot_with(
+    fs: &Arc<dyn Fs>,
+    data_dir: &Path,
+    snapshot: &Snapshot,
+) -> Result<(), SnapshotError> {
     let dir = meta_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
+    fs.create_dir_all(&dir)?;
 
     let body = snapshot.encode_body()?;
     let crc = xxhash_rust::xxh3::xxh3_64(&body);
@@ -193,37 +208,50 @@ pub fn write_snapshot(data_dir: &Path, snapshot: &Snapshot) -> Result<(), Snapsh
     let final_path = dir.join(snapshot_name(snapshot.id));
     let tmp_path = dir.join(format!("{}.tmp", snapshot_name(snapshot.id)));
 
-    // Write + fsync the tmp file.
+    // Write + fsync the tmp file (looping over any short write).
     {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(&framed)?;
+        let mut f = fs.open(&tmp_path, OpenOpts::create_truncate())?;
+        write_all_at(f.as_mut(), 0, &framed)?;
         f.sync_all()?;
     }
     // Atomic rename over the final name, then fsync the directory so the rename
     // (a directory metadata change) is itself durable.
-    std::fs::rename(&tmp_path, &final_path)?;
-    fsync_dir(&dir)?;
+    fs.rename(&tmp_path, &final_path)?;
+    // Named crash point: the tmp→final rename has issued but the directory has NOT
+    // been fsynced yet, so the rename may roll back on crash (FakeDisk models
+    // rename-durable-only-after-sync_dir). The F-SNAP-CRASH-AFTER-RENAME-BEFORE-
+    // DIRFSYNC oracle: recovery loads either the new or the previous snapshot —
+    // exactly one valid snapshot, never zero. No-op without `--features failpoints`.
+    fail::fail_point!("snapshot::after_rename");
+    // Named crash point: just before the directory fsync that hardens the rename
+    // (F-SNAP-CRASH-AFTER-TMP-BEFORE-RENAME's sibling — see also recovery). A crash
+    // here leaves the rename non-durable; recovery falls back to the old snapshot.
+    fail::fail_point!("snapshot::before_dirfsync");
+    fs.sync_dir(&dir)?;
 
     // Remove older snapshots now that the new one is durably in place.
-    for existing in list_snapshot_files(&dir)? {
+    for existing in list_snapshot_files(fs, &dir)? {
         if existing.id < snapshot.id {
-            let _ = std::fs::remove_file(&existing.path);
+            let _ = fs.remove_file(&existing.path);
         }
     }
     Ok(())
 }
 
-/// fsync a directory so a contained rename/create is durable. Best-effort on
-/// platforms where opening a directory for fsync is unsupported.
-fn fsync_dir(dir: &Path) -> io::Result<()> {
-    match std::fs::File::open(dir) {
-        Ok(f) => f.sync_all(),
-        Err(_) => Ok(()),
+/// Write the whole of `bytes` at `offset`, looping over short writes.
+fn write_all_at(f: &mut dyn super::fs::File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let n = f.write_at(offset + written as u64, &bytes[written..])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_at made no progress",
+            ));
+        }
+        written += n;
     }
+    Ok(())
 }
 
 /// A discovered snapshot file: parsed id + path.
@@ -233,15 +261,9 @@ struct SnapshotFile {
 }
 
 /// Enumerate `snapshot-<n>.bin` files in `dir`, ascending by id (ignores `.tmp`).
-fn list_snapshot_files(dir: &Path) -> io::Result<Vec<SnapshotFile>> {
+fn list_snapshot_files(fs: &Arc<dyn Fs>, dir: &Path) -> io::Result<Vec<SnapshotFile>> {
     let mut out = Vec::new();
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(e),
-    };
-    for entry in rd {
-        let path = entry?.path();
+    for path in fs.read_dir(dir)? {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
@@ -261,8 +283,13 @@ fn list_snapshot_files(dir: &Path) -> io::Result<Vec<SnapshotFile>> {
 /// The next snapshot id to use under `<data_dir>/meta` (highest existing + 1, or
 /// 1 for a fresh dir).
 pub fn next_snapshot_id(data_dir: &Path) -> u64 {
+    next_snapshot_id_with(&RealFs::arc(), data_dir)
+}
+
+/// As [`next_snapshot_id`], routed through `fs`.
+pub fn next_snapshot_id_with(fs: &Arc<dyn Fs>, data_dir: &Path) -> u64 {
     let dir = meta_dir(data_dir);
-    list_snapshot_files(&dir)
+    list_snapshot_files(fs, &dir)
         .ok()
         .and_then(|v| v.last().map(|f| f.id + 1))
         .unwrap_or(1)
@@ -274,10 +301,19 @@ pub fn next_snapshot_id(data_dir: &Path) -> u64 {
 /// valid one (and `None` if none is valid ⇒ caller falls back to full WAL
 /// replay). A missing `meta` dir is a clean `None` (fresh start).
 pub fn load_latest(data_dir: &Path) -> Result<Option<Snapshot>, SnapshotError> {
+    load_latest_with(&RealFs::arc(), data_dir)
+}
+
+/// As [`load_latest`], routed through `fs`. Recovery passes the same `fs` the WAL
+/// reads through so the whole load path is governed by one injected FS.
+pub fn load_latest_with(
+    fs: &Arc<dyn Fs>,
+    data_dir: &Path,
+) -> Result<Option<Snapshot>, SnapshotError> {
     let dir = meta_dir(data_dir);
-    let files = list_snapshot_files(&dir)?;
+    let files = list_snapshot_files(fs, &dir)?;
     for f in files.into_iter().rev() {
-        match read_snapshot_file(&f.path) {
+        match read_snapshot_file(fs, &f.path) {
             Ok(snap) => return Ok(Some(snap)),
             Err(e) => {
                 tracing::warn!(path = %f.path.display(), error = %e, "skipping invalid snapshot");
@@ -289,10 +325,10 @@ pub fn load_latest(data_dir: &Path) -> Result<Option<Snapshot>, SnapshotError> {
 }
 
 /// Read + validate a single snapshot file.
-fn read_snapshot_file(path: &Path) -> Result<Snapshot, SnapshotError> {
-    let mut f = std::fs::File::open(path)?;
+fn read_snapshot_file(fs: &Arc<dyn Fs>, path: &Path) -> Result<Snapshot, SnapshotError> {
+    let f = fs.open(path, OpenOpts::read_only())?;
     let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
+    f.read_to_end_from(0, &mut buf)?;
     if buf.len() < SNAPSHOT_HEADER_LEN {
         return Err(SnapshotError::Framing("file shorter than header".into()));
     }
@@ -418,7 +454,7 @@ mod tests {
         assert_eq!(loaded.id, 2);
         assert_eq!(loaded.checkpoint.last_checkpoint_seq, 9999);
         // The older snapshot file was pruned.
-        let remaining = list_snapshot_files(&meta_dir(dir.path())).unwrap();
+        let remaining = list_snapshot_files(&RealFs::arc(), &meta_dir(dir.path())).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, 2);
         // next id advances past the latest.

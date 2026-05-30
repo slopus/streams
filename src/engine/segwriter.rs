@@ -640,6 +640,13 @@ impl SegmentWriter {
         // and the relocator simply re-runs the (idempotent) drop.
         let (start, end) = (seg.start_seq, seg.end_seq);
         seg.tier = Tier::Cold;
+        // Named crash point: the tier pointer is flipped to COLD (the cold copy is
+        // already durable) but the redundant HOT copy has NOT been deleted yet
+        // (F-COLD-CRASH-AFTER-FLIP-BEFORE-DELETE). On restart the in-memory flip is
+        // lost but the cold copy exists; `BoxTier::resolve` re-derives the tier
+        // (HOT preferred while both exist) and the relocator re-runs the idempotent
+        // drop — no loss, never zero copies. No-op without `--features failpoints`.
+        fail::fail_point!("cold::after_flip_before_delete");
         // Delete the now-redundant HOT copy (idempotent).
         if let Err(e) = self.tier.hot().delete(id) {
             tracing::warn!(segment = id, error = %e, "relocate: hot delete failed (will retry)");
