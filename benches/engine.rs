@@ -154,6 +154,7 @@ fn tagged_index(n: usize, tenants: usize) -> (BoxIndex, u64) {
             bytes: 0,
             deleted: false,
             payload_resident: true,
+            hops: 0,
         });
         index.index_tag(seq, &tag);
     }
@@ -266,6 +267,7 @@ fn warm_box(n: usize) -> Arc<BoxState> {
             bytes: 64,
             deleted: false,
             payload_resident: true,
+            hops: 0,
         })
         .collect();
     b.append(records, now);

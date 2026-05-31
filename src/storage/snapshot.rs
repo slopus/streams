@@ -89,6 +89,15 @@ pub struct SnapshotBox {
     pub live_count: u64,
     /// The live record set (ascending by seq).
     pub records: Vec<SnapshotRecord>,
+    /// The derived-router source-trim floor (`forward_v2`; codex P1 #5): the highest
+    /// dest seq a router could not materialize because the SOURCE trimmed the
+    /// corresponding record. It surfaces a `source_trim` tombstone instead of a
+    /// silent gap, so it MUST persist across a snapshot or a previously-surfaced
+    /// `source_trim` gap would degrade into a silent deleted gap after restart.
+    /// Trailing + `#[serde(default)]` so a snapshot from a build predating it decodes
+    /// with `0` (no source-trim history).
+    #[serde(default)]
+    pub source_trim_floor: u64,
 }
 
 /// A router as captured in a snapshot. Mirrors [`crate::storage::RouterOp`] plus
@@ -107,6 +116,13 @@ pub struct SnapshotRouter {
     pub filter: Option<(u8, String)>,
     pub forward_cursor: u64,
     pub forwarded_total: u64,
+    /// Deterministic dest-seq base (the dest seq just below this router's first
+    /// forwarded record); the next forwarded dest seq is `dest_base +
+    /// forwarded_total + 1`. Trailing + `#[serde(default)]` so a snapshot from a
+    /// build predating the async/derived router decodes with `0` (postcard leaves a
+    /// missing trailing field empty); recovery then re-seeds it deterministically.
+    #[serde(default)]
+    pub dest_base: u64,
 }
 
 /// The checkpoint position a snapshot corresponds to. With WAL sharding the
@@ -491,6 +507,7 @@ mod tests {
                         bytes: 20,
                     },
                 ],
+                source_trim_floor: 0,
             }],
             routers: vec![SnapshotRouter {
                 name: "jobs->audit".into(),
@@ -503,6 +520,7 @@ mod tests {
                 filter: Some((1, "t:".into())),
                 forward_cursor: 3,
                 forwarded_total: 3,
+                dest_base: 0,
             }],
         }
     }

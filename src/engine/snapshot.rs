@@ -79,6 +79,17 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     let shard_keys: Vec<String> = keyed.iter().map(|(k, _)| k.clone()).collect();
     let (wal_idx, wal_offset) = shard_positions.first().copied().unwrap_or((0, 0));
 
+    // Quiesce router advancement across BOTH the box capture and the router-cursor
+    // capture below (codex P0 #1). `advance_router` holds this lock SHARED while it
+    // publishes a router's derived dest records and advances that router's cursor;
+    // taking it EXCLUSIVE here freezes every router so the captured (derived dest
+    // content, cursor) pair is one consistent checkpoint unit — a snapshot can never
+    // record a dest at one cursor and the cursor at another, which would re-derive a
+    // duplicate (old cursor + new dest) or silently drop (new cursor + old dest) on
+    // recovery. Held for the rest of `capture` (released on return). Inert under
+    // v2-off (no `advance_router` ever contends).
+    let _router_freeze = engine.router_snapshot_lock.write();
+
     // 3) Materialize every box's live state + the router set. Each box is captured
     //    under its own `append_lock` (codex P0): a durable write may have its WAL
     //    frame *before* the checkpoint offset yet still be staged-but-unpublished
@@ -109,7 +120,7 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
         .lock()
         .snapshot_all()
         .into_iter()
-        .map(|(r, cursor, total)| router_to_snapshot(r, cursor, total))
+        .map(|(r, cursor, total, dest_base)| router_to_snapshot(r, cursor, total, dest_base))
         .collect();
 
     Some(Snapshot {
@@ -156,6 +167,7 @@ fn capture_box(b: &BoxState) -> SnapshotBox {
             bytes_retained: 0,
             live_count: 0,
             records: Vec::new(),
+            source_trim_floor: 0,
         };
     }
 
@@ -246,11 +258,12 @@ fn capture_box(b: &BoxState) -> SnapshotBox {
         bytes_retained: b.bytes(),
         live_count: b.count(),
         records,
+        source_trim_floor: floors.source_trim_floor,
     }
 }
 
 /// Encode a [`Router`] into a [`SnapshotRouter`].
-fn router_to_snapshot(r: Router, cursor: u64, total: u64) -> SnapshotRouter {
+fn router_to_snapshot(r: Router, cursor: u64, total: u64, dest_base: u64) -> SnapshotRouter {
     SnapshotRouter {
         name: r.name,
         source: r.source,
@@ -270,6 +283,7 @@ fn router_to_snapshot(r: Router, cursor: u64, total: u64) -> SnapshotRouter {
         }),
         forward_cursor: cursor,
         forwarded_total: total,
+        dest_base,
     }
 }
 
@@ -333,7 +347,7 @@ pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
                 filter,
                 allow_cycle: sr.allow_cycle,
             };
-            graph.restore(router, sr.forward_cursor, sr.forwarded_total);
+            graph.restore(router, sr.forward_cursor, sr.forwarded_total, sr.dest_base);
         }
     }
 
@@ -378,6 +392,7 @@ fn restore_box(sb: SnapshotBox, config: BoxConfig) -> BoxState {
                 bytes: r.bytes,
                 deleted: false,
                 payload_resident: true,
+                hops: 0,
             });
             next = r.seq + 1;
         }
@@ -389,6 +404,9 @@ fn restore_box(sb: SnapshotBox, config: BoxConfig) -> BoxState {
         floors.evict_floor = sb.evict_floor;
         floors.expiry_floor = sb.expiry_floor;
         floors.delete_floor = sb.delete_floor;
+        // Restore the derived-router source-trim floor (codex P1 #5) so a
+        // previously-surfaced `source_trim` gap stays a tombstone, not a silent gap.
+        floors.source_trim_floor = sb.source_trim_floor;
     }
     state.head_seq.store(sb.head_seq, Ordering::Release);
     // The snapshot's head is durable, so the reservation ceiling starts there

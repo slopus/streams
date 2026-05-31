@@ -136,6 +136,7 @@ fn sample(id: u64, last_seq: u64) -> Snapshot {
                     bytes: 10,
                 },
             ],
+            source_trim_floor: 0,
         }],
         routers: vec![],
     }

@@ -138,6 +138,23 @@ pub struct RouterOp {
     pub allow_cycle: bool,
     /// Optional forward filter, encoded like [`MatchSel`].
     pub filter: Option<MatchSel>,
+    /// The forward cursor (source seq) the router was seeded at when this frame was
+    /// logged (`forward_v2`; codex P0 #3). The async/derived model re-derives the
+    /// dest from `source[cursor..head]`, so the cursor MUST be durable independent of
+    /// replay order: under WAL sharding the source's appends can replay on a
+    /// different shard than this control frame, so recomputing the cursor from
+    /// "whatever source head exists when this frame replays" would backfill pre-create
+    /// history or skip post-create records depending on shard interleave. Persisting
+    /// the create-time cursor pins it. A legacy frame predating the field carries
+    /// `0` (the trailing field is absent on the wire); recovery then falls back to
+    /// the source head at replay time (the pre-fix behavior, correct for the
+    /// single-shard layout these frames came from).
+    pub initial_cursor: u64,
+    /// The deterministic dest-seq base the router was seeded at when this frame was
+    /// logged (`forward_v2`; codex P0 #3). The next derived dest seq is `dest_base +
+    /// forwarded_total + 1`, so the base MUST be durable to keep dest seqs stable
+    /// across a restart. A legacy frame carries `0`.
+    pub initial_dest_base: u64,
 }
 
 /// A box create/config payload logged with [`WalRecord::BoxConfig`]. The opaque
@@ -506,6 +523,12 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
                 | ((op.allow_cycle as u8) << 3);
             data_buf.push(bools);
             write_match(&mut data_buf, &op.filter);
+            // Trailing `initial_cursor` + `initial_dest_base` (forward_v2, codex P0
+            // #3): appended after the legacy fields so an old reader stops cleanly
+            // (it never reads past `filter`) and a new reader picks them up when
+            // present. A legacy frame omits them ⇒ decode falls back to `0`.
+            data_buf.extend_from_slice(&op.initial_cursor.to_le_bytes());
+            data_buf.extend_from_slice(&op.initial_dest_base.to_le_bytes());
             data = &data_buf;
         }
         WalRecord::RouterDelete { name, ts: rts } => {
@@ -755,6 +778,19 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
             let dest = read_lp_str(data, &mut pos);
             let bools = read_u8(data, &mut pos);
             let filter = read_match(data, &mut pos);
+            // Trailing `initial_cursor` + `initial_dest_base` (forward_v2, codex P0
+            // #3) — `0` for a legacy frame that predates them (the fields are absent
+            // on the wire). They MUST be read as a PAIR: a frame written by the new
+            // encoder always carries both, so a present cursor with an absent base
+            // would be a torn frame.
+            let initial_cursor = read_u64(data, &mut pos);
+            let initial_dest_base = read_u64(data, &mut pos);
+            let (initial_cursor, initial_dest_base) = match (initial_cursor, initial_dest_base) {
+                (Some(c), Some(b)) => (c, b),
+                (None, None) => (0, 0),
+                // A half-present pair is a torn trailing field.
+                _ => return DecodeStep::Torn,
+            };
             match (name, source, dest, bools, filter) {
                 (Some(name), Some(source), Some(dest), Some(bools), Some(filter)) => {
                     WalRecord::RouterCreate {
@@ -767,6 +803,8 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
                             create_dest: bools & 4 != 0,
                             allow_cycle: bools & 8 != 0,
                             filter,
+                            initial_cursor,
+                            initial_dest_base,
                         },
                         ts,
                     }
@@ -2081,6 +2119,8 @@ mod tests {
                     create_dest: true,
                     allow_cycle: false,
                     filter: Some(MatchSel::Glob("t:".into())),
+                    initial_cursor: 42,
+                    initial_dest_base: 7,
                 },
                 ts: 5,
             },

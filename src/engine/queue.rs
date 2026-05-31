@@ -373,6 +373,10 @@ impl Engine {
         if node.len() > config::MAX_NODE_BYTES {
             return Err(Error::invalid_request("node too long"));
         }
+        // Read-path catch-up (forward_v2): drain routers feeding this queue so jobs
+        // forwarded by a router are claimable on an immediate claim after a source
+        // write (read-your-writes). Inert under v2-off.
+        self.catch_up_dest(name);
         let b = self.get_queue(name)?;
         let claimers = vec![Claimer {
             node: node.to_string(),
@@ -416,6 +420,9 @@ impl Engine {
         claimers: &[Claimer],
         lease_ms: Option<u64>,
     ) -> Result<(Vec<Vec<LeasedJob>>, u64)> {
+        // Read-path catch-up (forward_v2): forwarded jobs are claimable
+        // read-your-writes. Inert under v2-off.
+        self.catch_up_dest(name);
         let b = self.get_queue(name)?;
         self.run_claim_cohort(&b, claimers, lease_ms)
     }
@@ -1057,6 +1064,7 @@ impl Engine {
                 bytes,
                 deleted: false,
                 payload_resident: true,
+                hops: 0,
             });
         }
         if !records.is_empty() {

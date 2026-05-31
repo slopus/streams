@@ -529,6 +529,14 @@ pub fn recover_and_open_with(
     // source box was materialized separately, regardless of replay order.
     engine.refresh_router_source_flags();
 
+    // Derived-router re-materialization (`forward_v2`): forwarded dest records were
+    // never WAL-logged, so each derived dest's content past the last snapshot is
+    // re-derived here by replaying forwarding from each router's recovered cursor
+    // with deterministic dest seqs (a consumer cursor into a dest stays valid). A
+    // source trimmed below a cursor surfaces a `source_trim` tombstone, never a
+    // silent gap. No-op under v2-off (the legacy WAL-replayed dest Append path).
+    engine.reforward_routers_on_recovery();
+
     // 8) Open the `n_shards` writers, each positioned to append after its recovered/
     //    truncated tail, through the same FS seam recovery read from. `n_shards == 1`
     //    uses the flat legacy layout (byte-for-byte the pre-sharding WAL).

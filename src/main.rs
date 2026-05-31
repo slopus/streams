@@ -106,6 +106,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Background router worker (async/derived forwarding, `STREAMS_FORWARD_V2`):
+    // drains dirty router sources off the write/ack path so forwarding progresses
+    // even with no dest reader (the read-path catch-up handles read-your-writes; this
+    // bounds worst-case latency and frees the ack path entirely). Elastic tick;
+    // `drain_router_sources` is a no-op when v2 is off, so the default path pays
+    // nothing. Runs on the blocking pool (it may do segment I/O on dest seals).
+    let router_engine = engine.clone();
+    let router_worker = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+            streams::config::ROUTER_TICK_INTERVAL_MS,
+        ));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let e = router_engine.clone();
+            // Loop the drain until a pass makes no progress, so a large fan-out is
+            // fully worked between ticks (each pass is bounded by ROUTER_BATCH).
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut total = 0u64;
+                loop {
+                    let n = e.drain_router_sources();
+                    total += n;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                total
+            })
+            .await;
+        }
+    });
+
     // Background relocator (Phase 6): when a cold tier is configured, periodically
     // sweep boxes for sealed segments beyond the hot-retention bound and relocate
     // them HOT → COLD. The copy is blocking I/O, so it runs on the blocking pool —
@@ -157,9 +189,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tuned keep-alive/HTTP-2 settings and graceful drain (streams::serve).
     streams::serve::serve_with_signal(listener, app, shutdown_signal(), sse_shutdown).await?;
 
-    // Graceful shutdown: stop the background snapshotter + relocator and write a
-    // final snapshot so a clean restart starts from a current checkpoint.
+    // Graceful shutdown: stop the background snapshotter + relocator + router worker
+    // and write a final snapshot so a clean restart starts from a current
+    // checkpoint. Do one FINAL router drain first so any forwarding that the worker
+    // had not yet picked up is reflected in the cursors the final snapshot captures
+    // (no-op when v2 is off).
     snapshotter.abort();
+    router_worker.abort();
+    {
+        let e = engine.clone();
+        let _ = tokio::task::spawn_blocking(move || loop {
+            if e.drain_router_sources() == 0 {
+                break;
+            }
+        })
+        .await;
+    }
     if let Some(relocator) = relocator {
         relocator.abort();
     }

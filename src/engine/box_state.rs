@@ -61,6 +61,15 @@ pub struct StoredRecord {
     /// the segment. The `bytes` accounting is unchanged (the record is still
     /// live; only where its payload lives changed).
     pub payload_resident: bool,
+    /// Router forward hop count (async/derived `forward_v2` cycle loop-breaker). A
+    /// direct user write is `0`; a record forwarded by a router carries
+    /// `source_record.hops + 1`. A record at/above [`crate::config::MAX_ROUTER_HOPS`]
+    /// is not forwarded again, so an `allow_cycle` topology terminates exactly as
+    /// the legacy synchronous `hops` recursion counter did. In-memory only (never
+    /// WAL-logged — derived dest records are not logged at all; a direct write is
+    /// always `0`), and re-derived identically on recovery by replaying forwarding
+    /// from the cursor.
+    pub hops: u8,
 }
 
 /// The seq→record index: a contiguous deque offset by `base_seq`
@@ -313,6 +322,7 @@ pub(crate) fn deleted_hole() -> StoredRecord {
         bytes: 0,
         deleted: true,
         payload_resident: true,
+        hops: 0,
     }
 }
 
@@ -466,6 +476,32 @@ pub struct BoxState {
     /// read path (segment-backed resolution) but never holding the index lock
     /// across a slow cold fetch (the Phase-6 HARD INVARIANT).
     pub segwriter: Option<Mutex<SegmentWriter>>,
+
+    /// Ordered-materialization seam (R6 / codex P1 #7). With the segment seal moved
+    /// OFF the publish gate, two same-box writers can reach `materialize_published`
+    /// out of seq order (writer B publishes + materializes `N+1` before writer A
+    /// materializes `N`). [`SegmentWriter`] assumes strictly monotonic append order
+    /// (a backwards seq trips its contiguity assert; a forward jump force-seals a
+    /// phantom gap), so the seam serializes materialization back into seq order: each
+    /// range is admitted to the writer only when it starts exactly at `next`, and any
+    /// earlier-arriving later range is buffered until its predecessor lands. The gate
+    /// stays seal-free (the fsync is still off the publish gate); only the cheap
+    /// in-order hand-off is serialized here.
+    pub materialize_seam: Mutex<MaterializeSeam>,
+}
+
+/// The ordered-materialization cursor + out-of-order buffer for one box (R6 / codex
+/// P1 #7). `next` is the next seq the segment writer expects; `pending` holds
+/// published ranges that arrived before their predecessor (keyed by start seq).
+#[derive(Debug, Default)]
+pub struct MaterializeSeam {
+    /// The next seq the writer expects to materialize (`seq_base` initially, then the
+    /// seq just past the last materialized range). `0` ⇒ uninitialized (set on the
+    /// first range from `seq_base`).
+    pub next: u64,
+    /// Ranges `(start, end)` published out of order, awaiting their predecessor.
+    /// Keyed by `start`; small in practice (bounded by in-flight same-box writers).
+    pub pending: std::collections::BTreeMap<u64, u64>,
 }
 
 /// Sentinel for a recency clock that has never fired.
@@ -509,6 +545,10 @@ impl BoxState {
             publish_gate: std::sync::Mutex::new(0),
             publish_cv: std::sync::Condvar::new(),
             segwriter: None,
+            materialize_seam: Mutex::new(MaterializeSeam {
+                next: seq_base,
+                pending: std::collections::BTreeMap::new(),
+            }),
         }
     }
 
@@ -528,6 +568,7 @@ impl BoxState {
         // steady-state eviction happens as new appends seal segments.
         let index = self.index.read();
         let base = index.base_seq;
+        let len = index.records.len() as u64;
         for (i, rec) in index.records.iter().enumerate() {
             let seq = base + i as u64;
             writer.append_record(
@@ -541,6 +582,10 @@ impl BoxState {
         }
         drop(index);
         self.segwriter = Some(Mutex::new(writer));
+        // The writer is now seeded through `base + len - 1`; the ordered-materialize
+        // seam (R6 / codex P1 #7) must continue from the next seq so a post-restore
+        // append materializes in order and never re-feeds a pre-seeded record.
+        self.materialize_seam.lock().next = base + len;
     }
 
     /// Whether this box is a queue (carries a lease projection).
@@ -665,6 +710,64 @@ impl BoxState {
         floors.evict_floor.max(floors.expiry_floor)
     }
 
+    /// Resolve a source record at `seq` for derived forwarding (`forward_v2`),
+    /// transparently across the resident slot, the bounded cache, and a cold
+    /// segment read. Returns `(record, alive)` where `alive` is `false` for a
+    /// deleted/missing slot (a deleted record is not forwarded). `None` if the seq
+    /// is physically below the box's base (reclaimed). Never holds the index lock
+    /// across a (possibly slow) segment read (the Phase-6 HARD INVARIANT).
+    pub fn forward_lookup(&self, seq: u64) -> Option<(StoredRecord, bool)> {
+        // Snapshot the slot's metadata under a brief read lock.
+        let (mut rec, resident) = {
+            let index = self.index.read();
+            let r = index.get(seq)?;
+            (r.clone(), r.payload_resident)
+        };
+        if rec.deleted {
+            return Some((rec, false));
+        }
+        if !resident {
+            // Payload was freed after sealing; resolve it off the index lock.
+            let resolved = self.resolve_payload(seq, &rec);
+            rec.data = resolved.data;
+            rec.meta = resolved.meta;
+        }
+        Some((rec, true))
+    }
+
+    /// Record that a derived router could not materialize `count` forwarded records
+    /// into this dest because the SOURCE trimmed them (async/derived `forward_v2`,
+    /// design §4 source-retention bound). Appends `count` deleted-hole slots so the
+    /// dest's seq space carries a real gap at the right deterministic position, and
+    /// advances `source_trim_floor` so a dest consumer crossing the gap reads a
+    /// `source_trim` tombstone rather than a silent skip. Returns the first/last
+    /// hole seqs (empty range for `count == 0`).
+    pub fn note_source_trim(&self, now_ms: i64) {
+        // One-hole step used by the engine per trimmed source record; the engine
+        // calls this exactly the number of trimmed records (see `advance_router`).
+        let _ = now_ms;
+        let staged = self.stage_append(vec![deleted_hole()]);
+        if staged.is_empty() {
+            return;
+        }
+        let hole_seq = staged.start;
+        // Publish the hole (advances head) and raise the source-trim floor to it.
+        self.head_seq.store(hole_seq, Ordering::Release);
+        {
+            let mut floors = self.floors.write();
+            if hole_seq > floors.source_trim_floor {
+                floors.source_trim_floor = hole_seq;
+            }
+        }
+        // Materialize the hole into the segment writer through the ordered seam (R6 /
+        // codex P1 #7), exactly like a deleted middle hole, so the seam's `next`
+        // advances past it and a following derived record materializes contiguously
+        // (otherwise the live record's range would start past `next` and stall
+        // forever in the out-of-order buffer). A writer-less box is a no-op.
+        self.materialize_published(hole_seq, hole_seq);
+        self.notify.notify_waiters();
+    }
+
     /// Read a recency clock, mapping the sentinel to `None`.
     pub fn read_ts(value: &AtomicI64) -> Option<i64> {
         match value.load(Ordering::Relaxed) {
@@ -757,8 +860,30 @@ impl BoxState {
     /// batch's WAL frame is durably committed (for a durable box), so an
     /// acknowledged write is always already durable.
     pub fn publish_staged(&self, staged: StagedAppend, now_ms: i64) {
+        if let Some((start, end)) = self.publish_staged_no_seal(staged, now_ms) {
+            // Materialize + seal inline (the convenience path: `append`, in-memory
+            // helpers, tests). Routed through the ORDERED seam (R6 / codex P1 #7) so
+            // the inline path and the gated path share one materialization cursor —
+            // a box never mixes a direct `materialize_segment` (which would desync the
+            // seam's `next`) with the ordered `materialize_published`. The gated write
+            // paths call `publish_staged_no_seal` + `materialize_published` directly
+            // AFTER releasing the publish gate (keep the seal fsync off the gate).
+            self.materialize_published(start, end);
+        }
+    }
+
+    /// **Publish** a staged batch but DO NOT materialize/seal: advance `head_seq`,
+    /// account bytes/count, set the write-recency clock, and wake waiters. Returns
+    /// `Some((start, end))` of the published range so the caller can run
+    /// [`Self::materialize_segment`] **after releasing the publish gate** (R6: the
+    /// segment seal `put` fsync no longer serializes same-box writers behind the
+    /// gate, which only orders head advances now). Returns `None` for an empty
+    /// batch. Crash-safety is preserved: the WAL already made the records durable
+    /// (a segment is a derivable materialization), and resident payloads are freed
+    /// only after the seal `put` returns Ok inside `materialize_segment`.
+    pub fn publish_staged_no_seal(&self, staged: StagedAppend, now_ms: i64) -> Option<(u64, u64)> {
         if staged.is_empty() {
-            return;
+            return None;
         }
         let new_head = staged.start + staged.count - 1;
         // Publish the new head_seq after the records are in the index so a
@@ -770,17 +895,68 @@ impl BoxState {
         self.live_count.fetch_add(staged.count, Ordering::Relaxed);
         self.last_write_ms.store(now_ms, Ordering::Relaxed);
 
-        // Materialize the freshly-committed records into the HOT segment writer
-        // (Phase 6 Stage 2). This is a derivable materialization of records that
-        // are already in the in-memory index (and, for a durable box, the WAL);
-        // it runs after head is published so it never delays a reader observing
-        // the new records, and frees the resident payloads of any seqs the seal
-        // boundary just crossed (memory bounding). A box with no writer skips all
-        // of this — the unchanged default path.
-        self.materialize_segment(staged.start, new_head);
-
         // Wake long-pollers (diff `wait_ms`) and SSE streams.
         self.notify.notify_waiters();
+        Some((staged.start, new_head))
+    }
+
+    /// Materialize a published `[start, end]` range into the HOT segment writer and
+    /// free the resident payloads of any seqs sealing crossed. Safe to run OFF the
+    /// publish gate (R6) — purely derivable from the already-published in-memory
+    /// index. No-op for a writer-less box. Public so the gated write paths can run
+    /// it after `ticket.done()`.
+    ///
+    /// ORDERED (R6 / codex P1 #7): because the seal is off the publish gate, a later
+    /// writer can call this for `N+1` before the earlier writer calls it for `N`.
+    /// [`SegmentWriter`] requires strictly monotonic append order, so this admits a
+    /// range to the writer ONLY when it starts exactly at the seam's `next`; an
+    /// earlier-arriving later range is buffered and drained once its predecessor
+    /// lands. A range entirely below `next` (already materialized — e.g. a duplicate
+    /// after recovery) is dropped. The actual writer feed (`materialize_segment`)
+    /// runs WITHOUT holding the seam lock, so a slow seal still never serializes the
+    /// publish gate; only the cheap in-order bookkeeping is under the seam.
+    pub fn materialize_published(&self, start: u64, end: u64) {
+        if self.segwriter.is_none() {
+            return; // writer-less box: nothing to materialize, nothing to order.
+        }
+        // Collect the contiguous prefix of ranges to feed, under the seam lock, then
+        // feed them off the lock.
+        let mut to_feed: Vec<(u64, u64)> = Vec::new();
+        {
+            let mut seam = self.materialize_seam.lock();
+            // Seam `next` defaults to seq_base; clamp this range's effective start up
+            // to `next` so an overlapping/duplicate prefix is never re-fed.
+            if end < seam.next {
+                return; // wholly already materialized.
+            }
+            let eff_start = start.max(seam.next);
+            if eff_start == seam.next {
+                // In order: feed it now and advance the seam.
+                to_feed.push((eff_start, end));
+                seam.next = end + 1;
+            } else {
+                // Out of order: buffer until the gap before it fills. Keep the
+                // largest end for a given start (idempotent re-publish is rare).
+                let e = seam.pending.entry(start).or_insert(end);
+                *e = (*e).max(end);
+            }
+            // Drain any now-contiguous buffered ranges.
+            while let Some((&pstart, &pend)) = seam.pending.range(..=seam.next).next_back() {
+                if pstart > seam.next {
+                    break;
+                }
+                seam.pending.remove(&pstart);
+                if pend < seam.next {
+                    continue; // fully subsumed already.
+                }
+                let feed_start = seam.next;
+                to_feed.push((feed_start, pend));
+                seam.next = pend + 1;
+            }
+        }
+        for (s, e) in to_feed {
+            self.materialize_segment(s, e);
+        }
     }
 
     /// **Roll back** a staged batch whose WAL append/fsync FAILED: pop the staged
@@ -1748,6 +1924,7 @@ mod tests {
                 bytes: 16,
                 deleted: false,
                 payload_resident: true,
+                hops: 0,
             }]);
             let start = staged.start;
             let mut t = ba.next_publish_ticket();
@@ -1779,6 +1956,7 @@ mod tests {
                 bytes: 16,
                 deleted: false,
                 payload_resident: true,
+                hops: 0,
             }]);
             let mut t = b.next_publish_ticket();
             t.wait_turn();

@@ -470,6 +470,13 @@ pub enum TombstoneReason {
     Ttl,
     Mixed,
     Recreated,
+    /// A derived router dest could not re-materialize a forwarded record because
+    /// the SOURCE box had already evicted/trimmed it (TTL / byte-cap involuntary
+    /// loss) below the router's forward cursor before it was forwarded. The dest
+    /// faithfully reflects the source's retention — the gap is surfaced, never a
+    /// silent skip (async/derived router model, design §4 source-retention bound).
+    /// Serializes as `"source_trim"`.
+    SourceTrim,
     /// SSE connect-time variant only.
     FromSeqTooOld,
 }

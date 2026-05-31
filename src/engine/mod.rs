@@ -116,6 +116,35 @@ pub struct Engine {
     pub config: ServerConfig,
     /// Process start, for `uptime_ms`.
     pub started_at: Instant,
+    /// Whether the ASYNC + derived (compact-WAL, cursor-driven, no-silent-loss)
+    /// forwarding path is active for this engine. Captured ONCE at construction
+    /// from [`config::forward_v2_enabled`] (env `STREAMS_FORWARD_V2`) so the flag is
+    /// stable for the engine's lifetime and not re-read per op. When `false`
+    /// (default) the live synchronous `forward_from` path runs unchanged. When
+    /// `true` the write/ack path stops forwarding; a background worker +
+    /// read-path catch-up drive `advance_router` instead (forwarded dest records
+    /// are derived, never separately WAL-logged — one WAL append per source append
+    /// regardless of fan-out).
+    forward_v2: bool,
+    /// Per-router advance serialization (`forward_v2`). The read-path catch-up and
+    /// the background worker both call `advance_router(name)`; this map hands each
+    /// router its own `Mutex<()>` so the two drivers never double-forward the same
+    /// source records concurrently (the cursor is the single source of truth for
+    /// progress). Created lazily on first advance; entries are pruned with the
+    /// router. A `DashMap` so taking one router's lock never blocks another.
+    router_advance_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Snapshot ⇄ router-advance barrier (`forward_v2`; codex P0 #1). `advance_router`
+    /// publishes a router's derived dest records and THEN advances that router's
+    /// cursor; a snapshot captures box state (incl. derived dest records) first and
+    /// router cursors second. Without coordination a snapshot could capture a dest
+    /// with the OLD cursor (⇒ duplicate re-forward on recovery) or capture a NEW
+    /// cursor after the OLD dest (⇒ silent loss). `advance_router` holds this lock
+    /// SHARED for its whole pass (dest publish + cursor advance are one unit);
+    /// snapshot `capture` holds it EXCLUSIVE across BOTH box capture and cursor
+    /// capture, so the (derived dest, cursor) pair is one consistent checkpoint unit.
+    /// A `parking_lot::RwLock` (reader-preferring is fine: capture is rare). Inert
+    /// under v2-off (no `advance_router` ever runs).
+    router_snapshot_lock: parking_lot::RwLock<()>,
 }
 
 /// Aggregate per-engine metrics gathered in one pass over the box registry for
@@ -181,6 +210,9 @@ impl Engine {
             clock,
             config,
             started_at: Instant::now(),
+            forward_v2: config::forward_v2_enabled(),
+            router_advance_locks: DashMap::new(),
+            router_snapshot_lock: parking_lot::RwLock::new(()),
         })
     }
 
@@ -252,6 +284,9 @@ impl Engine {
             clock,
             config,
             started_at: Instant::now(),
+            forward_v2: config::forward_v2_enabled(),
+            router_advance_locks: DashMap::new(),
+            router_snapshot_lock: parking_lot::RwLock::new(()),
         });
 
         // Recover from any existing WAL, then open the writer for new appends.
@@ -1076,9 +1111,42 @@ impl Engine {
                 return Err(e);
             }
         }
-        dest.publish_staged(staged, now);
+        // R6: publish (advance head, wake readers) UNDER the gate, but seal/fsync
+        // the segment AFTER releasing the gate so a slow seal `put` never serializes
+        // same-box writers (the gate now orders only head advances).
+        let pub_range = dest.publish_staged_no_seal(staged, now);
         ticket.done();
+        if let Some((start, end)) = pub_range {
+            dest.materialize_published(start, end);
+        }
         Ok(seqs)
+    }
+
+    /// Append DERIVED router-forwarded records into `dest` (`forward_v2`): stage +
+    /// publish + materialize into the segment writer, but write **NO WAL frame**
+    /// (the no-amplification property — a forwarded dest record is derived off the
+    /// source WAL + the per-router cursor, never separately logged). Used only by
+    /// `advance_router` under the per-router advance lock, so the dest is a
+    /// single-writer derived box: no publish-ticket gate is needed (no concurrent
+    /// stagers compete for seq order). The seal/fsync runs off any gate by
+    /// construction. Returns the assigned dest seqs.
+    fn derived_append(&self, dest: &BoxState, records: Vec<StoredRecord>, now: i64) -> Vec<u64> {
+        if records.is_empty() {
+            return Vec::new();
+        }
+        // Stage under the dest append lock (orders seq assignment against any other
+        // derived stager — there is none in practice, but keep it correct), then
+        // publish (no WAL) + materialize off the lock.
+        let (staged, seqs) = {
+            let _guard = dest.append_lock.lock();
+            let staged = dest.stage_append(records);
+            let seqs = staged.seqs();
+            (staged, seqs)
+        };
+        if let Some((start, end)) = dest.publish_staged_no_seal(staged, now) {
+            dest.materialize_published(start, end);
+        }
+        seqs
     }
 
     /// Compute the effective priority of a box right now (DESIGN §3.1).
@@ -1494,6 +1562,9 @@ impl Engine {
             bytes,
             deleted: false,
             payload_resident: true,
+            // A replayed Append frame is always a direct write (derived dest
+            // records are never WAL-logged), so its hop count is 0.
+            hops: 0,
         };
         let assigned = b.append(vec![sr], rec.ts);
         debug_assert_eq!(
@@ -1518,15 +1589,48 @@ impl Engine {
             filter: op.filter.as_ref().map(matchsel_to_filter),
             allow_cycle: op.allow_cycle,
         };
-        // Use the source's current head so a replayed router doesn't re-forward
-        // historical records (matches live `put_router` semantics).
-        let src_head = self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0);
+        // A frame written by the current encoder carries the create-time cursor +
+        // dest_base it was seeded at (codex P0 #3). A LEGACY frame carries `0`/`0`
+        // (the trailing fields were absent on the wire); for that we fall back to the
+        // source head at replay time (the pre-fix behavior — correct for the
+        // single-shard layout those frames came from). Detect "legacy" as BOTH zero,
+        // which is also the genuine value for a router created against an empty source
+        // with an empty dest, where the source-head fallback yields the same `0`.
+        let legacy_frame = op.initial_cursor == 0 && op.initial_dest_base == 0;
+        // v1 (sync) recovery: seed the cursor to the source's current head so a
+        // replayed router doesn't re-forward historical records (matches live
+        // `put_router`). v2 (derived) recovery re-materializes the dest by replaying
+        // forwarding from the cursor in `reforward_routers_on_recovery`, so it must
+        // NOT clobber a snapshot-restored cursor here — a router newly created after
+        // the last snapshot keeps its logged create-time cursor (durable, replay-order
+        // independent under WAL sharding).
         {
             let mut graph = self.routers.lock();
-            // `upsert` can only fail on a cycle; a logged router was already accepted
-            // live, so ignore the (impossible-here) error to keep replay total.
-            let _ = graph.upsert(router);
-            graph.note_forwarded(&op.name, src_head, 0);
+            let created = graph.upsert(router).unwrap_or(false);
+            if self.forward_v2 {
+                // Derived model: preserve any restored cursor/total; seed the cursor +
+                // dest_base only for a fresh (post-snapshot) router so re-derivation
+                // numbers dest seqs from the right base. Use the LOGGED create-time
+                // values (durable, replay-order independent) when present; only a
+                // legacy frame recomputes from the live source head.
+                if created {
+                    let cursor = if legacy_frame {
+                        self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0)
+                    } else {
+                        op.initial_cursor
+                    };
+                    let dest_base = if legacy_frame {
+                        self.get_box(&op.dest).map(|b| b.head_seq()).unwrap_or(0)
+                    } else {
+                        op.initial_dest_base
+                    };
+                    graph.note_forwarded(&op.name, cursor, 0);
+                    graph.seed_dest_base(&op.name, dest_base);
+                }
+            } else {
+                let src_head = self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0);
+                graph.note_forwarded(&op.name, src_head, 0);
+            }
         }
         self.refresh_router_source_flags();
     }
@@ -1535,6 +1639,59 @@ impl Engine {
     pub(crate) fn apply_router_delete_for_recovery(&self, name: &str) {
         self.routers.lock().remove(name);
         self.refresh_router_source_flags();
+    }
+
+    /// Re-materialize every derived dest by replaying forwarding from each router's
+    /// recovered cursor (`forward_v2` recovery; design §4). The durable truth after
+    /// recovery is the source WAL + the router defs + the per-router cursor (from the
+    /// snapshot). Forwarded dest records were NEVER WAL-logged, so the dest content
+    /// past the last snapshot is re-derived here by replaying `source[cursor..head]`
+    /// through each router's filter, re-forwarding with the SAME deterministic dest
+    /// seqs (a consumer cursor into the dest stays valid across the restart). A
+    /// source that trimmed below a router's cursor surfaces the un-derivable gap as a
+    /// `source_trim` tombstone (never a silent skip). No-op unless `forward_v2`.
+    ///
+    /// Ordering: routers are replayed source-first via a topological pass over the
+    /// edge set so a chain A→B→C re-materializes A's writes into B before B→C runs.
+    /// Cycles fall out via the per-record hop cap (carried on each re-derived record).
+    pub(crate) fn reforward_routers_on_recovery(&self) {
+        if !self.forward_v2 {
+            return;
+        }
+        // Drain each router to its source head, iterating to a fixed point so a
+        // chain (forwarding into a dest that is itself a source) fully propagates.
+        // Bounded by a generous pass cap so a pathological topology cannot spin.
+        let router_names: Vec<String> = {
+            let graph = self.routers.lock();
+            graph.iter().map(|r| r.name.clone()).collect()
+        };
+        let mut pass = 0u32;
+        loop {
+            let mut progressed = 0u64;
+            for name in &router_names {
+                // Drive this router fully (ROUTER_BATCH chunks) to its source head.
+                let mut guard = 0u32;
+                loop {
+                    let n = self.advance_router(name);
+                    progressed += n;
+                    if n == 0 {
+                        break;
+                    }
+                    guard += 1;
+                    if guard > 1_000_000 {
+                        break;
+                    }
+                }
+            }
+            if progressed == 0 {
+                break;
+            }
+            pass += 1;
+            if pass > 64 {
+                tracing::warn!("forward_v2 recovery re-forward did not reach a fixed point");
+                break;
+            }
+        }
     }
 
     /// Recompute every box's `is_router_source` atomic from the current router
@@ -1558,6 +1715,10 @@ impl Engine {
         let b = self
             .get_box(name)
             .ok_or_else(|| Error::box_not_found(name))?;
+        // Read-path catch-up (forward_v2): drain routers feeding this dest so the
+        // reported head_seq/count reflect forwarded records on an immediate state
+        // read after a source write (read-your-writes). Inert under v2-off.
+        self.catch_up_dest(name);
         let now = self.clock.now_ms();
 
         // Lazily advance floors so count/earliest_seq reflect current TTL/cap.
@@ -2100,10 +2261,17 @@ impl Engine {
                 }
             }
             // Durably committed AND (for disk) durably reserved: NOW publish the
-            // staged records, making them visible + notifying waiters.
-            b.publish_staged(staged, now);
+            // staged records, making them visible + notifying waiters. R6: seal the
+            // segment AFTER releasing the publish gate (below) so a slow seal `put`
+            // fsync never serializes same-box writers behind the gate.
+            let pub_range = b.publish_staged_no_seal(staged, now);
             let head = b.head_seq();
             ticket.done();
+            // Materialize/seal off the gate (purely derivable from the published
+            // in-memory index; payloads freed only after the seal `put` is Ok).
+            if let Some((start, end)) = pub_range {
+                b.materialize_published(start, end);
+            }
             (head, fsync_ms)
         };
 
@@ -2140,7 +2308,14 @@ impl Engine {
         // recursing through chained routers with a bounded hop counter. Skipped
         // entirely when this box is not a router source (the common case): the
         // snapshot was never even cloned above, so there is nothing to forward.
-        if need_forward {
+        // `forward_v2`: the write/ack path does NOT forward. Forwarded dest records
+        // are DERIVED off the durable source log + the per-router cursor, never
+        // separately WAL-logged, so a source append fanning to N dests is ONE WAL
+        // append (this box's) + the periodic cursor, not N (no amplification). The
+        // `mark_dirty_fast` below wakes the background router worker; an immediate
+        // dest read also catches up via `catch_up_dest` (read-your-writes). The
+        // legacy synchronous `forward_from` path runs only with v2 OFF.
+        if need_forward && !self.forward_v2 {
             let forwarded: Vec<ForwardRecord> = stored_snapshot
                 .into_iter()
                 .map(|sr| ForwardRecord {
@@ -2322,6 +2497,346 @@ impl Engine {
     }
 
     // -----------------------------------------------------------------------
+    // Async + derived forwarding (docs/ASYNC_ROUTER_DESIGN.md)
+    //
+    // Active only when `self.forward_v2` is set (env `STREAMS_FORWARD_V2`). The
+    // write/ack path then stops forwarding entirely; these are the idempotent,
+    // cursor-driven step the two drivers (read-path catch-up + background worker)
+    // share. Forwarded dest records are DERIVED off the source log + per-router
+    // cursor and never separately WAL-logged (no amplification); the cursor
+    // advances ONLY by the committed count (no silent loss — the R2 fix).
+    // -----------------------------------------------------------------------
+
+    /// The per-router advance lock (`forward_v2`), creating it on first use. Held
+    /// across one `advance_router` pass so the read-path catch-up and the
+    /// background worker never double-forward the same source records.
+    fn router_advance_lock(&self, name: &str) -> Arc<Mutex<()>> {
+        if let Some(l) = self.router_advance_locks.get(name) {
+            return l.clone();
+        }
+        self.router_advance_locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Forward as many source records as possible for ONE router, in strict
+    /// source-seq order, advancing the durable per-router cursor ONLY by the
+    /// count actually committed into the dest (at-least-once; no silent loss —
+    /// the R2 fix). Replays `source[cursor+1 ..= head]` through the router's
+    /// filter, stopping at the first back-pressured/WAL-failed record (which stays
+    /// below the cursor for a later retry). A filtered record genuinely not bound
+    /// for the dest is a consume (the cursor passes it). Bounded to `ROUTER_BATCH`
+    /// source records per call so a large fan-out yields cooperatively (the source
+    /// is re-marked dirty when it is still behind). Returns the number of source
+    /// records consumed (forwarded + filtered) this pass.
+    pub(crate) fn advance_router(&self, name: &str) -> u64 {
+        if !self.forward_v2 {
+            return 0;
+        }
+        // Serialize the two drivers per router.
+        let lock = self.router_advance_lock(name);
+        let _guard = lock.lock();
+
+        // Hold the snapshot barrier SHARED for the whole pass (codex P0 #1): the dest
+        // publish + the cursor advance below must be ONE unit relative to a snapshot,
+        // so a capture can never observe a published dest with a stale cursor or an
+        // advanced cursor with a stale dest. Concurrent advances of OTHER routers run
+        // in parallel (shared lock); only `capture` (exclusive) blocks them.
+        let _snap_guard = self.router_snapshot_lock.read();
+
+        // Read the router definition + its current cursor under the graph lock,
+        // then drop it so we never hold the graph lock across a dest append.
+        let (router, cursor) = {
+            let graph = self.routers.lock();
+            match graph.get(name) {
+                Some(r) => (r.clone(), graph.cursor(name)),
+                None => return 0, // router gone (deleted) — nothing to do.
+            }
+        };
+
+        let Some(source) = self.get_box(&router.source) else {
+            return 0;
+        };
+        let Some(dest) = self.get_box(&router.dest) else {
+            return 0; // dest gone; the cascade should have removed the router.
+        };
+
+        let now = self.clock.now_ms();
+
+        // Run durable retention on the SOURCE before reading its head / evict floor
+        // (codex P1 #6): a TTL-expired source record that no read/write has swept yet
+        // would otherwise be forwarded (live-looking), and worse, forwarded WITHOUT
+        // its trim being durably recorded — a later restart could then re-derive a
+        // record the source has since dropped, or surface an un-durable floor. If the
+        // floor cannot be durably hardened we stop WITHOUT advancing the cursor (the
+        // records are retried next pass), never forwarding past an un-hardened floor.
+        if let Err(e) = self.enforce_retention_durable(&source, now) {
+            tracing::warn!(
+                source = %source.name, error = %e,
+                "forward_v2: source retention harden failed; deferring forward"
+            );
+            return 0;
+        }
+
+        let src_head = source.head_seq();
+        if cursor >= src_head {
+            return 0; // already caught up.
+        }
+
+        // Source-retention bound (design §4): a record evicted/trimmed below the
+        // cursor cannot be re-derived. If the source's involuntary loss floor
+        // (`evict_earliest_seq`) has advanced past the cursor, clamp the cursor up
+        // to the floor and stamp the dest's source-trim tombstone boundary so the
+        // gap surfaces to dest consumers (never a silent skip). The forwarded dest
+        // records below the new cursor are accounted as consumed so the
+        // deterministic dest-seq base stays aligned.
+        let mut cursor = cursor;
+        let src_evict_earliest = source.evict_earliest_seq();
+        if src_evict_earliest > cursor + 1 {
+            let trimmed = (src_evict_earliest - 1) - cursor;
+            // Append one dest hole per un-derivable source record so the dest seq
+            // space carries a real (deterministic) gap that surfaces as a
+            // `source_trim` tombstone — never a silent skip. Conservatively counts
+            // every trimmed source record (the filter outcome is unknowable once the
+            // source evicted it); the gap range is informational.
+            for _ in 0..trimmed {
+                dest.note_source_trim(now);
+            }
+            let mut graph = self.routers.lock();
+            cursor = src_evict_earliest - 1;
+            graph.set_cursor(name, cursor);
+            // Count the un-derivable records as consumed so the deterministic dest
+            // seq (dest_base + forwarded_total) reflects the surfaced gap.
+            graph.note_forwarded(name, cursor, trimmed);
+        }
+
+        // Walk source[cursor+1 ..= head] in seq order, bounded by ROUTER_BATCH.
+        // Build the contiguous forwardable prefix; stop at the first deferred
+        // (back-pressured) record so it is retried later (no silent loss).
+        let batch_end = src_head.min(cursor + config::ROUTER_BATCH as u64);
+        let mut to_append: Vec<StoredRecord> = Vec::new();
+        let mut consumed: u64 = 0; // source records the cursor will pass this call.
+        let mut deferred = false;
+
+        // Resolve discard policy / caps of the dest once for the back-pressure check.
+        let (discard, cap_records, cap_bytes) = {
+            let cfg = dest.config.read();
+            (cfg.discard, cfg.cap_records, cfg.cap_bytes)
+        };
+        if discard == Discard::Reject {
+            dest.enforce_retention(now);
+        }
+
+        let mut seq = cursor + 1;
+        while seq <= batch_end {
+            // Resolve the source record (payload may be sealed/cold).
+            let Some((rec, alive)) = source.forward_lookup(seq) else {
+                // Physically gone below base (reclaimed after the evict floor we
+                // already clamped to) — consume it (the trim tombstone covers it).
+                consumed += 1;
+                seq += 1;
+                continue;
+            };
+            if !alive {
+                // A deleted/expired source slot is consumed (not forwarded) — it is
+                // genuinely not deliverable; the source log still owns it.
+                consumed += 1;
+                seq += 1;
+                continue;
+            }
+
+            // Hop cap (cycle loop-breaker): a record already at the cap is not
+            // forwarded again, but IS consumed (the cursor passes it) so the loop
+            // terminates exactly like the legacy `hops` recursion.
+            if rec.hops >= config::MAX_ROUTER_HOPS {
+                consumed += 1;
+                seq += 1;
+                continue;
+            }
+
+            // Filter: a non-matching record is a consume (not a loss) — the cursor
+            // passes it; the source retains it.
+            if let Some(f) = &router.filter {
+                let matches = matches!(&rec.tag, Some(t) if f.matches(t));
+                if !matches {
+                    consumed += 1;
+                    seq += 1;
+                    continue;
+                }
+            }
+
+            // preserve_node / preserve_tag, and the hop increment.
+            let fwd_node = if router.preserve_node {
+                rec.node.clone()
+            } else {
+                None
+            };
+            let fwd_tag = if router.preserve_tag {
+                rec.tag.clone()
+            } else {
+                None
+            };
+            let mut sr =
+                match build_stored_owned(rec.data.clone(), fwd_tag, fwd_node, rec.meta, now) {
+                    Ok(sr) => sr,
+                    Err(_) => {
+                        // A record we cannot rebuild (oversized after transform) is
+                        // consumed rather than wedging the cursor forever.
+                        consumed += 1;
+                        seq += 1;
+                        continue;
+                    }
+                };
+            sr.hops = rec.hops.saturating_add(1);
+
+            // Back-pressure (discard:"reject" full dest): stop the prefix HERE. The
+            // record stays below the cursor and is retried when the dest drains —
+            // no silent loss. Everything already in `to_append` still commits.
+            if discard == Discard::Reject {
+                let incoming = sr.bytes;
+                let pending: u64 = to_append.iter().map(|s| s.bytes).sum();
+                let decision = eviction::admit(
+                    discard,
+                    cap_records,
+                    cap_bytes,
+                    dest.count() + to_append.len() as u64,
+                    dest.bytes() + pending,
+                    1,
+                    incoming,
+                );
+                if decision == AdmitDecision::Reject {
+                    deferred = true;
+                    break;
+                }
+            }
+
+            to_append.push(sr);
+            consumed += 1;
+            seq += 1;
+        }
+
+        // Commit the forwardable prefix into the dest as a DERIVED append: append to
+        // the in-memory index + segment writer, but write NO WAL frame for the dest
+        // (the no-amplification win — one source append fanning to N dests is ONE
+        // WAL append, not N). The dest's durable truth is re-derived on recovery
+        // from the source WAL + the per-router cursor (durable via snapshot). The
+        // cursor advances ONLY after this append commits + only by the count
+        // forwarded, so a crash/retry re-derives the same records with the same
+        // deterministic seqs (at-least-once, no silent loss).
+        let forwarded = to_append.len() as u64;
+        if !to_append.is_empty() {
+            self.derived_append(&dest, to_append, now);
+            // A forward that pushes the dest past a TTL/byte-cap floor durably
+            // persists the new floor before it advances (R7), retried on failure.
+            if let Err(e) = self.enforce_retention_durable(&dest, now) {
+                tracing::warn!(
+                    dest = %dest.name, error = %e,
+                    "forward_v2: eviction watermark fsync failed; deferring eviction"
+                );
+            }
+            // Wake the dest's readers / its own routers (chains).
+            self.scheduler.mark_dirty_fast(
+                &router.dest,
+                self.effective_priority(&dest),
+                &dest.sched_dirty,
+            );
+        }
+
+        // Advance the durable cursor by the consumed prefix (forwarded + filtered +
+        // dead + hop-capped), pinning forwarded_total by the count actually
+        // committed (deterministic dest seqs). The cursor lands at `cursor +
+        // consumed` — strictly below the first deferred record when back-pressured.
+        if consumed > 0 {
+            let new_cursor = cursor + consumed;
+            let mut graph = self.routers.lock();
+            graph.note_forwarded(name, new_cursor, forwarded);
+        }
+
+        // If the source is still behind (we hit the batch cap or deferred), re-mark
+        // it dirty so the worker re-drains it (cooperative yielding).
+        if deferred || batch_end < src_head {
+            self.scheduler.mark_dirty_fast(
+                &router.source,
+                self.effective_priority(&source),
+                &source.sched_dirty,
+            );
+        }
+
+        consumed
+    }
+
+    /// Read-path catch-up: before a dest box is read (`diff`/SSE/queue/GET
+    /// state), drain every router whose `dest == dest_name` up to the source
+    /// head, so an immediate read after a source write is read-your-writes
+    /// consistent (what keeps the no-sleep router tests green under async ack).
+    /// No-op unless `forward_v2` is active. Repeats the advance until each feeding
+    /// router is fully caught up (a large fan-out yields in `ROUTER_BATCH` chunks).
+    pub(crate) fn catch_up_dest(&self, dest_name: &str) {
+        if !self.forward_v2 {
+            return;
+        }
+        let feeders: Vec<String> = {
+            let graph = self.routers.lock();
+            graph
+                .iter()
+                .filter(|r| r.dest == dest_name)
+                .map(|r| r.name.clone())
+                .collect()
+        };
+        for name in feeders {
+            // Drive each feeding router to its source head. `advance_router`
+            // forwards at most ROUTER_BATCH per call; loop until it makes no more
+            // progress (caught up or wedged on durable back-pressure), bounding the
+            // loop so a pathological cycle can never spin forever here.
+            let mut guard = 0u32;
+            while self.advance_router(&name) > 0 {
+                guard += 1;
+                if guard > 1_000_000 {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Background-worker pass: drain every dirty router source off the write/ack
+    /// path (elastic throttle; reuses the `sched_dirty` wake hook via the
+    /// scheduler ready-set). Returns the number of source records consumed this
+    /// pass. No-op unless `forward_v2` is active.
+    pub fn drain_router_sources(&self) -> u64 {
+        if !self.forward_v2 {
+            return 0;
+        }
+        // Drain the scheduler's dirty set, clearing each box's `sched_dirty` flag so
+        // a future write re-enqueues it. For every drained box that is a router
+        // source, advance each of its routers one bounded pass. A router still
+        // behind re-marks its source dirty (in `advance_router`), so the next pass
+        // continues it — no box monopolizes a pass.
+        let drained = self.scheduler.drain_order_clearing(|name| {
+            if let Some(b) = self.boxes.get(name) {
+                b.value()
+                    .sched_dirty
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        });
+        let mut total = 0u64;
+        for box_name in drained {
+            let routers: Vec<String> = {
+                let graph = self.routers.lock();
+                graph
+                    .routers_for_source(&box_name)
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect()
+            };
+            for name in routers {
+                total += self.advance_router(&name);
+            }
+        }
+        total
+    }
+
+    // -----------------------------------------------------------------------
     // Diff (API §3)
     // -----------------------------------------------------------------------
 
@@ -2332,6 +2847,10 @@ impl Engine {
         let b = self
             .get_box(name)
             .ok_or_else(|| Error::box_not_found(name))?;
+        // Read-path catch-up (forward_v2): drain routers feeding this dest so an
+        // immediate read after a source write is read-your-writes consistent.
+        // Inert under the default flag (Stage 1), so the live path is unchanged.
+        self.catch_up_dest(name);
         let now = self.clock.now_ms();
 
         // Advance floors so the retention/tombstone boundary reflects the clock.
@@ -2732,6 +3251,46 @@ impl Engine {
             return Err(Error::box_not_found(&req.dest));
         }
 
+        // No-fan-in rule for a derived dest (`forward_v2`; codex P0 #2/#4). A derived
+        // dest's seq stream must have exactly ONE forwarding owner for deterministic
+        // re-materialization: two routers with DIFFERENT sources interleaving derived
+        // records into one dest would assign seqs non-deterministically across a
+        // restart (the re-forward replay order is not pinned). So reject a SECOND
+        // router whose dest is already fed by another router with a different source.
+        // An idempotent re-PUT of the SAME router, or re-pointing this router, keeps
+        // single ownership and is allowed. This does NOT forbid a box that also takes
+        // direct writes or closes a cycle (the `/v0` `allow_cycle` contract permits a
+        // box to be both a router source with direct writes AND a router dest) — only
+        // genuine multi-source fan-in is refused. The check is read-only + pre-slot,
+        // so a refused router leaves no phantom box. (Mixed direct-write + derived
+        // boxes — e.g. an `allow_cycle` loop — are supported but their derived tail is
+        // re-materialized best-effort on recovery; see ASYNC_ROUTER_DESIGN.md §4.1.)
+        if self.forward_v2 {
+            let fan_in = {
+                let graph = self.routers.lock();
+                graph.routers_touching_box(&req.dest).into_iter().any(|rn| {
+                    rn != name
+                        && graph
+                            .get(&rn)
+                            .is_some_and(|r| r.dest == req.dest && r.source != req.source)
+                })
+            };
+            if fan_in {
+                return Err(Error::new(
+                    ErrorCode::BoxExistsIncompatible,
+                    format!(
+                        "box {:?} is already the destination of another router with a \
+                         different source; a derived dest is single-owner (no multi-source \
+                         fan-in) while STREAMS_FORWARD_V2 is on",
+                        req.dest
+                    ),
+                )
+                .with_detail(
+                    serde_json::json!({ "box": req.dest, "reason": "router_dest_fan_in" }),
+                ));
+            }
+        }
+
         let router = Router {
             name: name.to_string(),
             source: req.source.clone(),
@@ -2778,6 +3337,26 @@ impl Engine {
         // so the write hot path forwards without taking the graph lock (codex P1).
         self.refresh_router_source_flags();
 
+        // Seed the deterministic dest-seq base (`forward_v2`): a router attached to a
+        // (possibly pre-populated) dest numbers its first forwarded record after the
+        // dest's current head, so derived dest seqs (`dest_base + forwarded_total`)
+        // never collide with existing records. Only on a fresh create (idempotent
+        // re-PUT of a forwarding router keeps its running base).
+        if created {
+            let dest_head = self.get_box(&req.dest).map(|b| b.head_seq()).unwrap_or(0);
+            self.routers.lock().seed_dest_base(name, dest_head);
+        }
+
+        // The cursor + dest_base actually seeded (read back under the graph lock):
+        // these are logged in the RouterCreate frame so the durable cursor is
+        // independent of WAL-replay order under sharding (codex P0 #3). For an
+        // idempotent re-PUT (`!created`) the running cursor/base are preserved and
+        // re-logged verbatim, so replay never regresses a forwarding router.
+        let (logged_cursor, logged_dest_base) = {
+            let graph = self.routers.lock();
+            (graph.cursor(name), graph.dest_base(name))
+        };
+
         // Log the router upsert (durable control frame) so it replays on restart.
         // PROPAGATE a WAL failure so a router a crash would lose is never reported
         // as created (bug #1). A fresh CREATE that failed to durably log is removed
@@ -2793,6 +3372,8 @@ impl Engine {
                     create_dest: req.create_dest,
                     allow_cycle: req.allow_cycle,
                     filter: req.filter.as_ref().map(filter_to_matchsel),
+                    initial_cursor: logged_cursor,
+                    initial_dest_base: logged_dest_base,
                 },
                 ts: self.clock.now_ms().max(0) as u64,
             },
@@ -3214,6 +3795,7 @@ fn build_stored_owned(
         bytes,
         deleted: false,
         payload_resident: true,
+        hops: 0,
     })
 }
 

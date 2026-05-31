@@ -27,6 +27,13 @@ pub struct Floors {
     /// Highest seq removed by a **voluntary** prefix/snapshot delete (`0` if
     /// none). Advances `earliest_seq` but never produces a tombstone.
     pub delete_floor: u64,
+    /// Highest **dest** seq that a derived router could not materialize because
+    /// the SOURCE had already trimmed the corresponding record (async/derived
+    /// `forward_v2`; design §4 source-retention bound). Involuntary loss bounded by
+    /// the source's retention: it advances `earliest_seq` AND surfaces a tombstone
+    /// (reason `source_trim`), so the dest faithfully reflects the source retention
+    /// instead of opening a silent gap. `0` if none.
+    pub source_trim_floor: u64,
 }
 
 impl Floors {
@@ -36,15 +43,19 @@ impl Floors {
         let floor = self
             .evict_floor
             .max(self.expiry_floor)
-            .max(self.delete_floor);
+            .max(self.delete_floor)
+            .max(self.source_trim_floor);
         let earliest = floor.saturating_add(1).max(seq_base);
         earliest.min(head_seq.saturating_add(1))
     }
 
-    /// The involuntary floor (cap/TTL only) used to decide whether a gap
-    /// produces a tombstone (DESIGN §5.4). `delete_floor` is excluded.
+    /// The involuntary floor (cap/TTL/source-trim) used to decide whether a gap
+    /// produces a tombstone (DESIGN §5.4). `delete_floor` is excluded (voluntary).
     pub fn evict_earliest(&self, seq_base: u64, head_seq: u64) -> u64 {
-        let floor = self.evict_floor.max(self.expiry_floor);
+        let floor = self
+            .evict_floor
+            .max(self.expiry_floor)
+            .max(self.source_trim_floor);
         let earliest = floor.saturating_add(1).max(seq_base);
         earliest.min(head_seq.saturating_add(1))
     }
@@ -53,17 +64,26 @@ impl Floors {
     ///
     /// A floor "contributes" to the gap iff it reaches into the lost range, i.e.
     /// `floor >= gap_from`. Both contribute ⇒ `mixed`; only cap ⇒ `cap`; only
-    /// ttl ⇒ `ttl`. The reason is best-effort; the gap range is authoritative.
+    /// ttl ⇒ `ttl`. A source-trim floor reaching the gap reports `source_trim`
+    /// (derived-router source-retention bound). The reason is best-effort; the gap
+    /// range is authoritative.
     pub fn reason_for_gap(&self, gap_from: u64) -> TombstoneReason {
         let cap = self.evict_floor >= gap_from && self.evict_floor > 0;
         let ttl = self.expiry_floor >= gap_from && self.expiry_floor > 0;
+        let src_trim = self.source_trim_floor >= gap_from && self.source_trim_floor > 0;
         match (cap, ttl) {
             (true, true) => TombstoneReason::Mixed,
             (false, true) => TombstoneReason::Ttl,
             (true, false) => TombstoneReason::Cap,
-            // Neither floor reaches the gap (e.g. delete+recreate handled by the
-            // caller): default to cap, the capacity-driven reason.
-            (false, false) => TombstoneReason::Cap,
+            // Neither cap nor ttl reaches the gap: a source-trim gap reports
+            // `source_trim`; otherwise default to cap (capacity-driven).
+            (false, false) => {
+                if src_trim {
+                    TombstoneReason::SourceTrim
+                } else {
+                    TombstoneReason::Cap
+                }
+            }
         }
     }
 }

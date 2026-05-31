@@ -13,10 +13,24 @@ use std::collections::HashMap;
 pub struct RouterGraph {
     /// Router name → definition.
     routers: HashMap<String, Router>,
-    /// Per-router forward cursor over its source box (seq last forwarded).
+    /// Per-router forward cursor over its source box (seq last forwarded). In the
+    /// async/derived (`forward_v2`) model this is the durable progress marker: the
+    /// source seq each router has forwarded *through*. It advances ONLY by the
+    /// count actually committed into the dest (no silent loss — the R2 fix), so a
+    /// filtered/back-pressured/crashed forward is re-driven from the un-advanced
+    /// cursor on the next pass.
     cursors: HashMap<String, u64>,
     /// Per-router count of records forwarded (`forwarded_total`).
     forwarded_total: HashMap<String, u64>,
+    /// Per-router `dest_base`: the dest seq just BELOW this router's first
+    /// forwarded record (captured when the router starts forwarding into a dest).
+    /// Together with `forwarded_total` it pins the deterministic dest seq of the
+    /// next forwarded record (`dest_base + forwarded_total + 1`), so a re-derived
+    /// dest record always gets the SAME seq across a restart (a consumer cursor
+    /// into the dest stays valid — §4 of the design). Defaulted to the dest head
+    /// at router-create time so a router attached to a pre-populated dest does not
+    /// collide with existing seqs.
+    dest_base: HashMap<String, u64>,
 }
 
 impl RouterGraph {
@@ -78,7 +92,8 @@ impl RouterGraph {
         // A fresh router starts its forward cursor at the source's current head
         // is the caller's concern; the registry tracks only the running cursor.
         self.cursors.entry(name.clone()).or_insert(0);
-        self.forwarded_total.entry(name).or_insert(0);
+        self.forwarded_total.entry(name.clone()).or_insert(0);
+        self.dest_base.entry(name).or_insert(0);
         Ok(created)
     }
 
@@ -114,6 +129,7 @@ impl RouterGraph {
         let existed = self.routers.remove(name).is_some();
         self.cursors.remove(name);
         self.forwarded_total.remove(name);
+        self.dest_base.remove(name);
         existed
     }
 
@@ -146,6 +162,7 @@ impl RouterGraph {
             self.routers.remove(name);
             self.cursors.remove(name);
             self.forwarded_total.remove(name);
+            self.dest_base.remove(name);
         }
         removed
     }
@@ -185,9 +202,43 @@ impl RouterGraph {
         *self.forwarded_total.entry(router.to_string()).or_insert(0) += count;
     }
 
-    /// Snapshot every router with its forward cursor + total (for a metadata
-    /// snapshot). Returns `(router, cursor, forwarded_total)` tuples.
-    pub fn snapshot_all(&self) -> Vec<(Router, u64, u64)> {
+    /// The per-router forward cursor (source seq forwarded through). `0` ⇒ nothing
+    /// forwarded yet (the source is 1-based, so seq 0 never exists).
+    pub fn cursor(&self, name: &str) -> u64 {
+        self.cursors.get(name).copied().unwrap_or(0)
+    }
+
+    /// Set the per-router forward cursor explicitly (recovery clamp / seeding).
+    pub fn set_cursor(&mut self, name: &str, cursor: u64) {
+        self.cursors.insert(name.to_string(), cursor);
+    }
+
+    /// The per-router `dest_base` (dest seq just below the first forwarded record).
+    pub fn dest_base(&self, name: &str) -> u64 {
+        self.dest_base.get(name).copied().unwrap_or(0)
+    }
+
+    /// Seed `dest_base` for a router ONLY if it has not been set yet (i.e. nothing
+    /// forwarded). Used at create-time so a router attached to a non-empty dest
+    /// numbers its first forwarded record after the dest's current head, and the
+    /// deterministic dest-seq scheme (`dest_base + forwarded_total`) starts from
+    /// the right base. Idempotent re-PUTs / replays never clobber a running base.
+    pub fn seed_dest_base(&mut self, name: &str, base: u64) {
+        if self.forwarded_total.get(name).copied().unwrap_or(0) == 0 {
+            self.dest_base.insert(name.to_string(), base);
+        }
+    }
+
+    /// The deterministic dest seq the NEXT forwarded record of `router` will get:
+    /// `dest_base + forwarded_total + 1`. Pure function of durable state, so it is
+    /// stable across a restart (the at-least-once re-derivation contract, §4).
+    pub fn next_dest_seq(&self, name: &str) -> u64 {
+        self.dest_base(name) + self.forwarded_total(name) + 1
+    }
+
+    /// Snapshot every router with its forward cursor + total + dest_base (for a
+    /// metadata snapshot). Returns `(router, cursor, forwarded_total, dest_base)`.
+    pub fn snapshot_all(&self) -> Vec<(Router, u64, u64, u64)> {
         self.routers
             .values()
             .map(|r| {
@@ -195,18 +246,20 @@ impl RouterGraph {
                     r.clone(),
                     self.cursors.get(&r.name).copied().unwrap_or(0),
                     self.forwarded_total.get(&r.name).copied().unwrap_or(0),
+                    self.dest_base.get(&r.name).copied().unwrap_or(0),
                 )
             })
             .collect()
     }
 
-    /// Restore a router (with its cursor + total) during snapshot load. Bypasses
-    /// the cycle check (the router was already accepted live).
-    pub fn restore(&mut self, router: Router, cursor: u64, forwarded_total: u64) {
+    /// Restore a router (with its cursor + total + dest_base) during snapshot load.
+    /// Bypasses the cycle check (the router was already accepted live).
+    pub fn restore(&mut self, router: Router, cursor: u64, forwarded_total: u64, dest_base: u64) {
         let name = router.name.clone();
         self.routers.insert(name.clone(), router);
         self.cursors.insert(name.clone(), cursor);
-        self.forwarded_total.insert(name, forwarded_total);
+        self.forwarded_total.insert(name.clone(), forwarded_total);
+        self.dest_base.insert(name, dest_base);
     }
 
     /// Whether adding `source -> dest` would create a directed cycle in the

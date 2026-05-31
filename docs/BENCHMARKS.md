@@ -1073,3 +1073,92 @@ single-volume host should set `STREAMS_WAL_SHARDS=1`.
   written, `kill -9`, restart 8 → 3 → 1; every acked durable record recovered
   (head/count = 20/20 per box, seqs 1..20 contiguous with correct payloads), and a
   post-reconfigure durable write acked + persisted.
+
+---
+
+# Async + Derived Router Forwarding (`STREAMS_FORWARD_V2`) — Fan-out
+
+The async/derived forwarding path (`STREAMS_FORWARD_V2=1`) removes the WAL
+amplification of router fan-out and takes forwarding off the write/ack path. This
+section records the **before (v1, legacy synchronous `forward_from`)** vs. **after
+(v2, async + derived)** numbers for a single source write fanning to **1 / 10 / 100
+/ 1000** router destinations.
+
+## Methodology
+
+Deterministic in-process measurement via `examples/forward_fanout_bench.rs` (the
+engine API directly, a real durable WAL under a temp dir, so the WAL-frame delta is
+EXACT). Every box is `fsync`-class, so the only WAL frames a source write produces
+are `Append` frames — the frame delta therefore IS the append amplification. The
+mode is captured at engine construction from the env var; the harness runs the
+binary twice. `ack_avg_us` is the wall-clock of the `Engine::write` call (the
+synchronous ack); `deliver_us` is the async forwarding drain (off the ack path
+under v2; inline / already-done under v1). Apple M4 Max, macOS, single shared-fsync
+volume (so each fsync is a real disk barrier — the absolute µs are host-bound; the
+SCALING with fan-out is the result).
+
+Reproduce:
+
+```bash
+cargo run --release --example forward_fanout_bench                       # v1 (sync)
+STREAMS_FORWARD_V2=1 cargo run --release --example forward_fanout_bench  # v2
+```
+
+## WAL writes per source write (the amplification)
+
+| fan-out | v1 (sync) WAL frames | v2 (async/derived) WAL frames | v2 writes/dest |
+|---:|---:|---:|---:|
+| 1    | 2    | **1** | 1.0000 |
+| 10   | 11   | **1** | 0.1000 |
+| 100  | 101  | **1** | 0.0100 |
+| 1000 | 1001 | **1** | 0.0010 |
+
+v1 logs `N + 1` frames (the source append + one per dest — each forwarded dest
+record is its own durable WAL append). **v2 logs exactly ONE frame** for any
+fan-out: the source append. Forwarded dest records are derived (source WAL + the
+durable per-router cursor), never separately WAL-logged. A 1000-fan-out drops from
+**1001 → 1 WAL write** (a 1000× reduction; 0.001 writes/dest).
+
+## Write-ack latency (does the ack block on fan-out?)
+
+| fan-out | v1 (sync) ack | v2 (async) ack |
+|---:|---:|---:|
+| 1    | ~8.4 ms    | **~4.2 ms** |
+| 10   | ~46 ms     | **~4.2 ms** |
+| 100  | ~0.43–0.71 s | **~4.2 ms** |
+| 1000 | **~4.2–4.6 s** | **~4.2 ms** |
+
+Under v1 the ack pays the full fan-out inline: it scales LINEARLY with the number
+of dests (a 1000-fan-out blocks the single source ack for **~4.2 seconds** on this
+single-fsync-volume host). **Under v2 the source ack is FLAT (~4.2 ms = one source
+fsync) regardless of fan-out** — the fan-out no longer serializes the ack. The
+forwarding runs off the ack path (a background worker + read-path catch-up):
+
+| fan-out | v2 async forward delivery (`deliver_us`) |
+|---:|---:|
+| 1    | ~35–45 µs |
+| 10   | ~140–190 µs |
+| 100  | ~1.2–1.6 ms |
+| 1000 | ~14.5 ms |
+
+Async delivery cost grows with fan-out as expected, but it is paid by the
+background drainer / the dest reader's catch-up, NOT by the source writer's ack.
+
+## Summary
+
+| property | v1 (sync) | v2 (async + derived) |
+|---|---|---|
+| WAL writes for a 1→N fan-out | `N + 1` | **1** (source only) |
+| source ack latency vs fan-out | linear (`O(N)` fsyncs) | **flat (1 fsync)** |
+| forwarded dest records | separately WAL-logged | **derived (no WAL frame)** |
+| where forwarding runs | inline on the write/ack path | **off the ack path** |
+
+## Verified (Stage 4 — async-router fixes)
+
+- `cargo test` 392 · `--features test-fs` 584 · `--features test-fs,failpoints` 594
+  — all green. clippy clean (default + `test-fs` + `--all-features`, `--all-targets`).
+- `streams-probe conformance` **117/117** with v2 OFF **and** v2 ON (the read-path
+  catch-up preserves the no-sleep `/v0` contract).
+- **kill -9 + restart** of a v2 server: the derived dest boxes re-materialize from
+  the source WAL + the durable per-router cursor with identical seqs (a consumer
+  cursor into a dest stays valid); no duplicate re-forward, no silent loss.

@@ -58,6 +58,29 @@ pub const SSE_RETRY_MS: u64 = 2_000;
 pub const MAX_ROUTER_HOPS: u8 = 8;
 
 // ---------------------------------------------------------------------------
+// Async + derived router forwarding (see docs/ASYNC_ROUTER_DESIGN.md)
+// ---------------------------------------------------------------------------
+
+/// Background router-worker tick (ms): the elastic upper bound on forward
+/// latency when no dest reader drives the cursor. Mirrors the snapshotter tick.
+pub const ROUTER_TICK_INTERVAL_MS: u64 = 50;
+
+/// Max source records a single `advance_router` pass forwards per router before
+/// yielding (cooperative fairness so a large fan-out never monopolizes the
+/// worker or a per-router lock; the source stays dirty and is re-drained).
+pub const ROUTER_BATCH: usize = 1024;
+
+/// Whether the ASYNC + derived (compact-WAL, cursor-driven, no-silent-loss)
+/// forwarding path is enabled. STAGE 1: default OFF (env `STREAMS_FORWARD_V2`),
+/// so the live synchronous `forward_from` path — and every current test — is
+/// unchanged until the cutover stage flips the default.
+pub fn forward_v2_enabled() -> bool {
+    std::env::var("STREAMS_FORWARD_V2")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
 // Queue limits (API §10)
 // ---------------------------------------------------------------------------
 

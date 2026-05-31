@@ -131,6 +131,7 @@ fn rec(data: &str, tag: Option<&str>) -> StoredRecord {
         bytes: data.len() as u64,
         deleted: false,
         payload_resident: true,
+        hops: 0,
     }
 }
 
