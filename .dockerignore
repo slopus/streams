@@ -1,0 +1,22 @@
+# Keep the build context small. The builder only needs the manifests, lockfile,
+# and source (src/, probe/src/, benches/) — everything else is excluded.
+
+# Build artifacts (39 GiB of target/ must never enter the context).
+target/
+**/target/
+
+# VCS + editor noise.
+.git/
+.gitignore
+.github/
+.DS_Store
+**/.DS_Store
+
+# Docs, tests fixtures, and markdown — not needed to compile the server.
+docs/
+tests/
+*.md
+
+# Container scaffolding itself.
+Dockerfile
+.dockerignore

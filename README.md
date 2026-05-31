@@ -251,6 +251,21 @@ cargo build --release
 ./target/release/streams
 ```
 
+### Running with Docker
+
+A multi-arch image is published to GHCR at `ghcr.io/slopus/streams`. The image
+binds `0.0.0.0:4000` and stores durable state in the `/data` volume. Because the
+server refuses to start on a non-loopback bind with no API keys, pass
+`STREAMS_API_KEYS=...` (or, for local/dev only, `STREAMS_ALLOW_INSECURE_NO_AUTH=1`):
+
+```bash
+docker run --rm -p 4000:4000 -v streams-data:/data \
+  -e STREAMS_API_KEYS=replace-with-a-real-secret \
+  ghcr.io/slopus/streams:latest
+```
+
+See [RELEASING.md](RELEASING.md) for the full run/release details.
+
 Configuration is read from the environment:
 
 | Variable | Default | Meaning |
