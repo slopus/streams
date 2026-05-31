@@ -536,6 +536,7 @@ fn f_pub_rollback_invisible() {
                             include_tags: false,
                             include_meta: false,
                             wait_ms: 0,
+                            max_batch_bytes: 0,
                         },
                     )
                     .unwrap();

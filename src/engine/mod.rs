@@ -93,7 +93,10 @@ impl Engine {
     /// Build a new **pure in-memory** engine (no WAL). Used by engine unit tests,
     /// property tests, and any caller that supplies no data dir. Mutating ops do
     /// not touch disk and report `wal_append_ms`/`fsync_ms` as `0.0`.
-    pub fn new(config: ServerConfig, clock: SharedClock) -> Arc<Self> {
+    pub fn new(mut config: ServerConfig, clock: SharedClock) -> Arc<Self> {
+        // Parse plaintext keys into the hashed store + zeroize the plaintext so no
+        // secret lingers in the engine's retained config (codex MEDIUM #9).
+        config.finalize_keys();
         Arc::new(Engine {
             boxes: DashMap::new(),
             routers: Mutex::new(RouterGraph::new()),
@@ -148,10 +151,13 @@ impl Engine {
     /// install the resumed writer, and open the readiness gate. Production passes
     /// `None` (transparent); the harness passes a fake.
     fn with_data_dir_inner(
-        config: ServerConfig,
+        mut config: ServerConfig,
         clock: SharedClock,
         fs: Option<Arc<dyn crate::storage::Fs>>,
     ) -> Result<Arc<Self>> {
+        // Parse plaintext keys into the hashed store + zeroize the plaintext so no
+        // secret lingers in the engine's retained config (codex MEDIUM #9).
+        config.finalize_keys();
         let data_dir = config
             .data_dir
             .clone()
@@ -338,6 +344,22 @@ impl Engine {
     /// Number of boxes currently registered.
     pub fn box_count(&self) -> u64 {
         self.boxes.len() as u64
+    }
+
+    /// Number of routers currently defined (resource-limit / observability).
+    pub fn router_count(&self) -> u64 {
+        self.routers.lock().len() as u64
+    }
+
+    /// Sum of retained record bytes across all boxes — the live total enforced by
+    /// the global byte quota (codex HIGH #5). O(boxes); only called on the write
+    /// path when the quota is enabled (non-zero), so the default/unlimited case
+    /// pays nothing. Each box's `bytes()` is a single relaxed atomic load.
+    pub fn total_bytes(&self) -> u64 {
+        self.boxes
+            .iter()
+            .map(|b| b.value().bytes())
+            .fold(0u64, |a, x| a.saturating_add(x))
     }
 
     /// Look up a box by name.
@@ -738,6 +760,29 @@ impl Engine {
             }
         }
 
+        // Resource limit: cap the number of boxes (DoS hardening; see
+        // [`crate::limits`]). Only a *new* box counts against the cap — an
+        // idempotent re-PUT of an existing box is an update and always proceeds, so
+        // a saturated server can still be reconfigured. `0` ⇒ unlimited (the
+        // back-compat default cap is large enough that existing suites never trip
+        // it). The check is a non-atomic read-then-create; a tiny concurrent
+        // overshoot past the cap is acceptable for a coarse DoS guard.
+        let exists = self.get_box(name).is_some();
+        if !exists && !self.config.limits.box_ok(self.box_count()) {
+            return Err(Error::new(
+                ErrorCode::Throttled,
+                format!(
+                    "box limit reached ({} boxes); cannot create {name:?}",
+                    self.config.limits.max_boxes
+                ),
+            )
+            .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+            .with_detail(serde_json::json!({
+                "limit": "max_boxes",
+                "max": self.config.limits.max_boxes,
+            })));
+        }
+
         // `type` is immutable once a box exists (API §0.10): a `PUT` that would
         // change it is rejected with `409 box_exists_incompatible`.
         if let Some(existing) = self.get_box(name) {
@@ -990,6 +1035,7 @@ impl Engine {
         page_size: usize,
         cursor: Option<&str>,
         touch: bool,
+        allow_prefixes: &[String],
     ) -> Result<BoxListResponse> {
         let start = Instant::now();
         let page_size = page_size.clamp(1, config::MAX_PAGE_SIZE);
@@ -997,11 +1043,16 @@ impl Engine {
         let now = self.clock.now_ms();
 
         // Collect + sort names for stable opaque-cursor paging (API §0.7).
+        // `allow_prefixes` is the caller key's box-name allowlist (empty ⇒ no
+        // restriction): a prefix-limited key must not see cross-tenant box names
+        // in the listing (codex MEDIUM #7), so names outside its allowlist are
+        // filtered out here just as they are rejected on direct access.
         let mut names: Vec<String> = self
             .boxes
             .iter()
             .map(|e| e.key().clone())
             .filter(|n| prefix.map(|p| n.starts_with(p)).unwrap_or(true))
+            .filter(|n| name_allowed(n, allow_prefixes))
             .filter(|n| after.as_deref().map(|a| n.as_str() > a).unwrap_or(true))
             .collect();
         names.sort();
@@ -1280,6 +1331,31 @@ impl Engine {
                 "cap_bytes": cap_bytes,
                 "head_seq": b.head_seq(),
                 "earliest_seq": b.earliest_seq(),
+            })));
+        }
+
+        // Global byte quota (DoS hardening; codex HIGH #5): bound total disk/RAM
+        // growth across all boxes. Checked ONLY when the quota is enabled
+        // (`max_total_bytes != 0`), so the default/unlimited path is unchanged and
+        // pays nothing. A write that would push the live total over the cap is a
+        // transient `429 throttled` — the operator/clients can delete/evict and
+        // retry. This is a coarse admission guard (a tiny concurrent overshoot is
+        // acceptable); the per-box `discard:"old"` eviction above already trims a
+        // capped box back down.
+        if self.config.limits.max_total_bytes != 0
+            && !self
+                .config
+                .limits
+                .total_bytes_ok(self.total_bytes(), incoming_bytes)
+        {
+            return Err(Error::new(
+                ErrorCode::Throttled,
+                "server total-bytes quota reached",
+            )
+            .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+            .with_detail(serde_json::json!({
+                "limit": "max_total_bytes",
+                "max": self.config.limits.max_total_bytes,
             })));
         }
 
@@ -1605,6 +1681,18 @@ impl Engine {
             req.limit.min(config::MAX_LIMIT)
         } as usize;
 
+        // Byte budget for this batch (DoS hardening; codex HIGH #6): the record
+        // walk stops once accumulated payload bytes reach this, so a response is
+        // bounded by bytes as well as by `limit` — one response can no longer
+        // approach `MAX_LIMIT` × `MAX_RECORD_BYTES`. `0` ⇒ the server default;
+        // clamped to the hard `MAX_BATCH_BYTES`. At least one record is always
+        // delivered (forward progress).
+        let max_batch_bytes = if req.max_batch_bytes == 0 {
+            config::DEFAULT_MAX_BATCH_BYTES
+        } else {
+            req.max_batch_bytes.min(config::MAX_BATCH_BYTES)
+        };
+
         let head = b.head_seq();
         let earliest = b.earliest_seq();
         // The involuntary (cap/TTL-only) floor: the SOLE tombstone trigger
@@ -1667,6 +1755,8 @@ impl Engine {
         let mut sealed_pending: Vec<(usize, u64)> = Vec::new();
         let mut scanned: u64 = 0;
         let mut next_from_seq = cursor;
+        // Accumulated delivered payload bytes, for the byte-budget cutoff.
+        let mut batch_bytes: u64 = 0;
         {
             let index = b.index.read();
             let mut seq = cursor.saturating_add(1);
@@ -1677,7 +1767,6 @@ impl Engine {
                     seq += 1;
                     continue;
                 };
-                scanned += 1;
                 let decision = filters::evaluate(
                     node_filter,
                     ttl_ms,
@@ -1687,6 +1776,19 @@ impl Engine {
                     rec.node.as_deref(),
                 );
                 if decision == filters::ReadDecision::Deliver {
+                    // Byte-budget cutoff (codex HIGH #6): stop BEFORE adding a
+                    // record that would push the batch past `max_batch_bytes` — but
+                    // always deliver at least one record so a single oversized
+                    // record cannot wedge the cursor. The cursor (`next_from_seq`)
+                    // is NOT advanced over this undelivered record, so the next diff
+                    // resumes at it (no silent skip).
+                    if !records.is_empty()
+                        && batch_bytes.saturating_add(rec.bytes) > max_batch_bytes
+                    {
+                        break;
+                    }
+                    batch_bytes = batch_bytes.saturating_add(rec.bytes);
+                    scanned += 1;
                     let (data, meta) = if rec.payload_resident {
                         (rec.data.clone(), if req.include_meta { rec.meta.clone() } else { None })
                     } else {
@@ -1703,6 +1805,8 @@ impl Engine {
                         data,
                         meta,
                     });
+                } else {
+                    scanned += 1;
                 }
                 // Deleted / NodeFiltered / Expired: silently skipped; the cursor
                 // still advances past the seq (DESIGN §6/§7).
@@ -1819,6 +1923,32 @@ impl Engine {
         }
         router::validate_router(&req.source, &req.dest)?;
 
+        // Resource limit: cap the number of routers (DoS hardening; [`crate::limits`]).
+        // Only a *new* router counts — an idempotent re-PUT of an existing router is
+        // an update and always proceeds. `0` ⇒ unlimited. Checked BEFORE any
+        // source/dest box auto-create so a router that would be refused does not
+        // leave phantom boxes behind.
+        {
+            let graph = self.routers.lock();
+            let exists = graph.get(name).is_some();
+            let count = graph.len() as u64;
+            drop(graph);
+            if !exists && !self.config.limits.router_ok(count) {
+                return Err(Error::new(
+                    ErrorCode::Throttled,
+                    format!(
+                        "router limit reached ({} routers); cannot create {name:?}",
+                        self.config.limits.max_routers
+                    ),
+                )
+                .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+                .with_detail(serde_json::json!({
+                    "limit": "max_routers",
+                    "max": self.config.limits.max_routers,
+                })));
+            }
+        }
+
         // Ensure `source` exists (lazy auto-create with defaults).
         if self.get_box(&req.source).is_none() {
             self.put_box(&req.source, BoxConfig::default())?;
@@ -1925,15 +2055,27 @@ impl Engine {
         dest: Option<&str>,
         page_size: usize,
         cursor: Option<&str>,
+        allow_prefixes: &[String],
     ) -> Result<RouterListResponse> {
         let start = Instant::now();
         let page_size = page_size.clamp(1, config::MAX_PAGE_SIZE);
         let after = decode_cursor(cursor)?;
 
+        // A prefix-limited key must not enumerate cross-tenant routers (codex
+        // MEDIUM #7): a router is visible only when its name AND both its source
+        // and dest are within the key's allowlist (empty ⇒ no restriction). This
+        // mirrors the create-time check (a scoped key can only build routers whose
+        // source/dest are in-allowlist), so the listing never leaks a name the key
+        // could not otherwise observe.
         let graph = self.routers.lock();
         let mut summaries: Vec<RouterSummary> = graph
             .iter()
             .filter(|r| prefix.map(|p| r.name.starts_with(p)).unwrap_or(true))
+            .filter(|r| {
+                name_allowed(&r.name, allow_prefixes)
+                    && name_allowed(&r.source, allow_prefixes)
+                    && name_allowed(&r.dest, allow_prefixes)
+            })
             .filter(|r| source.map(|s| r.source == s).unwrap_or(true))
             .filter(|r| dest.map(|d| r.dest == d).unwrap_or(true))
             .filter(|r| after.as_deref().map(|a| r.name.as_str() > a).unwrap_or(true))
@@ -2083,6 +2225,15 @@ pub(crate) fn resolve_sealed_off_lock(
 /// Wall-time elapsed since `start`, in fractional milliseconds.
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Whether a box/router `name` is permitted by an `allow_prefixes` allowlist: an
+/// **empty** allowlist permits any name (no restriction), otherwise `name` must
+/// start with one of the prefixes. Used to filter list results so a prefix-limited
+/// key never enumerates names outside its allowlist (codex MEDIUM #7). Mirrors
+/// [`crate::auth::Principal::allows_name`].
+fn name_allowed(name: &str, allow_prefixes: &[String]) -> bool {
+    allow_prefixes.is_empty() || allow_prefixes.iter().any(|p| name.starts_with(p.as_str()))
 }
 
 /// Validate a box config's value ranges (API §1.1). `priority` is clamped on
@@ -2297,6 +2448,68 @@ mod tests {
             from_seq,
             ..DiffRequest::default()
         }
+    }
+
+    #[test]
+    fn diff_byte_budget_bounds_the_batch_and_resumes() {
+        // codex HIGH #6: a small `max_batch_bytes` stops the walk early (well
+        // before `limit`), the cursor resumes at the first undelivered record, and
+        // a single oversized record is always delivered (forward progress).
+        let (engine, _clock) = engine_with_clock();
+        // Ten records, each ~100 bytes of data.
+        let payload = "a".repeat(100);
+        let records: Vec<RecordIn> = (0..10)
+            .map(|_| rec(json!(payload.clone()), None, None))
+            .collect();
+        engine.write("logs", write_req(records), true).unwrap();
+
+        // A 250-byte budget admits ~2 records, not all 10.
+        let req = DiffRequest {
+            from_seq: 0,
+            limit: 1000,
+            max_batch_bytes: 250,
+            ..DiffRequest::default()
+        };
+        let d = engine.diff("logs", req).unwrap();
+        assert!(
+            d.records.len() < 10 && !d.records.is_empty(),
+            "byte budget bounds the batch: got {} records",
+            d.records.len()
+        );
+        assert!(!d.caught_up, "not caught up: more records remain");
+        // Resume from the cursor; eventually all 10 are read across batches.
+        let mut total = d.records.len();
+        let mut cursor = d.next_from_seq;
+        for _ in 0..20 {
+            if total >= 10 {
+                break;
+            }
+            let req = DiffRequest {
+                from_seq: cursor,
+                limit: 1000,
+                max_batch_bytes: 250,
+                ..DiffRequest::default()
+            };
+            let d = engine.diff("logs", req).unwrap();
+            assert!(!d.records.is_empty(), "forward progress every batch");
+            total += d.records.len();
+            cursor = d.next_from_seq;
+        }
+        assert_eq!(total, 10, "all records delivered across byte-bounded batches");
+
+        // A single record larger than the whole budget is still delivered alone.
+        let huge = "h".repeat(10_000);
+        engine
+            .write("big", write_req(vec![rec(json!(huge), None, None)]), true)
+            .unwrap();
+        let req = DiffRequest {
+            from_seq: 0,
+            limit: 1000,
+            max_batch_bytes: 100,
+            ..DiffRequest::default()
+        };
+        let d = engine.diff("big", req).unwrap();
+        assert_eq!(d.records.len(), 1, "oversized record delivered (no wedge)");
     }
 
     #[test]
@@ -3007,7 +3220,7 @@ mod tests {
         assert_eq!(removed, vec!["a->b".to_string(), "b->c".to_string()]);
         // Neither router resolvable anymore.
         assert!(engine.get_router("a->b").is_err());
-        assert!(engine.list_routers(None, None, None, 100, None).unwrap().routers.is_empty());
+        assert!(engine.list_routers(None, None, None, 100, None, &[]).unwrap().routers.is_empty());
     }
 
     #[test]
@@ -3020,12 +3233,12 @@ mod tests {
         engine.put_router("a->c", router_req("a", "c")).unwrap();
         // Filter by source.
         let listed = engine
-            .list_routers(None, Some("a"), None, 100, None)
+            .list_routers(None, Some("a"), None, 100, None, &[])
             .unwrap();
         assert_eq!(listed.routers.len(), 2);
         // Filter by dest.
         let by_dest = engine
-            .list_routers(None, None, Some("c"), 100, None)
+            .list_routers(None, None, Some("c"), 100, None, &[])
             .unwrap();
         assert_eq!(by_dest.routers.len(), 1);
         assert_eq!(by_dest.routers[0].router, "a->c");
@@ -3088,16 +3301,16 @@ mod tests {
                 .unwrap();
         }
         // Prefix filter.
-        let page = engine.list_boxes(Some("a"), 100, None, false).unwrap();
+        let page = engine.list_boxes(Some("a"), 100, None, false, &[]).unwrap();
         assert_eq!(page.boxes.len(), 3);
         assert!(page.next_cursor.is_none());
 
         // Paging: page_size 2 → cursor → next page.
-        let p1 = engine.list_boxes(Some("a"), 2, None, false).unwrap();
+        let p1 = engine.list_boxes(Some("a"), 2, None, false, &[]).unwrap();
         assert_eq!(p1.boxes.len(), 2);
         let cursor = p1.next_cursor.expect("more pages");
         let p2 = engine
-            .list_boxes(Some("a"), 2, Some(&cursor), false)
+            .list_boxes(Some("a"), 2, Some(&cursor), false, &[])
             .unwrap();
         assert_eq!(p2.boxes.len(), 1);
         assert!(p2.next_cursor.is_none());

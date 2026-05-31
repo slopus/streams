@@ -422,6 +422,15 @@ pub struct DiffRequest {
     pub include_meta: bool,
     #[serde(default)]
     pub wait_ms: u32,
+    /// Soft byte budget for the response batch (DoS hardening; codex HIGH #6).
+    /// The record walk stops once the accumulated payload bytes reach this budget
+    /// (at least one record is always returned so forward progress is guaranteed),
+    /// bounding a single response's allocation independently of `limit`. `0` ⇒ the
+    /// server default ([`crate::config::DEFAULT_MAX_BATCH_BYTES`]); clamped to
+    /// [`crate::config::MAX_BATCH_BYTES`]. Not part of the documented wire contract
+    /// floor — absent in a normal request, where the default applies.
+    #[serde(default)]
+    pub max_batch_bytes: u64,
 }
 
 fn default_include_meta() -> bool {
@@ -437,6 +446,7 @@ impl Default for DiffRequest {
             include_tags: false,
             include_meta: default_include_meta(),
             wait_ms: 0,
+            max_batch_bytes: 0,
         }
     }
 }
@@ -994,6 +1004,7 @@ pub enum ErrorCode {
     BatchTooLarge,
     RecordTooLarge,
     Unauthorized,
+    Forbidden,
     BoxNotFound,
     RouterNotFound,
     NotFound,
@@ -1019,6 +1030,7 @@ impl ErrorCode {
         match self {
             InvalidRequest | BatchTooLarge | RecordTooLarge => 400,
             Unauthorized => 401,
+            Forbidden => 403,
             BoxNotFound | RouterNotFound | NotFound => 404,
             MethodNotAllowed => 405,
             NotAcceptable => 406,
@@ -1040,6 +1052,7 @@ impl ErrorCode {
             BatchTooLarge => "batch_too_large",
             RecordTooLarge => "record_too_large",
             Unauthorized => "unauthorized",
+            Forbidden => "forbidden",
             BoxNotFound => "box_not_found",
             RouterNotFound => "router_not_found",
             NotFound => "not_found",

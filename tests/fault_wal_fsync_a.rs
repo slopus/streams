@@ -120,6 +120,7 @@ fn recovered_seqs(engine: &Engine, name: &str) -> (Vec<u64>, u64) {
                     include_tags: true,
                     include_meta: true,
                     wait_ms: 0,
+                    max_batch_bytes: 0,
                 },
             )
             .expect("diff");

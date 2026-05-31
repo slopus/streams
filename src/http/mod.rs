@@ -9,12 +9,13 @@ pub mod queue;
 pub mod routers;
 pub mod watch;
 
+use crate::auth::{KeyStore, Principal, Scope};
 use crate::engine::Engine;
 use crate::error::Error;
 use crate::types::ErrorCode;
 use axum::{
     extract::{DefaultBodyLimit, Request},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, post, put},
@@ -34,15 +35,39 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     /// Per-box coalescing-window claim coordinator + `/work` conn ids (API §10).
     pub coordinator: Arc<ClaimCoordinator>,
+    /// Hashed, constant-time API-key store (scopes + box-name prefix allowlist).
+    /// Parsed **once** here from `STREAMS_API_KEYS`; the auth middleware reuses it
+    /// per request. Empty ⇒ auth disabled (dev mode).
+    pub keys: Arc<KeyStore>,
+    /// Live, mutable per-instance resource counters for the concurrency limits
+    /// (SSE connections, per-key in-flight requests; see [`crate::limits`]). The
+    /// box/router/session caps are checked against the registries directly.
+    pub live: Arc<crate::limits::LiveCounts>,
 }
 
 /// Build the full `/v0` axum router with middleware applied.
+///
+/// Parses the configured API keys into a hashed [`KeyStore`] once. A malformed
+/// scope token in `STREAMS_API_KEYS` makes the parse fail; rather than booting
+/// with auth silently degraded, this **panics** (the binary's startup also
+/// validates via [`build_router_checked`], which surfaces the error cleanly).
 pub fn build_router(engine: Arc<Engine>) -> Router {
+    build_router_checked(engine).unwrap_or_else(|msg| {
+        panic!("invalid STREAMS_API_KEYS configuration: {msg}");
+    })
+}
+
+/// Like [`build_router`] but returns the key-parse error instead of panicking, so
+/// the binary can fail closed with a clear message at startup.
+pub fn build_router_checked(engine: Arc<Engine>) -> std::result::Result<Router, String> {
     let max_body = engine.config.max_body_bytes;
+    let keys = engine.config.key_store()?;
     let state = AppState {
         engine,
         sessions: Arc::new(SessionStore::new()),
         coordinator: Arc::new(ClaimCoordinator::new()),
+        keys: Arc::new(keys),
+        live: Arc::new(crate::limits::LiveCounts::new()),
     };
 
     let v0 = Router::new()
@@ -79,7 +104,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/ready", get(health::ready))
         .route("/metrics", get(health::metrics));
 
-    Router::new()
+    Ok(Router::new()
         .nest("/v0", v0)
         // Root-level probe aliases for load balancers (API §8).
         .route("/healthz", get(health::health))
@@ -92,24 +117,28 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .layer(DefaultBodyLimit::max(max_body))
         // Rewrite bare 413/404/405/415 onto the canonical error envelope.
         .layer(middleware::from_fn(error_envelope_middleware))
-        .with_state(state)
+        .with_state(state))
 }
-
-/// The authenticated principal (the matched api key) for a request, stashed in
-/// request extensions by [`auth_middleware`] so a handler (e.g. `POST /v0/watch`)
-/// can bind a created resource to its creator. `None`/absent in dev mode.
-#[derive(Clone)]
-pub struct Principal(pub String);
 
 /// Bearer-auth middleware. Disabled when no keys are configured (dev mode).
 /// Probe endpoints skip auth unless `STREAMS_PROBE_AUTH` is set.
 ///
+/// When auth is enabled it (1) authenticates the bearer against the hashed
+/// [`KeyStore`] in constant time, (2) enforces the route's required
+/// [`Scope`] and the key's box-name **prefix allowlist**, then (3) stashes the
+/// matched [`Principal`] (scopes + prefixes, *no secret*) in request extensions
+/// so a handler can bind a created resource (e.g. a watch session) to its
+/// creator and scope. A key with no scopes / no prefixes is full-access
+/// (back-compat), so an authenticated server with a single bare key behaves
+/// exactly as before.
+///
 /// `GET /v0/watch/:wid` is special: the `wid` is an unguessable bearer capability
 /// (minted by the authenticated `POST /v0/watch`), so the stream GET is authorized
 /// by *possessing* the wid and is NOT gated here — the handler enforces the
-/// per-session principal binding. This lets browser `EventSource` (GET-only, no
-/// custom headers) open the stream with just the secret URL, without putting a
-/// long-lived api key in a logged query string.
+/// per-session principal binding (which already captured the creator's scope).
+/// This lets browser `EventSource` (GET-only, no custom headers) open the stream
+/// with just the secret URL, without putting a long-lived api key in a logged
+/// query string.
 async fn auth_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
     mut req: Request,
@@ -117,6 +146,9 @@ async fn auth_middleware(
 ) -> Response {
     let cfg = &state.engine.config;
     if !cfg.auth_enabled() {
+        // Dev mode: every handler runs as an implicit full-access principal so
+        // its scope/prefix checks are uniform with the auth-enabled path.
+        req.extensions_mut().insert(Principal::full_access());
         return next.run(req).await;
     }
 
@@ -128,32 +160,200 @@ async fn auth_middleware(
 
     // Capability-authorized: the SSE stream GET is gated by the wid, not by a
     // bearer in the URL. Defer to the handler (which checks the wid binding).
-    if req.method() == axum::http::Method::GET && is_watch_stream_path(path) {
+    if req.method() == Method::GET && is_watch_stream_path(path) {
         return next.run(req).await;
     }
 
-    // Bearer token from header, or `?token=` for EventSource GET (dev-only
-    // fallback; the header is preferred since a query string leaks via logs).
+    // Bearer token from the `Authorization` header. The `?token=` query-string
+    // fallback (which leaks via proxy/access logs and browser history; codex
+    // MEDIUM #8) is accepted ONLY for the long-lived SSE stream GETs, where a
+    // browser `EventSource` cannot set a custom header — never for ordinary
+    // data/control-plane routes, which must use the header. (The `/v0/watch/:wid`
+    // stream GET is handled by its own handler above; this covers `/work`.)
+    let allow_query_token = req.method() == Method::GET && is_sse_stream_path(path);
     let provided = extract_bearer(req.headers())
         .map(str::to_string)
-        .or_else(|| query_token(req.uri().query()));
+        .or_else(|| {
+            if allow_query_token {
+                query_token(req.uri().query())
+            } else {
+                None
+            }
+        });
 
-    match provided {
-        Some(token) if cfg.key_matches(&token) => {
-            // Stash the authenticated principal so a handler can bind a created
-            // resource (e.g. a watch session) to its creator.
-            req.extensions_mut().insert(Principal(token));
-            next.run(req).await
+    let principal = match provided.as_deref().and_then(|t| state.keys.authenticate(t)) {
+        Some(p) => p,
+        None => {
+            return Error::new(ErrorCode::Unauthorized, "missing or invalid bearer token")
+                .into_response()
         }
-        _ => Error::new(ErrorCode::Unauthorized, "missing or invalid bearer token")
-            .into_response(),
+    };
+
+    // Per-key in-flight (concurrency) cap (DoS hardening; [`crate::limits`]). The
+    // guard is held across `next.run` and released on drop (response sent or
+    // handler panic), so a stuck handler frees its slot. `0` ⇒ unlimited; dev mode
+    // (no key) is never capped. SSE streams are long-lived and are bounded by the
+    // dedicated SSE-connection caps instead, so they do not consume an in-flight
+    // slot for their whole lifetime — release it before the handler runs (the
+    // stream's own `SseGuard` then bounds it).
+    let limits = &state.engine.config.limits;
+    let inflight_guard = match state.live.try_acquire_inflight(limits, principal.key_id) {
+        Some(g) => g,
+        None => {
+            return Error::new(
+                ErrorCode::Throttled,
+                "too many concurrent requests for this api key",
+            )
+            .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+            .into_response();
+        }
+    };
+    // The SSE stream GETs (`/v0/boxes/:q/work`) are long-lived; do not pin an
+    // in-flight slot for the whole stream (the per-key SSE-connection cap covers
+    // them). They are bounded separately in their handlers.
+    if req.method() == Method::GET && is_sse_stream_path(path) {
+        drop(inflight_guard);
     }
+
+    // Enforce the route's required scope + the key's box-name prefix allowlist.
+    // A full-access key (Scope::ALL, no prefixes) passes both unconditionally, so
+    // this is transparent for the back-compat single-key case.
+    if let Some((needed, name)) = route_requirement(req.method(), path) {
+        if !principal.allows_scope(needed) {
+            return Error::new(
+                ErrorCode::Forbidden,
+                "api key lacks the scope required for this operation",
+            )
+            .into_response();
+        }
+        if let Some(name) = name {
+            if !principal.allows_name(name) {
+                return Error::new(
+                    ErrorCode::Forbidden,
+                    "api key is not allowed to access this box/router name",
+                )
+                .into_response();
+            }
+        }
+    }
+
+    req.extensions_mut().insert(principal);
+    next.run(req).await
 }
 
+/// The scope a request requires plus the box/router name it touches (for the
+/// prefix-allowlist check), derived from the method + `/v0` path. `None` means
+/// the route is unguarded by scope (e.g. probes, or `GET /v0/watch/:wid` which is
+/// capability-gated and handled separately). The name is `None` for collection
+/// routes (`/v0/boxes`, `/v0/routers`, `POST /v0/watch`) where no single name is
+/// addressed at the path; per-box prefix filtering of *list* results is a future
+/// refinement and not required for the security boundary (a list cannot mutate).
+fn route_requirement<'a>(method: &Method, path: &'a str) -> Option<(Scope, Option<&'a str>)> {
+    // Strip the `/v0` prefix; root probes (`/healthz`, `/readyz`) are unguarded.
+    let rest = path.strip_prefix("/v0")?;
+
+    // /boxes ...
+    if let Some(seg) = rest.strip_prefix("/boxes") {
+        // Collection: GET /v0/boxes (list) needs read; no single name.
+        if seg.is_empty() || seg == "/" {
+            return Some((Scope::READ, None));
+        }
+        let seg = seg.strip_prefix('/')?;
+        // seg is `:box` or `:box/<action>`.
+        let (box_name, action) = match seg.split_once('/') {
+            Some((b, a)) => (b, Some(a)),
+            None => (seg, None),
+        };
+        let scope = match (method, action) {
+            // PUT /v0/boxes/:box — control-plane (create/configure).
+            (&Method::PUT, None) => Scope::ADMIN,
+            // GET /v0/boxes/:box — read state.
+            (&Method::GET, None) => Scope::READ,
+            // DELETE /v0/boxes/:box — delete.
+            (&Method::DELETE, None) => Scope::DELETE,
+            // POST /v0/boxes/:box — write records.
+            (&Method::POST, None) => Scope::WRITE,
+            // POST /v0/boxes/:box/diff — read.
+            (&Method::POST, Some("diff")) => Scope::READ,
+            // POST /v0/boxes/:box/delete — delete.
+            (&Method::POST, Some("delete")) => Scope::DELETE,
+            // Queue claim / work: lease (mutate) + return ⇒ read+write.
+            (&Method::POST, Some("claim")) | (&Method::GET, Some("work")) => {
+                Scope::READ.union(Scope::WRITE)
+            }
+            // Queue ack/nack/extend — write (mutate lease state).
+            (&Method::POST, Some("ack"))
+            | (&Method::POST, Some("nack"))
+            | (&Method::POST, Some("extend")) => Scope::WRITE,
+            // Anything else under /boxes/:box: require write as a safe default so
+            // an unknown future mutating sub-route is never under-guarded. (A
+            // method-not-allowed path still gets here but the scope check on a
+            // full-access key is a no-op, and a scoped key fails closed.)
+            _ => Scope::WRITE,
+        };
+        return Some((scope, Some(box_name)));
+    }
+
+    // /routers ...
+    if let Some(seg) = rest.strip_prefix("/routers") {
+        if seg.is_empty() || seg == "/" {
+            // GET /v0/routers (list) needs read; no single name.
+            return Some((Scope::READ, None));
+        }
+        let router = seg.strip_prefix('/')?;
+        // Router path is a single `:router` segment (no sub-actions).
+        let scope = match *method {
+            Method::PUT => Scope::ADMIN,      // create/configure
+            Method::GET => Scope::READ,       // read
+            Method::DELETE => Scope::DELETE,  // delete
+            _ => Scope::ADMIN,                // fail-closed default
+        };
+        return Some((scope, Some(router)));
+    }
+
+    // POST /v0/watch — create a watch session (a read subscription). The bound
+    // boxes are validated/scoped at session creation in the handler (it knows the
+    // body's box map); the GET stream is capability-gated. Require read here.
+    if rest == "/watch" {
+        return Some((Scope::READ, None));
+    }
+
+    // GET /v0/metrics — operational telemetry (box count). Gated behind auth by
+    // default (codex LOW #12); a read-scoped monitoring key suffices.
+    if rest == "/metrics" {
+        return Some((Scope::READ, None));
+    }
+
+    // Liveness/readiness probes (`/v0/health`, `/v0/ready`) and anything else: no
+    // scope requirement (probe auth, if enabled, is just authentication above).
+    None
+}
+
+/// True for a long-lived SSE stream GET that should NOT hold a per-key in-flight
+/// slot for its whole lifetime (it is bounded by the SSE-connection caps instead):
+/// the watch stream `GET /v0/watch/:wid` and the queue `GET /v0/boxes/:q/work`.
+fn is_sse_stream_path(path: &str) -> bool {
+    if is_watch_stream_path(path) {
+        return true;
+    }
+    // /v0/boxes/:box/work
+    matches!(
+        path.strip_prefix("/v0/boxes/")
+            .and_then(|rest| rest.split_once('/')),
+        Some((_box, "work"))
+    )
+}
+
+/// The unauthenticated probe set: only the **minimal liveness/readiness** checks
+/// (`/healthz`, `/readyz`, `/v0/health`, `/v0/ready`) so a load balancer can poll
+/// them without a key. `/v0/metrics` is deliberately NOT here — it exposes the box
+/// count and is gated behind auth by default (codex LOW #12); set
+/// `STREAMS_PROBE_AUTH` to additionally require auth on the liveness/readiness
+/// probes, or scrape `/v0/metrics` with a read-scoped key.
 fn is_probe_path(path: &str) -> bool {
     matches!(
         path,
-        "/healthz" | "/readyz" | "/v0/health" | "/v0/ready" | "/v0/metrics"
+        "/healthz" | "/readyz" | "/v0/health" | "/v0/ready"
     )
 }
 

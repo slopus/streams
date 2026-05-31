@@ -48,7 +48,10 @@ pub async fn ready(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /v0/metrics` — Prometheus text exposition by default; JSON snapshot
-/// when `Accept: application/json`. Always `200`.
+/// when `Accept: application/json`. Always `200`. Requires authentication (a
+/// read-scoped key) when auth is enabled — it exposes operational state (box
+/// count), so it is not in the unauthenticated liveness/readiness probe set
+/// (codex LOW #12).
 pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let wants_json = headers
         .get(header::ACCEPT)

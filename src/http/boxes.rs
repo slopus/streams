@@ -74,6 +74,7 @@ pub async fn get_box(
 pub async fn list_boxes(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
+    extensions: axum::http::Extensions,
 ) -> Result<Json<BoxListResponse>> {
     let prefix = params.get("prefix").map(String::as_str);
     let page_size = params
@@ -82,9 +83,22 @@ pub async fn list_boxes(
         .unwrap_or(config::DEFAULT_PAGE_SIZE);
     let cursor = params.get("cursor").map(String::as_str);
     let touch = query_bool(&params, "touch", false);
+    // Filter the listing to the caller key's box-name allowlist (empty ⇒ no
+    // restriction) so a prefix-limited key cannot enumerate cross-tenant box
+    // names (codex MEDIUM #7).
+    let allow = principal_prefixes(&extensions);
     Ok(Json(
-        state.engine.list_boxes(prefix, page_size, cursor, touch)?,
+        state.engine.list_boxes(prefix, page_size, cursor, touch, &allow)?,
     ))
+}
+
+/// The caller principal's box-name prefix allowlist (empty ⇒ no restriction).
+/// Returns empty in dev mode / when no principal was stashed (full access).
+pub(crate) fn principal_prefixes(extensions: &axum::http::Extensions) -> Vec<String> {
+    extensions
+        .get::<crate::auth::Principal>()
+        .map(|p| p.prefixes.clone())
+        .unwrap_or_default()
 }
 
 /// `DELETE /v0/boxes/:box` — delete box (cascades routers). `?if_empty=true`

@@ -29,6 +29,16 @@ pub const MAX_LIMIT: u32 = 1000;
 /// Max `wait_ms` long-poll — clamped, not rejected.
 pub const MAX_WAIT_MS: u32 = 30_000;
 
+/// Default soft byte budget for a single diff/SSE response batch when the request
+/// does not specify one (DoS hardening; codex HIGH #6). The record walk stops once
+/// the accumulated payload bytes reach this budget, so one response cannot grow to
+/// `MAX_LIMIT` × `MAX_RECORD_BYTES` (≈ 1 GiB) regardless of `limit`. At least one
+/// record is always returned (forward progress). 1 MiB.
+pub const DEFAULT_MAX_BATCH_BYTES: u64 = 1 << 20;
+/// Hard upper bound a caller-supplied `max_batch_bytes` is clamped to, so an
+/// over-large request value cannot defeat the budget. 8 MiB.
+pub const MAX_BATCH_BYTES: u64 = 8 << 20;
+
 /// Default list page size.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// Max list page size.
@@ -206,8 +216,25 @@ pub struct ServerConfig {
     /// non-loopback address explicitly (and set keys, or
     /// `STREAMS_ALLOW_INSECURE_NO_AUTH=1`) to expose it.
     pub bind_addr: String,
-    /// Accepted bearer API keys. Empty ⇒ auth disabled (dev mode).
+    /// Accepted bearer API keys, in **plaintext** — the build-time *input* only.
+    /// This is consumed by [`ServerConfig::finalize_keys`], which parses it into
+    /// the hashed [`KeyStore`](crate::auth::KeyStore) cached in
+    /// [`key_store`](Self::key_store_cached), then **zeroizes and clears** this vec
+    /// so no plaintext secret lingers in the long-lived process config (codex
+    /// MEDIUM #9). After finalize this is empty; use [`auth_enabled`](Self::auth_enabled).
     pub api_keys: Vec<String>,
+    /// The hashed key store, parsed once from [`api_keys`](Self::api_keys) by
+    /// [`finalize_keys`](Self::finalize_keys). `None` until finalized (lazy parse).
+    /// Holds **only SHA-256 digests** + scopes/prefixes — never a plaintext secret.
+    /// Public only so external callers can use struct-update syntax; set it via
+    /// [`finalize_keys`](Self::finalize_keys), not by hand.
+    #[doc(hidden)]
+    pub key_store_cached: Option<crate::auth::KeyStore>,
+    /// Number of configured keys, recorded at finalize so boot logging / auth
+    /// gating do not depend on the (now-cleared) plaintext vec. Public only for
+    /// struct-update syntax; set it via [`finalize_keys`](Self::finalize_keys).
+    #[doc(hidden)]
+    pub key_count: usize,
     /// Escape hatch (`STREAMS_ALLOW_INSECURE_NO_AUTH=1`): permit binding a
     /// NON-loopback address with NO api keys configured. Off by default so the
     /// insecure combination refuses to start (see [`ServerConfig::startup_guard`]).
@@ -233,6 +260,11 @@ pub struct ServerConfig {
     /// are transparent: with no `cold_dir`, sealing still happens but nothing
     /// relocates.
     pub segment: SegmentConfig,
+    /// Resource / rate limits (DoS hardening; see [`crate::limits`]). Caps the
+    /// number of boxes/routers/watch-sessions and concurrent SSE connections +
+    /// per-key in-flight requests. Defaults are generous; a literal `0` for any
+    /// limit means unlimited. Read on every creation path.
+    pub limits: crate::limits::Limits,
 }
 
 impl Default for ServerConfig {
@@ -240,12 +272,15 @@ impl Default for ServerConfig {
         ServerConfig {
             bind_addr: "127.0.0.1:4000".to_string(),
             api_keys: Vec::new(),
+            key_store_cached: None,
+            key_count: 0,
             allow_insecure_no_auth: false,
             probe_auth: false,
             max_body_bytes: MAX_BODY_BYTES,
             data_dir: None,
             cold_dir: None,
             segment: SegmentConfig::default(),
+            limits: crate::limits::Limits::default(),
         }
     }
 }
@@ -310,32 +345,116 @@ impl ServerConfig {
         }
 
         cfg.segment = SegmentConfig::from_env();
+        cfg.limits = crate::limits::Limits::from_env();
+
+        // Parse the plaintext keys into the hashed store ONCE, then zeroize/clear
+        // the plaintext so no secret lingers in the long-lived config (codex
+        // MEDIUM #9). A malformed scope token is left for `key_store()` to surface
+        // (fail-closed) at router build; finalize is best-effort and idempotent.
+        cfg.finalize_keys();
 
         cfg
     }
 
-    /// Whether bearer auth is enforced.
-    pub fn auth_enabled(&self) -> bool {
-        !self.api_keys.is_empty()
+    /// Parse [`api_keys`](Self::api_keys) into the hashed [`KeyStore`] cache, record
+    /// the key count, then **zeroize and clear** the plaintext vec so no secret
+    /// remains in the retained process config (codex MEDIUM #9). Idempotent: a
+    /// second call (or a call when `api_keys` is already empty) is a no-op. If a
+    /// scope token is malformed the plaintext is still cleared and the count is set
+    /// from the raw entries; `key_store()` re-parses and surfaces the error (the
+    /// startup path fails closed there).
+    pub fn finalize_keys(&mut self) {
+        if self.api_keys.is_empty() {
+            return;
+        }
+        self.key_count = self.api_keys.len();
+        // Build the hashed store; on a parse error leave the cache `None` so
+        // `key_store()` re-parses (it can no longer, since we clear plaintext —
+        // so on error we keep the cache None AND must not clear). Fail-closed:
+        // only clear the plaintext once we have a valid hashed store.
+        match Self::parse_store(&self.api_keys) {
+            Ok(store) => {
+                self.key_store_cached = Some(store);
+                Self::zeroize_clear(&mut self.api_keys);
+            }
+            Err(_) => {
+                // Malformed: keep plaintext so `key_store()` can re-parse and
+                // surface the precise error at startup (the server then refuses to
+                // boot). The window is the startup path only.
+            }
+        }
     }
 
-    /// Constant-time check that `provided` matches one of the configured api keys.
-    ///
-    /// Compares against EVERY key with no early-exit so the running time does not
-    /// reveal which key (or how many bytes of a key) matched — defeating a timing
-    /// side-channel that a naive `==` / `.any(==)` would leak. `subtle`'s
-    /// `ConstantTimeEq` does the per-byte comparison without branching on contents;
-    /// only the (public) key/candidate lengths affect timing.
-    pub fn key_matches(&self, provided: &str) -> bool {
-        use subtle::ConstantTimeEq;
-        let mut hit = subtle::Choice::from(0u8);
-        let pb = provided.as_bytes();
-        for k in &self.api_keys {
-            // `ct_eq` on unequal lengths is constant-time false; fold every key in
-            // (no `break`) so a match's position is not timing-observable.
-            hit |= k.as_bytes().ct_eq(pb);
+    /// Overwrite each plaintext key's bytes before dropping the vec, so the secret
+    /// does not linger in freed heap memory. Pure-Rust manual zeroization (no extra
+    /// dependency); a `volatile`-free best-effort scrub adequate for this threat
+    /// (the secret is no longer needed past finalize).
+    fn zeroize_clear(keys: &mut Vec<String>) {
+        for k in keys.iter_mut() {
+            // SAFETY: overwriting the existing bytes in place, same length.
+            unsafe {
+                for b in k.as_bytes_mut() {
+                    *b = 0;
+                }
+            }
+            k.clear();
         }
-        hit.into()
+        keys.clear();
+        keys.shrink_to_fit();
+    }
+
+    fn parse_store(
+        entries: &[String],
+    ) -> std::result::Result<crate::auth::KeyStore, String> {
+        let mut keys = Vec::new();
+        for entry in entries {
+            if let Some(k) = crate::auth::ApiKey::parse_entry(entry)? {
+                keys.push(k);
+            }
+        }
+        Ok(crate::auth::KeyStore::from_keys(keys))
+    }
+
+    /// Whether bearer auth is enforced: true when any key was configured. Reads the
+    /// recorded key count (set at finalize) OR the not-yet-finalized plaintext vec,
+    /// so it is correct both before and after [`finalize_keys`](Self::finalize_keys).
+    pub fn auth_enabled(&self) -> bool {
+        self.key_count > 0 || !self.api_keys.is_empty()
+    }
+
+    /// Number of configured keys (for boot logging — never the keys themselves).
+    pub fn key_count(&self) -> usize {
+        self.key_count.max(self.api_keys.len())
+    }
+
+    /// The cached hashed key store, if [`finalize_keys`](Self::finalize_keys) has
+    /// run and parsed it (holds only digests + scopes/prefixes, no plaintext).
+    pub fn key_store_cached(&self) -> Option<&crate::auth::KeyStore> {
+        self.key_store_cached.as_ref()
+    }
+
+    /// The hashed, constant-time [`KeyStore`](crate::auth::KeyStore) (scopes +
+    /// prefix allowlist). Returns the cached store when finalized; otherwise parses
+    /// the (not-yet-cleared) plaintext entries once. A malformed scope token aborts
+    /// with an error (fail-closed): the server must not silently grant the wrong
+    /// scope. Built **once** at router construction and cached in the HTTP
+    /// `AppState`, not per request.
+    pub fn key_store(&self) -> std::result::Result<crate::auth::KeyStore, String> {
+        if let Some(store) = &self.key_store_cached {
+            return Ok(store.clone());
+        }
+        Self::parse_store(&self.api_keys)
+    }
+
+    /// Constant-time check that `provided` matches one of the configured api keys
+    /// (back-compat helper; ignores scopes/prefixes). Prefer [`key_store`] +
+    /// [`KeyStore::authenticate`](crate::auth::KeyStore::authenticate) on the hot
+    /// path, which also returns the matched principal's scopes.
+    pub fn key_matches(&self, provided: &str) -> bool {
+        match self.key_store() {
+            Ok(store) => store.authenticate(provided).is_some(),
+            Err(_) => false,
+        }
     }
 
     /// Whether [`bind_addr`](Self::bind_addr) resolves to a loopback-only host.

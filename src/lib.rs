@@ -5,11 +5,13 @@
 //! as a library lets the integration suite (`tests/`) drive the exact same
 //! in-process app via `tower::ServiceExt::oneshot` — no sockets, no sleeps.
 
+pub mod auth;
 pub mod clock;
 pub mod config;
 pub mod engine;
 pub mod error;
 pub mod http;
+pub mod limits;
 pub mod sched;
 pub mod serve;
 pub mod storage;

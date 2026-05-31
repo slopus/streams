@@ -26,14 +26,60 @@ Authorization: Bearer <API_KEY>
 ```
 
 Plain bearer token. Keys are supplied at startup (`STREAMS_API_KEYS`, comma-separated). A
-missing/unknown key returns `401`. The key check is **constant-time** (the candidate is
-compared against every configured key with no early-exit), so it does not leak which key —
-or how many leading bytes — matched via a timing side-channel.
+missing/unknown key returns `401`. **Keys are hashed at rest** (SHA-256) — only the digest is
+retained in memory, never the plaintext, and tokens are never logged. The check is
+**constant-time**: the presented token is hashed and its digest compared against every
+configured key's digest with no early-exit, so it does not leak which key — or how many
+leading bytes — matched via a timing side-channel.
 
 If the server starts with **no** keys configured, auth is disabled (single-tenant dev mode)
-and the header is ignored — logged loudly at boot. There are no scopes in `/v0`; a valid key
-has full access. (Scopes / multi-tenant isolation are **planned**, not yet implemented — see
-§0.11.)
+and the header is ignored — logged loudly at boot.
+
+#### Optional scopes & box-name prefix allowlist
+
+A key **may** carry a scope set and a box-name prefix allowlist. **This is fully additive and
+back-compatible**: a bare `key` (no scopes, no prefixes) is a **full-access** key, exactly as
+before. The `STREAMS_API_KEYS` entry syntax is extended:
+
+```
+key                       # full access (back-compat): all scopes, all boxes
+key:scopes                # scopes only, all boxes
+key:scopes:prefixes       # scopes + a box-name PREFIX allowlist
+key::prefixes             # empty scopes field = ALL scopes, prefix-restricted
+```
+
+- **`scopes`** — a `+`-separated subset of `{read, write, delete, admin}` (single letters
+  `r`/`w`/`d`/`a` and the alias `rw` are accepted). An **empty** scopes field means **all**
+  scopes. Per-route requirements:
+  | Scope | Routes |
+  |---|---|
+  | `read` | `GET /v0/boxes`, `GET /v0/boxes/:box`, `POST /v0/boxes/:box/diff`, `GET /v0/routers`, `GET /v0/routers/:r`, `POST /v0/watch` (+ the SSE GET, capability-gated) |
+  | `write` | `POST /v0/boxes/:box` (records), queue `ack`/`nack`/`extend` |
+  | `read`+`write` | queue `claim` and the `GET /v0/boxes/:q/work` stream (a lease *mutates* then returns jobs) |
+  | `delete` | `DELETE /v0/boxes/:box`, `DELETE /v0/routers/:r`, `POST /v0/boxes/:box/delete` |
+  | `admin` | `PUT /v0/boxes/:box`, `PUT /v0/routers/:r` (control-plane create/configure) |
+  The `read` scope additionally gates `GET /v0/metrics` (§8.3).
+- **`prefixes`** — a `|`-separated list of box/router-name prefixes the key may touch
+  (e.g. `tenant42:|shared.`). An **empty** prefixes field means **any** name. The match is a
+  byte prefix against the raw name, so the `tenant:` convention (§3) becomes a real boundary.
+  The key secret may not contain `:` (the field delimiter); everything before the first `:` is
+  the secret. The allowlist is enforced against **both** the path name and the relevant
+  **request-body** names: the boxes a `POST /v0/watch` names, and a router's `source`/`dest`
+  (auto-created on its behalf). The **list** endpoints (`GET /v0/boxes`, `GET /v0/routers`) are
+  filtered to the allowlist, so a prefix-limited key cannot enumerate cross-tenant names.
+
+A request that authenticates but lacks the required scope, or addresses a box/router name
+outside its prefix allowlist (path or relevant body name), returns **`403 forbidden`**. A
+**malformed scope token** in `STREAMS_API_KEYS` makes the server **refuse to start**
+(fail-closed — it will not silently grant the wrong scope). The plaintext keys are parsed into
+the hashed store once at startup and then **zeroized**, so no plaintext secret lingers in the
+process config.
+
+The watch `wid` (§7.1) is bound to **both** the creating key and its scope: the SSE GET can
+never exceed the scope of the key that created the session, and a *valid but different* key
+presented on the GET is rejected. **When auth is enabled the `wid` alone does not authorize the
+GET** — the creating key must be presented (header or the dev-only `?token=`), so a leaked
+`wid` is not a credential.
 
 **Bind & the no-auth refusal.** The default bind is **`127.0.0.1:4000` (loopback only)** so an
 unconfigured server is never an accidental public, unauthenticated event store. If the
@@ -49,16 +95,24 @@ bind via `STREAMS_HOST`/`STREAMS_PORT`.
 
 ### 0.11 Planned security work (not yet implemented)
 
-These are documented as the intended direction so clients can anticipate them; none are in
-`/v0` yet, and their absence is by design for the single-machine dev/loopback default:
+These are documented as the intended direction so clients can anticipate them; their absence is
+by design for the single-machine dev/loopback default:
 
 - **TLS:** streams speaks plain HTTP today. Until native TLS lands, terminate TLS at a reverse
   proxy or bind loopback. No wire-contract change is anticipated when TLS is added (it is a
   transport concern).
-- **Scopes / tenant isolation:** today any valid key has full access to every box/router. A
-  future revision will bind keys to scopes (e.g. per-box / per-prefix read/write) and tenant
-  namespaces. Box names already support a `tenant:` prefix convention (§3) to ease the later
-  migration; it is **not** an isolation boundary today.
+- **Scopes / prefix allowlist — *implemented* (§0.2).** A key may now carry a scope set
+  (`read`/`write`/`delete`/`admin`) and a box-name prefix allowlist; keys are hashed at rest.
+  A bare key is still full-access for back-compat. The `tenant:` prefix convention (§3) becomes
+  a real boundary when a key is prefix-restricted. **Multi-tenant *namespace* isolation** (a
+  hard partition of the box/router namespace per tenant, rather than a prefix filter) remains a
+  future revision.
+- **Resource / rate limits — *implemented* (§11).** Configurable caps on boxes, routers, watch
+  sessions, concurrent SSE connections (global + per-key), per-key in-flight requests, and a
+  global **total-bytes** quota (`STREAMS_MAX_TOTAL_BYTES`), enforced on every creation/write path
+  with a `429 throttled`; plus a per-response **byte budget**, a length bound on queue `seqs`
+  arrays, and idle watch-session GC. See §11 for the env vars and §12 for the consolidated
+  threat model.
 
 ### 0.3 Content types & encoding
 
@@ -129,6 +183,7 @@ top-level `error` key is the only success/failure discriminator.
 | `201` | Created (box/router created on this call) | — |
 | `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large` |
 | `401` | Missing/invalid bearer token | `unauthorized` |
+| `403` | Authenticated but the key lacks the required scope, or the box/router name is outside its prefix allowlist (§0.2) | `forbidden` |
 | `404` | Box/router does not exist (and was not auto-created) | `box_not_found`, `router_not_found` |
 | `405` | Wrong method for path | `method_not_allowed` |
 | `406` | `Accept` not `text/event-stream` (SSE GET) | `not_acceptable` |
@@ -136,7 +191,7 @@ top-level `error` key is the only success/failure discriminator.
 | `413` | Body exceeds server hard limit (pre-parse) | `payload_too_large` |
 | `415` | Wrong/missing `Content-Type` | `unsupported_media_type` |
 | `422` | Semantically invalid (write to a full `discard:"reject"` box) | `box_full` |
-| `429` | Elastic throttle / backpressure under CPU pressure | `throttled` — carries `Retry-After` + `error.detail.retry_after_ms` |
+| `429` | Elastic throttle / backpressure under CPU pressure, **or** a resource cap reached (§11) | `throttled` — carries `Retry-After`; a CPU-pressure throttle adds `error.detail.retry_after_ms`, a resource cap adds `error.detail.limit` |
 | `500` | Internal error (bug) | `internal` |
 | `503` | Not ready (WAL replay on boot) / shutting down | `not_ready`, `shutting_down` — carries `Retry-After` |
 
@@ -811,24 +866,32 @@ for a query string, and browser `EventSource` is GET-only with no body/headers. 
 **POST** carries the full JSON subscription (and returns `400`/`404` *before* any stream is
 open, while the client can still read the error body), and the **GET** is a tiny,
 `EventSource`-compatible URL. A session holds the subscription definition plus the
-last-delivered cursor per box (so GET reconnects resume exactly) and is GC'd after
-`session_ttl_ms` (default 300000) of no active GET.
+last-delivered cursor per box (so GET reconnects resume exactly) and is **reclaimed** after
+`session_ttl_ms` (default 300000) of no active GET. The idle-session GC runs opportunistically
+on every `POST /v0/watch` and stream-open: a session with no live stream whose last access is
+older than the TTL is removed, so an abandoned session cannot pin a `STREAMS_MAX_WATCH_SESSIONS`
+slot until restart. A session with an open stream is never reclaimed (its cursor map is in use).
 
 **Auth & the `wid` capability.** The **POST** is authenticated normally
-(`Authorization: Bearer`). The returned `wid` is an **unguessable random bearer capability**
+(`Authorization: Bearer`) and additionally enforces the key's **box-name prefix allowlist**
+against every box named in the body — a prefix-limited key cannot watch a box outside its
+allowlist (`403 forbidden`). The returned `wid` is an **unguessable random bearer capability**
 (≥128 bits of entropy, base64url, e.g. `wid_BuRguGorNdVFWNQULz-rrw`) — it is not a guessable
-counter. **Possessing the `wid` authorizes the GET stream**, so a browser `EventSource` (which
-cannot send custom headers) opens the stream with just the secret URL and **no api key in the
-query string**. When auth is enabled the `wid` is **bound to the principal that created it**:
-if the GET *does* present a bearer (header, or the dev-only `?token=` fallback below), it must
-match the creating key (defense in depth); presenting none is fine — the `wid` alone suffices.
+counter, and the GET stream is found by the `wid` alone (a browser `EventSource`-compatible URL).
+**When auth is enabled, the `wid` alone is NOT sufficient to open the stream**: the GET must
+present the **creating key** (via the `Authorization: Bearer` header or the dev-only `?token=`
+fallback below), and a *different valid* key is rejected just like an invalid one. This is
+defense-in-depth: a `wid` that leaks via logs/history cannot be opened by a holder who does not
+also have the key. In dev mode (no auth) the `wid` alone opens the stream. The session is bound
+to the creating key's scope so the stream can never exceed it.
 
-> **`?token=<key>` is a documented dev-only fallback** for environments where you cannot set
-> the `wid` capability flow (the `wid` is the preferred mechanism). A query string leaks via
-> server logs, browser history, and proxies, so **prefer the `Authorization: Bearer` header**,
-> and never put a long-lived api key in a URL in production. The parameter is parsed with a
-> real `x-www-form-urlencoded` decoder (percent-escapes and `+` are decoded; a duplicated
-> `token=` takes the first occurrence).
+> **`?token=<key>` is a documented dev-only fallback** for browser `EventSource` (which cannot
+> send custom headers) on the **SSE stream GETs only** (`/v0/watch/:wid`, `/v0/boxes/:q/work`);
+> it is **never** accepted on ordinary data/control-plane routes (use the header there). A query
+> string leaks via server logs, browser history, and proxies, so **prefer the
+> `Authorization: Bearer` header**, and never put a long-lived api key in a URL in production.
+> The parameter is parsed with a real `x-www-form-urlencoded` decoder (percent-escapes and `+`
+> are decoded; a duplicated `token=` takes the first occurrence).
 
 ### 7.2 POST /v0/watch — create session
 
@@ -857,7 +920,7 @@ match the creating key (defense in depth); presenting none is fine — the `wid`
 | `boxes[b].from_seq` | Deliver records with `$seq > from_seq`. `0` = from earliest. | `0` |
 | `boxes[b].tail` | If `true`, ignore `from_seq` and start at the box's current head (only records after subscribe; the SSE analog of Redis `XREAD $`). | `false` |
 | `limit` | Max records per `record` frame (per box, per flush). | `256` |
-| `max_batch_bytes` | Soft cap on a single frame's `data` size. | `262144` (256 KiB) |
+| `max_batch_bytes` | **Enforced** soft byte budget for a single `record` frame: the per-box read stops once the batch reaches this many payload bytes (at least one record is always delivered), so a frame cannot balloon to `limit`×record-cap. `0` ⇒ server default (1 MiB), clamped to 8 MiB. | `262144` (256 KiB) |
 | `heartbeat_ms` | Heartbeat interval. Clamped to `[1000, 60000]`. | `15000` |
 | `include_meta` | Include record `meta` in frames. | `true` |
 | `include_tags` | Include `$tag` in frames. | `false` |
@@ -1050,6 +1113,12 @@ streams_wal_fsync_seconds{quantile="0.99"} 0.0007
 streams_scheduler_throttle_total 0
 ```
 `200` always (even when not ready — metrics describe the recovering process).
+
+> **Auth.** Unlike `/v0/health` and `/v0/ready` (which stay unauthenticated so a load balancer
+> can poll liveness/readiness), `/v0/metrics` exposes operational state (box count, …) and is
+> therefore **gated behind auth by default** when keys are configured: it needs a key with the
+> `read` scope (a full-access key suffices). In dev mode (no keys) it is open. Set
+> `STREAMS_PROBE_AUTH` to additionally require auth on the liveness/readiness probes.
 
 ---
 
@@ -1392,4 +1461,145 @@ connection's deliveries, a worker holding leases from a separate `claim` poll is
 **Errors at establishment** — `200` (stream opened); `400 invalid_request` (missing `node`,
 bad `max`); `404 box_not_found`; `406 not_acceptable` (`Accept` not `text/event-stream`);
 `409 not_a_queue`; `429 throttled`.
+
+---
+
+## 11. Resource & rate limits (DoS hardening)
+
+streams enforces a small set of **configurable resource caps** so a single instance — or a
+single api key — cannot exhaust the server by creating unbounded resources or opening unbounded
+streams. Every cap has a **sane default** and is **disabled by setting it to `0`** (unlimited).
+The defaults are generous; a normal deployment never trips them, and an unconfigured dev box on
+loopback behaves exactly as before.
+
+| Limit | Env var | Default | Scope | Enforced on |
+|---|---|---|---|---|
+| Max boxes | `STREAMS_MAX_BOXES` | `100000` | instance | every box **creation** (`PUT /v0/boxes/:box` and write auto-create) |
+| Max routers | `STREAMS_MAX_ROUTERS` | `10000` | instance | every router **creation** (`PUT /v0/routers/:r`) |
+| Max watch sessions | `STREAMS_MAX_WATCH_SESSIONS` | `10000` | instance | `POST /v0/watch` |
+| Max SSE connections | `STREAMS_MAX_SSE_CONNECTIONS` | `10000` | instance | every SSE stream GET (`/v0/watch/:wid`, `/v0/boxes/:q/work`) |
+| Max SSE connections / key | `STREAMS_MAX_SSE_CONNECTIONS_PER_KEY` | `1000` | per key | same, attributed to the authenticated key |
+| Max in-flight requests / key | `STREAMS_MAX_INFLIGHT_PER_KEY` | `1000` | per key | every request — a per-key **concurrency** cap (held for the request's duration) |
+| Max total bytes | `STREAMS_MAX_TOTAL_BYTES` | `0` (unlimited) | instance | every **write** — a global disk/RAM growth quota over the sum of retained record bytes across all boxes |
+
+Two additional, **non-configurable** hard bounds protect the read/response paths:
+
+- A single `record` frame / `diff` response is bounded by a **byte budget** (`max_batch_bytes`,
+  default 1 MiB, clamped to 8 MiB) as well as by `limit`, so one response cannot grow to
+  `MAX_LIMIT`×record-cap (§7.2). At least one record is always delivered (forward progress).
+- Queue `ack`/`nack`/`extend` reject a `seqs` array longer than `STREAMS_MAX_CLAIM` (1000) with
+  `400 batch_too_large`, so a request cannot make the server allocate/echo an unbounded vec.
+
+**Semantics.**
+
+- A **creation** that would exceed a cap returns **`429 throttled`** with a `Retry-After`
+  header and `error.detail.limit` naming the cap (e.g. `"max_boxes"`) and `error.detail.max`.
+  Capacity is transient — the client retries after another client sheds load. This reuses the
+  existing elastic-throttle signal (§0.6), so a client that already handles `429` needs no
+  change.
+- Only **new** resources count against the box/router caps: an idempotent re-`PUT` of an
+  **existing** box/router is an *update* and always succeeds, so a saturated server can still
+  be reconfigured. A router refused by `max_routers` is rejected **before** any source/dest box
+  auto-create, so it leaves no phantom boxes.
+- The **total-bytes** quota (`STREAMS_MAX_TOTAL_BYTES`, default `0`/unlimited) bounds disk/RAM
+  growth from authenticated writers: a write that would push the live total over the cap is a
+  `429 throttled` (`error.detail.limit:"max_total_bytes"`). It is checked only when enabled, so
+  the default path is unchanged. Combine with per-box `cap_bytes`/`cap_records` + `discard:"old"`
+  (§0.10) for fine-grained, self-trimming per-box bounds.
+- Idle **watch sessions** are reclaimed after `session_ttl_ms` of no active stream (§7.1), so an
+  abandoned session does not pin a `max_watch_sessions` slot until restart.
+- **Concurrency caps free their slot when the request/stream ends** (the response is sent, or
+  the SSE connection closes — clean close, broken pipe, or cancel), via RAII guards, so a
+  dropped stream or a panicking handler can never permanently consume capacity. SSE streams are
+  long-lived and are bounded by the **SSE-connection** caps, not the per-key in-flight cap (so
+  holding a stream open does not block ordinary requests for that key).
+- The **per-key** caps apply only when **auth is enabled** (there is a key to attribute use
+  to). In dev mode (no keys) only the instance-wide caps apply. An SSE connection on a watch
+  session is attributed to the **session's creating key** (constant across reconnects).
+
+These caps are independent of the per-request **batching limits** (§2) and the elastic
+**CPU-pressure** throttle (§0.6); all three can produce `429`. A `429` from a resource cap
+carries `error.detail.limit`.
+
+---
+
+## 12. Security & operations (threat model)
+
+This section is the operator-facing security note: what streams protects, what it does **not**,
+and how to deploy it safely. It restates the model spread across §0.2 / §0.11 / §11 in one
+place.
+
+### 12.1 What's in scope
+
+- **Authentication** — bearer tokens (`Authorization: Bearer <key>`), supplied at startup via
+  `STREAMS_API_KEYS`. **Keys are hashed at rest**: the plaintext is parsed into the hashed store
+  **once** at startup and then **zeroized and dropped** — only the SHA-256 digest is held in
+  memory for the process lifetime, never the plaintext, and **tokens are never logged**. The
+  presented token is hashed and its digest compared against every configured key's digest in
+  **constant time** with no early exit, so neither *which* key nor *how many leading bytes*
+  matched leaks via timing.
+- **Authorization** — optional per-key **scopes** (`read`/`write`/`delete`/`admin`) and a
+  box-name **prefix allowlist**, enforced per route (§0.2). A key outside its scope or prefix
+  gets **`403 forbidden`**. The prefix allowlist is enforced not only on the path name but on
+  the **request body's** box names where relevant: the boxes a `POST /v0/watch` subscribes to,
+  and a router's `source` **and** `dest` (which the engine would otherwise auto-create) — so a
+  scoped key cannot watch, or route data into, a box outside its allowlist. **List** endpoints
+  (`GET /v0/boxes`, `GET /v0/routers`) are filtered to the key's allowlist, so a prefix-limited
+  key cannot even enumerate cross-tenant names. A bare `key` is full access (back-compat). A
+  **malformed scope token** makes the server **refuse to start** (fail-closed — it never
+  silently grants the wrong scope). `/v0/metrics` requires the `read` scope by default (§8.3).
+- **Watch capability** — the `wid` is an unguessable 128-bit random capability bound to the
+  creating key **and** its scope. **When auth is enabled, the `wid` alone does not open the
+  stream**: the GET must present the creating key (header or the dev-only `?token=`), so a
+  leaked `wid` is not a credential. The SSE GET cannot exceed the creator's scope, and a *valid
+  but different* key presented on the GET is rejected (§7.1).
+- **Resource exhaustion (DoS)** — configurable caps on boxes / routers / watch sessions /
+  concurrent SSE connections (global + per-key) / per-key in-flight requests / **total retained
+  bytes**, plus a **byte budget** on each read response and a **length bound** on queue
+  ack/nack/extend `seqs` arrays, and **idle watch-session GC** so abandoned sessions free their
+  slot (§11).
+- **Accidental public exposure** — the default bind is **loopback** (`127.0.0.1:4000`); a
+  non-loopback bind with no keys **refuses to start** unless `STREAMS_ALLOW_INSECURE_NO_AUTH=1`
+  (§0.2).
+- **No path traversal** — user-controlled box/router **names never reach the filesystem** as
+  path components. On-disk segment/WAL/snapshot files are keyed by an interned **numeric
+  box id**, not the name; names are strictly validated to a fixed charset
+  (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$`, plus `>` for routers) at the engine boundary before
+  any keyed-by-id filesystem use.
+
+### 12.2 What's NOT in scope (deploy accordingly)
+
+- **No TLS.** streams speaks **plain HTTP** and does not terminate TLS. A bearer token on plain
+  HTTP — or in a URL query string (the dev-only `?token=` SSE fallback, §7.1) — can be observed
+  in transit or in logs. **For any non-loopback exposure, run streams behind a TLS-terminating
+  reverse proxy** (nginx / Caddy / Envoy / a cloud LB), or bind loopback and tunnel (SSH /
+  WireGuard). Native TLS is planned (§0.11) and is a transport concern (no wire-contract
+  change anticipated).
+- **No hard tenant isolation.** The prefix allowlist is a *filter*, not a namespace partition:
+  two keys with overlapping prefixes share the same box namespace. Hard per-tenant isolation is
+  planned (§0.11).
+- **No audit log / no key rotation API.** Keys are static for the process lifetime (set at
+  startup); rotate by restarting with a new `STREAMS_API_KEYS`. There is no per-request audit
+  trail beyond the operational tracing logs (which never contain tokens).
+- **Trusted operator.** Anyone who can read the process environment or the boot logs can see
+  the configured key **plaintext** (it is supplied via `STREAMS_API_KEYS`); the *hashing at
+  rest* protects the in-memory/runtime surface and crash dumps, not the startup configuration.
+  Manage `STREAMS_API_KEYS` as a secret (e.g. a secrets manager / systemd `LoadCredential`),
+  not a committed file.
+
+### 12.3 Recommended hardened deployment
+
+1. **Terminate TLS at a reverse proxy** in front of streams; have the proxy forward to a
+   **loopback** streams bind (`STREAMS_HOST=127.0.0.1`). Then a leaked plain-HTTP token is not
+   network-observable.
+2. **Set `STREAMS_API_KEYS`** with **least-privilege scopes + prefixes** per client — e.g. a
+   read-only dashboard key `dash:read:tenant42:`, a producer `prod:write:tenant42:`, an admin
+   key `ops::` (all scopes, all boxes). Avoid bare full-access keys in production.
+3. **Tune the resource caps (§11)** to your capacity. Leave the defaults unless you have a
+   specific reason; set a cap to `0` only to deliberately disable it.
+4. **Never set `STREAMS_ALLOW_INSECURE_NO_AUTH=1`** outside a trusted private network — it
+   disables the no-auth refusal that exists to prevent an accidental open event store.
+5. **Treat the data directory** (`STREAMS_DATA_DIR`) as sensitive: it contains every record's
+   payload in the WAL/segments in the clear. Protect it with filesystem permissions and
+   at-rest disk encryption as your threat model requires (streams does not encrypt payloads).
 

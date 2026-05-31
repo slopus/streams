@@ -351,6 +351,7 @@ pub async fn work(
     State(state): State<AppState>,
     Path(box_name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
+    extensions: axum::http::Extensions,
     headers: HeaderMap,
 ) -> Result<Response> {
     require_event_stream_accept(&headers)?;
@@ -380,8 +381,24 @@ pub async fn work(
         return Err(Error::not_a_queue(&box_name));
     }
 
+    // Resource limit: admit this SSE connection under the global + per-key
+    // connection caps (DoS hardening; [`crate::limits`]). The guard is moved into
+    // the stream and released on drop, so a disconnect frees the slot. Attribute to
+    // the authenticated key (full-access principal / `None` in dev mode). `0` ⇒
+    // unlimited.
+    let key_id = extensions
+        .get::<crate::auth::Principal>()
+        .and_then(|p| p.key_id);
+    let sse_guard = state
+        .live
+        .try_acquire_sse(&state.engine.config.limits, key_id)
+        .ok_or_else(|| {
+            Error::new(ErrorCode::Throttled, "too many concurrent SSE connections")
+                .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+        })?;
+
     let conn = state.coordinator.alloc_conn();
-    let stream = build_work_stream(state.clone(), box_name, node, max, lease_ms, conn);
+    let stream = build_work_stream(state.clone(), box_name, node, max, lease_ms, conn, sse_guard);
 
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -423,6 +440,7 @@ fn build_work_stream(
     max: u32,
     lease_ms: Option<u64>,
     conn: u64,
+    sse_guard: crate::limits::SseGuard,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
     let guard = WorkConnGuard {
         state: state.clone(),
@@ -433,6 +451,9 @@ fn build_work_stream(
         // Move the guard into the stream body so disconnect (drop of this future)
         // triggers release-on-disconnect.
         let _guard = guard;
+        // Hold the SSE-connection slot for the stream's lifetime; released on drop
+        // (DoS hardening; [`crate::limits`]).
+        let _sse_guard = sse_guard;
 
         // `retry:` once at open (deliberate 2 s backoff; API §7.5/§10.8).
         yield Ok(Event::default().retry(Duration::from_millis(config::SSE_RETRY_MS)));

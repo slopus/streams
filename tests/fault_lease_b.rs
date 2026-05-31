@@ -257,6 +257,7 @@ fn f_clock_backward_lease() {
                 include_tags: true,
                 include_meta: false,
                 wait_ms: 0,
+                max_batch_bytes: 0,
             },
         )
         .expect("diff");

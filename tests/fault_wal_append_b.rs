@@ -712,6 +712,7 @@ fn f_nfs_estale_wal_fd() {
                 include_tags: true,
                 include_meta: true,
                 wait_ms: 0,
+                max_batch_bytes: 0,
             },
         )
         .expect("diff after recovery");

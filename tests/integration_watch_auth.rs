@@ -7,8 +7,9 @@
 //!   * the `wid` shape is the random-capability form (`wid_` + base64url), not the
 //!     old guessable monotonic counter;
 //!   * `POST /v0/watch` still requires a valid bearer when auth is on;
-//!   * `GET /v0/watch/:wid` opens with the wid alone (no bearer) — the EventSource
-//!     capability case;
+//!   * `GET /v0/watch/:wid` when auth is on REQUIRES the creating key (header or
+//!     the dev-only `?token=`); the wid alone is NOT sufficient — a leaked wid
+//!     cannot be opened by a holder who lacks the key (codex HIGH #3);
 //!   * `GET` with a WRONG bearer (header or `?token=`) is `401` (binding enforced);
 //!   * `GET` with the CORRECT bearer (header or `?token=`) opens;
 //!   * an unknown wid is `404` regardless of credentials.
@@ -82,7 +83,7 @@ fn wid_is_unguessable_random_capability() {
 }
 
 #[test]
-fn stream_opens_with_wid_capability_no_bearer_when_auth_on() {
+fn stream_requires_creating_key_not_just_wid_when_auth_on() {
     let h = auth_harness("s3cr3t");
     // Seed + create the session WITH a valid key (POST is authenticated).
     h.post_auth(
@@ -98,12 +99,19 @@ fn stream_opens_with_wid_capability_no_bearer_when_auth_on() {
     assert_eq!(status, StatusCode::OK);
     let stream_url = body["stream_url"].as_str().unwrap();
 
-    // The wid alone authorizes the GET stream — no bearer in the URL (the browser
-    // `EventSource` case). This is the capability guarantee.
+    // When auth is enabled the wid alone is NOT sufficient: the GET must present
+    // the creating key (header or the dev-only `?token=`). A leaked wid opened
+    // with no credential is rejected (codex HIGH #3).
     assert_eq!(
         get_stream_status(&h, stream_url, None),
+        StatusCode::UNAUTHORIZED,
+        "wid alone (no bearer) must NOT open the stream when auth is on"
+    );
+    // With the creating key it opens.
+    assert_eq!(
+        get_stream_status(&h, stream_url, Some("s3cr3t")),
         StatusCode::OK,
-        "wid capability should open the stream with no bearer"
+        "the creating key opens the stream"
     );
 }
 

@@ -71,34 +71,74 @@ pub struct Session {
     pub req: WatchCreateRequest,
     /// Authoritative `box → last-delivered seq` cursor map.
     pub cursors: Mutex<BTreeMap<String, u64>>,
-    /// The principal (api key) that created this session, when auth is enabled.
-    /// `None` in dev mode (no keys). The GET stream is authorized by *possessing*
-    /// the unguessable `wid` (a bearer capability); a presented bearer, if any,
-    /// must also match this binding (defense in depth). See [`Session::authorize`].
-    pub principal: Option<String>,
+    /// The id of the key that created this session, when auth is enabled (a
+    /// non-secret SHA-256 digest, never the plaintext). `None` in dev mode. The
+    /// GET stream is authorized by *possessing* the unguessable `wid` (a bearer
+    /// capability); a presented bearer, if any, must also resolve to this same
+    /// key (defense in depth). See [`Session::authorize`].
+    pub key_id: Option<crate::auth::KeyId>,
+    /// The creating key's effective scope set, captured at creation so the SSE
+    /// stream can never exceed the creator's scope even if that key is later
+    /// re-scoped or the wid leaks. A session bound to a key without [`Scope::READ`]
+    /// could not have been created (POST /v0/watch requires read), so in practice
+    /// this always contains READ; it is retained for completeness / future frames.
+    pub scopes: crate::auth::Scope,
+    /// Monotonic-ish wall-clock ms of the last create/GET access, for idle-session
+    /// GC (codex MEDIUM #11): a session with no active stream and a last access
+    /// older than [`config::SESSION_TTL_MS`] is reclaimed so a client cannot fill
+    /// `max_watch_sessions` and hold the slots until restart.
+    pub last_access_ms: std::sync::atomic::AtomicI64,
+    /// Count of currently-open SSE streams for this session. A session with an
+    /// active stream is never GC'd (the cursor map is in use); the count is bumped
+    /// on stream open and decremented on close via [`StreamHandle`].
+    pub active_streams: std::sync::atomic::AtomicU64,
 }
 
 impl Session {
-    /// Authorize a GET-stream request against this session's principal binding.
+    /// Stamp the last-access time (called on create + each GET-stream open) so the
+    /// idle-GC TTL is measured from the most recent use.
+    fn touch(&self, now_ms: i64) {
+        self.last_access_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this session is reclaimable at `now_ms`: no open stream AND idle
+    /// past the TTL.
+    fn is_expired(&self, now_ms: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        self.active_streams.load(Ordering::Relaxed) == 0
+            && now_ms.saturating_sub(self.last_access_ms.load(Ordering::Relaxed))
+                > config::SESSION_TTL_MS as i64
+    }
+}
+
+impl Session {
+    /// Authorize a GET-stream request against this session's key binding.
     ///
-    /// The `wid` itself is the capability: holding the unguessable random `wid`
-    /// authorizes the stream (API §7.1). When the session is bound to a principal
-    /// (auth enabled), a presented bearer token — if any — must match that
-    /// principal in constant time; presenting *no* bearer is allowed (the wid
-    /// alone suffices, which is the `EventSource` case). An unbound session (dev
-    /// mode) is always allowed.
-    pub fn authorize(&self, presented_bearer: Option<&str>) -> bool {
-        match (&self.principal, presented_bearer) {
+    /// When the session is bound to a key (auth enabled), the caller MUST present
+    /// a bearer (header, or the dev-only `?token=` fallback) that resolves — via
+    /// the constant-time hashed [`KeyStore`](crate::auth::KeyStore) — to the
+    /// *same* key that created the session. Holding the `wid` is necessary (it
+    /// names the session) but NOT sufficient: a leaked high-scope `wid` opened by
+    /// anyone, or replayed under a *different valid* key, is rejected (codex HIGH
+    /// #3). An unbound session (dev mode, `key_id == None`) is always allowed —
+    /// there is no key to bind to.
+    pub fn authorize(
+        &self,
+        presented_bearer: Option<&str>,
+        keys: &crate::auth::KeyStore,
+    ) -> bool {
+        match (&self.key_id, presented_bearer) {
             // Unbound (dev mode): the wid alone authorizes.
             (None, _) => true,
-            // Bound, no bearer presented: the wid capability is sufficient.
-            (Some(_), None) => true,
-            // Bound, bearer presented: it must match the creating principal.
-            (Some(p), Some(b)) => {
-                use subtle::ConstantTimeEq;
-                let m: bool = p.as_bytes().ct_eq(b.as_bytes()).into();
-                m
-            }
+            // Bound, bearer presented: it must authenticate AND be the same key.
+            (Some(bound), Some(b)) => match keys.authenticate(b) {
+                Some(p) => p.key_id == Some(*bound),
+                None => false,
+            },
+            // Bound, NO bearer presented: the wid is a capability *name*, not a
+            // credential — reject so a leaked wid cannot be opened without the key.
+            (Some(_), None) => false,
         }
     }
 }
@@ -143,6 +183,68 @@ impl SessionStore {
     fn get(&self, wid: &str) -> Option<Arc<Session>> {
         self.sessions.get(wid).map(|s| s.clone())
     }
+
+    /// Reclaim idle, expired sessions (codex MEDIUM #11): any session with no open
+    /// stream whose last access is older than [`config::SESSION_TTL_MS`] at `now_ms`
+    /// is removed. Called opportunistically on session create and on stream open,
+    /// so a client that abandons sessions cannot pin `max_watch_sessions` slots
+    /// until restart. `DashMap::retain` holds shard locks only briefly.
+    fn gc_expired(&self, now_ms: i64) {
+        self.sessions.retain(|_wid, s| !s.is_expired(now_ms));
+    }
+
+    /// Mark a stream as open on `wid` (if it still exists), returning an RAII
+    /// [`StreamHandle`] that decrements the active-stream count and re-stamps the
+    /// last-access time on drop (clean close / broken pipe). While the handle is
+    /// held the session is never GC'd.
+    fn open_stream(self: &Arc<Self>, wid: &str, now_ms: i64) -> Option<StreamHandle> {
+        let s = self.get(wid)?;
+        s.touch(now_ms);
+        s.active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(StreamHandle {
+            store: self.clone(),
+            wid: wid.to_string(),
+        })
+    }
+
+    /// Number of live sessions in the registry (resource-limit check;
+    /// [`crate::limits`]).
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Whether the registry holds no sessions.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
+/// RAII handle for an open SSE stream on a session: decrements the session's
+/// active-stream count on drop and re-stamps its last-access time so the idle-GC
+/// TTL is measured from when the stream *ended* (codex MEDIUM #11). Held inside the
+/// stream future; a broken pipe / cancel frees it just like a clean close.
+pub struct StreamHandle {
+    store: Arc<SessionStore>,
+    wid: String,
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(s) = self.store.get(&self.wid) {
+            s.active_streams.fetch_sub(1, Ordering::Relaxed);
+            // Re-stamp so the TTL clock starts now (stream just ended), not from
+            // the original open.
+            s.last_access_ms.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 /// `POST /v0/watch` — create a watch session; returns a `wid` + `stream_url`.
@@ -170,6 +272,48 @@ pub async fn create_watch(
             config::MAX_WATCH_BOXES
         )));
     }
+
+    // Authorization: a prefix-restricted key may only watch boxes within its
+    // allowlist. The route-level scope check (`POST /v0/watch` needs read) does
+    // NOT see the body's box names — they arrive here — so the prefix allowlist
+    // must be enforced against every requested box BEFORE resolving/storing the
+    // session, or a prefix-limited read key could subscribe to any box (codex
+    // HIGH #1). A full-access / unrestricted key (empty allowlist) passes
+    // transparently. The dev-mode principal is full-access.
+    let principal = extensions.get::<crate::auth::Principal>();
+    if let Some(p) = principal {
+        for name in req.boxes.keys() {
+            if !p.allows_name(name) {
+                return Err(Error::new(
+                    ErrorCode::Forbidden,
+                    "api key is not allowed to watch this box",
+                )
+                .with_detail(serde_json::json!({ "box": name })));
+            }
+        }
+    }
+
+    // Reclaim idle, expired sessions before the cap check (codex MEDIUM #11) so a
+    // freed slot is reusable and a client that abandons sessions cannot pin the
+    // `max_watch_sessions` slots until restart.
+    let now_ms = state.engine.clock.now_ms();
+    state.sessions.gc_expired(now_ms);
+
+    // Resource limit: cap the number of live watch sessions (DoS hardening;
+    // [`crate::limits`]). `0` ⇒ unlimited. Capacity exhaustion is a transient
+    // `429 throttled` (the client can retry after sessions free up).
+    let limits = &state.engine.config.limits;
+    if !limits.watch_session_ok(state.sessions.len() as u64) {
+        return Err(Error::new(
+            ErrorCode::Throttled,
+            "watch session limit reached",
+        )
+        .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+        .with_detail(serde_json::json!({
+            "limit": "max_watch_sessions",
+            "max": limits.max_watch_sessions,
+        })));
+    }
     // Clamp heartbeat into the documented bounds (API §7.2).
     req.heartbeat_ms = req
         .heartbeat_ms
@@ -185,16 +329,21 @@ pub async fn create_watch(
     }
 
     // Bind the session to the authenticated creator (when auth is enabled) so the
-    // capability `wid` cannot be replayed under a different principal. The
-    // `Principal` is stashed by the auth middleware; absent in dev mode.
-    let principal = extensions
-        .get::<super::Principal>()
-        .map(|p| p.0.clone());
+    // capability `wid` cannot be replayed under a different key, and capture the
+    // creator's scope so the stream can never exceed it. The `Principal` is
+    // stashed by the auth middleware (full-access in dev mode).
+    let key_id = principal.and_then(|p| p.key_id);
+    let scopes = principal
+        .map(|p| p.scopes)
+        .unwrap_or(crate::auth::Scope::ALL);
 
     let wid = state.sessions.insert(Session {
         req: req.clone(),
         cursors: Mutex::new(cursors),
-        principal,
+        key_id,
+        scopes,
+        last_access_ms: std::sync::atomic::AtomicI64::new(now_ms),
+        active_streams: std::sync::atomic::AtomicU64::new(0),
     });
 
     Ok(Json(WatchCreateResponse {
@@ -229,12 +378,41 @@ pub async fn stream_watch(
     // dev-only `?token=` fallback) must match the creating principal; presenting
     // none is allowed (the wid alone authorizes, the `EventSource` case).
     let presented_bearer = bearer_from_request(&headers, &params);
-    if !session.authorize(presented_bearer.as_deref()) {
+    if !session.authorize(presented_bearer.as_deref(), &state.keys) {
         return Err(Error::new(
             ErrorCode::Unauthorized,
             "watch token does not match the session's principal",
         ));
     }
+
+    // Resource limit: admit this SSE connection under the global + per-key
+    // connection caps (DoS hardening; [`crate::limits`]). The returned guard is
+    // moved into the stream and released on drop (clean close / broken pipe), so a
+    // dropped connection frees its slot. Attribute the connection to the session's
+    // creating key (constant across reconnects), so a session a key created counts
+    // against that key's cap. `0` ⇒ unlimited.
+    let sse_guard = match state
+        .live
+        .try_acquire_sse(&state.engine.config.limits, session.key_id)
+    {
+        Some(g) => g,
+        None => {
+            return Err(Error::new(
+                ErrorCode::Throttled,
+                "too many concurrent SSE connections",
+            )
+            .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S));
+        }
+    };
+
+    // Mark the session as having an open stream + re-stamp its last-access time
+    // (codex MEDIUM #11). The returned handle is moved into the stream future and
+    // decrements the count / restarts the idle-TTL clock on drop, so a session is
+    // never GC'd while a stream is live and its TTL resumes when the stream ends.
+    // GC any idle sessions opportunistically on each open, too.
+    let now_ms = state.engine.clock.now_ms();
+    state.sessions.gc_expired(now_ms);
+    let stream_handle = state.sessions.open_stream(&wid, now_ms);
 
     // `Last-Event-ID` (or the `cursor` query) may rewind the session cursors to
     // an exact prior map — never advance past the authoritative server state.
@@ -255,7 +433,7 @@ pub async fn stream_watch(
     }
 
     let engine = state.engine.clone();
-    let stream = build_stream(engine, session);
+    let stream = build_stream(engine, session, sse_guard, stream_handle);
 
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -278,6 +456,8 @@ pub async fn stream_watch(
 fn build_stream(
     engine: Arc<Engine>,
     session: Arc<Session>,
+    sse_guard: crate::limits::SseGuard,
+    stream_handle: Option<StreamHandle>,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
     let heartbeat_ms = session.req.heartbeat_ms;
     // The projection variant for this session's record frames (drives which
@@ -288,6 +468,14 @@ fn build_stream(
         session.req.include_meta,
     );
     async_stream::stream! {
+        // Hold the SSE-connection slot guard for the stream's whole lifetime;
+        // dropping it (clean close / broken pipe / cancel) releases the global +
+        // per-key connection slot (DoS hardening; [`crate::limits`]).
+        let _sse_guard = sse_guard;
+        // Hold the session stream handle: keeps the session out of idle-GC while
+        // streaming and restarts its TTL clock on close (codex MEDIUM #11).
+        let _stream_handle = stream_handle;
+
         // `retry:` once at open (deliberate 2 s backoff; API §7.5).
         yield Ok(Event::default().retry(Duration::from_millis(config::SSE_RETRY_MS)));
 
@@ -346,6 +534,10 @@ fn build_stream(
                         include_tags: session.req.include_tags,
                         include_meta: session.req.include_meta,
                         wait_ms: 0,
+                        // Bound each SSE record frame by the session's byte budget
+                        // (codex HIGH #6); the diff loop stops at this many payload
+                        // bytes so one frame cannot balloon to limit×record-cap.
+                        max_batch_bytes: session.req.max_batch_bytes,
                     };
                     let Ok(d) = engine.diff(name, req) else {
                         // Diff only fails with box_not_found here.
@@ -568,7 +760,10 @@ mod tests {
                 consistency: Consistency::Eventual,
             },
             cursors: Mutex::new(cursors),
-            principal: None,
+            key_id: None,
+            scopes: crate::auth::Scope::ALL,
+            last_access_ms: std::sync::atomic::AtomicI64::new(0),
+            active_streams: std::sync::atomic::AtomicU64::new(0),
         };
         let id = encode_session_id(&session);
         let decoded = decode_cursor_id(&id).expect("decodes");
@@ -576,7 +771,7 @@ mod tests {
         assert_eq!(decoded.get("events"), Some(&88130));
     }
 
-    fn empty_session(principal: Option<String>) -> Session {
+    fn empty_session(key_id: Option<crate::auth::KeyId>) -> Session {
         Session {
             req: WatchCreateRequest {
                 node: None,
@@ -590,24 +785,35 @@ mod tests {
                 consistency: Consistency::Eventual,
             },
             cursors: Mutex::new(BTreeMap::new()),
-            principal,
+            key_id,
+            scopes: crate::auth::Scope::ALL,
+            last_access_ms: std::sync::atomic::AtomicI64::new(0),
+            active_streams: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     #[test]
     fn session_authorize_capability_and_binding() {
+        use crate::auth::{KeyId, KeyStore};
+        // A store holding the creating key `s3cr3t` plus an unrelated valid key.
+        let keys = KeyStore::parse("s3cr3t,other").unwrap();
+
         // Unbound (dev mode): the wid alone authorizes, with or without a bearer.
         let dev = empty_session(None);
-        assert!(dev.authorize(None));
-        assert!(dev.authorize(Some("anything")));
+        assert!(dev.authorize(None, &keys));
+        assert!(dev.authorize(Some("anything"), &keys));
 
-        // Bound: no bearer presented ⇒ the wid capability suffices.
-        let bound = empty_session(Some("s3cr3t".to_string()));
-        assert!(bound.authorize(None));
-        // Bound + matching bearer ⇒ ok.
-        assert!(bound.authorize(Some("s3cr3t")));
-        // Bound + mismatched bearer ⇒ rejected (cannot replay under another key).
-        assert!(!bound.authorize(Some("wrong")));
+        // Bound to the id of `s3cr3t`.
+        let bound = empty_session(Some(KeyId::of("s3cr3t")));
+        // No bearer presented ⇒ the wid alone is NOT sufficient (codex HIGH #3):
+        // a leaked wid cannot be opened without the creating key.
+        assert!(!bound.authorize(None, &keys));
+        // Matching bearer ⇒ ok.
+        assert!(bound.authorize(Some("s3cr3t"), &keys));
+        // A DIFFERENT but valid key ⇒ rejected (cannot replay under another key).
+        assert!(!bound.authorize(Some("other"), &keys));
+        // An invalid bearer ⇒ rejected.
+        assert!(!bound.authorize(Some("wrong"), &keys));
     }
 
     #[test]

@@ -247,6 +247,17 @@ impl Engine {
         Ok(b)
     }
 
+    /// Push a job seq back onto the reclaim freelist so it becomes claimable
+    /// again. Used to recover a job whose ack/dead-letter durable delete failed
+    /// after its lease was already dropped (codex HIGH #4) — without this the seq
+    /// is below the advanced claim cursor and off the freelist, so it would never
+    /// be handed out again.
+    fn reclaim_seq(&self, b: &BoxState, seq: u64) {
+        if let Some(q) = &b.queue {
+            q.lock().push_reclaim(seq);
+        }
+    }
+
     /// Compute the live `queue` counters (§10.7) for a queue box at `now`.
     pub(crate) fn queue_counters(&self, b: &BoxState, now: i64) -> QueueState {
         let Some(q) = &b.queue else {
@@ -587,6 +598,7 @@ impl Engine {
         if node.is_empty() {
             return Err(Error::invalid_request("ack requires a non-empty `node`"));
         }
+        check_seqs_len("ack", seqs)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
@@ -612,12 +624,24 @@ impl Engine {
 
         // Delete the acked jobs from the jobs log (the §7 permanent delete). Ack
         // durability == jobs-log durability: a durable box fsyncs the delete
-        // BEFORE the ack returns (codex P0). On a durable WAL failure we propagate
-        // the error rather than reporting a phantom ack — the lease is already
-        // dropped, so the job simply resurfaces as claimable (at-least-once).
+        // BEFORE the ack returns (codex P0).
+        //
+        // The lease was already removed from the projection above. If the durable
+        // delete then FAILS, the job is no longer leased AND not deleted — and
+        // `next_claimable` consults only the reclaim freelist + claim cursor (the
+        // cursor has already advanced past this seq), so the job would be stranded
+        // forever (codex HIGH #4). Re-push the seq onto the reclaim freelist before
+        // propagating the error so it resurfaces as claimable (at-least-once)
+        // instead of being lost.
         let mut fsync_ms = 0.0;
         for &(seq, lease_id) in &acked_seqs {
-            fsync_ms += self.delete_one_seq(&b, seq, now)?;
+            match self.delete_one_seq(&b, seq, now) {
+                Ok(ms) => fsync_ms += ms,
+                Err(e) => {
+                    self.reclaim_seq(&b, seq);
+                    return Err(e);
+                }
+            }
             self.log_lease_event(
                 box_id,
                 seq,
@@ -660,6 +684,7 @@ impl Engine {
         if node.is_empty() {
             return Err(Error::invalid_request("nack requires a non-empty `node`"));
         }
+        check_seqs_len("nack", seqs)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
@@ -727,6 +752,7 @@ impl Engine {
         if node.is_empty() {
             return Err(Error::invalid_request("extend requires a non-empty `node`"));
         }
+        check_seqs_len("extend", seqs)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
@@ -926,14 +952,18 @@ impl Engine {
         }
         // Permanently delete the dead-lettered jobs from the source jobs log. The
         // DL copy is already durably appended; a failure to durably log the source
-        // delete here is self-healing (the job resurfaces as claimable and is
-        // re-dead-lettered — at-least-once), so we log a warning and move on rather
-        // than fail the whole claim pass.
+        // delete here must NOT strand the job: the diverted seq was popped off the
+        // claim cursor / reclaim freelist and never leased, so on a delete failure
+        // it is neither claimable nor reclaimable (codex HIGH #4). Push it back onto
+        // the reclaim freelist so it resurfaces as claimable and is re-dead-lettered
+        // (at-least-once) rather than being lost. We log a warning and continue
+        // rather than failing the whole claim pass.
         for &seq in seqs {
             if let Err(e) = self.delete_one_seq(src, seq, now) {
+                self.reclaim_seq(src, seq);
                 tracing::warn!(
                     src = %src.name, seq, error = %e,
-                    "dead-letter: durable source delete failed; job stays claimable (self-heals)"
+                    "dead-letter: durable source delete failed; re-queued for reclaim (self-heals)"
                 );
             }
         }
@@ -1036,6 +1066,29 @@ impl Engine {
             ts: now.max(0) as u64,
         });
     }
+}
+
+/// Reject an unbounded `seqs` array on ack/nack/extend (codex MEDIUM #10): a
+/// single request must not carry more than [`config::MAX_CLAIM`] seqs, so an
+/// attacker cannot make the server allocate/scan/echo an arbitrarily large vec
+/// (the `skipped` array echoes unmatched seqs back). The same bound already caps
+/// a `claim`'s `max`. An empty array is allowed (a no-op).
+fn check_seqs_len(op: &str, seqs: &[u64]) -> Result<()> {
+    if seqs.len() > config::MAX_CLAIM as usize {
+        return Err(Error::new(
+            ErrorCode::BatchTooLarge,
+            format!(
+                "{op} names {} seqs, exceeds max {}",
+                seqs.len(),
+                config::MAX_CLAIM
+            ),
+        )
+        .with_detail(serde_json::json!({
+            "seqs": seqs.len(),
+            "max": config::MAX_CLAIM,
+        })));
+    }
+    Ok(())
 }
 
 /// Pull the next claimable, live seq for a claim pass: the reclaim freelist is
@@ -1261,6 +1314,26 @@ mod tests {
         let a2 = engine.ack("jobs", "w1", &seqs).unwrap();
         assert_eq!(a2.acked, 0);
         assert_eq!(a2.skipped, seqs);
+    }
+
+    #[test]
+    fn ack_nack_extend_reject_unbounded_seqs() {
+        // codex MEDIUM #10: a seqs array longer than MAX_CLAIM is rejected with
+        // batch_too_large before any allocation/echo; a bounded array is accepted.
+        let (engine, _clock) = engine_with_clock();
+        engine.put_box("jobs", queue_cfg()).unwrap();
+        let over: Vec<u64> = (1..=(config::MAX_CLAIM as u64 + 1)).collect();
+
+        let e = engine.ack("jobs", "w1", &over).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BatchTooLarge);
+        let e = engine.nack("jobs", "w1", &over, 0).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BatchTooLarge);
+        let e = engine.extend("jobs", "w1", &over, 30_000).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BatchTooLarge);
+
+        // Exactly MAX_CLAIM is allowed (boundary).
+        let at: Vec<u64> = (1..=(config::MAX_CLAIM as u64)).collect();
+        assert!(engine.ack("jobs", "w1", &at).is_ok());
     }
 
     #[test]

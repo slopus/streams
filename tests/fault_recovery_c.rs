@@ -127,6 +127,7 @@ fn dump(engine: &Engine, name: &str) -> Option<Dump> {
                     include_tags: true,
                     include_meta: true,
                     wait_ms: 0,
+                    max_batch_bytes: 0,
                 },
             )
             .ok()?;

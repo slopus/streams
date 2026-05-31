@@ -215,6 +215,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
                     include_tags: true,
                     include_meta: true,
                     wait_ms: 0,
+                    max_batch_bytes: 0,
                 },
             )
             .ok()?;

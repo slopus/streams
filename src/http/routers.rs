@@ -17,10 +17,30 @@ use std::collections::HashMap;
 pub async fn put_router(
     State(state): State<AppState>,
     Path(router): Path<String>,
+    extensions: axum::http::Extensions,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
     let req: RouterCreateRequest = parse_json_body(&headers, &body)?;
+
+    // Authorization: a prefix-restricted key may only create a router whose
+    // source AND dest are within its allowlist (the router-path name was already
+    // checked at the route level, but the body's source/dest are not — and the
+    // engine auto-creates them; codex HIGH #2). Without this a scoped admin key
+    // could route forbidden data into an allowed box, or auto-create boxes
+    // outside its allowlist. A full-access / unrestricted key passes transparently.
+    if let Some(p) = extensions.get::<crate::auth::Principal>() {
+        for name in [req.source.as_str(), req.dest.as_str()] {
+            if !p.allows_name(name) {
+                return Err(crate::error::Error::new(
+                    crate::types::ErrorCode::Forbidden,
+                    "api key is not allowed to route to/from this box",
+                )
+                .with_detail(serde_json::json!({ "box": name })));
+            }
+        }
+    }
+
     let engine = state.engine.clone();
     let (created, resp) = run_blocking(move || engine.put_router(&router, req)).await?;
     let status = if created {
@@ -43,6 +63,7 @@ pub async fn get_router(
 pub async fn list_routers(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
+    extensions: axum::http::Extensions,
 ) -> Result<Json<RouterListResponse>> {
     let prefix = params.get("prefix").map(String::as_str);
     let source = params.get("source").map(String::as_str);
@@ -52,8 +73,11 @@ pub async fn list_routers(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(config::DEFAULT_PAGE_SIZE);
     let cursor = params.get("cursor").map(String::as_str);
+    // Filter to the caller key's box-name allowlist (empty ⇒ no restriction) so a
+    // prefix-limited key cannot enumerate cross-tenant routers (codex MEDIUM #7).
+    let allow = super::boxes::principal_prefixes(&extensions);
     Ok(Json(state.engine.list_routers(
-        prefix, source, dest, page_size, cursor,
+        prefix, source, dest, page_size, cursor, &allow,
     )?))
 }
 

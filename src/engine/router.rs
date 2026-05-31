@@ -28,6 +28,16 @@ impl RouterGraph {
         self.routers.get(name)
     }
 
+    /// Number of routers currently defined (resource-limit check; [`crate::limits`]).
+    pub fn len(&self) -> usize {
+        self.routers.len()
+    }
+
+    /// Whether the graph holds no routers.
+    pub fn is_empty(&self) -> bool {
+        self.routers.is_empty()
+    }
+
     pub fn forwarded_total(&self, name: &str) -> u64 {
         self.forwarded_total.get(name).copied().unwrap_or(0)
     }

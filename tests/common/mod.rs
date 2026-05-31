@@ -280,6 +280,29 @@ impl Harness {
         self.send(self.client.get(self.url(path)).bearer_auth(token))
     }
 
+    /// `PUT path` with a JSON body and a bearer token header.
+    pub fn put_auth(&self, path: &str, body: Value, token: &str) -> (StatusCode, Value) {
+        self.send(self.client.put(self.url(path)).bearer_auth(token).json(&body))
+    }
+
+    /// `DELETE path` (no body) with a bearer token header.
+    pub fn delete_auth(&self, path: &str, token: &str) -> (StatusCode, Value) {
+        self.send(self.client.delete(self.url(path)).bearer_auth(token))
+    }
+
+    /// Send `method` to `path` (no body) with a bearer token header. Supports the
+    /// no-body verbs the scope tests exercise (`DELETE`); other methods get their
+    /// own typed helper.
+    pub fn send_auth(&self, method: &str, path: &str, token: &str) -> (StatusCode, Value) {
+        let url = self.url(path);
+        let req = match method {
+            "DELETE" => self.client.delete(url),
+            "GET" => self.client.get(url),
+            other => panic!("send_auth: unsupported method {other}"),
+        };
+        self.send(req.bearer_auth(token))
+    }
+
     /// Send a prepared request, returning `(status, body-as-json-or-Null)`.
     fn send(&self, req: reqwest::blocking::RequestBuilder) -> (StatusCode, Value) {
         let resp = req.send().expect("request failed to send");

@@ -292,6 +292,7 @@ fn dump_records(engine: &Engine, name: &str) -> BTreeMap<u64, ModelRecord> {
                     include_tags: true,
                     include_meta: true,
                     wait_ms: 0,
+                    max_batch_bytes: 0,
                 },
             )
             .expect("diff");

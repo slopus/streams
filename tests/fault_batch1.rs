@@ -137,6 +137,7 @@ fn dump_records(engine: &Engine, name: &str) -> Option<BTreeMap<u64, String>> {
                     include_tags: true,
                     include_meta: true,
                     wait_ms: 0,
+                    max_batch_bytes: 0,
                 },
             )
             .ok()?;
@@ -185,6 +186,7 @@ fn full_dump(engine: &Engine, name: &str) -> Option<FullDump> {
                     include_tags: true,
                     include_meta: true,
                     wait_ms: 0,
+                    max_batch_bytes: 0,
                 },
             )
             .ok()?;

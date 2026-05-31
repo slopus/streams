@@ -168,9 +168,10 @@ curl -X POST localhost:4000/v0/watch \
   -d '{ "node": "worker-eu-1",
         "boxes": { "jobs": { "from_seq": 0 }, "events": { "tail": true } } }'
 # -> { "wid": "wid_BuRguGorNdVFWNQULz-rrw", "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw", ... }
-# The wid is an unguessable random capability: possessing it authorizes the GET
-# stream (so EventSource needs no api key in the URL). When auth is on, the wid
-# is bound to the key that created it.
+# The wid is an unguessable random capability that names the GET stream. In dev
+# mode (no auth) the wid alone opens it. When auth is ON the GET also requires the
+# creating key (Authorization header, or the dev-only ?token= on the SSE GET), so
+# a leaked wid is not a credential; the stream can never exceed the creator's scope.
 
 # Step 2: open the stream (EventSource-compatible)
 curl -N localhost:4000/v0/watch/wid_BuRguGorNdVFWNQULz-rrw
@@ -256,10 +257,17 @@ Configuration is read from the environment:
 |---|---|---|
 | `STREAMS_HOST` | `127.0.0.1` | Bind host (loopback-only by default; may also be a full `host:port`). |
 | `STREAMS_PORT` | `4000` | Listen port. |
-| `STREAMS_API_KEYS` | _(unset)_ | Comma-separated bearer keys (constant-time compared). Unset ⇒ **auth disabled** (dev mode). |
+| `STREAMS_API_KEYS` | _(unset)_ | Comma-separated bearer keys. **Hashed at rest** (SHA-256) and constant-time compared. Each entry may carry optional scopes + a box-name prefix allowlist: `key` \| `key:scopes` \| `key:scopes:prefixes` (§0.2). A bare `key` = full access. Unset ⇒ **auth disabled** (dev mode). |
 | `STREAMS_ALLOW_INSECURE_NO_AUTH` | `0` | Required to start on a **non-loopback** bind with **no** keys — otherwise the server refuses to start (it would be an open, unauthenticated event store). |
 | `STREAMS_DATA_DIR` | `./streams-data` | Directory for the WAL, segments, and snapshots. Replayed on start; a missing/empty dir is a fresh start. |
 | `STREAMS_COLD_DIR` | _(unset)_ | Optional cold-tier directory. Set ⇒ sealed segments past the hot-retention bound relocate here off the hot path; unset ⇒ tiering disabled (everything stays hot). |
+| `STREAMS_MAX_BOXES` | `100000` | Max boxes (DoS hardening). `0` = unlimited. Creating past it ⇒ `429 throttled`. |
+| `STREAMS_MAX_ROUTERS` | `10000` | Max routers. `0` = unlimited. |
+| `STREAMS_MAX_WATCH_SESSIONS` | `10000` | Max live watch sessions. `0` = unlimited. |
+| `STREAMS_MAX_SSE_CONNECTIONS` | `10000` | Max concurrent SSE connections, server-wide. `0` = unlimited. |
+| `STREAMS_MAX_SSE_CONNECTIONS_PER_KEY` | `1000` | Max concurrent SSE connections per api key. `0` = unlimited. |
+| `STREAMS_MAX_INFLIGHT_PER_KEY` | `1000` | Max concurrent in-flight requests per api key. `0` = unlimited. |
+| `STREAMS_MAX_TOTAL_BYTES` | `0` (unlimited) | Global quota on total retained record bytes across all boxes. A write past it ⇒ `429 throttled`. |
 | `RUST_LOG` | `info` | Tracing filter. |
 
 Durability is **per box**, in three commit classes (`durability`, §0.10) — the
@@ -288,13 +296,31 @@ commands above work verbatim.
   accidentally a public, unauthenticated event store. Binding a **non-loopback** address with
   **no** `STREAMS_API_KEYS` makes the server **refuse to start** unless you set
   `STREAMS_ALLOW_INSECURE_NO_AUTH=1` (it logs the reason loudly).
-- **Bearer keys** are constant-time compared. A valid key has full access (no scopes yet).
-- **Watch streams** are gated by an **unguessable `wid` capability** minted by the
-  authenticated `POST /v0/watch`; the GET stream needs no api key in the URL. The dev-only
-  `?token=` query fallback exists but leaks via logs — prefer the `Authorization` header.
+- **Bearer keys are hashed at rest** (SHA-256 — the plaintext is parsed once at startup, then
+  **zeroized and dropped**; only the digest is kept in memory, and tokens are never logged) and
+  **constant-time** compared with no early-exit.
+- **Optional scopes + prefix allowlist** — a key may carry a scope set
+  (`read`/`write`/`delete`/`admin`) and a box-name prefix allowlist, enforced per route; a key
+  outside its scope/prefix gets `403 forbidden`. The prefix allowlist is enforced on **body**
+  names too (the boxes a watch subscribes to; a router's `source`/`dest`), and **list** results
+  are filtered to the allowlist, so a scoped key cannot watch, route into, or enumerate
+  cross-tenant boxes. `/v0/metrics` requires the `read` scope. A bare `key` is full access
+  (back-compat). A malformed scope token makes the server refuse to start (fail-closed). See
+  `docs/API.md` §0.2.
+- **Resource / rate limits (DoS hardening)** — configurable caps on boxes, routers, watch
+  sessions, concurrent SSE connections (global + per-key), per-key in-flight requests, and a
+  global total-bytes quota; plus a per-response byte budget, a length bound on queue `seqs`
+  arrays, and idle watch-session GC. Past a cap ⇒ `429 throttled`. Sane defaults; `0` =
+  unlimited. See §11.
+- **Watch streams** are gated by an **unguessable 128-bit `wid` capability** minted by the
+  authenticated `POST /v0/watch`, bound to the creating key **and** its scope. When auth is on,
+  the GET stream requires the **creating key** (header or the dev-only `?token=`) — the `wid`
+  alone is not a credential, so a leaked `wid` cannot be opened by a holder who lacks the key —
+  and can never exceed the creator's scope. The `?token=` query fallback is accepted **only on
+  the SSE stream GETs** and leaks via logs — prefer the `Authorization` header.
 - **streams speaks plain HTTP** (no built-in TLS). For any non-loopback exposure, run it
-  behind a **TLS-terminating reverse proxy** (or bind loopback). TLS and per-key scopes /
-  tenant isolation are **planned** — see `docs/API.md` §0.2 / §0.11.
+  behind a **TLS-terminating reverse proxy** (or bind loopback). Native TLS is **planned** —
+  see `docs/API.md` §0.2 / §0.11.
 
 ---
 
@@ -370,6 +396,10 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
   pressure delivery degrades in latency, never in correctness.
 - **Single static binary** — WAL + segments on local NVMe, restartable at any instant;
   only data not yet in the WAL is lost.
+- **Hardened auth + resource model** — bearer keys hashed at rest (SHA-256) and constant-time
+  compared; optional per-key scopes (`read`/`write`/`delete`/`admin`) + a box-name prefix
+  allowlist enforced per route; configurable DoS-hardening limits on boxes / routers / watch
+  sessions / concurrent SSE connections / per-key in-flight requests. Loopback-default bind.
 
 ### Status — what's implemented vs planned
 
@@ -381,7 +411,12 @@ partial or planned):
   three durability commit classes (`memory`/`disk`/`fsync`); segments + snapshots +
   crash-recovery replay (including the directory-fsync hardening so a rotated/first WAL
   file's entry is durable before an ack); per-box tag index; node loop-prevention; bearer
-  auth + loopback-default bind.
+  auth with **keys hashed at rest** (SHA-256, constant-time compare, plaintext zeroized after
+  startup), **optional per-key scopes + box-name prefix allowlist** (enforced on path, request
+  body, and list results), **resource/rate limits** (boxes / routers / watch sessions / SSE
+  connections / per-key in-flight / total-bytes quota, a per-response byte budget, queue `seqs`
+  length bound, idle watch-session GC), the `wid`-plus-key watch-stream binding, and the
+  loopback-default bind.
 - **Partial:** router forwarding is **synchronous on the append path** and at-least-once via
   the source log, but a *failed* durable forward into a slow/erroring destination is treated
   as backpressure (left in the source) with **no background retry driver** yet — recovery does
@@ -389,9 +424,10 @@ partial or planned):
   The cap-vs-TTL tombstone **reason** is best-effort across a restart (the gap *range* is
   always authoritative). The throughput/latency targets above are design goals validated by
   the in-memory baseline benchmarks, not yet a tuned production SLO on durable boxes.
-- **Planned:** TLS termination (run behind a reverse proxy today), per-key scopes / tenant
-  isolation, and a durable router-backlog worker that retries failed forwards from a
-  persisted cursor. See `docs/API.md` §0.2 / §0.11 and `docs/ROADMAP.md`.
+- **Planned:** TLS termination (run behind a reverse proxy today), hard multi-tenant
+  *namespace* isolation (beyond the prefix-allowlist filter that ships today), and a durable
+  router-backlog worker that retries failed forwards from a persisted cursor. See
+  `docs/API.md` §0.2 / §0.11 and `docs/ROADMAP.md`.
 
 ---
 

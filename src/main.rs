@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if config.auth_enabled() {
         info!(
-            keys = config.api_keys.len(),
+            keys = config.key_count(),
             bind = %config.bind_addr,
             "bearer auth enabled (constant-time key comparison)"
         );
@@ -46,6 +46,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              — this server is reachable on the network with NO authentication"
         );
     }
+
+    // Resource/rate limits (DoS hardening). A `0` for any limit means unlimited;
+    // the defaults are generous. Logged so an operator can see the active caps.
+    let lim = &config.limits;
+    info!(
+        max_boxes = lim.max_boxes,
+        max_routers = lim.max_routers,
+        max_watch_sessions = lim.max_watch_sessions,
+        max_sse_connections = lim.max_sse_connections,
+        max_sse_connections_per_key = lim.max_sse_connections_per_key,
+        max_inflight_per_key = lim.max_inflight_per_key,
+        "resource limits active (0 = unlimited)"
+    );
 
     let data_dir = config
         .data_dir
@@ -120,7 +133,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let app = http::build_router(engine.clone());
+    // Build the router, parsing STREAMS_API_KEYS into the hashed key store. A
+    // malformed scope token fails closed here (rather than booting with auth
+    // silently degraded) with a clear message.
+    let app = match http::build_router_checked(engine.clone()) {
+        Ok(app) => app,
+        Err(msg) => {
+            error!("invalid STREAMS_API_KEYS: {msg}");
+            return Err(msg.into());
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     info!(

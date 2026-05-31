@@ -552,8 +552,9 @@ fn auth_good_token_succeeds() {
 #[test]
 fn auth_probe_endpoints_skip_auth_by_default() {
     let h = auth_harness("s3cr3t");
-    // Health/ready/metrics do not require auth unless STREAMS_PROBE_AUTH is set
-    // (API §8): reachable with no token even on an auth-enabled server.
+    // Health/ready (liveness/readiness) do not require auth unless
+    // STREAMS_PROBE_AUTH is set (API §8): reachable with no token even on an
+    // auth-enabled server. `/v0/metrics` is gated behind auth by default.
     let (status, body) = h.get("/v0/health");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");

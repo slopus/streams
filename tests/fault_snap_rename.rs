@@ -124,6 +124,7 @@ fn read_records(engine: &Engine, name: &str) -> Vec<(u64, String)> {
                     include_tags: true,
                     include_meta: false,
                     wait_ms: 0,
+                    max_batch_bytes: 0,
                 },
             )
             .expect("diff");
