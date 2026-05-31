@@ -23,13 +23,8 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
   const pageMap = await getPageMap()
   const navbar = (
     <Navbar logo={<Logo />} projectLink={GITHUB_URL}>
-      <a
-        href={`${GITHUB_URL}/blob/main/docs/API.md`}
-        target="_blank"
-        rel="noreferrer"
-        className="nav-extra-link"
-      >
-        /v0 spec
+      <a href={withBase('/api')} className="nav-extra-link">
+        /v0 API
       </a>
     </Navbar>
   )
