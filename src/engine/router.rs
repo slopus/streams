@@ -170,6 +170,14 @@ impl RouterGraph {
         self.routers.values().any(|r| r.source == box_name)
     }
 
+    /// The distinct set of box names that are the SOURCE of at least one router.
+    /// Used to refresh the per-box `is_router_source` atomic after any graph
+    /// mutation, so the write hot path can check that atomic instead of taking the
+    /// graph lock on every append (codex P1).
+    pub fn source_names(&self) -> std::collections::HashSet<String> {
+        self.routers.values().map(|r| r.source.clone()).collect()
+    }
+
     /// Record that `count` records were forwarded by `router` up through source
     /// seq `src_head` (advances the per-router cursor + `forwarded_total`).
     pub fn note_forwarded(&mut self, router: &str, src_head: u64, count: u64) {

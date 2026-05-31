@@ -395,6 +395,24 @@ pub struct BoxState {
     /// `last_consumed_at` for auto-priority (DESIGN §3).
     pub last_consumed_ms: AtomicI64,
 
+    /// Whether this box is the SOURCE of at least one router (forwarding rule).
+    /// A lock-free fast path for the write hot path: a write checks this atomic
+    /// instead of taking the global router-graph mutex on EVERY append (codex P1).
+    /// Maintained by the router-graph mutations (create/delete/box-delete) under the
+    /// graph lock — the rare control path — so the common write path never contends
+    /// on the graph lock just to learn "are there routers fed by me?". `Relaxed` is
+    /// sufficient: a momentarily-stale read only over- or under-triggers a forward
+    /// that the synchronous `forward_from` (which re-reads the graph under its lock)
+    /// reconciles; it never drops or duplicates a committed record.
+    pub is_router_source: std::sync::atomic::AtomicBool,
+    /// Advisory "already marked dirty in the scheduler" flag (codex P1). The
+    /// scheduler ready-set is drained only by the (not-yet-wired) phase-4 governor,
+    /// so once a box is dirty it stays dirty; this atomic lets the write hot path
+    /// skip the global scheduler mutex + string alloc on every append after the
+    /// first, removing a global lock that capped WAL-shard scaling. Reset to `false`
+    /// when the ready-set is drained so the box re-enters on its next write.
+    pub sched_dirty: std::sync::atomic::AtomicBool,
+
     /// Wakes SSE/diff long-pollers on append (ARCHITECTURE §1.2).
     pub notify: Notify,
 
@@ -481,6 +499,8 @@ impl BoxState {
             last_write_ms: AtomicI64::new(TS_NEVER),
             last_read_ms: AtomicI64::new(TS_NEVER),
             last_consumed_ms: AtomicI64::new(TS_NEVER),
+            is_router_source: std::sync::atomic::AtomicBool::new(false),
+            sched_dirty: std::sync::atomic::AtomicBool::new(false),
             notify: Notify::new(),
             broadcast: BroadcastCache::new(),
             queue,

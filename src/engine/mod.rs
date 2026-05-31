@@ -17,7 +17,7 @@ use crate::clock::SharedClock;
 use crate::config::{self, ServerConfig};
 use crate::error::{Error, Result};
 use crate::sched::Scheduler;
-use crate::storage::{MatchSel, RouterOp, WalRecord, WalWriter};
+use crate::storage::{MatchSel, RouterOp, ShardedWalWriter, WalRecord};
 use crate::types::*;
 use box_state::{BoxState, DedupeEntry, RetentionAdvance, StoredRecord};
 use dashmap::DashMap;
@@ -73,10 +73,12 @@ pub struct Engine {
     /// its own `bytes()` for per-box accounting/recovery; this gauge is the sum,
     /// reconciled on recovery + box delete.
     total_bytes_live: AtomicU64,
-    /// The WAL writer, present once a data dir is configured (durability layer,
-    /// phase 4). `None` ⇒ pure in-memory mode (engine unit tests / phase-2 shape):
-    /// mutating ops skip WAL append and `fsync_ms`/`wal_append_ms` report `0.0`.
-    wal: Option<WalWriter>,
+    /// The sharded WAL writer, present once a data dir is configured (durability
+    /// layer, phase 4). Routes each record to its box's shard by a stable hash of
+    /// the interned `box_id`. `None` ⇒ pure in-memory mode (engine unit tests /
+    /// phase-2 shape): mutating ops skip WAL append and `fsync_ms`/`wal_append_ms`
+    /// report `0.0`.
+    wal: Option<ShardedWalWriter>,
     /// Keeps the owned [`crate::storage::Wal`] alive (its `Drop` drains + fsyncs
     /// the writer and joins the thread). `None` in pure in-memory mode.
     _wal_owner: Option<Arc<WalHandle>>,
@@ -276,10 +278,8 @@ impl Engine {
             // the current clock, so the first auto-snapshot fires on growth/age
             // measured from startup, not from zero.
             if let Some(w) = &m.wal {
-                m.last_snapshot_bytes.store(
-                    w.metrics().bytes_written.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
+                m.last_snapshot_bytes
+                    .store(w.bytes_written(), Ordering::Relaxed);
             }
             m.last_snapshot_ms
                 .store(m.clock.now_ms().max(0) as u64, Ordering::Relaxed);
@@ -376,7 +376,7 @@ impl Engine {
         let Some(snap) = snapshot::capture(self, id) else {
             return Ok(false);
         };
-        let checkpoint = snap.checkpoint;
+        let checkpoint = snap.checkpoint.clone();
         // Route the snapshot write through the injected fake disk (crash harness)
         // when one is installed, so the snapshot lands on the same image the WAL
         // does and a `crash()` exercises the real atomic-swap path. Production has
@@ -388,18 +388,18 @@ impl Engine {
                 .map_err(|e| Error::internal(format!("snapshot write failed: {e}")))?,
         }
 
-        // The snapshot is durably in place: WAL files numbered strictly below the
-        // checkpoint's active file are fully absorbed and can be dropped
-        // (ARCHITECTURE §3.1, §2.4). The active file is kept (replay resumes from
-        // its checkpoint offset).
-        recovery::drop_absorbed_wal_files(dir, checkpoint.wal_idx);
+        // The snapshot is durably in place: in EACH shard, WAL files numbered
+        // strictly below that shard's checkpoint active file are fully absorbed and
+        // can be dropped (ARCHITECTURE §3.1, §2.4). The active file is kept (replay
+        // resumes from its checkpoint offset). Shard count is taken from the running
+        // writer so the per-shard subdir layout matches.
+        let shard_count = self.wal.as_ref().map(|w| w.shards()).unwrap_or(1);
+        recovery::drop_absorbed_wal_files(dir, &checkpoint.shard_positions(), shard_count);
 
         // Reset the snapshot triggers.
         if let Some(w) = &self.wal {
-            self.last_snapshot_bytes.store(
-                w.metrics().bytes_written.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+            self.last_snapshot_bytes
+                .store(w.bytes_written(), Ordering::Relaxed);
         }
         self.last_snapshot_ms
             .store(self.clock.now_ms().max(0) as u64, Ordering::Relaxed);
@@ -415,7 +415,7 @@ impl Engine {
         if self.boxes.is_empty() {
             return false;
         }
-        let written = w.metrics().bytes_written.load(Ordering::Relaxed);
+        let written = w.bytes_written();
         let since_bytes = written.saturating_sub(self.last_snapshot_bytes.load(Ordering::Relaxed));
         if since_bytes >= config::SNAPSHOT_BYTES_THRESHOLD {
             return true;
@@ -516,7 +516,7 @@ impl Engine {
     /// rotation counters), for the Prometheus exporter (M3). `None` in pure
     /// in-memory mode (no WAL).
     pub fn wal_metrics(&self) -> Option<Arc<crate::storage::WalMetrics>> {
-        self.wal.as_ref().map(|w| w.metrics())
+        self.wal.as_ref().map(|w| w.aggregated_metrics())
     }
 
     /// One O(boxes) pass collecting the aggregate engine metrics for the
@@ -976,7 +976,7 @@ impl Engine {
             })
             .collect();
         let token = w
-            .submit_batch(frames, durable)
+            .submit_batch(box_id, frames, durable)
             .map_err(|e| Error::internal(format!("WAL append failed: {e}")))?;
         Ok((elapsed_ms(t0), Some(token)))
     }
@@ -1472,6 +1472,7 @@ impl Engine {
             self.box_count.fetch_sub(1, Ordering::AcqRel);
         }
         self.routers.lock().remove_touching_box(name);
+        self.refresh_router_source_flags();
     }
 
     /// Re-insert a replayed record at its logged seq (no WAL logging). Appends in
@@ -1520,16 +1521,35 @@ impl Engine {
         // Use the source's current head so a replayed router doesn't re-forward
         // historical records (matches live `put_router` semantics).
         let src_head = self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0);
-        let mut graph = self.routers.lock();
-        // `upsert` can only fail on a cycle; a logged router was already accepted
-        // live, so ignore the (impossible-here) error to keep replay total.
-        let _ = graph.upsert(router);
-        graph.note_forwarded(&op.name, src_head, 0);
+        {
+            let mut graph = self.routers.lock();
+            // `upsert` can only fail on a cycle; a logged router was already accepted
+            // live, so ignore the (impossible-here) error to keep replay total.
+            let _ = graph.upsert(router);
+            graph.note_forwarded(&op.name, src_head, 0);
+        }
+        self.refresh_router_source_flags();
     }
 
     /// Remove a router during replay (no WAL logging).
     pub(crate) fn apply_router_delete_for_recovery(&self, name: &str) {
         self.routers.lock().remove(name);
+        self.refresh_router_source_flags();
+    }
+
+    /// Recompute every box's `is_router_source` atomic from the current router
+    /// graph (codex P1). Called after ANY graph mutation (create / delete / box
+    /// delete / replay / restore) — all rare control-plane ops — so the write hot
+    /// path can read the per-box atomic instead of locking the global graph on
+    /// every append. O(boxes + routers); never on the write path.
+    pub(crate) fn refresh_router_source_flags(&self) {
+        let sources = self.routers.lock().source_names();
+        for entry in self.boxes.iter() {
+            let b = entry.value();
+            let is_src = sources.contains(&b.name);
+            b.is_router_source
+                .store(is_src, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// `GET /v0/boxes/:box` — box state. Never auto-creates.
@@ -1723,6 +1743,7 @@ impl Engine {
             );
         }
         self.routers.lock().remove_touching_box(name);
+        self.refresh_router_source_flags();
 
         Ok(BoxDeleteResponse {
             box_name: name.to_string(),
@@ -1928,9 +1949,14 @@ impl Engine {
         // forwarding when this box is a router source. A write that needs
         // NEITHER (no WAL, no routers — e.g. a `memory` box, or any box on an
         // in-memory engine) skips the deep clone of every `serde_json::Value`
-        // entirely on that hot path (codex P0 #2). The router check is a cheap
-        // existence scan (no owned `Router` clones) under the graph lock.
-        let need_forward = self.routers.lock().has_routers_for_source(name);
+        // entirely on that hot path (codex P0 #2). The router check reads the box's
+        // lock-free `is_router_source` atomic (maintained by the rare graph-mutation
+        // control path) instead of taking the GLOBAL router-graph mutex on every
+        // append — that global lock capped WAL-shard write scaling (codex P1). The
+        // synchronous `forward_from` below still re-reads the graph under its lock to
+        // get the actual routes, so a momentarily-stale flag never drops/duplicates a
+        // record; it only decides whether to snapshot the payloads for forwarding.
+        let need_forward = b.is_router_source.load(Ordering::Relaxed);
         let need_wal = self.wal.is_some() && class != Durability::Memory;
         let stored_snapshot = if need_wal || need_forward {
             stored.clone()
@@ -2127,8 +2153,11 @@ impl Engine {
             self.forward_from(name, &forwarded, now, 0);
         }
 
-        // Mark the box dirty in the scheduler (advisory in phase 2).
-        self.scheduler.mark_dirty(name, self.effective_priority(&b));
+        // Mark the box dirty in the scheduler (advisory in phase 2). Lock-free once
+        // the box is already dirty, so this no longer takes a GLOBAL mutex on every
+        // append — that lock capped WAL-shard write scaling (codex P1).
+        self.scheduler
+            .mark_dirty_fast(name, self.effective_priority(&b), &b.sched_dirty);
 
         // Populate WAL timings: real `fsync_ms` for a durable box (the response
         // is fsync-gated), `0.0` for non-durable and for pure in-memory mode.
@@ -2277,8 +2306,11 @@ impl Engine {
             }
 
             // Mark the dest dirty in the scheduler (delivery work; advisory).
-            self.scheduler
-                .mark_dirty(&r.dest, self.effective_priority(&dest));
+            self.scheduler.mark_dirty_fast(
+                &r.dest,
+                self.effective_priority(&dest),
+                &dest.sched_dirty,
+            );
 
             // Advance the per-router cursor + forwarded_total.
             let src_head = self.get_box(source).map(|b| b.head_seq()).unwrap_or(0);
@@ -2739,8 +2771,12 @@ impl Engine {
             if created {
                 self.routers.lock().remove(name);
             }
+            self.refresh_router_source_flags();
             return Err(e);
         }
+        // The source box now (auto-)exists; refresh its lock-free router-source flag
+        // so the write hot path forwards without taking the graph lock (codex P1).
+        self.refresh_router_source_flags();
 
         // Log the router upsert (durable control frame) so it replays on restart.
         // PROPAGATE a WAL failure so a router a crash would lose is never reported
@@ -2764,6 +2800,7 @@ impl Engine {
         ) {
             if created {
                 self.routers.lock().remove(name);
+                self.refresh_router_source_flags();
             }
             return Err(e);
         }
@@ -2900,6 +2937,9 @@ impl Engine {
             )?;
         }
         let deleted = self.routers.lock().remove(name);
+        if deleted {
+            self.refresh_router_source_flags();
+        }
         Ok(RouterDeleteResponse {
             router: name.to_string(),
             deleted,

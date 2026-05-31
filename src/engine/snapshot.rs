@@ -33,29 +33,51 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     let writer = engine.wal.as_ref()?;
     let now = engine.clock.now_ms().max(0) as u64;
 
-    // 1) Flush barrier: write a durable CheckpointMark and wait for its fsync so
-    //    the writer's published position covers every prior committed frame.
-    //    (Replay treats CheckpointMark as a no-op, so logging it is harmless.)
-    //    PROPAGATE a barrier failure (codex P0): if the CheckpointMark cannot be
-    //    durably synced, the published position does NOT cover prior frames, so a
-    //    snapshot taken against it could exclude an acked write — abandon the
-    //    snapshot rather than record a checkpoint that races ahead of durability.
-    if writer
-        .append(
-            crate::storage::WalRecord::CheckpointMark {
-                last_checkpoint_seq: 0,
-                ts: now,
-            },
-            true,
-        )
-        .is_err()
-    {
+    // 1) Flush barrier on EVERY shard: write a durable CheckpointMark to each shard
+    //    and wait for its fsync so each shard's published position covers every
+    //    prior committed frame on that shard. (Replay treats CheckpointMark as a
+    //    no-op, so logging it is harmless.) PROPAGATE a barrier failure (codex P0):
+    //    if any shard's CheckpointMark cannot be durably synced, its published
+    //    position does NOT cover prior frames, so a snapshot taken against it could
+    //    exclude an acked write — abandon the snapshot rather than record a
+    //    checkpoint that races ahead of durability.
+    if writer.checkpoint_barrier_all(now).is_err() {
         return None;
     }
 
-    // 2) Record the checkpoint position FIRST (before materializing state), so a
-    //    racing write lands at/after this offset and is replayed.
-    let (wal_idx, wal_offset) = writer.position();
+    // 2) Record the per-group checkpoint positions FIRST (before materializing
+    //    state), so a racing write lands at/after its group's offset and is
+    //    replayed. Each position is keyed by its PHYSICAL group identity (the
+    //    relative dir under `wal/`: `""` flat, `shard-NN` sharded), so recovery only
+    //    ever applies an offset to the exact group it was measured against — a flat
+    //    group and a `shard-00/` group are never conflated across a shard-count
+    //    reconfigure (codex P0 #1/#3).
+    let mut keyed = writer.keyed_positions();
+    // Also record an absorbed position for EVERY leftover/orphan WAL group still on
+    // disk from a PRIOR layout (a group the current writers do not cover). Its
+    // frames were already replayed + materialized into this snapshot, so its current
+    // tail is the fully-absorbed boundary; recording it means a later recovery skips
+    // that group entirely even if its files were not yet (or could not be) deleted —
+    // so an absorbed group's control frames (Delete/BoxConfig/EvictWatermark/
+    // HeadWatermark) can never replay-from-zero and regress snapshotted state
+    // (codex P0 #2). Best-effort: a group we cannot stat is simply not recorded
+    // (recovery then replays it, still correct — Appends are seq-idempotent).
+    if let Some(dir) = &engine.data_dir {
+        let fs = engine
+            .recovery_fs
+            .clone()
+            .unwrap_or_else(crate::storage::RealFs::arc);
+        let have: std::collections::HashSet<String> =
+            keyed.iter().map(|(k, _)| k.clone()).collect();
+        for (key, pos) in crate::engine::recovery::discover_group_tails(&fs, dir) {
+            if !have.contains(&key) {
+                keyed.push((key, pos));
+            }
+        }
+    }
+    let shard_positions: Vec<(u64, u64)> = keyed.iter().map(|(_, p)| *p).collect();
+    let shard_keys: Vec<String> = keyed.iter().map(|(k, _)| k.clone()).collect();
+    let (wal_idx, wal_offset) = shard_positions.first().copied().unwrap_or((0, 0));
 
     // 3) Materialize every box's live state + the router set. Each box is captured
     //    under its own `append_lock` (codex P0): a durable write may have its WAL
@@ -98,6 +120,8 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
             wal_idx,
             wal_offset,
             last_checkpoint_seq: max_seq,
+            shards: shard_positions,
+            shard_keys,
         },
         boxes,
         routers,

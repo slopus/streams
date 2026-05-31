@@ -109,18 +109,98 @@ pub struct SnapshotRouter {
     pub forwarded_total: u64,
 }
 
-/// The checkpoint position a snapshot corresponds to: replay resumes from this
-/// `(wal_idx, wal_offset)` (the active WAL file index + byte offset at snapshot
-/// time); WAL files numbered below `wal_idx` are fully absorbed and droppable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The checkpoint position a snapshot corresponds to. With WAL sharding the
+/// snapshot records a position **per WAL group**: `shards[i] = (wal_idx,
+/// wal_offset)` is group `i`'s active WAL file index + byte offset at snapshot
+/// time, and `shard_keys[i]` is that group's PHYSICAL identity (the relative dir
+/// name under `wal/`: `""` for the flat single-shard layout, `shard-NN` for shard
+/// `NN`). Recovery resumes each group's replay from its own offset and drops that
+/// group's WAL files numbered below its `wal_idx` (they are fully absorbed).
+///
+/// # Why positions are keyed by physical group, not bare shard index
+///
+/// A bare numeric shard index conflates physically-distinct WAL groups across a
+/// `STREAMS_WAL_SHARDS` reconfigure: a multi-shard snapshot records `shards[0]` for
+/// `shard-00/`, but a later single-shard run writes to the FLAT `wal/` group (also
+/// "index 0"). Applying `shard-00`'s old offset to the flat group's freshly-written
+/// frames would skip acked frames or regress control state (codex P0 #1/#3). Keying
+/// by `shard_keys[i]` (the relative dir) makes the flat group and `shard-00/`
+/// distinct, so an offset is only ever applied to the group it was measured against.
+/// The snapshot also records absorbed positions for EVERY discovered group on disk
+/// (current writers AND any leftover/orphan group from a prior layout), so even if
+/// orphan removal later fails, recovery still has each group's absorbed offset and
+/// never replays an absorbed group's control frames from zero (codex P0 #2).
+///
+/// The leading `wal_idx`/`wal_offset` mirror `shards[0]` for the single-shard
+/// (legacy) layout and for older snapshots that predate `shards` (postcard leaves
+/// a missing trailing field empty, so an old snapshot decodes with an empty
+/// `shards` and recovery falls back to the flat `(wal_idx, wal_offset)` position).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
-    /// Numeric suffix of the WAL file the snapshot's tail is in.
+    /// Numeric suffix of the (shard-0 / single-shard) WAL file the snapshot's tail
+    /// is in. Mirrors `shards[0].0` when `shards` is populated.
     pub wal_idx: u64,
-    /// Byte offset within `wal-<wal_idx>.log` of the first un-checkpointed frame.
+    /// Byte offset within `wal-<wal_idx>.log` of the first un-checkpointed frame
+    /// (shard 0 / single shard). Mirrors `shards[0].1`.
     pub wal_offset: u64,
     /// Highest global seq absorbed by the snapshot (informational; the byte
     /// offset is the authoritative replay boundary).
     pub last_checkpoint_seq: u64,
+    /// Per-group `(wal_idx, wal_offset)` positions. Empty for an older snapshot
+    /// predating sharding (recovery then uses `(wal_idx, wal_offset)` as a single
+    /// flat-group position). Includes a position for EVERY WAL group present on
+    /// disk at snapshot time, not just the current shard count, so a leftover group
+    /// from a prior layout is also recorded as fully absorbed.
+    #[serde(default)]
+    pub shards: Vec<(u64, u64)>,
+    /// The physical identity of each entry in `shards`: `shard_keys[i]` is the
+    /// relative dir name under `wal/` for group `i` (`""` flat, `shard-NN` sharded).
+    /// Parallel to `shards`. Empty for an older snapshot (predates keying); recovery
+    /// then falls back to index-based matching for back-compat.
+    #[serde(default)]
+    pub shard_keys: Vec<String>,
+}
+
+impl Checkpoint {
+    /// The per-group `(wal_idx, wal_offset)` positions, falling back to the flat
+    /// single position for an older (pre-sharding) snapshot whose `shards` is empty.
+    /// Used by absorbed-file dropping, which only needs the offsets.
+    pub fn shard_positions(&self) -> Vec<(u64, u64)> {
+        if self.shards.is_empty() {
+            vec![(self.wal_idx, self.wal_offset)]
+        } else {
+            self.shards.clone()
+        }
+    }
+
+    /// The checkpoint position for the WAL group whose relative dir name is `key`
+    /// (`""` flat, `shard-NN` sharded), or `None` when this snapshot recorded no
+    /// position for that physical group (⇒ recovery replays it from frame zero,
+    /// never an over-skip). Matches by PHYSICAL group identity so a flat group and a
+    /// `shard-00/` group are never conflated across a shard-count reconfigure.
+    ///
+    /// Back-compat for an older snapshot whose `shard_keys` is empty: the flat group
+    /// (`key == ""`) uses `(wal_idx, wal_offset)` only when the snapshot was itself
+    /// single-position/flat; a `shard-NN` key maps positionally to `shards[NN]` (the
+    /// pre-keying layout was always `shard-NN` indexed).
+    pub fn position_for_key(&self, key: &str) -> Option<(u64, u64)> {
+        if !self.shard_keys.is_empty() {
+            return self
+                .shard_keys
+                .iter()
+                .position(|k| k == key)
+                .and_then(|i| self.shards.get(i).copied());
+        }
+        if key.is_empty() {
+            if self.shards.len() <= 1 {
+                return Some((self.wal_idx, self.wal_offset));
+            }
+            return None;
+        }
+        key.strip_prefix("shard-")
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|idx| self.shards.get(idx).copied())
+    }
 }
 
 /// The full snapshot body.
@@ -375,6 +455,8 @@ mod tests {
                 wal_idx: 3,
                 wal_offset: 4096,
                 last_checkpoint_seq: 1234,
+                shards: vec![(3, 4096)],
+                shard_keys: vec![String::new()],
             },
             boxes: vec![SnapshotBox {
                 name: "jobs".into(),

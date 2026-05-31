@@ -80,6 +80,28 @@ pub const WORK_POLL_MS: u64 = 250;
 /// (phase 4 durability layer; see [`crate::storage`]).
 pub const DEFAULT_DATA_DIR: &str = "./streams-data";
 
+/// Hard ceiling on the number of WAL shards (`STREAMS_WAL_SHARDS`). The default
+/// (`from_env`) picks `min(num_cpus, MAX_WAL_SHARDS)`. The cap bounds the writer
+/// thread / file-descriptor / preallocation footprint: each shard owns a dedicated
+/// OS writer thread and a preallocated active WAL file, so more shards trade fixed
+/// overhead for write parallelism. 8 is a generous default ceiling — past it the
+/// single durable-fsync stream is rarely the bottleneck on a single node, and the
+/// per-shard preallocation (64 MiB each by default) and thread count grow linearly.
+pub const MAX_WAL_SHARDS: usize = 8;
+
+/// The default WAL shard count when `STREAMS_WAL_SHARDS` is unset: `min(num_cpus,
+/// MAX_WAL_SHARDS)`, at least 1. Sharding the single ordered WAL writer scales
+/// durable write throughput ~linearly with shard count (each shard is an
+/// independent thread / mpsc / fsync stream with no shared hot-path contention),
+/// so matching the shard count to the available CPU parallelism (capped) is a good
+/// out-of-the-box default; the operator can override via the env var.
+pub fn default_wal_shards() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cpus.clamp(1, MAX_WAL_SHARDS)
+}
+
 // ---------------------------------------------------------------------------
 // Tiered / segment storage (Phase 6; ARCHITECTURE §3, §6)
 // ---------------------------------------------------------------------------
@@ -274,6 +296,16 @@ pub struct ServerConfig {
     /// are transparent: with no `cold_dir`, sealing still happens but nothing
     /// relocates.
     pub segment: SegmentConfig,
+    /// Number of WAL shards (`STREAMS_WAL_SHARDS`): the single ordered WAL writer
+    /// is split into this many independent shards (own thread / mpsc / fsync stream
+    /// / file set) to scale durable write throughput. Each box routes to exactly
+    /// one shard by a stable hash of its interned id, so per-box ordering and every
+    /// durability guarantee still hold. `1` (the struct [`Default`]) is the
+    /// pre-sharding single-writer behavior with the flat on-disk layout, exactly.
+    /// [`ServerConfig::from_env`] picks [`default_wal_shards`] (num_cpus-based) when
+    /// the env var is unset. Recovery is shard-count-agnostic, so this may be
+    /// changed between restarts without data loss.
+    pub wal_shards: usize,
     /// Resource / rate limits (DoS hardening; see [`crate::limits`]). Caps the
     /// number of boxes/routers/watch-sessions and concurrent SSE connections +
     /// per-key in-flight requests. Defaults are generous; a literal `0` for any
@@ -294,6 +326,10 @@ impl Default for ServerConfig {
             data_dir: None,
             cold_dir: None,
             segment: SegmentConfig::default(),
+            // Default = single shard ⇒ exact pre-sharding behavior + flat on-disk
+            // layout. `from_env` overrides with the num_cpus-based default for the
+            // production binary; in-process callers (tests) opt in explicitly.
+            wal_shards: 1,
             limits: crate::limits::Limits::default(),
         }
     }
@@ -360,6 +396,18 @@ impl ServerConfig {
 
         cfg.segment = SegmentConfig::from_env();
         cfg.limits = crate::limits::Limits::from_env();
+
+        // WAL sharding (`STREAMS_WAL_SHARDS`): split the single ordered WAL writer
+        // into N independent shards to scale durable write throughput. Unset (or
+        // unparsable / `0`) ⇒ the num_cpus-based default. Clamped to at least 1
+        // (`1` is the single-writer / flat-layout back-compat path).
+        cfg.wal_shards = match std::env::var("STREAMS_WAL_SHARDS") {
+            Ok(v) => match v.trim().parse::<usize>() {
+                Ok(n) if n >= 1 => n,
+                _ => default_wal_shards(),
+            },
+            Err(_) => default_wal_shards(),
+        };
 
         // Parse the plaintext keys into the hashed store ONCE, then zeroize/clear
         // the plaintext so no secret lingers in the long-lived config (codex

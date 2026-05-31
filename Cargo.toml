@@ -72,3 +72,9 @@ tower = { version = "0.5.3", features = ["util"] }
 [[bench]]
 name = "engine"
 harness = false
+
+# WAL-sharding scaling benchmark (Stage 2): a plain `main` that sweeps
+# STREAMS_WAL_SHARDS and prints an aggregate durable-write-ack throughput table.
+[[bench]]
+name = "wal_scaling"
+harness = false

@@ -331,6 +331,8 @@ fn monitorfs_passes_real_snapshot_write() {
             wal_idx: 1,
             wal_offset: 0,
             last_checkpoint_seq: 7,
+            shards: vec![(1, 0)],
+            shard_keys: vec![String::new()],
         },
         boxes: vec![],
         routers: vec![],

@@ -115,6 +115,50 @@ impl Scheduler {
         }
     }
 
+    /// Mark a box dirty on the WRITE HOT PATH without taking the global ready-set
+    /// mutex once the box is already dirty (codex P1). `already_dirty` is the box's
+    /// `sched_dirty` atomic: a `compare_exchange` flips it `false → true` lock-free,
+    /// and only the FIRST transition takes the mutex to enqueue the name. Since the
+    /// ready-set is drained only by the (not-yet-wired) phase-4 governor — which
+    /// clears the flag via [`Scheduler::drain_order_clearing`] — a hot box stays
+    /// dirty and every subsequent append on it is a single relaxed atomic load +
+    /// failed CAS, removing the per-write global lock that capped WAL-shard scaling.
+    pub fn mark_dirty_fast(
+        &self,
+        box_name: &str,
+        eff_priority: i64,
+        already_dirty: &std::sync::atomic::AtomicBool,
+    ) {
+        use std::sync::atomic::Ordering;
+        // Lock-free fast path: already dirty ⇒ nothing to do (and no lock).
+        if already_dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        // Claim the first transition; a lost race means another writer enqueued it.
+        if already_dirty
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.mark_dirty(box_name, eff_priority);
+    }
+
+    /// As [`Scheduler::drain_order`], but also clears each drained box's
+    /// `sched_dirty` flag (looked up via `clear`) so a future write re-enqueues it.
+    /// The phase-4 governor will use this; provided now so the `sched_dirty`
+    /// fast-path stays correct whenever a drainer is wired in.
+    pub fn drain_order_clearing<F>(&self, clear: F) -> Vec<String>
+    where
+        F: Fn(&str),
+    {
+        let out = self.drain_order();
+        for name in &out {
+            clear(name);
+        }
+        out
+    }
+
     /// Bump a box's recency clock to `now`, so its auto-priority term resets to
     /// `AUTO_MAX` (a "consume" event: GET state / diff / SSE attach or delivery;
     /// DESIGN §3.1). Centralizes the recency write behind the scheduler so the
@@ -276,5 +320,34 @@ mod tests {
         assert_eq!(order, vec!["hi", "hi2", "mid", "low", "neg"]);
         // Drained empties the set.
         assert!(sched.drain_order().is_empty());
+    }
+
+    /// The lock-free `mark_dirty_fast` enqueues a box exactly once (the first
+    /// transition of its `sched_dirty` flag), and `drain_order_clearing` clears the
+    /// flag so a later write re-enqueues it (codex P1 hot-path lock removal).
+    #[test]
+    fn mark_dirty_fast_enqueues_once_then_reenqueues_after_clear() {
+        use std::sync::atomic::AtomicBool;
+        let (sched, _clock) = sched_with_clock(0);
+        let dirty = AtomicBool::new(false);
+
+        // First mark enqueues; repeated marks while still dirty are no-ops (and take
+        // no lock).
+        sched.mark_dirty_fast("hot", 800, &dirty);
+        sched.mark_dirty_fast("hot", 800, &dirty);
+        sched.mark_dirty_fast("hot", 800, &dirty);
+        assert!(dirty.load(Ordering::Relaxed), "flag set after first mark");
+
+        // Drain (clearing the flag via the supplied closure) returns it exactly once.
+        let order = sched.drain_order_clearing(|name| {
+            assert_eq!(name, "hot");
+            dirty.store(false, Ordering::Relaxed);
+        });
+        assert_eq!(order, vec!["hot"], "enqueued exactly once despite 3 marks");
+        assert!(!dirty.load(Ordering::Relaxed), "flag cleared on drain");
+
+        // After the clear a fresh write re-enqueues it.
+        sched.mark_dirty_fast("hot", 800, &dirty);
+        assert_eq!(sched.drain_order(), vec!["hot"], "re-enqueued after clear");
     }
 }

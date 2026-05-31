@@ -826,6 +826,11 @@ fn spawn_server(port: u16, data_dir: &std::path::Path) -> std::process::Child {
         .env("STREAMS_HOST", "127.0.0.1")
         .env("STREAMS_PORT", port.to_string())
         .env("STREAMS_DATA_DIR", data_dir)
+        // Pin a single WAL shard for a deterministic on-disk layout across the
+        // restart (the default is num_cpus-based); these tests recover via the
+        // shard-agnostic engine, so this only keeps the layout stable for any
+        // direct file inspection.
+        .env("STREAMS_WAL_SHARDS", "1")
         .env("RUST_LOG", "error")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -27,6 +27,7 @@
 pub mod fs;
 pub mod segment;
 pub mod segstore;
+pub mod sharded_wal;
 pub mod snapshot;
 pub mod wal;
 
@@ -48,6 +49,7 @@ pub use segment::{
 pub use segstore::{
     BoxTier, LocalSegmentStore, SegmentId, SegmentPart, SegmentStore, StoreError, Tier,
 };
+pub use sharded_wal::{shard_for_box, shard_wal_dir, ShardedWal, ShardedWalWriter};
 pub use snapshot::{
     load_latest, load_latest_with, next_snapshot_id, next_snapshot_id_with, write_snapshot,
     write_snapshot_with, Checkpoint, Snapshot, SnapshotBox, SnapshotError, SnapshotRecord,

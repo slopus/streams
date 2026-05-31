@@ -191,6 +191,8 @@ fn mk_snapshot(id: u64, seq: u64) -> Snapshot {
             wal_idx: 1,
             wal_offset: 0,
             last_checkpoint_seq: seq,
+            shards: vec![(1, 0)],
+            shard_keys: vec![String::new()],
         },
         boxes: vec![],
         routers: vec![],

@@ -976,3 +976,100 @@ start of the iteration; "After" = these final verified numbers.
   (~126 K jobs/s) and was unaffected.
 - **fsync-class latency (~5 ms)** is the physical NVMe `fdatasync` floor and is
   not an engine bug — it is the cost of the acked⇒durable guarantee.
+
+# WAL sharding — write scaling (2026-05-31)
+
+The single ordered WAL writer (one thread / mpsc / fsync stream) serialized ALL
+durable writes — the write-throughput bottleneck. This iteration splits it into
+`N` independent shards (`STREAMS_WAL_SHARDS`), each its own WAL file set + writer
+thread + group commit + per-shard checkpoint, with each box routed to exactly one
+shard by a stable hash of its interned `box_id`. Recovery is **shard-count-agnostic**:
+it replays every WAL group on disk (flat `wal/` + every `shard-NN/`) dispatched by
+`box_id`, so `STREAMS_WAL_SHARDS` can be reconfigured between restarts with no data
+loss (verified live below: 8 → 3 → 1 restarts, all acked durable records recovered).
+
+**Machine:** Apple M4 Max, 16 cores (12P+4E), 128 GiB, macOS/APFS single volume.
+Bench: `benches/wal_scaling.rs` — 64 concurrent writers across 256 boxes, 256 B
+payload, aggregate write-ack throughput; `cargo bench --bench wal_scaling`.
+
+## The hardware ceiling: fsync-class is device-bound, not software-bound
+
+On this single-APFS-volume Mac, **durable (`fsync`-class) throughput does not scale
+with shards** — and that is a property of the device, not the engine. APFS takes a
+volume-level barrier per `fsync`, so concurrent fsync streams do not parallelize
+(a standalone raw-`fdatasync` probe: 1 thread 227 fsync/s @ 4.4 ms; 16 threads only
+672 fsync/s @ 22.8 ms). Splitting writers across N shards shrinks each shard's
+group-commit cohort, so you issue MORE fsyncs that then serialize at the device
+anyway — a double loss. The `disk`-class curve here shows the same wall (avg fsync
+4.4 ms → 6.9 ms as shards rise 1 → 8):
+
+| shards | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| disk-class acks/s | 230 K | 205 K | 169 K | 145 K |
+| avg fsync | 4.4 ms | 4.7 ms | 5.5 ms | 6.9 ms |
+
+So on a single shared-volume host, the right tuning is **FEWER shards + fat group
+commits**, not more. Sharding pays off where fsync actually parallelizes — Linux +
+ext4/XFS/NVMe, or a separate device per shard — and where a single writer thread is
+the bottleneck (the planned dedicated Linux/NVMe + per-core `taskset` iteration).
+
+## The software path DOES scale (the codex-P1 hot-path lock fix)
+
+To prove the **engine's** write path scales with shard count once the device wall is
+removed, measure the `memory`-class path (no `fsync` at all, so only software cost +
+contention remains). This iteration also removed the two GLOBAL locks that previously
+sat on the per-write hot path and capped scaling regardless of shard count (codex
+P1): the router-graph mutex (`has_routers_for_source` on every append → a lock-free
+per-box `is_router_source` atomic) and the scheduler ready-set mutex (`mark_dirty` on
+every append → a lock-free `sched_dirty` fast path). With those gone the memory-class
+path scales positively with shards up to the core/contention limit:
+
+| shards | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| memory-class acks/s | 1.53 M | 1.88 M | 2.46 M | 2.13 M |
+| speedup vs 1 shard | 1.00× | 1.23× | 1.61× | 1.40× (plateau) |
+
+The curve climbs to ~1.6× at 4 shards then plateaus at 8 — the expected shape for 64
+writers / 256 boxes on a 16-core box: the software path no longer has a single global
+write lock, so throughput rises with parallelism until it saturates CPU / cross-core
+cache traffic. (Before the P1 fix, the global router + scheduler mutexes pinned the
+per-write critical section, so adding shards bought little.)
+
+## Honest assessment: near-linear?
+
+**Not near-linear on this Mac, and that is a hardware result, not a design defect.**
+- `fsync`-class (the production-durable class) is **fsync-device-bound** on a single
+  APFS volume and gets *worse* with shards — set `STREAMS_WAL_SHARDS=1` on such a host.
+- The **software write path** scales positively (≈1.6× at 4 shards, memory-class)
+  now that the global hot-path locks are gone — sub-linear because of CPU/cache
+  saturation at this writer/box/core ratio, not a shared lock. Per-box append-order,
+  the commit sequencer, R3 durable head watermark, R5 atomic batch, and the
+  durability classes all still hold per shard (each box owns one shard's ordered
+  writer); cross-box global order was never a guarantee.
+- True near-linear durable scaling needs **fsync parallelism** (Linux + NVMe/XFS or
+  per-shard devices), where each shard's independent fsync stream actually runs
+  concurrently. That is the planned dedicated iteration; this Mac's single-volume
+  fsync barrier physically caps the fsync-class demonstration.
+
+## Default: `min(num_cpus, 8)`
+
+`STREAMS_WAL_SHARDS` defaults to `min(num_cpus, 8)` (≥ 1). Rationale: on the Linux/
+NVMe target one writer thread per core (capped at 8) matches available fsync
+parallelism without oversharding (which fragments each shard's group commit and
+spawns idle writer threads). The cap of 8 bounds the writer-thread count and keeps
+per-shard cohorts fat enough to amortize fsync. `shards = 1` is the flat legacy
+layout, byte-for-byte identical to the pre-sharding WAL (back-compat, and the right
+setting for a single shared-fsync-volume host like this Mac). Operators on a
+single-volume host should set `STREAMS_WAL_SHARDS=1`.
+
+## Verified (this iteration)
+
+- `cargo test` 384 · `--features test-fs` 575 · `--features test-fs,failpoints` 585
+  — all green. clippy clean (default + `test-fs`, `--all-targets`).
+- `streams-probe conformance` **117/117** against a default-config server running an
+  8-shard WAL (`shard-00..07` confirmed on disk), and **117/117** against a 3-shard
+  server after reconfigure.
+- **kill -9 + restart with a DIFFERENT shard count**: 12 durable boxes × 20 records
+  written, `kill -9`, restart 8 → 3 → 1; every acked durable record recovered
+  (head/count = 20/20 per box, seqs 1..20 contiguous with correct payloads), and a
+  post-reconfigure durable write acked + persisted.

@@ -953,7 +953,8 @@ impl Iterator for WalReader {
 /// WAL writer tuning knobs (ARCHITECTURE §2.3/§2.4).
 #[derive(Debug, Clone)]
 pub struct WalConfig {
-    /// Data directory; the WAL lives under `<data_dir>/wal`.
+    /// Data directory; the WAL lives under `<data_dir>/wal` (plus an optional
+    /// per-shard subdirectory, see [`WalConfig::shard_subdir`]).
     pub dir: PathBuf,
     /// Minimum group-commit window (a lone durable write fsyncs ~immediately).
     pub gc_min: Duration,
@@ -963,11 +964,17 @@ pub struct WalConfig {
     pub file_size: u64,
     /// Ingest channel capacity (bounded backpressure for the single writer).
     pub channel_cap: usize,
+    /// Optional per-shard subdirectory beneath `<dir>/wal` (WAL sharding). When
+    /// `Some("shard-00")`, this writer's files live at
+    /// `<dir>/wal/shard-00/wal-<idx>.log`; when `None` (the default, and the
+    /// single-shard back-compat layout) they live flat at `<dir>/wal/wal-<idx>.log`,
+    /// byte-for-byte identical to the pre-sharding on-disk layout.
+    pub shard_subdir: Option<String>,
 }
 
 impl WalConfig {
     /// Defaults matching ARCHITECTURE §2.3 (GC 0.5..10 ms) and §2.4 (64 MiB
-    /// preallocated files).
+    /// preallocated files). No shard subdirectory ⇒ the flat single-writer layout.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         WalConfig {
             dir: dir.into(),
@@ -975,6 +982,17 @@ impl WalConfig {
             gc_max: Duration::from_millis(10),
             file_size: 64 << 20,
             channel_cap: 4096,
+            shard_subdir: None,
+        }
+    }
+
+    /// The directory this writer's `wal-<idx>.log` files live in: `<dir>/wal`
+    /// (single-shard / legacy layout) or `<dir>/wal/<shard_subdir>` (a WAL shard).
+    fn wal_dir(&self) -> PathBuf {
+        let base = self.dir.join("wal");
+        match &self.shard_subdir {
+            Some(sub) => base.join(sub),
+            None => base,
         }
     }
 }
@@ -1152,6 +1170,14 @@ impl WalMetrics {
 pub struct WalWriter {
     tx: mpsc::SyncSender<Submission>,
     metrics: Arc<WalMetrics>,
+    /// Shared stop signal (also held by the writer task). Once set, [`submit`]
+    /// rejects with [`WalError::WriterGone`] so no token is created after the
+    /// writer has begun its final drain — closing the shutdown race where a
+    /// post-drain `submit` could enqueue a [`Submission`] the writer never sees,
+    /// leaving its [`CommitToken`] forever unsignaled (codex P2). The drain side
+    /// (`drain_and_commit_remaining`) waits for the in-flight gauge (`metrics.queued`)
+    /// to reach zero, so a submit already PAST the shutdown check is still committed.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WalWriter {
@@ -1203,8 +1229,25 @@ impl WalWriter {
         // (which decrements on dequeue) can never race ahead of this bump and
         // underflow the gauge. Rolled back below if the send fails. This is the
         // observable WAL queue depth / R5 backpressure signal (counts submissions,
-        // i.e. channel slots).
+        // i.e. channel slots). The bump is ALSO the shutdown handshake: it is
+        // published (SeqCst) before the shutdown check, so a drain side waiting for
+        // `queued == 0` either sees this in-flight submission (and waits to commit
+        // it) or this submit observes `shutdown` and rolls the gauge back. Either
+        // way no accepted submission is ever stranded (codex P2).
         self.metrics.enqueued();
+        // Full fence so the `queued` bump above is globally ordered before the
+        // shutdown load below — pairs with the writer's `store(shutdown, SeqCst)`
+        // then `load(queued, SeqCst)` in `drain_and_commit_remaining`, giving the
+        // total order that guarantees: the writer either observes this in-flight
+        // bump (and drains/commits this submission) OR this submit observes shutdown
+        // (and rejects). No accepted submission is ever stranded (codex P2).
+        std::sync::atomic::fence(Ordering::SeqCst);
+        // Reject once shutdown has begun: the writer is draining toward exit and a
+        // token created now might never be signaled. Roll the gauge back first.
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.metrics.enqueue_rollback();
+            return Err(WalError::WriterGone);
+        }
         self.tx
             .try_send(Submission {
                 records,
@@ -1305,7 +1348,7 @@ impl Wal {
         first_idx: u64,
         existing_len: u64,
     ) -> Result<Wal, WalError> {
-        let wal_dir = cfg.dir.join("wal");
+        let wal_dir = cfg.wal_dir();
         fs.create_dir_all(&wal_dir)?;
         // Harden the `wal/` directory entry itself by fsyncing its parent (codex
         // P0): a crash after a durable ack must not lose the `wal/` directory entry
@@ -1344,7 +1387,11 @@ impl Wal {
             .map_err(WalError::Io)?;
 
         Ok(Wal {
-            writer: WalWriter { tx, metrics },
+            writer: WalWriter {
+                tx,
+                metrics,
+                shutdown: shutdown.clone(),
+            },
             shutdown,
             handle: Some(handle),
         })
@@ -1542,20 +1589,16 @@ impl WriterTask {
             // under load (the channel backs up while the writer was busy).
             self.drain_ready(&mut pending, &mut any_durable);
 
-            // Adaptive window: only a *durable* batch needs to wait at all, and
-            // only to let concurrent durable writers join this fsync. The window
-            // collapses to ~0 when quiet (a lone durable write fsyncs at once)
-            // and widens toward `gc_max` under load. Cheap load proxy = how many
-            // frames we just coalesced relative to the channel capacity.
+            // Adaptive group-commit coalescing: only a *durable* batch waits at
+            // all, and only to let concurrent durable writers join THIS fsync so
+            // one fdatasync amortizes across the whole cohort (the batching factor
+            // is what makes throughput scale — and what keeps WAL sharding from
+            // fragmenting the group commit when writers are spread thin across
+            // shards). A lone durable write with nothing else waiting fsyncs at
+            // once (the window collapses to ~0); under load the writer keeps
+            // coalescing until arrivals stall or the bounded `gc_max` deadline hits.
             if any_durable {
-                let window = self.adaptive_window(pending.len());
-                if window > Duration::ZERO {
-                    // ONE bounded sleep (never a spin-loop): bounded by gc_max,
-                    // so the writer always makes progress.
-                    std::thread::sleep(window);
-                    // Pull any stragglers that arrived during the window.
-                    self.drain_ready(&mut pending, &mut any_durable);
-                }
+                self.coalesce_durable(&mut pending, &mut any_durable);
             }
 
             self.commit_batch(&mut scratch, &mut batch_bytes, pending, any_durable);
@@ -1565,26 +1608,90 @@ impl WriterTask {
         let _ = self.file.fdatasync();
     }
 
-    /// The adaptive group-commit window for a batch that just coalesced
-    /// `batched` frames. Lerps `gc_min..gc_max` by load; a tiny batch (quiet)
-    /// uses ~`gc_min`, a large one (saturated) approaches `gc_max`.
-    fn adaptive_window(&self, batched: usize) -> Duration {
-        let cap = self.cfg.channel_cap.max(1);
-        let frac = (batched as f64 / cap as f64).min(1.0);
-        let span = self.cfg.gc_max.saturating_sub(self.cfg.gc_min);
-        self.cfg.gc_min + span.mul_f64(frac)
+    /// Coalesce as many concurrent durable submissions as possible into the
+    /// `pending` batch before the single group fdatasync, so one fsync amortizes
+    /// across the whole writer cohort. This is the load-bearing throughput lever:
+    /// the more writes per fsync, the fewer (expensive) fsyncs per second the
+    /// device must do — and with WAL sharding, each shard sees fewer writers, so a
+    /// naive fixed window would let each shard fragment its group commit into many
+    /// tiny fsyncs (measured: frames/fsync collapsing as shard count rose, which
+    /// reversed the scaling). Coalescing aggressively per shard keeps the batching
+    /// factor high regardless of shard count.
+    ///
+    /// Strategy (bounded, no busy-spin past the deadline): if at least one more
+    /// durable submission is already visible in the ingest queue, keep draining in
+    /// short slices until **arrivals stall** (a full slice passed with nothing new)
+    /// or the `gc_max` deadline is reached. A lone durable write with an empty
+    /// queue does NOT wait — it fsyncs immediately (latency-optimal when quiet).
+    /// The per-slice park is `gc_min` (sub-millisecond), so the writer reacts fast
+    /// to a stall yet never spins hot. Every wait is capped by `gc_max`, so the
+    /// writer always makes timely forward progress.
+    fn coalesce_durable(&mut self, pending: &mut Vec<Submission>, any_durable: &mut bool) {
+        // Nothing else is queued behind what we already drained ⇒ a quiet, lone
+        // durable batch. Fsync now (no added latency).
+        if self.metrics.queued.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let deadline = Instant::now() + self.cfg.gc_max;
+        loop {
+            // First drain everything already waiting (cheap, non-blocking) — this
+            // is the bulk of the cohort under load.
+            self.drain_ready(pending, any_durable);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // Block up to one `gc_min` slice for the NEXT straggler. `recv_timeout`
+            // parks (no spin) until an arrival or the slice elapses; a timeout means
+            // arrivals have stalled, so the cohort has stopped growing and waiting
+            // longer would only add latency.
+            let slice = self.cfg.gc_min.min(remaining);
+            match self.rx.recv_timeout(slice) {
+                Ok(s) => {
+                    self.metrics.dequeued();
+                    *any_durable |= s.durable;
+                    pending.push(s);
+                    // Loop: sweep any others that arrived alongside it, then keep
+                    // coalescing until arrivals stall or the deadline passes.
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
     }
 
-    /// On shutdown, commit every already-submitted frame in one final fsynced
-    /// batch so no queued write is lost, then return. The channel may still be
-    /// open (clones outstanding) but only currently-queued frames are drained.
+    /// On shutdown, commit every already-submitted frame so no queued write is
+    /// lost, then return. The channel may stay open (engine clones outstanding),
+    /// so we cannot rely on disconnection. Instead we drain in a loop until the
+    /// in-flight gauge (`metrics.queued`, bumped by `submit` BEFORE its shutdown
+    /// check) reaches zero: every submission that passed its shutdown check is
+    /// counted there and is therefore drained + committed here, while every submit
+    /// AFTER `shutdown` was set rejects (and rolls the gauge back) so it adds no new
+    /// token. That closes the shutdown race where a straggler `submit` between the
+    /// drain and the receiver drop would leave its `CommitToken` forever unsignaled
+    /// (codex P2). A brief park between passes avoids a hot spin while an in-flight
+    /// submit completes its `try_send`.
     fn drain_and_commit_remaining(&mut self, scratch: &mut Vec<u8>, batch_bytes: &mut Vec<u8>) {
-        let mut pending: Vec<Submission> = Vec::new();
-        let mut any_durable = false;
-        self.drain_ready(&mut pending, &mut any_durable);
-        // Force a fsync on the final batch regardless of class, so a clean
-        // shutdown hardens the tail.
-        self.commit_batch(scratch, batch_bytes, pending, true);
+        loop {
+            let mut pending: Vec<Submission> = Vec::new();
+            let mut any_durable = false;
+            self.drain_ready(&mut pending, &mut any_durable);
+            if !pending.is_empty() {
+                // Force a fsync on each drained batch, so a clean shutdown hardens
+                // every frame's tail.
+                self.commit_batch(scratch, batch_bytes, pending, true);
+                continue;
+            }
+            // Nothing immediately available. If no submission is still in flight
+            // (gauge drained), we are done. Otherwise an in-flight `submit` has
+            // bumped the gauge but not yet completed its `try_send` (or will reject
+            // and roll back) — park briefly and re-drain so we never exit while an
+            // accepted submission is still arriving.
+            if self.metrics.queued.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Move every immediately-available submission out of the channel.
@@ -2579,5 +2686,62 @@ mod tests {
         );
 
         wal.shutdown();
+    }
+
+    /// codex P2: a `submit` racing with shutdown must never leave a `CommitToken`
+    /// unsignaled. Many writer threads hammer `submit` while another thread triggers
+    /// shutdown; every returned token must resolve (Ok or WriterGone) — a hang here
+    /// (token never signaled) would deadlock the join via the harness timeout.
+    #[test]
+    fn submit_racing_shutdown_never_strands_a_token() {
+        use std::sync::mpsc::channel;
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let wal = Wal::open_at(WalConfig::new(dir.path()), 1, 0).unwrap();
+            let w = wal.writer();
+
+            let (tx, rx) = channel::<Result<(), WalError>>();
+            let mut handles = Vec::new();
+            for t in 0..8u32 {
+                let w = w.clone();
+                let tx = tx.clone();
+                handles.push(std::thread::spawn(move || {
+                    for seq in 0..50u64 {
+                        // submit then wait: a stranded token would hang this wait.
+                        let r = match w
+                            .submit(append(1, t as u64 * 50 + seq + 1, None, None, b"x"), true)
+                        {
+                            Ok(tok) => tok.wait(),
+                            Err(e) => Err(e),
+                        };
+                        let _ = tx.send(r);
+                    }
+                }));
+            }
+            drop(tx);
+
+            // Trigger shutdown partway through the race (drops + joins the writer).
+            std::thread::spawn(move || {
+                std::thread::yield_now();
+                wal.shutdown();
+            });
+
+            // Every submitted token resolved one way or the other — none stranded.
+            // `recv` returns until all senders (writer threads) are done; a stranded
+            // token would block a worker forever and this loop would hang (caught by
+            // the test harness timeout) instead of completing.
+            let mut results = 0usize;
+            while rx.recv().is_ok() {
+                results += 1;
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                results,
+                8 * 50,
+                "every submit produced exactly one resolved outcome"
+            );
+        }
     }
 }

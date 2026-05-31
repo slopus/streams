@@ -1,29 +1,39 @@
 //! WAL + snapshot recovery (ARCHITECTURE §4): on startup, load the latest valid
-//! metadata snapshot, then replay the WAL from the snapshot's checkpoint
+//! metadata snapshot, then replay **every** WAL shard from its checkpoint
 //! position to rebuild the in-memory index, truncate any torn tail, then resume
-//! the writer for new appends.
+//! the (sharded) writer for new appends.
+//!
+//! # Shard-count-agnostic recovery (WAL sharding)
+//!
+//! The WAL is split into N independent shards (one writer thread / file set each,
+//! see [`crate::storage::sharded_wal`]). Recovery is driven by the WAL FILES on
+//! disk, NOT by the configured shard count: it discovers and replays the flat
+//! layout (`wal/wal-<idx>.log`, the single-shard / legacy layout) AND every
+//! `wal/shard-NN/` subdir, dispatching each frame to its box by `box_id` (never
+//! assuming a box lives in `box_id % N`). This lets `STREAMS_WAL_SHARDS` be
+//! reconfigured between restarts with no data loss — a dir written with K shards
+//! recovers correctly when reopened with any N. The NEW writers use the current
+//! layout; previous-layout files are absorbed + dropped at the next snapshot.
 //!
 //! Recovery order (ARCHITECTURE §4):
 //!
-//! 1. Load the latest valid snapshot under `<data_dir>/meta` (if any) and
-//!    restore the box registry, per-box materialized state + floors, routers,
-//!    and `next_box_id`. A missing/torn snapshot ⇒ start from an empty state and
-//!    replay the WAL from frame zero (the Stage-2 behavior).
-//! 2. Replay WAL frames **after the checkpoint position**: WAL files numbered
-//!    below the checkpoint's active file are fully absorbed (skipped); the
-//!    active file is replayed from the checkpoint byte offset onward. Frames are
-//!    applied in global (file-index, then in-file) order, reproducing the
-//!    pre-crash state on top of the snapshot:
+//! 1. Load the latest valid snapshot under `<data_dir>/meta` (if any) and restore
+//!    the box registry, per-box materialized state + floors, routers, and
+//!    `next_box_id`. The snapshot's checkpoint carries a PER-SHARD `(wal_idx,
+//!    wal_offset)`; replay resumes each shard from its own offset. A missing/torn
+//!    snapshot ⇒ start empty and replay every WAL file from frame zero.
+//! 2. Replay frames **after each shard's checkpoint**, in-stream, dispatched by
+//!    `box_id`. Files below a shard's checkpoint index are absorbed (skipped):
 //!
-//!    - `Append`  → re-insert the record at its logged seq, **unless** its seq is
-//!      already `<= head` for that box (already covered by the snapshot) ⇒
-//!      skipped (idempotent overlap; ARCHITECTURE §4).
+//!    - `Append`  → re-insert at its logged seq, unless `seq <= head` (snapshot
+//!      overlap ⇒ skipped, idempotent). An out-of-contiguity append from a
+//!      shard-count reconfigure is deferred + re-applied seq-sorted.
 //!    - `Delete`  → re-apply the `before_seq`/`match` selector (idempotent).
 //!    - `BoxConfig` (create/update / tombstone) → create/update or remove a box.
 //!    - `RouterCreate`/`RouterDelete` → rebuild the router graph.
 //!    - `EvictWatermark` → restore the cap/TTL floor.
 //!
-//! 3. Truncate the active WAL file's torn tail (length overrun / CRC) so a new
+//! 3. Truncate each shard's active-file torn tail (length overrun / CRC) so a new
 //!    append can never be confused with a partial one.
 
 use std::path::{Path, PathBuf};
@@ -33,7 +43,10 @@ use crate::engine::{
     decode_record_payload, matchsel_to_filter, snapshot as engine_snapshot, wal_glue::WalHandle,
     Engine, ReplayRecord,
 };
-use crate::storage::{Fs, OpenOpts, RealFs, Wal, WalConfig, WalReader, WalRecord, WalWriter};
+use crate::storage::{
+    shard_wal_dir, Fs, OpenOpts, RealFs, ShardedWal, ShardedWalWriter, WalConfig, WalReader,
+    WalRecord,
+};
 use crate::types::BoxConfig;
 
 /// The parsed numeric suffix + path of a `wal-<n>.log` file.
@@ -42,10 +55,54 @@ struct WalFile {
     path: PathBuf,
 }
 
+/// A discovered on-disk WAL shard group: the files of one writer (the flat
+/// `wal/` layout, or one `wal/shard-NN/` subdir), plus the shard index that
+/// names it. The flat layout is shard index `0` (it is the single-shard / legacy
+/// layout). Recovery replays EVERY discovered group regardless of how many shards
+/// the current config asks for — the shard-count-agnostic-replay property.
+struct WalShardGroup {
+    /// The shard index this group's name implies (flat ⇒ 0, `shard-NN` ⇒ NN). Used
+    /// only for a deterministic sort order; the AUTHORITATIVE checkpoint match is by
+    /// physical group `key()`, never this bare index (codex P0 #1/#3).
+    shard_idx: usize,
+    /// The physical directory this group's files live in (`wal/` for the flat
+    /// layout, or `wal/shard-NN/`). Stored explicitly so a flat group and a
+    /// `shard-00/` group (both `shard_idx == 0`) are never conflated.
+    dir: PathBuf,
+    /// `wal-<n>.log` files in this group, ascending by index.
+    files: Vec<WalFile>,
+}
+
+impl WalShardGroup {
+    /// This group's PHYSICAL identity for checkpoint matching: the relative dir name
+    /// under `wal/` (`""` for the flat layout, `shard-NN` for a sharded subdir).
+    /// Matches the key the snapshot recorded via [`crate::storage::shard_group_key`],
+    /// so a position is only ever applied to the exact physical group it was measured
+    /// against. `wal_dir` is `<data_dir>/wal`.
+    fn key(&self, wal_dir: &Path) -> String {
+        if self.dir == wal_dir {
+            String::new()
+        } else {
+            self.dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string()
+        }
+    }
+}
+
 /// Enumerate `wal-<n>.log` files under `wal_dir`, ascending by numeric suffix.
 fn list_wal_files(fs: &Arc<dyn Fs>, wal_dir: &Path) -> std::io::Result<Vec<WalFile>> {
     let mut files: Vec<WalFile> = Vec::new();
-    for path in fs.read_dir(wal_dir)? {
+    let entries = match fs.read_dir(wal_dir) {
+        Ok(e) => e,
+        // A missing shard dir is simply an empty group (e.g. a shard that never
+        // received a write, or a layout that does not use this subdir).
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+        Err(e) => return Err(e),
+    };
+    for path in entries {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
@@ -62,6 +119,179 @@ fn list_wal_files(fs: &Arc<dyn Fs>, wal_dir: &Path) -> std::io::Result<Vec<WalFi
     Ok(files)
 }
 
+/// Parse a `shard-NN` directory name into its shard index.
+fn parse_shard_dir(name: &str) -> Option<usize> {
+    name.strip_prefix("shard-").and_then(|s| s.parse().ok())
+}
+
+/// Discover **every** WAL shard group on disk under `<data_dir>/wal`,
+/// shard-count-agnostically: the flat `wal/` layout (legacy / single-shard) AND
+/// every `wal/shard-NN/` subdirectory, regardless of how many shards the current
+/// config requests. This is the basis of the shard-count-agnostic-replay
+/// property: a dir written with K shards is fully replayed when reopened with any
+/// N (the configured count only governs the NEW writers, not which files replay).
+///
+/// Returns the groups sorted by `shard_idx`, each with its files ascending by
+/// index. An empty result means a fresh data dir.
+fn discover_shard_groups(fs: &Arc<dyn Fs>, wal_dir: &Path) -> std::io::Result<Vec<WalShardGroup>> {
+    let mut groups: Vec<WalShardGroup> = Vec::new();
+
+    // The flat layout: `wal-<n>.log` files directly under `wal/` (shard 0 / legacy
+    // single-shard). Present iff a single-shard run wrote here.
+    let flat = list_wal_files(fs, wal_dir)?;
+    if !flat.is_empty() {
+        groups.push(WalShardGroup {
+            shard_idx: 0,
+            dir: wal_dir.to_path_buf(),
+            files: flat,
+        });
+    }
+
+    // Every `shard-NN/` subdir (a multi-shard run). Discovered independently of the
+    // current shard count.
+    let entries = match fs.read_dir(wal_dir) {
+        Ok(e) => e,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(groups),
+        Err(e) => return Err(e),
+    };
+    for path in entries {
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(shard_idx) = parse_shard_dir(name) {
+            let files = list_wal_files(fs, &path)?;
+            // A `shard-00` subdir AND a flat layout (both `shard_idx == 0`) can
+            // coexist after a reconfigure (a prior multi-shard run wrote `shard-00`,
+            // a current single-shard run writes flat). They are kept as SEPARATE
+            // groups with their own `dir`, so nothing is conflated or dropped — both
+            // replay, and the Append seq-skip makes any overlap idempotent.
+            groups.push(WalShardGroup {
+                shard_idx,
+                dir: path.clone(),
+                files,
+            });
+        }
+    }
+
+    groups.sort_by_key(|g| g.shard_idx);
+    Ok(groups)
+}
+
+/// Enumerate every on-disk WAL group under `<data_dir>/wal` and return each one's
+/// `(physical group key, (last_file_idx, valid_tail_len))`. The key is the relative
+/// dir under `wal/` (`""` flat, `shard-NN` sharded). The tail position is the index
+/// of the highest `wal-<n>.log` and its CRC-valid byte length — i.e. the offset just
+/// past the last intact frame.
+///
+/// Used by snapshot capture (codex P0 #2) to record an ABSORBED checkpoint position
+/// for every leftover/orphan group from a prior layout, so a later recovery skips an
+/// already-materialized group entirely even if its files were not yet deleted — its
+/// control frames can never replay-from-zero and regress snapshotted state. A group
+/// whose files cannot be read is omitted (best-effort; recovery then replays it,
+/// still correct).
+pub(crate) fn discover_group_tails(fs: &Arc<dyn Fs>, data_dir: &Path) -> Vec<(String, (u64, u64))> {
+    let wal_dir = data_dir.join("wal");
+    let Ok(groups) = discover_shard_groups(fs, &wal_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(groups.len());
+    for g in &groups {
+        let Some(last) = g.files.last() else { continue };
+        let Ok(reader) = WalReader::open_with(fs, &last.path) else {
+            continue;
+        };
+        let valid = reader.count_valid_len() as u64;
+        out.push((g.key(&wal_dir), (last.idx, valid)));
+    }
+    out
+}
+
+/// Pre-scan: the set of `box_id`s whose (post-checkpoint) frames appear in MORE
+/// THAN ONE discovered WAL group — i.e. boxes split across groups by a shard-count
+/// reconfigure. Only these need ordered buffering on replay; everything else applies
+/// in-stream. A cheap framing scan (no payload decode). `box_id == 0` (box-agnostic
+/// control frames) is excluded — those replay shard-independently in stream order.
+fn find_split_boxes<F>(
+    fs: &Arc<dyn Fs>,
+    groups: &[WalShardGroup],
+    ckpt_for: &F,
+) -> std::collections::HashSet<u32>
+where
+    F: Fn(&WalShardGroup) -> (u64, u64),
+{
+    // box_id → count of distinct groups it appears in.
+    let mut groups_per_box: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
+    for g in groups {
+        let (ckpt_idx, ckpt_offset) = ckpt_for(g);
+        let mut seen_here: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for wf in &g.files {
+            if wf.idx < ckpt_idx {
+                continue;
+            }
+            let start_offset = if wf.idx == ckpt_idx { ckpt_offset } else { 0 };
+            let Ok(mut r) = WalReader::open_with(fs, &wf.path) else {
+                continue;
+            };
+            while let Some(frame) = r.next() {
+                if (r.valid_len() as u64) > start_offset {
+                    let bid = frame.record.box_id();
+                    if bid != 0 {
+                        seen_here.insert(bid);
+                    }
+                }
+            }
+        }
+        for bid in seen_here {
+            *groups_per_box.entry(bid).or_default() += 1;
+        }
+    }
+    groups_per_box
+        .into_iter()
+        .filter(|&(_, c)| c > 1)
+        .map(|(bid, _)| bid)
+        .collect()
+}
+
+/// Replay each split box's buffered frames in reconstructed logged order. For each
+/// box we order its GROUPS by the lowest `Append` seq each group holds for that box
+/// (the older run has the lower seqs — a box's seqs increase monotonically across
+/// runs and never reset), then concatenate each group's frames preserving in-group
+/// order. That is the box's true logged order across the reconfigure, so its
+/// create → config-update → append → delete frames apply in order (codex P0 #3). A
+/// group that holds no `Append` for the box (e.g. a control-only fragment) sorts by
+/// its on-disk group order as a stable fallback.
+fn replay_split_boxes(
+    engine: &Engine,
+    split_frames: std::collections::HashMap<u32, Vec<(usize, usize, WalRecord)>>,
+) {
+    for (_box_id, mut frames) in split_frames {
+        // Per group_order, the minimum Append seq for this box (None ⇒ no appends).
+        let mut min_seq: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        for (go, _idx, rec) in &frames {
+            if let WalRecord::Append { seq, .. } = rec {
+                let e = min_seq.entry(*go).or_insert(u64::MAX);
+                if *seq < *e {
+                    *e = *seq;
+                }
+            }
+        }
+        // Order key for a frame: (group has appends?, group rank, group_order,
+        // in-group position). Append-bearing groups (`false` sorts first) order by
+        // their min Append seq, so the older run replays first; an append-less group
+        // (a rare control-only fragment) sorts AFTER, by its on-disk group order —
+        // order-insensitive in practice. `group_order`+`in_group_idx` are the stable
+        // tiebreak that preserves each group's logged order.
+        frames.sort_by_key(|(go, idx, _)| {
+            let rank = min_seq.get(go).copied();
+            (rank.is_none(), rank.unwrap_or(0), *go, *idx)
+        });
+        for (_go, _idx, rec) in frames {
+            replay_frame(engine, rec);
+        }
+    }
+}
+
 /// Recover the engine's in-memory state from any existing snapshot + WAL under
 /// `data_dir`, truncate the torn tail of the active file, then open the writer
 /// for new appends. Returns `(handle, writer)`; `handle` owns the running writer
@@ -69,7 +299,7 @@ fn list_wal_files(fs: &Arc<dyn Fs>, wal_dir: &Path) -> std::io::Result<Vec<WalFi
 pub fn recover_and_open(
     engine: &Engine,
     data_dir: &Path,
-) -> std::io::Result<(WalHandle, WalWriter)> {
+) -> std::io::Result<(WalHandle, ShardedWalWriter)> {
     recover_and_open_with(RealFs::arc(), engine, data_dir)
 }
 
@@ -81,93 +311,203 @@ pub fn recover_and_open_with(
     fs: Arc<dyn Fs>,
     engine: &Engine,
     data_dir: &Path,
-) -> std::io::Result<(WalHandle, WalWriter)> {
+) -> std::io::Result<(WalHandle, ShardedWalWriter)> {
     let wal_dir = data_dir.join("wal");
     fs.create_dir_all(&wal_dir)?;
+    let n_shards = engine.config.wal_shards.max(1);
 
-    // 1) Load + restore the latest valid snapshot. The checkpoint tells us where
-    //    in the WAL to resume replay (file index + byte offset). With no valid
-    //    snapshot, replay the whole WAL from frame zero.
-    let (ckpt_idx, ckpt_offset) = match crate::storage::load_latest_with(&fs, data_dir) {
-        Ok(Some(snap)) => {
-            tracing::info!(
-                snapshot_id = snap.id,
-                boxes = snap.boxes.len(),
-                routers = snap.routers.len(),
-                "restored snapshot"
-            );
-            let ckpt = engine_snapshot::restore(engine, snap);
-            (ckpt.wal_idx, ckpt.wal_offset)
-        }
-        Ok(None) => (0, 0),
-        Err(e) => {
-            tracing::warn!(error = %e, "snapshot load failed; replaying WAL from start");
-            (0, 0)
-        }
+    // 1) Load + restore the latest valid snapshot. The checkpoint tells us where in
+    //    EACH WAL group to resume replay (per-group file index + byte offset, keyed
+    //    by the group's PHYSICAL identity — the relative dir under `wal/`). With no
+    //    valid snapshot, replay every WAL file from frame zero.
+    let checkpoint: Option<crate::storage::Checkpoint> =
+        match crate::storage::load_latest_with(&fs, data_dir) {
+            Ok(Some(snap)) => {
+                tracing::info!(
+                    snapshot_id = snap.id,
+                    boxes = snap.boxes.len(),
+                    routers = snap.routers.len(),
+                    shards = snap.checkpoint.shards.len(),
+                    "restored snapshot"
+                );
+                Some(engine_snapshot::restore(engine, snap))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "snapshot load failed; replaying WAL from start");
+                None
+            }
+        };
+    // The checkpoint offset for a discovered WAL group, matched by its PHYSICAL group
+    // key (the relative dir under `wal/`), NEVER by a bare numeric shard index. This
+    // is the fix for the flat ↔ `shard-00/` conflation across a shard-count
+    // reconfigure (codex P0 #1/#3): the flat group (`""`) and a `shard-00/` group
+    // resolve to different recorded positions. A group the snapshot did not record
+    // (key absent) replays from frame zero — never an over-skip.
+    let ckpt_for = |g: &WalShardGroup| -> (u64, u64) {
+        checkpoint
+            .as_ref()
+            .and_then(|c| c.position_for_key(&g.key(&wal_dir)))
+            .unwrap_or((0, 0))
     };
 
-    let files = list_wal_files(&fs, &wal_dir)?;
+    // 2) DISCOVER every WAL shard group on disk (flat + every `shard-NN/`),
+    //    shard-count-agnostically. This is the property that lets STREAMS_WAL_SHARDS
+    //    be reconfigured between restarts: replay is driven by the files on disk,
+    //    NOT by the configured shard count.
+    //
+    //    Order groups so the CURRENT layout's groups replay LAST. After a shard-count
+    //    reconfigure, the previous layout's WAL files coexist with the current one
+    //    until the next snapshot absorbs + drops them. A box's frames live in one
+    //    group per run, but across the reconfigure its OLD frames (create + earlier
+    //    seqs) sit in a previous-layout group while NEW frames (later seqs, written
+    //    after reopen) sit in a current-layout group. Replaying previous-layout
+    //    groups first keeps each box's frames in seq order (older seqs before newer),
+    //    so the per-box contiguity holds (`seq == head + 1`) and nothing is dropped.
+    //    Within a single layout the groups are ordered by shard_idx (irrelevant to
+    //    correctness — different boxes — but deterministic).
+    let mut groups = discover_shard_groups(&fs, &wal_dir)?;
+    // The set of physical dirs the CURRENT layout (count `n_shards`) writes to. A
+    // group whose dir is in this set is "current"; one in a leftover dir from a
+    // prior layout is "previous". Identified by DIR (not shard_idx) so a flat group
+    // and a `shard-00/` group are distinguished when `n_shards == 1` writes flat but
+    // a prior multi-shard run left `shard-00/`.
+    let current_dirs: std::collections::HashSet<PathBuf> = (0..n_shards)
+        .map(|s| shard_wal_dir(data_dir, s, n_shards))
+        .collect();
+    let is_current = |g: &WalShardGroup| current_dirs.contains(&g.dir);
+    groups.sort_by_key(|g| (is_current(g), g.shard_idx));
 
-    // Pre-count the frames that will be replayed (post-checkpoint) so the
-    // readiness gate can report `replay_progress` (API §8.2). This is a cheap
-    // framing-only scan (no body decode); the apply pass below decodes + applies.
-    let total_frames = count_replay_frames(&fs, &files, ckpt_idx, ckpt_offset);
+    // Pre-count the frames that will be replayed (post-checkpoint, across ALL
+    // groups) so the readiness gate can report `replay_progress` (API §8.2).
+    let total_frames: u64 = groups
+        .iter()
+        .map(|g| {
+            let (ci, co) = ckpt_for(g);
+            count_replay_frames(&fs, &g.files, ci, co)
+        })
+        .sum();
     engine.set_replay_total(total_frames);
 
-    // 2) Replay frames after the checkpoint. Files numbered below `ckpt_idx` are
-    //    fully absorbed by the snapshot ⇒ skipped. The checkpoint's own file is
-    //    replayed starting at `ckpt_offset`; higher files are replayed in full.
-    let mut active_idx = ckpt_idx.max(1);
-    let mut active_valid_len = ckpt_offset;
-    for (pos, wf) in files.iter().enumerate() {
-        if wf.idx < ckpt_idx {
-            continue; // absorbed by the snapshot.
-        }
-        let start_offset = if wf.idx == ckpt_idx { ckpt_offset } else { 0 };
-        let mut r = WalReader::open_with(&fs, &wf.path)?;
-        // Apply only frames whose *end* offset is strictly greater than the
-        // checkpoint offset (the absorbed prefix of the checkpoint file is
-        // skipped). `next()` then `valid_len()` reads the per-frame boundary
-        // without an overlapping borrow. The Append seq-skip is the safety net,
-        // but skipping by offset also protects idempotent-but-stale control
-        // frames (e.g. an older BoxConfig) from overwriting snapshotted state.
-        while let Some(frame) = r.next() {
-            let end = r.valid_len() as u64;
-            if end > start_offset {
-                replay_frame(engine, frame.record);
-                engine.note_replayed_frame();
-                // Named crash point: a SECOND crash partway through WAL replay
-                // (F-REC-CRASH-DURING-REPLAY). Replay is idempotent (Append
-                // seq-skip, delete/evict monotone), so a re-run from the durable
-                // WAL converges to the same state; nothing is half-committed as
-                // final. No-op without `--features failpoints`.
-                fail::fail_point!("recovery::mid_replay");
+    // 3) Replay frames after each group's checkpoint, dispatching every frame to
+    //    its box by `box_id` (NEVER assuming a box lives in `box_id % N`). Frames
+    //    apply IN-STREAM in group order, so a box's appends, deletes, config updates,
+    //    and watermarks keep their logged relative order — a selector `Delete`
+    //    re-derives its matched seqs from the records appended BEFORE it, exactly as
+    //    logged, and a config UPDATE replays after the box's create.
+    //
+    //    A box's frames live in ONE shard per run, so within a run (within a group)
+    //    they are already in logged order. A shard-count RECONFIGURE, however, splits
+    //    a box's frames across the previous-layout group and the current-layout group
+    //    — and after a NON-multiple reconfigure (e.g. 3→7) the box's NEW group can
+    //    sort BEFORE its OLD group, so a naive in-stream pass would replay a NEW
+    //    `Delete`/`BoxConfig`-update/append BEFORE the box's OLD create + earlier
+    //    appends. That regresses delete/config durability and breaks per-box
+    //    contiguity (codex P0 #3).
+    //
+    //    Fix: a box whose frames appear in MORE THAN ONE group is "split". For split
+    //    boxes we BUFFER every frame and replay them in a final per-box pass that
+    //    orders the box's groups by the LOWEST append seq each group holds for it
+    //    (the older run has the lower seqs, since a box's seqs increase monotonically
+    //    across runs and never reset), preserving each group's in-group order. That
+    //    reconstructs the true logged order regardless of how the groups sort on disk,
+    //    so create→update→append→delete all replay in order. Non-split boxes (the
+    //    common case, incl. every box in a single-layout multi-shard run where each
+    //    box is in exactly one group) apply IN-STREAM with zero buffering.
+    let maybe_split = groups.len() > 1;
+    // Pre-scan: which box_ids appear in more than one group (post-checkpoint)? Only
+    // these need ordered buffering. Cheap framing scan (no payload decode). box_id 0
+    // (box-agnostic control frames) is never "split" — those frames replay in stream.
+    let split_boxes: std::collections::HashSet<u32> = if maybe_split {
+        find_split_boxes(&fs, &groups, &ckpt_for)
+    } else {
+        std::collections::HashSet::new()
+    };
+    // Buffered frames for split boxes: box_id → list of (group_order, in_group_idx,
+    // record). `group_order` is the index of the group in the replay-sorted `groups`.
+    let mut split_frames: std::collections::HashMap<u32, Vec<(usize, usize, WalRecord)>> =
+        std::collections::HashMap::new();
+    let mut group_tails: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(groups.len());
+    for (group_order, g) in groups.iter().enumerate() {
+        let (ckpt_idx, ckpt_offset) = ckpt_for(g);
+        let mut active_idx = ckpt_idx.max(1);
+        let mut active_valid_len = ckpt_offset;
+        let mut in_group_idx = 0usize;
+        for (pos, wf) in g.files.iter().enumerate() {
+            if wf.idx < ckpt_idx {
+                continue; // absorbed by the snapshot for this shard.
+            }
+            let start_offset = if wf.idx == ckpt_idx { ckpt_offset } else { 0 };
+            let mut r = WalReader::open_with(&fs, &wf.path)?;
+            while let Some(frame) = r.next() {
+                let end = r.valid_len() as u64;
+                if end > start_offset {
+                    let bid = frame.record.box_id();
+                    if !split_boxes.is_empty() && split_boxes.contains(&bid) {
+                        // A split box: buffer for the final ordered pass.
+                        split_frames.entry(bid).or_default().push((
+                            group_order,
+                            in_group_idx,
+                            frame.record,
+                        ));
+                        in_group_idx += 1;
+                        engine.note_replayed_frame();
+                        fail::fail_point!("recovery::mid_replay");
+                        continue;
+                    }
+                    replay_frame(engine, frame.record);
+                    in_group_idx += 1;
+                    engine.note_replayed_frame();
+                    // Named crash point: a SECOND crash partway through WAL replay
+                    // (F-REC-CRASH-DURING-REPLAY). Replay is idempotent (Append
+                    // seq-skip, delete/evict monotone), so a re-run from the durable
+                    // WAL converges to the same state. No-op without failpoints.
+                    fail::fail_point!("recovery::mid_replay");
+                }
+            }
+            if pos + 1 == g.files.len() {
+                active_idx = wf.idx;
+                active_valid_len = r.valid_len() as u64;
             }
         }
-        // The last (highest-index) file is the active one we resume appending to.
-        if pos + 1 == files.len() {
-            active_idx = wf.idx;
-            active_valid_len = r.valid_len() as u64;
+        if !g.files.is_empty() {
+            group_tails.push((g.dir.clone(), active_idx, active_valid_len));
+        }
+    }
+    // Final pass: replay each split box's frames in reconstructed logged order. Empty
+    // in the common (no-reconfigure / no-split) path, so zero-cost there.
+    if !split_frames.is_empty() {
+        replay_split_boxes(engine, split_frames);
+    }
+
+    // 4) Truncate each discovered group's active-file torn tail (idempotent on a
+    //    clean file), in its OWN physical dir.
+    fail::fail_point!("recovery::before_truncate");
+    for (dir, active_idx, active_valid_len) in &group_tails {
+        let active_path = dir.join(format!("wal-{:016}.log", active_idx));
+        truncate_active(&fs, &active_path, *active_valid_len)?;
+    }
+
+    // 5) Compute each NEW shard's resume position. The new layout uses
+    //    `shard_wal_dir(data_dir, s, n_shards)`; a new shard resumes after the
+    //    highest existing valid tail in its physical dir (which may be a dir a
+    //    prior run already wrote, under a different shard count). Files were already
+    //    replayed above, so resuming after the (truncated) tail never loses data.
+    let mut first_idx = vec![1u64; n_shards];
+    let mut existing_len = vec![0u64; n_shards];
+    for s in 0..n_shards {
+        let dir = shard_wal_dir(data_dir, s, n_shards);
+        let files = list_wal_files(&fs, &dir)?;
+        if let Some(last) = files.last() {
+            // Re-derive the valid tail of this physical file (it was truncated above
+            // if it belonged to a discovered group; otherwise read it fresh).
+            let valid = WalReader::open_with(&fs, &last.path)?.count_valid_len() as u64;
+            first_idx[s] = last.idx;
+            existing_len[s] = valid;
         }
     }
 
-    // 3) Truncate the active file's torn tail (idempotent on a clean file). For a
-    //    fresh dir there is no active file yet.
-    if !files.is_empty() {
-        let active_path = wal_dir.join(format!("wal-{:016}.log", active_idx));
-        // Named crash point: replay has finished but the active file's torn tail
-        // has NOT been truncated yet (F-REC-CRASH-BEFORE-TRUNCATE). The torn tail
-        // is still on disk; the next recovery re-replays the same valid prefix and
-        // truncates again (convergent), and the un-truncated tail is never misread
-        // (still Torn). No-op without `--features failpoints`.
-        fail::fail_point!("recovery::before_truncate");
-        truncate_active(&fs, &active_path, active_valid_len)?;
-    } else {
-        active_idx = active_idx.max(1);
-        active_valid_len = 0;
-    }
-
-    // 4) Apply durable head reservations (R3). Every Append has now replayed, so
+    // 6) Apply durable head reservations (R3). Every Append has now replayed, so
     //    any box whose fsynced `HeadWatermark` reserved a seq BEYOND its replayed
     //    head lost the un-fsynced `disk` tail to the crash: advance its head to the
     //    reservation and pad the reserved-but-unwritten seqs as silent deleted gaps
@@ -175,7 +515,7 @@ pub fn recover_and_open_with(
     //    never re-handed (disk-class seq monotonicity across restart).
     engine.apply_head_watermarks();
 
-    // 5) Re-derive droppable/orphan segments and reclaim them idempotently
+    // 7) Re-derive droppable/orphan segments and reclaim them idempotently
     //    (ARCHITECTURE §4 step 5): a cap/TTL/delete reclaim interrupted by a crash
     //    (segment registered-dead, or its unlink never completed) is re-run here,
     //    so a reclaimed segment never resurfaces and a half-dropped one never
@@ -183,27 +523,68 @@ pub fn recover_and_open_with(
     //    there are no segments (pure in-memory boxes carry no writer).
     engine.reclaim_segments_on_recovery();
 
-    // Open the writer positioned to append after the recovered/truncated tail,
-    // through the same FS seam recovery read from.
+    // Seed every box's lock-free `is_router_source` flag from the recovered router
+    // graph (codex P1), so the post-recovery write hot path forwards without taking
+    // the global graph lock per append. Covers a snapshot-restored router whose
+    // source box was materialized separately, regardless of replay order.
+    engine.refresh_router_source_flags();
+
+    // 8) Open the `n_shards` writers, each positioned to append after its recovered/
+    //    truncated tail, through the same FS seam recovery read from. `n_shards == 1`
+    //    uses the flat legacy layout (byte-for-byte the pre-sharding WAL).
     let cfg = WalConfig::new(data_dir);
-    let wal = Wal::open_at_with(fs.clone(), cfg, active_idx, active_valid_len)
+    let wal = ShardedWal::open_at_with(fs.clone(), cfg, n_shards, &first_idx, &existing_len)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let writer = wal.writer();
     Ok((WalHandle::new(wal), writer))
 }
 
-/// Drop `wal-<n>.log` files whose index is strictly below `keep_from` — they are
-/// fully absorbed by a durable snapshot's checkpoint (ARCHITECTURE §3.1). The
-/// active (checkpoint) file is retained so replay can resume from its offset.
-pub fn drop_absorbed_wal_files(data_dir: &Path, keep_from: u64) {
+/// Drop, in EACH shard, the `wal-<n>.log` files whose index is strictly below that
+/// shard's checkpoint active file — they are fully absorbed by a durable
+/// snapshot's checkpoint (ARCHITECTURE §3.1). Each shard's active (checkpoint)
+/// file is retained so replay can resume from its offset.
+///
+/// `positions[s] = (wal_idx, _offset)` is shard `s`'s checkpoint; `shard_count` is
+/// the live shard count (so the per-shard subdir layout matches). Also prunes any
+/// ORPHAN `shard-NN/` subdir left by a prior run with MORE shards than the current
+/// `shard_count` (its data was already replayed + absorbed by the snapshot), so a
+/// shrink in `STREAMS_WAL_SHARDS` does not leak files forever.
+pub fn drop_absorbed_wal_files(data_dir: &Path, positions: &[(u64, u64)], shard_count: usize) {
     let fs = RealFs::arc();
     let wal_dir = data_dir.join("wal");
-    let Ok(files) = list_wal_files(&fs, &wal_dir) else {
-        return;
-    };
-    for wf in files {
-        if wf.idx < keep_from {
-            let _ = fs.remove_file(&wf.path);
+    let n = shard_count.max(1);
+    for s in 0..n {
+        let keep_from = positions.get(s).map(|(idx, _)| *idx).unwrap_or(0);
+        let dir = shard_wal_dir(data_dir, s, n);
+        if let Ok(files) = list_wal_files(&fs, &dir) {
+            for wf in files {
+                if wf.idx < keep_from {
+                    let _ = fs.remove_file(&wf.path);
+                }
+            }
+        }
+    }
+    // Prune orphan `shard-NN/` subdirs beyond the current shard count. The active
+    // layout never names these (the snapshot absorbed their frames + the live
+    // writers replayed them into shards `0..n`), so their files are dead.
+    if let Ok(entries) = fs.read_dir(&wal_dir) {
+        for path in entries {
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if let Some(idx) = parse_shard_dir(name) {
+                // Keep `shard-NN` only when the CURRENT layout uses it (`n > 1` and
+                // `idx < n`). A flat (`n == 1`) layout uses no subdir, so every
+                // `shard-NN/` is orphaned.
+                let in_use = n > 1 && idx < n;
+                if !in_use {
+                    if let Ok(files) = list_wal_files(&fs, &path) {
+                        for wf in files {
+                            let _ = fs.remove_file(&wf.path);
+                        }
+                    }
+                }
+            }
         }
     }
 }

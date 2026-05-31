@@ -598,7 +598,7 @@ fn f_snap_checkpoint_ahead_of_wal() {
     let snap = streams::storage::load_latest_with(&disk.arc(), Path::new(DATA_DIR))
         .expect("load snapshot")
         .expect("a snapshot exists");
-    let real_ckpt = snap.checkpoint;
+    let real_ckpt = snap.checkpoint.clone();
 
     // Phase 2: rewrite the snapshot with a checkpoint offset pushed FAR past the
     // actual WAL end (simulating lost WAL writes after the recorded position). The
@@ -609,6 +609,8 @@ fn f_snap_checkpoint_ahead_of_wal() {
         wal_idx: real_ckpt.wal_idx,
         wal_offset: real_ckpt.wal_offset + 1_000_000, // way past the file end.
         last_checkpoint_seq: real_ckpt.last_checkpoint_seq,
+        shards: vec![(real_ckpt.wal_idx, real_ckpt.wal_offset + 1_000_000)],
+        shard_keys: vec![String::new()],
     };
     rewrite_latest_snapshot(&disk, &bad);
 
