@@ -21,7 +21,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::io;
@@ -469,7 +474,9 @@ fn f_snap_eio_tmp_fsync() {
         for (seq, rec) in recovered {
             m2.ack_append("s", seq, rec);
         }
-        engine.write_snapshot().expect("retry snapshot now succeeds");
+        engine
+            .write_snapshot()
+            .expect("retry snapshot now succeeds");
         sync_dirs(&disk);
         drop(engine);
         assert!(
@@ -506,9 +513,7 @@ fn f_snap_torn_body() {
     // The snapshot installed; tear its durable body (truncate mid-body), modelling
     // a tmp body that was torn before the rename hardened it.
     let snap = latest_snapshot_path(&disk).expect("a snapshot file exists");
-    let durable = disk
-        .durable_bytes(&snap)
-        .expect("snapshot file is durable");
+    let durable = disk.durable_bytes(&snap).expect("snapshot file is durable");
     assert!(durable.len() > 20, "snapshot has a header + body");
     // Keep the 20-byte header + a sliver of body, dropping the rest (body overrun).
     let torn_len = 20 + (durable.len() - 20) / 2;
@@ -589,7 +594,9 @@ fn load_latest_id(disk: &FakeDisk) -> Option<u64> {
 /// itself is durable (models a torn body that reached the platter short).
 fn truncate_durable(disk: &FakeDisk, path: &std::path::Path, len: u64) {
     let fs = disk.arc();
-    let mut f = fs.open(path, OpenOpts::rw_existing()).expect("open snapshot");
+    let mut f = fs
+        .open(path, OpenOpts::rw_existing())
+        .expect("open snapshot");
     f.set_len(len).expect("set_len");
     f.sync_all().expect("sync truncation durable");
 }
@@ -601,11 +608,15 @@ fn garble_durable_byte(disk: &FakeDisk, path: &std::path::Path, off: u64) {
     let current = disk.durable_bytes(path).expect("durable bytes");
     let mut b = current[off as usize];
     b ^= 0xFF;
-    let mut f = fs.open(path, OpenOpts::rw_existing()).expect("open snapshot");
+    let mut f = fs
+        .open(path, OpenOpts::rw_existing())
+        .expect("open snapshot");
     let mut written = 0;
     let buf = [b];
     while written < buf.len() {
-        let n = f.write_at(off + written as u64, &buf[written..]).expect("write");
+        let n = f
+            .write_at(off + written as u64, &buf[written..])
+            .expect("write");
         written += n.max(1);
     }
     f.sync_all().expect("sync garble durable");

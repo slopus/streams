@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e2ed4d99c79b0e9e1828e87a82d5b30a93af05da248677ce45c6612ace3cb98c # shrinks to ops = [Append { name: "a", data: "v0", tag: None, node: None }, PutBox { name: "a", durable: false, cap: 0 }], crash_frac = 50, seed = 0

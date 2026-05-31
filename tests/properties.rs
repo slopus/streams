@@ -140,7 +140,11 @@ fn drain(engine: &Engine, name: &str, mut from_seq: u64) -> (Vec<u64>, bool) {
 enum Op {
     /// Append a batch of `n` records, each optionally tagged "t{k}" and from
     /// node "n{m}".
-    Write { n: u8, tag_k: Option<u8>, node_m: Option<u8> },
+    Write {
+        n: u8,
+        tag_k: Option<u8>,
+        node_m: Option<u8>,
+    },
     /// Advance the test clock (drives TTL expiry).
     Advance { ms: u32 },
     /// Delete by `before_seq` (relative to head: head - back).

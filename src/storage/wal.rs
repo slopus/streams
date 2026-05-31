@@ -11,7 +11,8 @@
 //!    0    4   frame_len   u32   bytes of this frame EXCLUDING this field
 //!    4    1   type        u8    1=Append 2=BoxCreate 3=BoxDelete 4=RouterCreate
 //!                                 5=RouterDelete 6=Delete 7=EvictWatermark
-//!                                 8=CheckpointMark 9=ConfigUpdate
+//!                                 8=CheckpointMark 9=ConfigUpdate 10=Lease
+//!                                 11=HeadWatermark
 //!    5    1   flags       u8    bit0=has_tag bit1=has_node bit2=durable
 //!    6    4   box_id      u32   interned numeric box id (string<->id in meta)
 //!   10    8   seq         u64   server-assigned (0 for non-Append control frames)
@@ -64,7 +65,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::fs::{File, Fs, OpenOpts, RealFs};
 
@@ -92,6 +93,11 @@ const T_EVICT_WATERMARK: u8 = 7;
 const T_CHECKPOINT_MARK: u8 = 8;
 const T_CONFIG_UPDATE: u8 = 9;
 const T_LEASE: u8 = 10;
+/// A durable per-box head reservation watermark (R3): the highest seq this box
+/// has DURABLY reserved, fsynced ahead of use so a `disk`-class write (acked
+/// before its frame is fsynced) can never have its seq re-handed after a crash
+/// that lost the un-fsynced frame. Recovery sets `head = max(replayed, watermark)`.
+const T_HEAD_WATERMARK: u8 = 11;
 
 // Flag bits.
 const FLAG_HAS_TAG: u8 = 1 << 0;
@@ -200,18 +206,22 @@ pub enum WalRecord {
     RouterCreate { op: RouterOp, ts: u64 },
     /// Router deleted (by name).
     RouterDelete { name: String, ts: u64 },
-    /// Eviction watermark advanced (cap/TTL involuntary floor) for a box.
+    /// Eviction watermark advanced (cap/TTL involuntary floor) for a box. The
+    /// `evict_floor` (cap-records / byte-cap) and `expiry_floor` (TTL) are carried
+    /// SEPARATELY so recovery restores each into its own floor and the from-0
+    /// tombstone reason (ttl / cap / mixed) is preserved across restart (R7). A
+    /// legacy frame predating the split carries `expiry_floor: 0` (the trailing
+    /// field is absent on the wire); recovery folds it into `evict_floor` only, the
+    /// prior best-effort behavior.
     EvictWatermark {
         box_id: u32,
         evict_floor: u64,
+        expiry_floor: u64,
         earliest_seq: u64,
         ts: u64,
     },
     /// Checkpoint boundary: every box's highest seq absorbed into segments.
-    CheckpointMark {
-        last_checkpoint_seq: u64,
-        ts: u64,
-    },
+    CheckpointMark { last_checkpoint_seq: u64, ts: u64 },
     /// A leases-log lifecycle event for a queue box (DESIGN §10.1): the pending
     /// who-holds-what state is the materialized projection of these events. Only
     /// written when the queue's `leases_durable:true`; otherwise the projection
@@ -232,6 +242,14 @@ pub enum WalRecord {
         deliveries: u64,
         ts: u64,
     },
+    /// A durable per-box head reservation watermark (R3). `head_seq` is the
+    /// highest seq the box has durably reserved; it is fsynced AHEAD of the seqs
+    /// actually handed out so a `disk`-class write (acked before its own frame is
+    /// fsynced) never has its seq re-handed after a crash that dropped the
+    /// un-fsynced frame. Recovery sets `head = max(replayed head, watermark)` and
+    /// pads any reserved-but-unwritten seqs as silent deleted gaps, so the seq
+    /// counter never regresses and an acked seq is never reused.
+    HeadWatermark { box_id: u32, head_seq: u64, ts: u64 },
 }
 
 /// The kind of a leases-log lifecycle event (the `event` byte of
@@ -249,13 +267,18 @@ impl WalRecord {
         match self {
             WalRecord::Append { .. } => T_APPEND,
             WalRecord::Delete { .. } => T_DELETE,
-            WalRecord::BoxConfig { tombstone: false, .. } => T_BOX_CREATE,
-            WalRecord::BoxConfig { tombstone: true, .. } => T_BOX_DELETE,
+            WalRecord::BoxConfig {
+                tombstone: false, ..
+            } => T_BOX_CREATE,
+            WalRecord::BoxConfig {
+                tombstone: true, ..
+            } => T_BOX_DELETE,
             WalRecord::RouterCreate { .. } => T_ROUTER_CREATE,
             WalRecord::RouterDelete { .. } => T_ROUTER_DELETE,
             WalRecord::EvictWatermark { .. } => T_EVICT_WATERMARK,
             WalRecord::CheckpointMark { .. } => T_CHECKPOINT_MARK,
             WalRecord::Lease { .. } => T_LEASE,
+            WalRecord::HeadWatermark { .. } => T_HEAD_WATERMARK,
         }
     }
 
@@ -268,6 +291,7 @@ impl WalRecord {
             WalRecord::BoxConfig { box_id, .. } => *box_id,
             WalRecord::EvictWatermark { box_id, .. } => *box_id,
             WalRecord::Lease { box_id, .. } => *box_id,
+            WalRecord::HeadWatermark { box_id, .. } => *box_id,
             WalRecord::RouterCreate { .. }
             | WalRecord::RouterDelete { .. }
             | WalRecord::CheckpointMark { .. } => 0,
@@ -491,6 +515,7 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
         }
         WalRecord::EvictWatermark {
             evict_floor,
+            expiry_floor,
             earliest_seq,
             ts: rts,
             ..
@@ -498,6 +523,9 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
             ts = *rts;
             data_buf.extend_from_slice(&evict_floor.to_le_bytes());
             data_buf.extend_from_slice(&earliest_seq.to_le_bytes());
+            // Trailing `expiry_floor` (R7): appended after the legacy two fields so
+            // an old reader stops cleanly and a new reader picks it up when present.
+            data_buf.extend_from_slice(&expiry_floor.to_le_bytes());
             data = &data_buf;
         }
         WalRecord::CheckpointMark {
@@ -524,6 +552,16 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
             data_buf.extend_from_slice(&deadline.to_le_bytes());
             data_buf.extend_from_slice(&deliveries.to_le_bytes());
             write_lp_bytes(&mut data_buf, n.as_bytes());
+            data = &data_buf;
+        }
+        WalRecord::HeadWatermark {
+            head_seq, ts: rts, ..
+        } => {
+            // `box_id` is taken from `record.box_id()` above; the watermark's seq
+            // ceiling rides the body (the header `seq` field stays 0, a control
+            // frame, so `WalRecord::seq()` excludes it from data-record scans).
+            ts = *rts;
+            data_buf.extend_from_slice(&head_seq.to_le_bytes());
             data = &data_buf;
         }
     }
@@ -747,10 +785,14 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
             let mut pos = 0usize;
             let evict_floor = read_u64(data, &mut pos);
             let earliest_seq = read_u64(data, &mut pos);
+            // Trailing `expiry_floor` (R7) — `0` for a legacy frame that predates
+            // the split (the field is simply absent on the wire).
+            let expiry_floor = read_u64(data, &mut pos).unwrap_or(0);
             match (evict_floor, earliest_seq) {
                 (Some(evict_floor), Some(earliest_seq)) => WalRecord::EvictWatermark {
                     box_id,
                     evict_floor,
+                    expiry_floor,
                     earliest_seq,
                     ts,
                 },
@@ -806,6 +848,17 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
                     }
                 }
                 _ => return DecodeStep::Torn,
+            }
+        }
+        T_HEAD_WATERMARK => {
+            let mut pos = 0usize;
+            match read_u64(data, &mut pos) {
+                Some(head_seq) => WalRecord::HeadWatermark {
+                    box_id,
+                    head_seq,
+                    ts,
+                },
+                None => return DecodeStep::Torn,
             }
         }
         _ => return DecodeStep::Torn, // unknown type ⇒ treat as torn.
@@ -969,10 +1022,15 @@ impl CommitToken {
     }
 }
 
-/// A submission handed to the writer: a record, its durability class, and the
-/// shared state used to signal the caller once committed.
+/// A submission handed to the writer: one OR MORE records (a single caller batch),
+/// their shared durability class, and the shared state used to signal the caller
+/// once committed. A multi-record submission is the WAL's atomicity unit (R5 /
+/// codex P0 #1): it consumes exactly ONE bounded-channel slot, so `submit_batch`
+/// either enqueues the whole batch or none of it — the single ordered writer can
+/// never accept a partial prefix of a caller's batch and leave the rest to be
+/// rolled back, which a crash would otherwise replay as orphan unacked records.
 struct Submission {
-    record: WalRecord,
+    records: Vec<WalRecord>,
     durable: bool,
     state: Arc<CommitState>,
 }
@@ -996,7 +1054,34 @@ pub struct WalMetrics {
     pub active_idx: AtomicU64,
     /// Valid byte length written to the active WAL file (the append position).
     pub active_len: AtomicU64,
+    /// Current depth of the bounded ingest queue: submissions accepted by
+    /// [`WalWriter::submit`] but not yet pulled off the channel by the writer
+    /// (R5 backpressure visibility; M3). Bumped on a successful `submit`,
+    /// decremented as the writer dequeues each submission.
+    pub queued: AtomicU64,
+    /// High-water mark of [`Self::queued`] (the deepest the ingest queue ever
+    /// got) — a sticky gauge so an operator can see how close the WAL ran to its
+    /// `channel_cap` ceiling even between scrapes.
+    pub queued_peak: AtomicU64,
+    /// Count of `submit`s rejected because the bounded ingest queue was full
+    /// ([`WalError::Full`]) — the R5 backpressure event counter.
+    pub submit_full: AtomicU64,
+    /// Whether the writer has latched read-only after a WAL-rotation failure
+    /// (R11): `0` = healthy, `1` = read-only. A sticky gauge for alerting.
+    pub read_only: AtomicU64,
+    /// fsync-latency histogram: cumulative counts in `le` buckets (microseconds)
+    /// matching [`FSYNC_BUCKETS_US`], plus the total observation count and the
+    /// summed latency (microseconds) for an average. Observed once per group
+    /// fsync.
+    pub fsync_buckets: [AtomicU64; FSYNC_BUCKETS_US.len()],
+    pub fsync_count: AtomicU64,
+    pub fsync_micros_total: AtomicU64,
 }
+
+/// fsync-latency histogram bucket upper bounds (microseconds). The implicit
+/// `+Inf` bucket equals [`WalMetrics::fsync_count`]. Sized for a fast local NVMe
+/// (tens of µs) through a stalled/contended device (tens of ms).
+pub const FSYNC_BUCKETS_US: [u64; 9] = [50, 100, 250, 500, 1_000, 5_000, 10_000, 50_000, 100_000];
 
 impl Default for WalMetrics {
     fn default() -> Self {
@@ -1008,15 +1093,64 @@ impl Default for WalMetrics {
             rotations: AtomicU64::new(0),
             active_idx: AtomicU64::new(0),
             active_len: AtomicU64::new(0),
+            queued: AtomicU64::new(0),
+            queued_peak: AtomicU64::new(0),
+            submit_full: AtomicU64::new(0),
+            read_only: AtomicU64::new(0),
+            fsync_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            fsync_count: AtomicU64::new(0),
+            fsync_micros_total: AtomicU64::new(0),
         }
+    }
+}
+
+impl WalMetrics {
+    /// Record one fsync latency observation (microseconds) into the histogram.
+    fn observe_fsync(&self, micros: u64) {
+        for (i, &le) in FSYNC_BUCKETS_US.iter().enumerate() {
+            if micros <= le {
+                self.fsync_buckets[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.fsync_count.fetch_add(1, Ordering::Relaxed);
+        self.fsync_micros_total.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Bump the live ingest-queue depth and keep the peak high-water mark current.
+    /// Called by `submit` BEFORE the channel send, so the writer can never observe
+    /// a dequeue for a submission whose enqueue bump has not yet landed (which
+    /// would underflow the gauge). A failed send rolls the bump back via
+    /// [`Self::enqueue_rollback`].
+    fn enqueued(&self) {
+        let now = self
+            .queued
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.queued_peak.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Undo an [`Self::enqueued`] bump when the channel send failed (the
+    /// submission never actually entered the queue).
+    fn enqueue_rollback(&self) {
+        self.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Drop the live ingest-queue depth as the writer dequeues a submission.
+    fn dequeued(&self) {
+        self.queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// Handle the engine holds to submit records to the WAL. Cloneable; all clones
 /// feed the same single writer thread.
+///
+/// The ingest channel is **bounded** to `channel_cap` (R5): a stalled writer
+/// (slow/stuck device) makes `submit` fail with [`WalError::Full`] rather than
+/// queue submissions without bound, so backpressure surfaces as a transient
+/// error the engine maps to `503` instead of unbounded memory growth.
 #[derive(Clone)]
 pub struct WalWriter {
-    tx: mpsc::Sender<Submission>,
+    tx: mpsc::SyncSender<Submission>,
     metrics: Arc<WalMetrics>,
 }
 
@@ -1027,17 +1161,66 @@ impl WalWriter {
     /// the buffered write (its durability follows on the next group fsync). Drop
     /// the token to fire-and-forget. An `Err` means the writer thread is gone.
     pub fn submit(&self, record: WalRecord, durable: bool) -> Result<CommitToken, WalError> {
+        self.submit_batch(vec![record], durable)
+    }
+
+    /// Submit an ENTIRE caller batch (one or more `records`) atomically as a
+    /// single unit, returning one [`CommitToken`] that resolves when the whole
+    /// batch is committed (R5 / codex P0 #1). The batch consumes exactly ONE
+    /// bounded-channel slot, so it is accepted all-or-none: a `Full` (the writer
+    /// stalled behind a slow device) rejects the WHOLE batch, never a prefix.
+    /// This is the load-bearing fix for the partial-batch hazard — the old
+    /// one-frame-per-`try_send` loop could accept the first frames and reject the
+    /// rest, and the accepted prefix would still be written/replayed as orphan
+    /// unacked records after the caller rolled the batch back in memory.
+    ///
+    /// An empty `records` is a no-op that returns a pre-committed token.
+    pub fn submit_batch(
+        &self,
+        records: Vec<WalRecord>,
+        durable: bool,
+    ) -> Result<CommitToken, WalError> {
+        if records.is_empty() {
+            // Nothing to write: hand back an already-committed token so callers
+            // can `wait()` uniformly.
+            return Ok(CommitToken {
+                state: Arc::new(CommitState {
+                    committed: Mutex::new(CommitOutcome::Ok),
+                    cv: Condvar::new(),
+                }),
+            });
+        }
         let state = Arc::new(CommitState {
             committed: Mutex::new(CommitOutcome::Pending),
             cv: Condvar::new(),
         });
+        // `try_send` on the bounded channel: a full queue means the single writer
+        // is stalled behind a slow/stuck device (R5). Surface `Full` (the engine
+        // maps it to a transient `503`) rather than blocking the caller or letting
+        // the queue grow without bound. A disconnected channel means the writer
+        // thread is gone. The WHOLE batch is one slot ⇒ accepted/rejected as a unit.
+        // Bump the live ingest-queue depth gauge BEFORE the send so the writer
+        // (which decrements on dequeue) can never race ahead of this bump and
+        // underflow the gauge. Rolled back below if the send fails. This is the
+        // observable WAL queue depth / R5 backpressure signal (counts submissions,
+        // i.e. channel slots).
+        self.metrics.enqueued();
         self.tx
-            .send(Submission {
-                record,
+            .try_send(Submission {
+                records,
                 durable,
                 state: state.clone(),
             })
-            .map_err(|_| WalError::WriterGone)?;
+            .map_err(|e| {
+                self.metrics.enqueue_rollback();
+                match e {
+                    mpsc::TrySendError::Full(_) => {
+                        self.metrics.submit_full.fetch_add(1, Ordering::Relaxed);
+                        WalError::Full
+                    }
+                    mpsc::TrySendError::Disconnected(_) => WalError::WriterGone,
+                }
+            })?;
         Ok(CommitToken { state })
     }
 
@@ -1070,6 +1253,13 @@ impl WalWriter {
 pub enum WalError {
     #[error("wal writer thread is gone")]
     WriterGone,
+    /// The bounded ingest queue is full: the single writer is stalled (a slow/
+    /// stuck device) and the channel reached `channel_cap`. The engine maps this
+    /// to a transient `503` so the caller backs off instead of the WAL growing
+    /// memory without bound (R5). Distinct from [`WalError::WriterGone`] (a dead
+    /// writer) so the engine can choose the right status.
+    #[error("wal ingest queue is full (writer stalled)")]
+    Full,
     #[error("wal io error: {0}")]
     Io(#[from] io::Error),
 }
@@ -1127,7 +1317,9 @@ impl Wal {
         }
 
         let metrics = Arc::new(WalMetrics::default());
-        let (tx, rx) = mpsc::channel::<Submission>();
+        // Bounded ingest queue (R5): backpressure under a stalled writer surfaces
+        // as `WalError::Full` from `submit` instead of unbounded memory growth.
+        let (tx, rx) = mpsc::sync_channel::<Submission>(cfg.channel_cap.max(1));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let file =
@@ -1144,6 +1336,7 @@ impl Wal {
             rx,
             shutdown: shutdown.clone(),
             metrics: metrics.clone(),
+            read_only: false,
         };
         let handle = std::thread::Builder::new()
             .name("streams-wal".to_string())
@@ -1277,7 +1470,9 @@ impl ActiveFile {
     fn write_all_at_tail(&mut self, bytes: &[u8]) -> io::Result<()> {
         let mut written = 0usize;
         while written < bytes.len() {
-            let n = self.file.write_at(self.len + written as u64, &bytes[written..])?;
+            let n = self
+                .file
+                .write_at(self.len + written as u64, &bytes[written..])?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -1308,6 +1503,11 @@ struct WriterTask {
     rx: mpsc::Receiver<Submission>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     metrics: Arc<WalMetrics>,
+    /// Latched read-only state (R11): set when a WAL-file rotation fails to create
+    /// the next file. We must NOT keep writing past the boundary into the full
+    /// active file, so every subsequent batch fails fast instead of silently
+    /// growing the file past its preallocation (or corrupting rotation ordering).
+    read_only: bool,
 }
 
 impl WriterTask {
@@ -1325,7 +1525,10 @@ impl WriterTask {
             // Park (bounded) until a submission arrives, shutdown is signalled, or
             // the timeout elapses (so we re-check the shutdown flag). No busy-spin.
             let first = match self.rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(s) => s,
+                Ok(s) => {
+                    self.metrics.dequeued();
+                    s
+                }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break, // all senders gone.
             };
@@ -1387,6 +1590,7 @@ impl WriterTask {
     /// Move every immediately-available submission out of the channel.
     fn drain_ready(&mut self, pending: &mut Vec<Submission>, any_durable: &mut bool) {
         while let Ok(s) = self.rx.try_recv() {
+            self.metrics.dequeued();
             *any_durable |= s.durable;
             pending.push(s);
         }
@@ -1406,10 +1610,24 @@ impl WriterTask {
         }
         batch_bytes.clear();
         let mut states: Vec<Arc<CommitState>> = Vec::with_capacity(pending.len());
+        let mut frame_count: u64 = 0;
         for sub in pending {
-            encode_frame(scratch, &sub.record, sub.durable);
-            batch_bytes.extend_from_slice(scratch);
+            // A submission carries an atomic caller batch of one or more records
+            // (R5 / codex P0 #1); encode every frame in it. They share one commit
+            // state, so the whole caller batch commits (or fails) together.
+            for rec in &sub.records {
+                encode_frame(scratch, rec, sub.durable);
+                batch_bytes.extend_from_slice(scratch);
+                frame_count += 1;
+            }
             states.push(sub.state);
+        }
+
+        // A prior rotation failure latched the WAL read-only (R11): never write
+        // past the boundary. Fail this (and every subsequent) batch.
+        if self.read_only {
+            Self::signal(&states, CommitOutcome::Failed);
+            return;
         }
 
         // Rotate if this batch would exceed the active file's preallocation.
@@ -1423,14 +1641,32 @@ impl WriterTask {
             // counter.
             let _ = self.file.fdatasync();
             let next_idx = self.file.idx + 1;
-            if let Ok(next) = ActiveFile::create(&self.fs, &self.wal_dir, next_idx, self.cfg.file_size)
-            {
-                self.file = next;
-                self.metrics.rotations.fetch_add(1, Ordering::Relaxed);
-                // Publish the new active file index + reset length so a snapshot
-                // records the post-rotation checkpoint position.
-                self.metrics.active_idx.store(next_idx, Ordering::Relaxed);
-                self.metrics.active_len.store(0, Ordering::Relaxed);
+            match ActiveFile::create(&self.fs, &self.wal_dir, next_idx, self.cfg.file_size) {
+                Ok(next) => {
+                    self.file = next;
+                    self.metrics.rotations.fetch_add(1, Ordering::Relaxed);
+                    // Publish the new active file index + reset length so a snapshot
+                    // records the post-rotation checkpoint position.
+                    self.metrics.active_idx.store(next_idx, Ordering::Relaxed);
+                    self.metrics.active_len.store(0, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // R11: the next WAL file could not be created. Previously this
+                    // was swallowed and the writer kept appending into the full
+                    // active file (past its preallocation, and reusing the boundary
+                    // a future rotation/recovery assumes is free). Instead, latch
+                    // read-only and FAIL this batch so the caller sees the failure
+                    // (no write past the boundary, no silent data loss).
+                    tracing::error!(
+                        error = %e,
+                        next_idx,
+                        "wal rotation failed to create next file; entering read-only"
+                    );
+                    self.read_only = true;
+                    self.metrics.read_only.store(1, Ordering::Relaxed);
+                    Self::signal(&states, CommitOutcome::Failed);
+                    return;
+                }
             }
         }
 
@@ -1443,7 +1679,7 @@ impl WriterTask {
         // overwrites them in the preallocated region, and since they were never
         // fsynced (and the tail is rewound) recovery never surfaces them.
         let len_before = self.file.len;
-        let frames = states.len() as u64;
+        let frames = frame_count;
         if let Err(e) = self.file.write_all_at_tail(batch_bytes) {
             tracing::error!(error = %e, "wal batch write failed; rewinding tail");
             self.file.len = len_before;
@@ -1470,6 +1706,7 @@ impl WriterTask {
         // One fsync per batch iff any frame in it is durable (§2.3). Non-durable
         // batches skip the fsync; their durability follows on a later group fsync.
         if any_durable {
+            let fsync_start = Instant::now();
             if let Err(e) = self.file.fdatasync() {
                 // The batch's bytes are written but the fsync FAILED — they are not
                 // durable, the tokens fail, and the callers roll back (not acked ⇒
@@ -1483,6 +1720,9 @@ impl WriterTask {
                 Self::signal(&states, CommitOutcome::Failed);
                 return;
             }
+            // Record the fsync latency into the histogram (M3 observability).
+            self.metrics
+                .observe_fsync(fsync_start.elapsed().as_micros() as u64);
             self.metrics.fsyncs.fetch_add(1, Ordering::Relaxed);
             // Named crash point: the durable batch is fsynced (promoted) but the
             // tokens have NOT yet been signalled. A crash here must keep the batch
@@ -1514,7 +1754,13 @@ impl WriterTask {
 mod tests {
     use super::*;
 
-    fn append(box_id: u32, seq: u64, node: Option<&str>, tag: Option<&str>, data: &[u8]) -> WalRecord {
+    fn append(
+        box_id: u32,
+        seq: u64,
+        node: Option<&str>,
+        tag: Option<&str>,
+        data: &[u8],
+    ) -> WalRecord {
         WalRecord::Append {
             box_id,
             seq,
@@ -1544,7 +1790,10 @@ mod tests {
 
     #[test]
     fn roundtrip_append_with_node_and_tag() {
-        roundtrip(append(7, 42, Some("nodeA"), Some("tenant:job-1"), b"payload"), true);
+        roundtrip(
+            append(7, 42, Some("nodeA"), Some("tenant:job-1"), b"payload"),
+            true,
+        );
     }
 
     #[test]
@@ -1745,6 +1994,7 @@ mod tests {
             WalRecord::EvictWatermark {
                 box_id: 4,
                 evict_floor: 1000,
+                expiry_floor: 800,
                 earliest_seq: 1001,
                 ts: 7,
             },
@@ -1754,6 +2004,18 @@ mod tests {
             WalRecord::CheckpointMark {
                 last_checkpoint_seq: 99999,
                 ts: 8,
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn roundtrip_head_watermark() {
+        roundtrip(
+            WalRecord::HeadWatermark {
+                box_id: 7,
+                head_seq: 4096,
+                ts: 12,
             },
             true,
         );
@@ -1788,7 +2050,11 @@ mod tests {
     #[test]
     fn crc_catches_a_flipped_byte() {
         let mut buf = Vec::new();
-        encode_frame(&mut buf, &append(2, 5, Some("node"), Some("tag"), b"hello"), false);
+        encode_frame(
+            &mut buf,
+            &append(2, 5, Some("node"), Some("tag"), b"hello"),
+            false,
+        );
 
         // Flip a byte in the payload region (after the header, before the CRC).
         let flip_at = FRAME_LEN_PREFIX + FRAME_HEADER_LEN + 1;
@@ -1821,12 +2087,20 @@ mod tests {
         encode_frame(&mut scratch, &append(1, 1, None, None, b"first"), true);
         buf.extend_from_slice(&scratch);
         let prefix_after_two_minus_one = buf.len();
-        encode_frame(&mut scratch, &append(1, 2, Some("n"), None, b"second"), true);
+        encode_frame(
+            &mut scratch,
+            &append(1, 2, Some("n"), None, b"second"),
+            true,
+        );
         buf.extend_from_slice(&scratch);
         let valid_end = buf.len();
 
         // A third frame, then chop it mid-write (simulate a torn tail).
-        encode_frame(&mut scratch, &append(1, 3, None, Some("t"), b"third-partial"), true);
+        encode_frame(
+            &mut scratch,
+            &append(1, 3, None, Some("t"), b"third-partial"),
+            true,
+        );
         buf.extend_from_slice(&scratch);
         // Truncate so the third frame is incomplete (drop its last 5 bytes).
         buf.truncate(buf.len() - 5);
@@ -1961,8 +2235,349 @@ mod tests {
         // The non-durable batch issued no fsync (shutdown does a best-effort one,
         // so we only assert the batch path itself did not, by frame/batch math).
         let wal_dir = dir.path().join("wal");
-        let f = std::fs::read_dir(&wal_dir).unwrap().next().unwrap().unwrap().path();
-        let seqs: Vec<u64> = WalReader::open(&f).unwrap().map(|fr| fr.record.seq()).collect();
+        let f = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let seqs: Vec<u64> = WalReader::open(&f)
+            .unwrap()
+            .map(|fr| fr.record.seq())
+            .collect();
         assert_eq!(seqs, vec![1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // R5 — bounded ingest queue / backpressure under a stalled writer.
+    // -----------------------------------------------------------------------
+
+    /// An `Fs` that wraps `RealFs` but blocks every `sync_data` (the group-commit
+    /// fsync) until released, so the single writer thread stalls mid-batch and the
+    /// bounded ingest channel can fill (R5).
+    struct StallFs {
+        inner: Arc<dyn Fs>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    struct StallFile {
+        inner: Box<dyn File>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl File for StallFile {
+        fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(off, buf)
+        }
+        fn write_at(&mut self, off: u64, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write_at(off, buf)
+        }
+        fn set_len(&mut self, len: u64) -> io::Result<()> {
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> io::Result<()> {
+            // Block until released — the writer thread is "stuck on a slow device".
+            let (lock, cv) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            self.inner.sync_data()
+        }
+        fn sync_all(&self) -> io::Result<()> {
+            self.inner.sync_all()
+        }
+        fn metadata_len(&self) -> io::Result<u64> {
+            self.inner.metadata_len()
+        }
+    }
+    impl Fs for StallFs {
+        fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<Box<dyn File>> {
+            Ok(Box::new(StallFile {
+                inner: self.inner.open(path, opts)?,
+                gate: self.gate.clone(),
+            }))
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn read_dir(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+            self.inner.read_dir(dir)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(dir)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn metadata_len(&self, path: &Path) -> io::Result<u64> {
+            self.inner.metadata_len(path)
+        }
+    }
+
+    #[test]
+    fn submit_backpressures_when_writer_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let fs: Arc<dyn Fs> = Arc::new(StallFs {
+            inner: RealFs::arc(),
+            gate: gate.clone(),
+        });
+        // Small bounded channel so it fills fast once the writer stalls in fsync.
+        let mut cfg = WalConfig::new(dir.path());
+        cfg.channel_cap = 4;
+        let wal = Wal::open_at_with(fs, cfg, 1, 0).unwrap();
+        let w = wal.writer();
+
+        // The writer parks on the first durable batch's fsync (gated). Keep
+        // submitting durable frames WITHOUT waiting; the bounded queue fills and
+        // `submit` must return `Full` rather than queue without bound.
+        let mut hit_full = false;
+        for seq in 1..=1000u64 {
+            match w.submit(append(1, seq, None, None, b"x"), true) {
+                Ok(token) => {
+                    // Don't wait (that would block on the stalled fsync); drop it.
+                    drop(token);
+                }
+                Err(WalError::Full) => {
+                    hit_full = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected submit error: {e}"),
+            }
+        }
+        assert!(
+            hit_full,
+            "bounded ingest queue must surface WalError::Full under a stalled writer"
+        );
+
+        // M3 observability: the backpressure event was counted and the queue-depth
+        // gauge peaked at/under the bounded `channel_cap` (a couple of slots may be
+        // in-flight in the writer's hands at the peak).
+        let metrics = wal.metrics();
+        assert!(
+            metrics.submit_full.load(Ordering::Relaxed) >= 1,
+            "submit_full counts the R5 backpressure rejection"
+        );
+        let peak = metrics.queued_peak.load(Ordering::Relaxed);
+        assert!(peak >= 1, "queue-depth peak was observed: {peak}");
+
+        // Release the device so the writer can drain + the WAL can shut down
+        // cleanly (no deadlock on join).
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        wal.shutdown();
+
+        // After the writer drains everything, the live queue-depth gauge returns
+        // to 0 (every accepted submission was dequeued).
+        assert_eq!(
+            metrics.queued.load(Ordering::Relaxed),
+            0,
+            "queue-depth gauge returns to 0 once drained"
+        );
+    }
+
+    /// R5 / codex P0 #1: `submit_batch` is ATOMIC — a whole caller batch commits
+    /// (all its frames durable, replayable) or none of it. A committed multi-record
+    /// batch must round-trip every frame through the on-disk WAL.
+    #[test]
+    fn submit_batch_commits_all_frames_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Wal::open_at(WalConfig::new(dir.path()), 1, 0).unwrap();
+        let w = wal.writer();
+
+        // One atomic batch of three frames; block until committed.
+        let batch = vec![
+            append(1, 1, None, None, b"a"),
+            append(1, 2, None, None, b"b"),
+            append(1, 3, None, None, b"c"),
+        ];
+        w.submit_batch(batch, true).unwrap().wait().unwrap();
+
+        // The frames metric counts every frame in the batch (not just the batch).
+        assert_eq!(
+            wal.metrics().frames.load(Ordering::Relaxed),
+            3,
+            "all three frames of the atomic batch were written"
+        );
+        wal.shutdown();
+
+        // Replay the on-disk WAL: exactly the three frames, in order.
+        let wal_dir = dir.path().join("wal");
+        let path = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let seqs: Vec<u64> = WalReader::open(&path)
+            .unwrap()
+            .map(|f| f.record.seq())
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3], "atomic batch round-trips all frames");
+    }
+
+    /// R5 / codex P0 #1: under writer backpressure a `submit_batch` that is rejected
+    /// (`Full`) must leave NO frames behind — the batch is one channel slot, so it
+    /// is accepted all-or-none. This is the load-bearing partial-prefix fix: the old
+    /// per-frame loop could accept a prefix and reject the rest, orphaning the
+    /// accepted frames in the WAL.
+    #[test]
+    fn submit_batch_rejected_under_backpressure_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let fs: Arc<dyn Fs> = Arc::new(StallFs {
+            inner: RealFs::arc(),
+            gate: gate.clone(),
+        });
+        let mut cfg = WalConfig::new(dir.path());
+        cfg.channel_cap = 2;
+        let wal = Wal::open_at_with(fs, cfg, 1, 0).unwrap();
+        let w = wal.writer();
+
+        // Fill the bounded queue with multi-frame batches while the writer stalls in
+        // fsync; eventually a whole batch is rejected with `Full`.
+        let mut hit_full = false;
+        let mut next = 1u64;
+        for _ in 0..1000 {
+            let batch = vec![
+                append(1, next, None, None, b"x"),
+                append(1, next + 1, None, None, b"y"),
+            ];
+            next += 2;
+            match w.submit_batch(batch, true) {
+                Ok(token) => drop(token), // don't wait (writer is stalled).
+                Err(WalError::Full) => {
+                    hit_full = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected submit error: {e}"),
+            }
+        }
+        assert!(
+            hit_full,
+            "a whole batch was rejected with Full (atomic, not partial)"
+        );
+
+        // Release the device + drain.
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let metrics = wal.metrics();
+        let frames_before = metrics.frames.load(Ordering::Relaxed);
+        wal.shutdown();
+        let frames_after = metrics.frames.load(Ordering::Relaxed);
+
+        // Every WRITTEN frame count is even: only whole 2-frame batches were ever
+        // accepted, never a 1-frame partial prefix of a rejected batch.
+        assert_eq!(
+            frames_after % 2,
+            0,
+            "no partial-prefix frame escaped a rejected batch (written frames: {frames_before}..{frames_after})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R11 — WAL rotation failure must surface (not be swallowed).
+    // -----------------------------------------------------------------------
+
+    /// An `Fs` that lets the first WAL file be created but fails any *subsequent*
+    /// `create`-style open of a `wal-*.log` path — modelling a rotation that
+    /// cannot create the next file (R11).
+    struct RotateFailFs {
+        inner: Arc<dyn Fs>,
+        creates: AtomicU64,
+    }
+    impl Fs for RotateFailFs {
+        fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<Box<dyn File>> {
+            let is_wal_create = opts.create
+                && opts.truncate
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("wal-"))
+                    .unwrap_or(false);
+            if is_wal_create {
+                let n = self.creates.fetch_add(1, Ordering::SeqCst);
+                if n >= 1 {
+                    // The next WAL file (rotation target) cannot be created.
+                    return Err(io::Error::other("disk full"));
+                }
+            }
+            self.inner.open(path, opts)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn read_dir(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+            self.inner.read_dir(dir)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(dir)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn metadata_len(&self, path: &Path) -> io::Result<u64> {
+            self.inner.metadata_len(path)
+        }
+    }
+
+    #[test]
+    fn rotation_failure_surfaces_and_latches_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn Fs> = Arc::new(RotateFailFs {
+            inner: RealFs::arc(),
+            creates: AtomicU64::new(0),
+        });
+        // Tiny preallocation so a handful of frames forces a rotation.
+        let mut cfg = WalConfig::new(dir.path());
+        cfg.file_size = 256;
+        let wal = Wal::open_at_with(fs, cfg, 1, 0).unwrap();
+        let w = wal.writer();
+
+        // Append until a batch would exceed the 256-byte file and rotation is
+        // attempted. The rotation-target create fails ⇒ the batch must FAIL
+        // (surfaced as WriterGone) rather than silently writing past the boundary.
+        let mut saw_failure = false;
+        for seq in 1..=200u64 {
+            match w.append(append(1, seq, None, None, b"payloadpayloadpayload"), true) {
+                Ok(()) => {}
+                Err(WalError::WriterGone) => {
+                    saw_failure = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            saw_failure,
+            "a WAL rotation create failure must surface to the caller, not be swallowed"
+        );
+
+        // Read-only is latched: subsequent appends keep failing (no write past the
+        // boundary into the full active file).
+        let after = w.append(append(1, 999, None, None, b"x"), true);
+        assert!(
+            matches!(after, Err(WalError::WriterGone)),
+            "writer stays read-only after a rotation failure"
+        );
+
+        wal.shutdown();
     }
 }

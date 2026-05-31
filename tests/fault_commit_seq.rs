@@ -52,7 +52,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::needless_range_loop)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::needless_range_loop
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -67,9 +72,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
-use streams::types::{
-    BoxConfig, BoxType, DiffRequest, Durability, RecordIn, WriteRequest,
-};
+use streams::types::{BoxConfig, BoxType, DiffRequest, Durability, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_concurrency_a.rs).
@@ -413,7 +416,10 @@ fn many_concurrent_durable_writers_contiguous_seqs() {
     );
 
     let st = engine.box_state("hot", false).unwrap();
-    assert_eq!(st.head_seq, total, "head advanced to cover every acked write");
+    assert_eq!(
+        st.head_seq, total,
+        "head advanced to cover every acked write"
+    );
     assert_eq!(st.count, total, "count == total (no gap, no loss)");
 }
 
@@ -568,7 +574,10 @@ fn fail_injected_batch_no_trace_no_gap() {
                 disable_backpressure: true,
             };
             let res = engine2.write("p", req, true);
-            assert!(res.is_err(), "durable write must fail when fsync EIOs (i={i})");
+            assert!(
+                res.is_err(),
+                "durable write must fail when fsync EIOs (i={i})"
+            );
         }
         // The failed batches must NOT be visible: head stayed at the phase-1 prefix
         // (the sequencer rolled back each failed batch's seqs, never publishing).
@@ -644,7 +653,13 @@ fn sweep_concurrent_durable_crash_points_oracle() {
 
     // Probe the sync_data call count with a never-firing FaultFs counter.
     let probe_disk = FakeDisk::new();
-    let probe = FaultFs::new(probe_disk.arc(), FaultOp::SyncData, FaultKind::Eio, u64::MAX, true);
+    let probe = FaultFs::new(
+        probe_disk.arc(),
+        FaultOp::SyncData,
+        FaultKind::Eio,
+        u64::MAX,
+        true,
+    );
     {
         let engine = Engine::with_data_dir_fs(cfg(), clock(), probe.arc()).expect("probe engine");
         let _ = run(&engine);
@@ -759,7 +774,11 @@ fn no_lost_wakeup_multi_box_high_thread_stress() {
         watch.join().unwrap(),
         "all {expected} durable writes completed within the bound (no lost wakeup/deadlock)"
     );
-    assert_eq!(completed.load(Ordering::Relaxed), expected, "every write acked");
+    assert_eq!(
+        completed.load(Ordering::Relaxed),
+        expected,
+        "every write acked"
+    );
 
     // Each box's published seqs are a dense [1..=k_box], in commit order.
     for b in 0..BOXES {
@@ -848,7 +867,11 @@ fn seq_sequencer_two_writer_stress() {
             head_before + 2
         );
         let head_after = engine.box_state("two", false).unwrap().head_seq;
-        assert_eq!(head_after, head_before + 2, "head advanced by exactly 2 (monotone)");
+        assert_eq!(
+            head_after,
+            head_before + 2,
+            "head advanced by exactly 2 (monotone)"
+        );
     }
     done.store(true, Ordering::Relaxed);
     reader.join().expect("reader joined (no deadlock)");
@@ -891,9 +914,7 @@ fn queue_durable_ack_delete_survives_crash() {
 
         // Enqueue 6 jobs (durable writes onto the jobs log).
         all_seqs = (0..6)
-            .map(|i| {
-                write_one(&engine, "q", &format!("job-{i}"), None).expect("job acked")[0]
-            })
+            .map(|i| write_one(&engine, "q", &format!("job-{i}"), None).expect("job acked")[0])
             .collect();
         assert_eq!(all_seqs, vec![1, 2, 3, 4, 5, 6]);
 
@@ -936,12 +957,17 @@ fn queue_durable_ack_delete_survives_crash() {
         assert!(enq.contains(s), "fabricated job seq {s} after recovery");
     }
     // The un-acked jobs (the other 3) survive and are claimable again.
-    let expected_survivors: BTreeSet<u64> = enq.difference(&acked_gone.iter().copied().collect()).copied().collect();
+    let expected_survivors: BTreeSet<u64> = enq
+        .difference(&acked_gone.iter().copied().collect())
+        .copied()
+        .collect();
     assert_eq!(
         survivors, expected_survivors,
         "exactly the un-acked jobs survive (acked-delete durable, rest self-heal)"
     );
-    let reclaim = engine.claim("q", "worker2", 10, Some(60_000)).expect("re-claim");
+    let reclaim = engine
+        .claim("q", "worker2", 10, Some(60_000))
+        .expect("re-claim");
     assert_eq!(
         reclaim.count as usize,
         expected_survivors.len(),
@@ -995,7 +1021,7 @@ fn queue_dead_letter_requeue_durable_through_sequencer() {
         let c1 = engine.claim("jobs", "w", 1, Some(1_000)).expect("claim #1");
         assert_eq!(c1.count, 1, "claimed the poison job once");
         clk.advance(5_000); // past the 1s lease ⇒ the job is reclaimable.
-        // Re-claim: this delivery exceeds max_deliveries ⇒ dead-letter move.
+                            // Re-claim: this delivery exceeds max_deliveries ⇒ dead-letter move.
         let _ = engine.claim("jobs", "w", 1, Some(60_000));
 
         // The job is now durably moved into "dead" and deleted from "jobs".

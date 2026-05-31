@@ -26,7 +26,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,9 +72,7 @@ fn build_segment() -> (Vec<u8>, Vec<u8>) {
 /// path under test is.
 fn hot_store_with_segment() -> (FakeDisk, Box<dyn SegmentStore>) {
     let hot_disk = FakeDisk::new();
-    hot_disk
-        .create_dir_all(&PathBuf::from(HOT_ROOT))
-        .unwrap();
+    hot_disk.create_dir_all(&PathBuf::from(HOT_ROOT)).unwrap();
     let hot = LocalSegmentStore::open_with(HOT_ROOT, hot_disk.arc()).unwrap();
     let (data, idx) = build_segment();
     hot.put(SEG_ID, &data, &idx).expect("seal hot segment");
@@ -137,8 +140,14 @@ fn f_cold_eio_copy() {
 
     // HOT copy untouched; the pointer never flipped (we did NOT call
     // confirm_relocated, mirroring the engine's `continue` on a failed copy).
-    assert!(tier.hot().exists(SEG_ID, SegmentPart::Data), "hot .data intact");
-    assert!(tier.hot().exists(SEG_ID, SegmentPart::Idx), "hot .idx intact");
+    assert!(
+        tier.hot().exists(SEG_ID, SegmentPart::Data),
+        "hot .data intact"
+    );
+    assert!(
+        tier.hot().exists(SEG_ID, SegmentPart::Idx),
+        "hot .idx intact"
+    );
     assert_eq!(
         tier.resolve(SEG_ID),
         Some(Tier::Hot),
@@ -170,7 +179,13 @@ fn f_cold_enospc_copy() {
     let cold_disk = FakeDisk::new();
     cold_disk.create_dir_all(&PathBuf::from(COLD_ROOT)).unwrap();
     // fail-always ENOSPC: the cold tier is full, every write refuses.
-    let cold_fs = FaultFs::new(cold_disk.arc(), FaultOp::WriteAt, FaultKind::Enospc, 0, false);
+    let cold_fs = FaultFs::new(
+        cold_disk.arc(),
+        FaultOp::WriteAt,
+        FaultKind::Enospc,
+        0,
+        false,
+    );
     let cold = LocalSegmentStore::open_with(COLD_ROOT, cold_fs.arc()).unwrap();
 
     let tier = Arc::new(BoxTier::new(hot, Some(Box::new(cold))));
@@ -179,7 +194,10 @@ fn f_cold_enospc_copy() {
     assert!(res.is_err(), "ENOSPC on cold must fail the copy");
 
     // Hot retained, no flip, resolve prefers hot, still readable.
-    assert!(tier.hot().exists(SEG_ID, SegmentPart::Data), "hot retained on ENOSPC");
+    assert!(
+        tier.hot().exists(SEG_ID, SegmentPart::Data),
+        "hot retained on ENOSPC"
+    );
     assert_eq!(tier.resolve(SEG_ID), Some(Tier::Hot), "resolve prefers hot");
     assert!(
         !tier.cold().unwrap().exists(SEG_ID, SegmentPart::Data),
@@ -236,7 +254,10 @@ fn f_cold_torn_copy() {
         Some(Tier::Hot),
         "resolve stays HOT over a torn/incomplete cold copy"
     );
-    assert!(tier.hot().exists(SEG_ID, SegmentPart::Data), "hot copy survives");
+    assert!(
+        tier.hot().exists(SEG_ID, SegmentPart::Data),
+        "hot copy survives"
+    );
     assert_record_readable(&tier, SEG_ID);
 
     // RE-RUN the relocation copy on a healed cold device: it completes (idempotent
@@ -274,7 +295,13 @@ fn f_cold_nfs_estale_copy() {
     let cold_disk = FakeDisk::new();
     cold_disk.create_dir_all(&PathBuf::from(COLD_ROOT)).unwrap();
     // ESTALE on the first cold write_at, fail-once (a transient stale handle).
-    let cold_fs = FaultFs::new(cold_disk.arc(), FaultOp::WriteAt, FaultKind::Estale, 0, true);
+    let cold_fs = FaultFs::new(
+        cold_disk.arc(),
+        FaultOp::WriteAt,
+        FaultKind::Estale,
+        0,
+        true,
+    );
     let cold = LocalSegmentStore::open_with(COLD_ROOT, cold_fs.arc()).unwrap();
 
     let tier = Arc::new(BoxTier::new(hot, Some(Box::new(cold))));
@@ -285,7 +312,10 @@ fn f_cold_nfs_estale_copy() {
 
     // Hot retained, pointer not flipped, resolve prefers hot, still readable —
     // the ESTALE relocation was never acked.
-    assert!(tier.hot().exists(SEG_ID, SegmentPart::Data), "hot retained on ESTALE");
+    assert!(
+        tier.hot().exists(SEG_ID, SegmentPart::Data),
+        "hot retained on ESTALE"
+    );
     assert_eq!(tier.resolve(SEG_ID), Some(Tier::Hot), "resolve stays HOT");
     assert!(
         !tier.cold().unwrap().exists(SEG_ID, SegmentPart::Data),

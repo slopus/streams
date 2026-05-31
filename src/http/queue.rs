@@ -238,6 +238,26 @@ async fn run_claim(
     Ok((jobs, ready))
 }
 
+/// Parse the optional per-seq fencing tokens from a request body's `lease_ids`
+/// (R4). The wire form mirrors the claim response: `"lease_<hex>"`. An empty
+/// `lease_ids` disables fencing (`Ok(vec![])`, legacy node-only match). An empty
+/// string entry is "no token for this seq" (`None`); a non-empty, malformed entry
+/// is a `400 invalid_request` (a client sending a token must send a real one).
+fn parse_lease_ids(lease_ids: &[String]) -> Result<Vec<Option<u64>>> {
+    lease_ids
+        .iter()
+        .map(|s| {
+            if s.is_empty() {
+                return Ok(None);
+            }
+            s.strip_prefix("lease_")
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                .map(Some)
+                .ok_or_else(|| Error::invalid_request(format!("invalid lease_id token {s:?}")))
+        })
+        .collect()
+}
+
 /// Project an engine [`LeasedJob`] onto the wire [`ClaimedJob`].
 fn to_claimed_job(j: LeasedJob) -> ClaimedJob {
     ClaimedJob {
@@ -271,15 +291,7 @@ pub async fn claim(
         parse_json_body(&headers, &body)?
     };
 
-    let (jobs, ready) = run_claim(
-        &state,
-        &box_name,
-        req.node,
-        req.max,
-        req.lease_ms,
-        None,
-    )
-    .await?;
+    let (jobs, ready) = run_claim(&state, &box_name, req.node, req.max, req.lease_ms, None).await?;
     let claimed: Vec<ClaimedJob> = jobs.into_iter().map(to_claimed_job).collect();
     let count = claimed.len() as u64;
     Ok(Json(ClaimResponse {
@@ -301,8 +313,11 @@ pub async fn ack(
     body: Bytes,
 ) -> Result<Json<AckResponse>> {
     let req: AckRequest = parse_json_body(&headers, &body)?;
+    let lease_ids = parse_lease_ids(&req.lease_ids)?;
     let engine = state.engine.clone();
-    let resp = super::run_blocking(move || engine.ack(&box_name, &req.node, &req.seqs)).await?;
+    let resp =
+        super::run_blocking(move || engine.ack_fenced(&box_name, &req.node, &req.seqs, &lease_ids))
+            .await?;
     Ok(Json(resp))
 }
 
@@ -315,10 +330,12 @@ pub async fn nack(
     body: Bytes,
 ) -> Result<Json<NackResponse>> {
     let req: NackRequest = parse_json_body(&headers, &body)?;
+    let lease_ids = parse_lease_ids(&req.lease_ids)?;
     let engine = state.engine.clone();
-    let resp =
-        super::run_blocking(move || engine.nack(&box_name, &req.node, &req.seqs, req.delay_ms))
-            .await?;
+    let resp = super::run_blocking(move || {
+        engine.nack_fenced(&box_name, &req.node, &req.seqs, req.delay_ms, &lease_ids)
+    })
+    .await?;
     Ok(Json(resp))
 }
 
@@ -331,10 +348,12 @@ pub async fn extend(
     body: Bytes,
 ) -> Result<Json<ExtendResponse>> {
     let req: ExtendRequest = parse_json_body(&headers, &body)?;
+    let lease_ids = parse_lease_ids(&req.lease_ids)?;
     let engine = state.engine.clone();
-    let resp =
-        super::run_blocking(move || engine.extend(&box_name, &req.node, &req.seqs, req.lease_ms))
-            .await?;
+    let resp = super::run_blocking(move || {
+        engine.extend_fenced(&box_name, &req.node, &req.seqs, req.lease_ms, &lease_ids)
+    })
+    .await?;
     Ok(Json(resp))
 }
 
@@ -398,7 +417,15 @@ pub async fn work(
         })?;
 
     let conn = state.coordinator.alloc_conn();
-    let stream = build_work_stream(state.clone(), box_name, node, max, lease_ms, conn, sse_guard);
+    let stream = build_work_stream(
+        state.clone(),
+        box_name,
+        node,
+        max,
+        lease_ms,
+        conn,
+        sse_guard,
+    );
 
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -461,6 +488,19 @@ fn build_work_stream(
         // In-flight depth tracked here (acks/nacks happen out-of-band, so we
         // reconcile against the engine's lease projection each pass).
         loop {
+            // Graceful shutdown (M11): wind down + close so the bounded drain
+            // completes. The connection's leases are released by `WorkConnGuard` on
+            // drop, so the jobs are immediately re-claimable on the next instance.
+            if state.shutdown.is_shutting_down() {
+                let data = serde_json::json!({
+                    "code": "server_shutting_down",
+                    "error": "server is shutting down; reconnect",
+                    "box": box_name
+                });
+                yield Ok(Event::default().event("error").data(data.to_string()));
+                break;
+            }
+
             // How many leases does this connection currently hold? Refill up to
             // `max`. We read it from a fresh claim attempt: claim the deficit.
             let in_flight = state.engine.work_conn_in_flight(&box_name, conn);
@@ -506,6 +546,7 @@ fn build_work_stream(
             };
             let notified = b.notify.notified();
             tokio::select! {
+                _ = state.shutdown.notified() => {}
                 _ = notified => {}
                 _ = tokio::time::sleep(Duration::from_millis(config::WORK_POLL_MS)) => {}
             }
@@ -518,7 +559,10 @@ fn job_frame(box_name: &str, j: &LeasedJob) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("box".into(), serde_json::json!(box_name));
     obj.insert("$seq".into(), serde_json::json!(j.seq));
-    obj.insert("lease_id".into(), serde_json::json!(format!("lease_{:x}", j.lease_id)));
+    obj.insert(
+        "lease_id".into(),
+        serde_json::json!(format!("lease_{:x}", j.lease_id)),
+    );
     obj.insert("deadline".into(), serde_json::json!(j.deadline));
     obj.insert("$ts".into(), serde_json::json!(j.ts));
     if let Some(tag) = &j.tag {

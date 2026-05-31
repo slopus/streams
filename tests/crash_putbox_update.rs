@@ -66,7 +66,10 @@ fn append(engine: &Engine, name: &str, data: &str) -> u64 {
         config: None,
         disable_backpressure: true,
     };
-    engine.write(name, req, true).expect("append acked").last_seq
+    engine
+        .write(name, req, true)
+        .expect("append acked")
+        .last_seq
 }
 
 fn live_records(engine: &Engine, name: &str) -> BTreeMap<u64, String> {
@@ -175,7 +178,10 @@ fn put_box_update_wal_fail_rolls_back_and_converges() {
                 ..Default::default()
             },
         );
-        assert!(res.is_err(), "config update must fail when its WAL fsync EIOs");
+        assert!(
+            res.is_err(),
+            "config update must fail when its WAL fsync EIOs"
+        );
 
         // ROLLED BACK: the in-memory config is the prior relaxed one, NOT the
         // tightened one the client was told (via the error) did not take effect.
@@ -213,8 +219,14 @@ fn put_box_update_wal_fail_rolls_back_and_converges() {
             rec_cfg.ttl_ms, mem_cfg.ttl_ms,
             "recovered ttl_ms converges with in-memory (rolled back)"
         );
-        assert_eq!(rec_cfg.cap_records, 0, "recovered config is the prior relaxed cap");
-        assert_eq!(rec_cfg.ttl_ms, 0, "recovered config is the prior relaxed ttl");
+        assert_eq!(
+            rec_cfg.cap_records, 0,
+            "recovered config is the prior relaxed cap"
+        );
+        assert_eq!(
+            rec_cfg.ttl_ms, 0,
+            "recovered config is the prior relaxed ttl"
+        );
     }
 }
 

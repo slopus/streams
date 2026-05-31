@@ -20,7 +20,10 @@ use serde_json::{json, Value};
 /// Append `records` to `box_name`, asserting the write succeeded (`200`/`201`),
 /// and return the parsed response body.
 fn write(h: &Harness, box_name: &str, records: Value) -> Value {
-    let (status, body) = h.post(&format!("/v0/boxes/{box_name}"), json!({ "records": records }));
+    let (status, body) = h.post(
+        &format!("/v0/boxes/{box_name}"),
+        json!({ "records": records }),
+    );
     assert!(
         status == StatusCode::OK || status == StatusCode::CREATED,
         "write to {box_name} should succeed, got {status}: {body}"
@@ -77,7 +80,10 @@ fn assert_delete_shape(
     if count == 0 {
         assert_eq!(body["bytes"], 0, "no live records ⇒ 0 bytes: {body}");
     } else {
-        assert!(body["bytes"].as_u64().unwrap() > 0, "live records ⇒ >0 bytes: {body}");
+        assert!(
+            body["bytes"].as_u64().unwrap() > 0,
+            "live records ⇒ >0 bytes: {body}"
+        );
     }
     assert!(
         body["performance"]["server_total_ms"].is_number(),
@@ -105,7 +111,11 @@ fn before_seq_snapshot_delete_is_silent() {
     // A fresh reader from 0 sees only 3,4,5 with NO tombstone (delete is silent).
     let d = diff(&h, "snap", 0);
     assert_eq!(seqs(&d), vec![3, 4, 5]);
-    assert_eq!(d["tombstone"], Value::Null, "purely-deleted prefix is silent");
+    assert_eq!(
+        d["tombstone"],
+        Value::Null,
+        "purely-deleted prefix is silent"
+    );
     assert_eq!(d["earliest_seq"], 3);
     assert_eq!(d["caught_up"], true);
 }
@@ -129,7 +139,11 @@ fn match_eq_and_glob_prefix_delete() {
     );
 
     // Exact (Eq) delete of job-1 (seq 1, the front record ⇒ earliest advances).
-    let r1 = delete_ok(&h, "jobs", json!({ "match": ["tag", "Eq", "tenant42:job-1"] }));
+    let r1 = delete_ok(
+        &h,
+        "jobs",
+        json!({ "match": ["tag", "Eq", "tenant42:job-1"] }),
+    );
     assert_delete_shape(&r1, "jobs", 1, 2, 4, 3);
     let d1 = diff(&h, "jobs", 0);
     assert_eq!(seqs(&d1), vec![2, 3, 4], "seq 1 removed from reads");
@@ -137,10 +151,18 @@ fn match_eq_and_glob_prefix_delete() {
     assert_eq!(d1["caught_up"], true);
 
     // Prefix (Glob) delete of all tenant42:* ⇒ removes seq 2 (1 already gone).
-    let r2 = delete_ok(&h, "jobs", json!({ "match": ["tag", "Glob", "tenant42:*"] }));
+    let r2 = delete_ok(
+        &h,
+        "jobs",
+        json!({ "match": ["tag", "Glob", "tenant42:*"] }),
+    );
     assert_delete_shape(&r2, "jobs", 1, 3, 4, 2);
     let d2 = diff(&h, "jobs", 0);
-    assert_eq!(seqs(&d2), vec![3, 4], "tenant42:* gone; other tag + untagged stay");
+    assert_eq!(
+        seqs(&d2),
+        vec![3, 4],
+        "tenant42:* gone; other tag + untagged stay"
+    );
     assert_eq!(d2["tombstone"], Value::Null);
 }
 
@@ -197,7 +219,11 @@ fn delete_is_point_in_time() {
     write(&h, "chat", json!([{ "data": "v2", "tag": "chat-42:msg" }])); // seq 2
 
     let d = diff(&h, "chat", 0);
-    assert_eq!(seqs(&d), vec![2], "future matching record is not retroactively deleted");
+    assert_eq!(
+        seqs(&d),
+        vec![2],
+        "future matching record is not retroactively deleted"
+    );
     assert_eq!(d["records"][0]["data"], "v2");
     assert_eq!(d["tombstone"], Value::Null);
     assert_eq!(d["caught_up"], true);
@@ -249,11 +275,18 @@ fn match_and_before_seq_keeps_newer_same_tag() {
 fn delete_silent_but_cap_eviction_still_tombstones() {
     let h = Harness::start();
     // Bounded box: cap_records = 4, discard old (evicts oldest on overflow).
-    let (status, _) = h.put("/v0/boxes/dual", json!({ "cap_records": 4, "discard": "old" }));
+    let (status, _) = h.put(
+        "/v0/boxes/dual",
+        json!({ "cap_records": 4, "discard": "old" }),
+    );
     assert!(status == StatusCode::CREATED || status == StatusCode::OK);
 
     // Write 4 (seqs 1..=4) — exactly at cap, nothing evicted yet.
-    write(&h, "dual", json!([{ "data": 1 }, { "data": 2 }, { "data": 3 }, { "data": 4 }]));
+    write(
+        &h,
+        "dual",
+        json!([{ "data": 1 }, { "data": 2 }, { "data": 3 }, { "data": 4 }]),
+    );
 
     // Voluntary delete of the prefix (seqs 1,2). This advances earliest but is
     // SILENT: reading across the purely-deleted gap yields tombstone:null.
@@ -274,12 +307,18 @@ fn delete_silent_but_cap_eviction_still_tombstones() {
 
     let d2 = diff(&h, "dual", 0);
     let tomb = &d2["tombstone"];
-    assert!(tomb.is_object(), "cap overflow must emit a tombstone, got {d2}");
+    assert!(
+        tomb.is_object(),
+        "cap overflow must emit a tombstone, got {d2}"
+    );
     assert_eq!(tomb["reason"], "cap", "involuntary cap loss ⇒ reason=cap");
     // The gap is authoritative; range fields are present and ordered.
     let gap_from = tomb["gap_from"].as_u64().expect("gap_from");
     let gap_to = tomb["gap_to"].as_u64().expect("gap_to");
-    assert!(gap_from >= 1 && gap_from <= gap_to, "valid gap range in {tomb}");
+    assert!(
+        gap_from >= 1 && gap_from <= gap_to,
+        "valid gap range in {tomb}"
+    );
     assert_eq!(d2["head_seq"], 10);
 }
 
@@ -292,7 +331,11 @@ fn empty_body_is_invalid_request() {
     write(&h, "b", json!([{ "data": 1 }]));
 
     let (status, body) = h.post("/v0/boxes/b/delete", json!({}));
-    assert_eq!(status, StatusCode::BAD_REQUEST, "empty selector ⇒ 400: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "empty selector ⇒ 400: {body}"
+    );
     assert_eq!(body["error"]["code"], "invalid_request");
 }
 
@@ -304,7 +347,11 @@ fn empty_body_is_invalid_request() {
 fn delete_on_absent_box_is_not_found() {
     let h = Harness::start();
     let (status, body) = h.post("/v0/boxes/ghost/delete", json!({ "before_seq": 10 }));
-    assert_eq!(status, StatusCode::NOT_FOUND, "delete never auto-creates: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "delete never auto-creates: {body}"
+    );
     assert_eq!(body["error"]["code"], "box_not_found");
 }
 

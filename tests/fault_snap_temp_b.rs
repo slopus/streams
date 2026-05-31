@@ -33,7 +33,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -148,7 +153,9 @@ fn read_file(fs: &Arc<dyn Fs>, path: &PathBuf) -> Vec<u8> {
 /// fsync so the corruption is durable for the subsequent load). Goes through the
 /// `Fs` seam so it works on any injected disk.
 fn rewrite_file(fs: &Arc<dyn Fs>, path: &PathBuf, bytes: &[u8]) {
-    let mut f = fs.open(path, OpenOpts::rw_existing()).expect("reopen snapshot rw");
+    let mut f = fs
+        .open(path, OpenOpts::rw_existing())
+        .expect("reopen snapshot rw");
     let mut off = 0usize;
     while off < bytes.len() {
         let n = f.write_at(off as u64, &bytes[off..]).expect("poke write");
@@ -303,7 +310,9 @@ fn f_snap_version_mismatch() {
                 config: None,
                 disable_backpressure: true,
             };
-            engine.write("jobs", req, true).expect("durable append acked");
+            engine
+                .write("jobs", req, true)
+                .expect("durable append acked");
         }
         // Force a durable checkpoint so a real snapshot exists on disk.
         let wrote = engine.write_snapshot().expect("write a snapshot");
@@ -322,8 +331,7 @@ fn f_snap_version_mismatch() {
         if name.starts_with("snapshot-") && name.ends_with(".bin") {
             let mut bytes = read_file(&fs, &p);
             if bytes.len() >= HEADER_LEN {
-                bytes[OFF_VERSION..OFF_VERSION + 4]
-                    .copy_from_slice(&(VERSION + 7).to_le_bytes());
+                bytes[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&(VERSION + 7).to_le_bytes());
                 rewrite_file(&fs, &p, &bytes);
                 corrupted_any = true;
             }
@@ -339,9 +347,14 @@ fn f_snap_version_mismatch() {
     // Recovery falls back to full WAL replay and rebuilds all 3 durable records.
     let engine = Engine::with_data_dir_fs(cfg(), clock(), disk.arc())
         .expect("recovery falls back to WAL when the snapshot is a bad version");
-    let st = engine.box_state("jobs", false).expect("jobs recovered from WAL");
+    let st = engine
+        .box_state("jobs", false)
+        .expect("jobs recovered from WAL");
     assert_eq!(st.head_seq, 3, "all 3 durable seqs recovered from the WAL");
-    assert_eq!(st.count, 3, "no record lost when the snapshot was unreadable");
+    assert_eq!(
+        st.count, 3,
+        "no record lost when the snapshot was unreadable"
+    );
 }
 
 // ===========================================================================
@@ -404,7 +417,10 @@ fn f_snap_truncated_header() {
         write_snapshot_with(&fs, &data_dir(), &sample(1, 100)).unwrap();
 
         let mut bytes = read_file(&fs, &snapshot_path(1));
-        assert!(bytes.len() > HEADER_LEN, "a full snapshot is longer than the header");
+        assert!(
+            bytes.len() > HEADER_LEN,
+            "a full snapshot is longer than the header"
+        );
         bytes.truncate(short_len);
         rewrite_file(&fs, &snapshot_path(1), &bytes);
 

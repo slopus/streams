@@ -133,7 +133,10 @@ impl QueueProjection {
     /// `in_flight`). Expired leases are not counted (they are logically
     /// reclaimable even before the next sweep records it).
     pub fn in_flight(&self, now_ms: i64) -> u64 {
-        self.leases.values().filter(|l| now_ms <= l.deadline_ms).count() as u64
+        self.leases
+            .values()
+            .filter(|l| now_ms <= l.deadline_ms)
+            .count() as u64
     }
 
     /// Re-apply a replayed leases-log event during recovery (DESIGN §10.1): fold
@@ -152,6 +155,19 @@ impl QueueProjection {
         if lease_id >= self.next_lease_id {
             self.next_lease_id = lease_id + 1;
         }
+        // Whether the lease currently materialized for `seq` was the one this
+        // event acted on (codex P1 #2): a Released/Extended/Acked event must only
+        // mutate the projection when its `lease_id` matches the CURRENT lease, so a
+        // delayed/out-of-order STALE event (from a prior delivery) can never clear
+        // or extend a NEWER recovered lease. WAL order is the live event order, but
+        // a torn/partial tail or an interleaved re-claim+release could otherwise let
+        // an older release frame replay over a newer claim's lease.
+        let current_lease_matches = |q: &Self| -> bool {
+            q.leases
+                .get(&seq)
+                .map(|l| l.lease_id == lease_id)
+                .unwrap_or(false)
+        };
         match event {
             // claimed
             0 => {
@@ -170,21 +186,29 @@ impl QueueProjection {
                     self.claim_cursor = seq + 1;
                 }
             }
-            // released (nack / expiry)
+            // released (nack / expiry) — only if it targets the current lease.
             1 => {
-                self.leases.remove(&seq);
-                self.push_reclaim(seq);
-            }
-            // extended
-            2 => {
-                if let Some(l) = self.leases.get_mut(&seq) {
-                    l.deadline_ms = deadline_ms;
+                if current_lease_matches(self) {
+                    self.leases.remove(&seq);
+                    self.push_reclaim(seq);
                 }
             }
-            // acked (job is deleted from the jobs log; drop all lease state)
+            // extended — only the current lease's deadline moves.
+            2 => {
+                if let Some(l) = self.leases.get_mut(&seq) {
+                    if l.lease_id == lease_id {
+                        l.deadline_ms = deadline_ms;
+                    }
+                }
+            }
+            // acked (job is deleted from the jobs log; drop all lease state) — only
+            // if it acks the current lease. A stale ack for an old delivery must not
+            // drop a newer lease's state.
             3 => {
-                self.leases.remove(&seq);
-                self.deliveries.remove(&seq);
+                if current_lease_matches(self) {
+                    self.leases.remove(&seq);
+                    self.deliveries.remove(&seq);
+                }
             }
             _ => {}
         }
@@ -198,10 +222,10 @@ impl QueueProjection {
 // ===========================================================================
 
 use crate::config;
-use crate::error::{Error, Result};
 use crate::engine::box_state::BoxState;
 use crate::engine::segwriter::SealedResolve;
 use crate::engine::Engine;
+use crate::error::{Error, Result};
 use crate::storage::{LeaseEvent, WalRecord};
 use crate::types::*;
 use std::sync::Arc;
@@ -240,7 +264,9 @@ impl Engine {
     /// Resolve a box that MUST be a queue, returning `404 box_not_found` if
     /// absent or `409 not_a_queue` if it is a plain log (API §10).
     fn get_queue(&self, name: &str) -> Result<Arc<BoxState>> {
-        let b = self.get_box(name).ok_or_else(|| Error::box_not_found(name))?;
+        let b = self
+            .get_box(name)
+            .ok_or_else(|| Error::box_not_found(name))?;
         if !b.is_queue() {
             return Err(Error::not_a_queue(name));
         }
@@ -324,7 +350,9 @@ impl Engine {
         drop(index);
 
         let live = b.live_count.load(std::sync::atomic::Ordering::Relaxed);
-        let ready = live.saturating_sub(leased_live).saturating_sub(delayed_live);
+        let ready = live
+            .saturating_sub(leased_live)
+            .saturating_sub(delayed_live);
         (ready, in_flight)
     }
 
@@ -598,11 +626,28 @@ impl Engine {
     /// event and permanently delete each from the jobs log (the ack *is* the
     /// delete, DESIGN §10.4). Seqs not held by `node` are silently skipped.
     pub fn ack(&self, name: &str, node: &str, seqs: &[u64]) -> Result<AckResponse> {
+        self.ack_fenced(name, node, seqs, &[])
+    }
+
+    /// As [`Self::ack`], with optional per-seq stale-worker fencing (R4). When
+    /// `lease_ids[i]` is `Some(id)`, `seqs[i]` is acked only if `node` currently
+    /// holds it *under that exact lease id*; a mismatched/stale token is rejected
+    /// (skipped), so a worker reusing the same `node` after its lease expired (the
+    /// job re-delivered under a new lease) cannot ack the newer delivery. An empty
+    /// `lease_ids` (or a `None` entry) preserves the legacy node-only match.
+    pub fn ack_fenced(
+        &self,
+        name: &str,
+        node: &str,
+        seqs: &[u64],
+        lease_ids: &[Option<u64>],
+    ) -> Result<AckResponse> {
         let start = Instant::now();
         if node.is_empty() {
             return Err(Error::invalid_request("ack requires a non-empty `node`"));
         }
         check_seqs_len("ack", seqs)?;
+        check_lease_ids_len("ack", seqs, lease_ids)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
@@ -619,9 +664,9 @@ impl Engine {
         {
             let mut q = b.queue.as_ref().expect("queue").lock();
             q.sweep_expired(now);
-            for &seq in seqs {
+            for (i, &seq) in seqs.iter().enumerate() {
                 match q.leases.get(&seq) {
-                    Some(l) if l.node == node => {
+                    Some(l) if l.node == node && lease_token_ok(lease_ids, i, l.lease_id) => {
                         let lease_id = l.lease_id;
                         q.leases.remove(&seq);
                         q.deliveries.remove(&seq);
@@ -696,11 +741,25 @@ impl Engine {
         seqs: &[u64],
         delay_ms: u64,
     ) -> Result<NackResponse> {
+        self.nack_fenced(name, node, seqs, delay_ms, &[])
+    }
+
+    /// As [`Self::nack`], with optional per-seq stale-worker fencing (R4); see
+    /// [`Self::ack_fenced`].
+    pub fn nack_fenced(
+        &self,
+        name: &str,
+        node: &str,
+        seqs: &[u64],
+        delay_ms: u64,
+        lease_ids: &[Option<u64>],
+    ) -> Result<NackResponse> {
         let start = Instant::now();
         if node.is_empty() {
             return Err(Error::invalid_request("nack requires a non-empty `node`"));
         }
         check_seqs_len("nack", seqs)?;
+        check_lease_ids_len("nack", seqs, lease_ids)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
@@ -718,9 +777,9 @@ impl Engine {
         {
             let mut q = b.queue.as_ref().expect("queue").lock();
             q.sweep_expired(now);
-            for &seq in seqs {
+            for (i, &seq) in seqs.iter().enumerate() {
                 match q.leases.get(&seq) {
-                    Some(l) if l.node == node => {
+                    Some(l) if l.node == node && lease_token_ok(lease_ids, i, l.lease_id) => {
                         let lease_id = l.lease_id;
                         q.leases.remove(&seq);
                         if delay > 0 {
@@ -770,11 +829,25 @@ impl Engine {
         seqs: &[u64],
         lease_ms: u64,
     ) -> Result<ExtendResponse> {
+        self.extend_fenced(name, node, seqs, lease_ms, &[])
+    }
+
+    /// As [`Self::extend`], with optional per-seq stale-worker fencing (R4); see
+    /// [`Self::ack_fenced`].
+    pub fn extend_fenced(
+        &self,
+        name: &str,
+        node: &str,
+        seqs: &[u64],
+        lease_ms: u64,
+        lease_ids: &[Option<u64>],
+    ) -> Result<ExtendResponse> {
         let start = Instant::now();
         if node.is_empty() {
             return Err(Error::invalid_request("extend requires a non-empty `node`"));
         }
         check_seqs_len("extend", seqs)?;
+        check_lease_ids_len("extend", seqs, lease_ids)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
@@ -790,15 +863,16 @@ impl Engine {
 
         let mut extended: Vec<(u64, u64)> = Vec::new();
         let mut skipped: Vec<u64> = Vec::new();
-        let mut deadlines: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut deadlines: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         {
             let mut q = b.queue.as_ref().expect("queue").lock();
             // Sweep first so an already-expired lease is treated as reclaimed and
             // cannot be extended (DESIGN §10.6).
             q.sweep_expired(now);
-            for &seq in seqs {
+            for (i, &seq) in seqs.iter().enumerate() {
                 match q.leases.get_mut(&seq) {
-                    Some(l) if l.node == node => {
+                    Some(l) if l.node == node && lease_token_ok(lease_ids, i, l.lease_id) => {
                         l.deadline_ms = deadline;
                         let lease_id = l.lease_id;
                         extended.push((seq, lease_id));
@@ -833,7 +907,7 @@ impl Engine {
     }
 
     /// Compute `(ready, in_flight)` for a queue box at `now`.
-    fn queue_ready_inflight(&self, b: &BoxState, now: i64) -> (u64, u64) {
+    pub(crate) fn queue_ready_inflight(&self, b: &BoxState, now: i64) -> (u64, u64) {
         let q = self.queue_counters(b, now);
         (q.ready, q.in_flight)
     }
@@ -1155,6 +1229,32 @@ fn check_seqs_len(op: &str, seqs: &[u64]) -> Result<()> {
     Ok(())
 }
 
+/// Validate the optional per-seq fencing tokens (R4): an empty `lease_ids`
+/// disables fencing (legacy node-only match); otherwise it must be exactly
+/// `seqs`-aligned so `lease_ids[i]` pairs with `seqs[i]`.
+fn check_lease_ids_len(op: &str, seqs: &[u64], lease_ids: &[Option<u64>]) -> Result<()> {
+    if !lease_ids.is_empty() && lease_ids.len() != seqs.len() {
+        return Err(Error::invalid_request(format!(
+            "{op} `lease_ids` length {} must equal `seqs` length {}",
+            lease_ids.len(),
+            seqs.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the fencing token for `seqs[i]` (if supplied) authorizes acting on the
+/// lease currently held under `held` (R4 stale-worker fencing). Returns `true`
+/// when no token was supplied (empty slice or `None` entry) — the legacy
+/// node-only match — or when the supplied token matches the held `lease_id`.
+#[inline]
+fn lease_token_ok(lease_ids: &[Option<u64>], i: usize, held: u64) -> bool {
+    match lease_ids.get(i).copied().flatten() {
+        Some(want) => want == held,
+        None => true,
+    }
+}
+
 /// Pull the next claimable, live seq for a claim pass: the reclaim freelist is
 /// drained first (reclaimed work jumps ahead of never-delivered work), then the
 /// monotonic claim cursor hands out fresh, never-yet-leased seqs (DESIGN §10.3).
@@ -1255,7 +1355,7 @@ mod tests {
         let seqs: Vec<u64> = r.claimed.iter().map(|c| c.seq).collect();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
         assert_eq!(r.ready, 6); // 10 - 4 leased.
-        // deliveries starts at 1.
+                                // deliveries starts at 1.
         assert!(r.claimed.iter().all(|c| c.deliveries == 1));
 
         // A second worker gets the next 4 (a claimed job is not re-leased).
@@ -1350,8 +1450,16 @@ mod tests {
         // Two claimers: max 2 and max 100. Round-robin fills the small one to its
         // cap (2) and gives the rest to the larger (7).
         let claimers = vec![
-            Claimer { node: "small".into(), max: 2, work_conn: None },
-            Claimer { node: "big".into(), max: 100, work_conn: None },
+            Claimer {
+                node: "small".into(),
+                max: 2,
+                work_conn: None,
+            },
+            Claimer {
+                node: "big".into(),
+                max: 100,
+                work_conn: None,
+            },
         ];
         let (results, _ready) = engine.claim_cohort("jobs", &claimers, None).unwrap();
         assert_eq!(results[0].len(), 2);
@@ -1416,10 +1524,7 @@ mod tests {
         // Reclaimed seqs are claimable again (freelist drained first), and the
         // delivery counter increments on the re-claim.
         let r2 = engine.claim("jobs", "w2", 2, None).unwrap();
-        assert_eq!(
-            r2.claimed.iter().map(|c| c.seq).collect::<Vec<_>>(),
-            seqs,
-        );
+        assert_eq!(r2.claimed.iter().map(|c| c.seq).collect::<Vec<_>>(), seqs,);
         assert!(r2.claimed.iter().all(|c| c.deliveries == 2));
     }
 
@@ -1435,7 +1540,7 @@ mod tests {
         let n = engine.nack("jobs", "w1", &[seq], 5_000).unwrap();
         assert_eq!(n.nacked, 1);
         assert_eq!(n.ready, 0); // not claimable yet (delay pending).
-        // Not claimable before the delay elapses.
+                                // Not claimable before the delay elapses.
         assert_eq!(engine.claim("jobs", "w2", 1, None).unwrap().count, 0);
 
         // After 5s it becomes claimable.
@@ -1471,6 +1576,113 @@ mod tests {
         let e2 = engine.extend("jobs", "w9", &[seq], 10_000).unwrap();
         assert_eq!(e2.extended, 0);
         assert_eq!(e2.skipped, vec![seq]);
+    }
+
+    /// Parse the `"lease_<hex>"` wire token back to the raw lease id (test-only).
+    fn parse_lease(token: &str) -> u64 {
+        u64::from_str_radix(token.strip_prefix("lease_").unwrap(), 16).unwrap()
+    }
+
+    #[test]
+    fn fenced_ack_rejects_stale_lease_token() {
+        // R4: a worker that reuses the same `node` after its lease expired (the job
+        // re-delivered under a NEW lease id) must NOT be able to ack the newer
+        // delivery with its stale token.
+        let (engine, clock) = engine_with_clock();
+        engine.put_box("jobs", queue_cfg()).unwrap();
+        produce(&engine, "jobs", 1);
+
+        // First delivery to w1 under lease L1 with a short lease.
+        let r1 = engine.claim("jobs", "w1", 1, Some(1_000)).unwrap();
+        let seq = r1.claimed[0].seq;
+        let stale_token = parse_lease(&r1.claimed[0].lease_id);
+
+        // Lease expires; the job is reclaimed and re-delivered to the SAME node
+        // under a new lease id L2 (L2 != L1 since the allocator is monotonic).
+        clock.advance(1_001);
+        let r2 = engine.claim("jobs", "w1", 1, Some(60_000)).unwrap();
+        assert_eq!(r2.claimed[0].seq, seq);
+        let fresh_token = parse_lease(&r2.claimed[0].lease_id);
+        assert_ne!(stale_token, fresh_token, "redelivery gets a new lease id");
+
+        // The stale worker acks with its OLD token: node matches but the fencing
+        // token does not ⇒ rejected (skipped), the newer delivery is untouched.
+        let a = engine
+            .ack_fenced("jobs", "w1", &[seq], &[Some(stale_token)])
+            .unwrap();
+        assert_eq!(a.acked, 0, "stale-token ack rejected");
+        assert_eq!(a.skipped, vec![seq]);
+        assert_eq!(a.in_flight, 1, "the fresh lease still holds the job");
+        assert_eq!(
+            engine.box_state("jobs", false).unwrap().count,
+            1,
+            "not deleted"
+        );
+
+        // The current holder acks with the CORRECT token ⇒ accepted+deleted.
+        let a2 = engine
+            .ack_fenced("jobs", "w1", &[seq], &[Some(fresh_token)])
+            .unwrap();
+        assert_eq!(a2.acked, 1);
+        assert!(a2.skipped.is_empty());
+        assert_eq!(engine.box_state("jobs", false).unwrap().count, 0, "deleted");
+    }
+
+    #[test]
+    fn fenced_nack_and_extend_reject_stale_token() {
+        // R4 for nack + extend: a stale token is rejected (skipped); the correct
+        // token is honored. An empty `lease_ids` preserves the legacy node match.
+        let (engine, clock) = engine_with_clock();
+        engine.put_box("jobs", queue_cfg()).unwrap();
+        produce(&engine, "jobs", 1);
+
+        let r1 = engine.claim("jobs", "w1", 1, Some(1_000)).unwrap();
+        let seq = r1.claimed[0].seq;
+        let stale = parse_lease(&r1.claimed[0].lease_id);
+
+        clock.advance(1_001);
+        let r2 = engine.claim("jobs", "w1", 1, Some(60_000)).unwrap();
+        let fresh = parse_lease(&r2.claimed[0].lease_id);
+        assert_ne!(stale, fresh);
+
+        // extend with the stale token: rejected.
+        let e = engine
+            .extend_fenced("jobs", "w1", &[seq], 30_000, &[Some(stale)])
+            .unwrap();
+        assert_eq!(e.extended, 0);
+        assert_eq!(e.skipped, vec![seq]);
+
+        // nack with the stale token: rejected (the job is NOT released).
+        let n = engine
+            .nack_fenced("jobs", "w1", &[seq], 0, &[Some(stale)])
+            .unwrap();
+        assert_eq!(n.nacked, 0);
+        assert_eq!(n.skipped, vec![seq]);
+        assert_eq!(n.in_flight, 1, "still held under the fresh lease");
+
+        // nack with the correct token: released for reclaim.
+        let n2 = engine
+            .nack_fenced("jobs", "w1", &[seq], 0, &[Some(fresh)])
+            .unwrap();
+        assert_eq!(n2.nacked, 1);
+        assert_eq!(n2.ready, 1);
+
+        // A `None` token (legacy node-only match) still works: re-claim + bare ack.
+        let r3 = engine.claim("jobs", "w1", 1, None).unwrap();
+        let s3 = r3.claimed[0].seq;
+        let a = engine.ack("jobs", "w1", &[s3]).unwrap();
+        assert_eq!(a.acked, 1);
+    }
+
+    #[test]
+    fn fenced_ops_reject_mismatched_lease_ids_length() {
+        // R4: a non-empty `lease_ids` must be exactly seqs-aligned.
+        let (engine, _clock) = engine_with_clock();
+        engine.put_box("jobs", queue_cfg()).unwrap();
+        let e = engine
+            .ack_fenced("jobs", "w1", &[1, 2], &[Some(7)])
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -1615,5 +1827,52 @@ mod tests {
             let r = engine.claim("jobs", "w-new", 3, None).unwrap();
             assert_eq!(r.count, 3);
         }
+    }
+
+    /// codex P1 #2: a replayed leases-log event must only mutate the projection
+    /// when its `lease_id` matches the CURRENT lease. A delayed/out-of-order STALE
+    /// Released (from a prior delivery) must NOT clear a newer recovered lease.
+    #[test]
+    fn lease_replay_ignores_stale_lease_id() {
+        let mut q = QueueProjection::new(1);
+        let seq = 5u64;
+
+        // Delivery #1: claimed under lease 100, then released (stale-to-come).
+        q.apply_lease_event(LeaseEvent::Claimed as u8, seq, "w1".into(), 100, 1_000, 1);
+        assert!(q.leases.contains_key(&seq), "lease 100 active");
+
+        // Delivery #2: re-claimed under a NEWER lease 200 (the seq was reclaimed and
+        // handed to a different worker).
+        q.apply_lease_event(LeaseEvent::Claimed as u8, seq, "w2".into(), 200, 2_000, 2);
+        assert_eq!(
+            q.leases.get(&seq).unwrap().lease_id,
+            200,
+            "newer lease 200 active"
+        );
+
+        // A STALE Released for the OLD lease 100 arrives (out of order): it must be
+        // ignored — the current lease is 200.
+        q.apply_lease_event(LeaseEvent::Released as u8, seq, "w1".into(), 100, 0, 0);
+        assert_eq!(
+            q.leases.get(&seq).map(|l| l.lease_id),
+            Some(200),
+            "stale release for lease 100 must not clear the newer lease 200"
+        );
+
+        // A stale Extended for lease 100 likewise leaves lease 200's deadline alone.
+        let dl_before = q.leases.get(&seq).unwrap().deadline_ms;
+        q.apply_lease_event(LeaseEvent::Extended as u8, seq, "w1".into(), 100, 9_999, 0);
+        assert_eq!(
+            q.leases.get(&seq).unwrap().deadline_ms,
+            dl_before,
+            "stale extend ignored"
+        );
+
+        // The CURRENT lease's own Released does clear it.
+        q.apply_lease_event(LeaseEvent::Released as u8, seq, "w2".into(), 200, 0, 0);
+        assert!(
+            !q.leases.contains_key(&seq),
+            "current lease's release clears it"
+        );
     }
 }

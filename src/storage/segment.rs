@@ -177,8 +177,7 @@ pub fn encode_data_frame(out: &mut Vec<u8>, rec: &SegmentRecord) -> u32 {
 
     // frame_len = everything after the prefix = (total - 4).
     let frame_len = (out.len() - frame_start - SEG_FRAME_LEN_PREFIX) as u32;
-    out[frame_start..frame_start + SEG_FRAME_LEN_PREFIX]
-        .copy_from_slice(&frame_len.to_le_bytes());
+    out[frame_start..frame_start + SEG_FRAME_LEN_PREFIX].copy_from_slice(&frame_len.to_le_bytes());
 
     (out.len() - frame_start) as u32
 }
@@ -190,7 +189,9 @@ pub fn encode_data_frame(out: &mut Vec<u8>, rec: &SegmentRecord) -> u32 {
 /// surfaces the error).
 pub fn decode_data_frame(buf: &[u8]) -> Result<SegmentRecord, SegmentError> {
     if buf.len() < SEG_FRAME_LEN_PREFIX {
-        return Err(SegmentError::Corrupt("shorter than frame_len prefix".into()));
+        return Err(SegmentError::Corrupt(
+            "shorter than frame_len prefix".into(),
+        ));
     }
     let frame_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     if frame_len < SEG_FRAME_HEADER_LEN + SEG_FRAME_CRC_LEN {
@@ -218,7 +219,9 @@ pub fn decode_data_frame(buf: &[u8]) -> Result<SegmentRecord, SegmentError> {
 
     let body = &h[SEG_FRAME_HEADER_LEN..crc_start - SEG_FRAME_LEN_PREFIX];
     if node_len + tag_len + data_len != body.len() {
-        return Err(SegmentError::Corrupt("internal length inconsistency".into()));
+        return Err(SegmentError::Corrupt(
+            "internal length inconsistency".into(),
+        ));
     }
     let node_bytes = &body[..node_len];
     let tag_bytes = &body[node_len..node_len + tag_len];
@@ -360,6 +363,11 @@ impl SegmentBuilder {
         self.next_seq.saturating_sub(1)
     }
 
+    /// The seq the next [`Self::push`] must carry (`start_seq` while empty).
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
     /// Number of records pushed so far.
     pub fn record_count(&self) -> usize {
         idx_len(&self.idx)
@@ -447,7 +455,14 @@ mod tests {
         let start = 1001;
         let mut b = SegmentBuilder::new(start);
         let records: Vec<SegmentRecord> = (0..5)
-            .map(|i| rec(start + i, (i % 2 == 0).then_some("n"), Some("tag"), b"{\"v\":7}"))
+            .map(|i| {
+                rec(
+                    start + i,
+                    (i % 2 == 0).then_some("n"),
+                    Some("tag"),
+                    b"{\"v\":7}",
+                )
+            })
             .collect();
         for r in &records {
             b.push(r);

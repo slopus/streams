@@ -28,7 +28,12 @@
 //! crashes are driven by the harness-level `FakeDisk.crash()` injector.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +47,9 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest};
+use streams::types::{
+    BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+};
 
 // ===========================================================================
 // Reference model (the oracle) — a trimmed copy of the crash_oracle.rs model,
@@ -128,9 +135,21 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox { name: String, durable: bool },
-    Append { name: String, data: String, tag: Option<String>, node: Option<String> },
-    Delete { name: String, before_seq: Option<u64>, tag_eq: Option<String> },
+    PutBox {
+        name: String,
+        durable: bool,
+    },
+    Append {
+        name: String,
+        data: String,
+        tag: Option<String>,
+        node: Option<String>,
+    },
+    Delete {
+        name: String,
+        before_seq: Option<u64>,
+        tag_eq: Option<String>,
+    },
 }
 
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
@@ -147,7 +166,12 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ensure_box(name, *durable);
                 }
             }
-            Op::Append { name, data, tag, node } => {
+            Op::Append {
+                name,
+                data,
+                tag,
+                node,
+            } => {
                 let req = WriteRequest {
                     records: vec![RecordIn {
                         data: json!({ "v": data }),
@@ -174,7 +198,11 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ack_append(name, &seqs, &rec);
                 }
             }
-            Op::Delete { name, before_seq, tag_eq } => {
+            Op::Delete {
+                name,
+                before_seq,
+                tag_eq,
+            } => {
                 let req = DeleteRequest {
                     before_seq: *before_seq,
                     match_: tag_eq.as_ref().map(|t| Filter::from_shorthand(t)),
@@ -295,7 +323,10 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         let m = model.ever_acked.get(seq).unwrap_or_else(|| {
             panic!("{name}: recovered seq {seq} was never acked (fabricated/torn): {rec:?}")
         });
-        assert_eq!(m, rec, "{name}: recovered record at seq {seq} differs from the model");
+        assert_eq!(
+            m, rec,
+            "{name}: recovered record at seq {seq} differs from the model"
+        );
     }
 
     // (2) NO SILENT LOSS of acked-durable (whole tail durable).
@@ -328,16 +359,44 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE.
-    assert!(
-        dump.head <= model.head,
-        "{name}: recovered head {} exceeds model head {} (future seq?)",
-        dump.head,
-        model.head
-    );
-    if model.durable && whole_tail_durable && !live.is_empty() {
-        assert_eq!(dump.head, model.head, "{name}: durable head must match model");
-        assert_eq!(dump.earliest, model.earliest(), "{name}: earliest must match model");
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box's head matches the
+    //     acked head exactly; a `disk` box (acked before fsync) recovers at its
+    //     durable head RESERVATION — its head may sit ABOVE the acked head by up to
+    //     `DISK_HEAD_RESERVE_AHEAD` (dropped un-fsynced seqs become silent gaps) and
+    //     never regresses below an acked seq when the whole tail was durable.
+    if model.durable {
+        assert!(
+            dump.head <= model.head,
+            "{name}: fsync recovered head {} exceeds model head {} (future seq?)",
+            dump.head,
+            model.head
+        );
+        if whole_tail_durable && !live.is_empty() {
+            assert_eq!(
+                dump.head, model.head,
+                "{name}: durable head must match model"
+            );
+            assert_eq!(
+                dump.earliest,
+                model.earliest(),
+                "{name}: earliest must match model"
+            );
+        }
+    } else {
+        if whole_tail_durable && model.head > 0 {
+            assert!(
+                dump.head >= model.head,
+                "{name}: disk recovered head {} REGRESSED below acked head {} (reuse!)",
+                dump.head,
+                model.head
+            );
+        }
+        assert!(
+            dump.head <= model.head + streams::config::DISK_HEAD_RESERVE_AHEAD,
+            "{name}: disk recovered head {} exceeds reservation ceiling {}",
+            dump.head,
+            model.head + streams::config::DISK_HEAD_RESERVE_AHEAD
+        );
     }
 
     // (5) A voluntary delete stays SILENT (never tombstones).
@@ -495,29 +554,69 @@ fn f_rec_delete_before_append_order() {
     // after the durable Delete commits but (likely) before the trailing Append's
     // fsync lands — placing the lost Append *after* a surviving Delete in WAL order.
     let ops = vec![
-        Op::PutBox { name: "q".into(), durable: true },
-        Op::Append { name: "q".into(), data: "a".into(), tag: Some("t".into()), node: None },
-        Op::Append { name: "q".into(), data: "b".into(), tag: Some("t".into()), node: None },
-        Op::Append { name: "q".into(), data: "c".into(), tag: None, node: None },
+        Op::PutBox {
+            name: "q".into(),
+            durable: true,
+        },
+        Op::Append {
+            name: "q".into(),
+            data: "a".into(),
+            tag: Some("t".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "q".into(),
+            data: "b".into(),
+            tag: Some("t".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "q".into(),
+            data: "c".into(),
+            tag: None,
+            node: None,
+        },
         // Delete the prefix below seq 2 (drops seq 1). This control frame is
         // durable; it precedes the lost tail Append in the log.
-        Op::Delete { name: "q".into(), before_seq: Some(2), tag_eq: None },
+        Op::Delete {
+            name: "q".into(),
+            before_seq: Some(2),
+            tag_eq: None,
+        },
         // The "target" Append that a crash may drop (its fsync may not return).
-        Op::Append { name: "q".into(), data: "d".into(), tag: None, node: None },
-        Op::Append { name: "q".into(), data: "e".into(), tag: None, node: None },
+        Op::Append {
+            name: "q".into(),
+            data: "d".into(),
+            tag: None,
+            node: None,
+        },
+        Op::Append {
+            name: "q".into(),
+            data: "e".into(),
+            tag: None,
+            node: None,
+        },
     ];
 
     // Probe the total write_at count (at = MAX ⇒ never fires).
     let probe_disk = FakeDisk::new();
-    let probe = FaultFs::new(probe_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, u64::MAX, true);
+    let probe = FaultFs::new(
+        probe_disk.arc(),
+        FaultOp::WriteAt,
+        FaultKind::Eio,
+        u64::MAX,
+        true,
+    );
     {
-        let engine =
-            Engine::with_data_dir_fs(cfg(), clock(), probe.arc()).expect("probe engine");
+        let engine = Engine::with_data_dir_fs(cfg(), clock(), probe.arc()).expect("probe engine");
         run_ops(&engine, &mut RefModel::default(), &ops);
         drop(engine);
     }
     let total = probe.calls_seen();
-    assert!(total >= 5, "workload issues several write_at calls (M={total})");
+    assert!(
+        total >= 5,
+        "workload issues several write_at calls (M={total})"
+    );
 
     // Sweep crash points: at each, the Delete-before-lost-Append ordering is
     // exercised when the crash lands after the delete's frame but before a later
@@ -529,8 +628,8 @@ fn f_rec_delete_before_append_order() {
         let trip = CrashAfter::new(disk.clone(), FaultOp::WriteAt, crash_point);
         let mut model = RefModel::default();
         {
-            let engine = Engine::with_data_dir_fs(cfg(), clock(), trip.arc())
-                .expect("sweep engine opens");
+            let engine =
+                Engine::with_data_dir_fs(cfg(), clock(), trip.arc()).expect("sweep engine opens");
             run_ops(&engine, &mut model, &ops);
             drop(engine);
         }
@@ -591,9 +690,22 @@ fn f_recdir_eio_create() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "d".into(), durable: true },
-                Op::Append { name: "d".into(), data: "1".into(), tag: None, node: None },
-                Op::Append { name: "d".into(), data: "2".into(), tag: None, node: None },
+                Op::PutBox {
+                    name: "d".into(),
+                    durable: true,
+                },
+                Op::Append {
+                    name: "d".into(),
+                    data: "1".into(),
+                    tag: None,
+                    node: None,
+                },
+                Op::Append {
+                    name: "d".into(),
+                    data: "2".into(),
+                    tag: None,
+                    node: None,
+                },
             ],
         );
         sync_dirs(&disk);
@@ -615,7 +727,11 @@ fn f_recdir_eio_create() {
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
     let dump = dump_box(&engine, "d").expect("d survives the failed-then-clean reopen");
-    assert_eq!(dump.records.len(), 2, "prior durable data intact after the EIO refusal");
+    assert_eq!(
+        dump.records.len(),
+        2,
+        "prior durable data intact after the EIO refusal"
+    );
 }
 
 // ===========================================================================
@@ -672,10 +788,7 @@ impl File for CtoFile {
         Ok(n)
     }
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        self.own_writes
-            .lock()
-            .unwrap()
-            .push((offset, buf.to_vec()));
+        self.own_writes.lock().unwrap().push((offset, buf.to_vec()));
         self.inner.write_at(offset, buf)
     }
     fn set_len(&mut self, len: u64) -> std::io::Result<()> {
@@ -732,18 +845,23 @@ impl Fs for CtoFs {
 #[test]
 fn f_nfs_cto_snapshot_read() {
     let disk = FakeDisk::new();
-    let cto = CtoFs { inner: disk.clone() };
+    let cto = CtoFs {
+        inner: disk.clone(),
+    };
     let cto_fs: Arc<dyn Fs> = Arc::new(cto.clone());
 
     // Build a durable engine THROUGH the CTO fs, write data, then take a snapshot
     // (which writes meta/snapshot-*.bin through the same CTO fs).
     let mut model = RefModel::default();
-    let snap_path = PathBuf::from(DATA_DIR).join("meta").join(format!("snapshot-{:016}.bin", 1));
+    let snap_path = PathBuf::from(DATA_DIR)
+        .join("meta")
+        .join(format!("snapshot-{:016}.bin", 1));
 
     // A stale reader handle opened on the snapshot path BEFORE it is written:
     // create the meta dir first so we can hold an open handle whose frozen view is
     // empty/absent, proving it never sees the later snapshot bytes.
-    disk.create_dir_all(&PathBuf::from(DATA_DIR).join("meta")).unwrap();
+    disk.create_dir_all(&PathBuf::from(DATA_DIR).join("meta"))
+        .unwrap();
 
     {
         let engine = Engine::with_data_dir_fs(cfg(), clock(), cto_fs.clone())
@@ -752,10 +870,28 @@ fn f_nfs_cto_snapshot_read() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "s".into(), durable: true },
-                Op::Append { name: "s".into(), data: "x".into(), tag: Some("g".into()), node: None },
-                Op::Append { name: "s".into(), data: "y".into(), tag: None, node: Some("n".into()) },
-                Op::Append { name: "s".into(), data: "z".into(), tag: Some("g".into()), node: None },
+                Op::PutBox {
+                    name: "s".into(),
+                    durable: true,
+                },
+                Op::Append {
+                    name: "s".into(),
+                    data: "x".into(),
+                    tag: Some("g".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "s".into(),
+                    data: "y".into(),
+                    tag: None,
+                    node: Some("n".into()),
+                },
+                Op::Append {
+                    name: "s".into(),
+                    data: "z".into(),
+                    tag: Some("g".into()),
+                    node: None,
+                },
             ],
         );
         // Open a STALE handle on the (not-yet-written) snapshot file's eventual
@@ -776,7 +912,9 @@ fn f_nfs_cto_snapshot_read() {
     // FakeDisk handle directly and freeze its view, then mutate via another handle.
     {
         // Confirm the snapshot file exists and is non-trivial when opened fresh.
-        let fresh = cto_fs.open(&snap_path, OpenOpts::read_only()).expect("fresh snapshot open");
+        let fresh = cto_fs
+            .open(&snap_path, OpenOpts::read_only())
+            .expect("fresh snapshot open");
         let mut fresh_bytes = Vec::new();
         fresh.read_to_end_from(0, &mut fresh_bytes).unwrap();
         assert!(
@@ -787,7 +925,9 @@ fn f_nfs_cto_snapshot_read() {
         // A stale handle: open fresh, then overwrite the file through a SECOND
         // handle; the stale handle keeps its frozen view (close-to-open), proving
         // a cached handle does NOT observe another handle's later writes.
-        let stale = cto_fs.open(&snap_path, OpenOpts::read_only()).expect("stale open");
+        let stale = cto_fs
+            .open(&snap_path, OpenOpts::read_only())
+            .expect("stale open");
         let mut stale_before = Vec::new();
         stale.read_to_end_from(0, &mut stale_before).unwrap();
         {
@@ -804,10 +944,16 @@ fn f_nfs_cto_snapshot_read() {
             "a stale cached handle does NOT observe another handle's later write (CTO)"
         );
         // But a brand-new open sees the change (read-current on fresh open).
-        let fresh2 = cto_fs.open(&snap_path, OpenOpts::read_only()).expect("fresh2");
+        let fresh2 = cto_fs
+            .open(&snap_path, OpenOpts::read_only())
+            .expect("fresh2");
         let mut fresh2_bytes = Vec::new();
         fresh2.read_to_end_from(0, &mut fresh2_bytes).unwrap();
-        assert_eq!(&fresh2_bytes[0..4], b"ZZZZ", "a fresh open reads the current bytes");
+        assert_eq!(
+            &fresh2_bytes[0..4],
+            b"ZZZZ",
+            "a fresh open reads the current bytes"
+        );
     }
 
     // Recovery opens snapshot + WAL FRESH (by path) ⇒ it reads the current,
@@ -815,7 +961,9 @@ fn f_nfs_cto_snapshot_read() {
     // (We rebuild the snapshot the previous block clobbered for the staleness
     // demo so recovery has a valid one; the WAL alone also fully covers the data.)
     let disk2 = FakeDisk::new();
-    let cto2: Arc<dyn Fs> = Arc::new(CtoFs { inner: disk2.clone() });
+    let cto2: Arc<dyn Fs> = Arc::new(CtoFs {
+        inner: disk2.clone(),
+    });
     let mut model2 = RefModel::default();
     {
         let engine =
@@ -824,10 +972,28 @@ fn f_nfs_cto_snapshot_read() {
             &engine,
             &mut model2,
             &[
-                Op::PutBox { name: "s".into(), durable: true },
-                Op::Append { name: "s".into(), data: "x".into(), tag: Some("g".into()), node: None },
-                Op::Append { name: "s".into(), data: "y".into(), tag: None, node: Some("n".into()) },
-                Op::Append { name: "s".into(), data: "z".into(), tag: Some("g".into()), node: None },
+                Op::PutBox {
+                    name: "s".into(),
+                    durable: true,
+                },
+                Op::Append {
+                    name: "s".into(),
+                    data: "x".into(),
+                    tag: Some("g".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "s".into(),
+                    data: "y".into(),
+                    tag: None,
+                    node: Some("n".into()),
+                },
+                Op::Append {
+                    name: "s".into(),
+                    data: "z".into(),
+                    tag: Some("g".into()),
+                    node: None,
+                },
             ],
         );
         sync_dirs(&disk2);
@@ -839,7 +1005,11 @@ fn f_nfs_cto_snapshot_read() {
     let engine = Engine::with_data_dir_fs(cfg(), clock(), cto2.clone()).expect("recover via CtoFs");
     assert_recovered_matches_model(&engine, &model2, true);
     let dump = dump_box(&engine, "s").expect("s recovered through fresh CTO opens");
-    assert_eq!(dump.records.len(), 3, "all 3 durable records recovered via fresh-open reads");
+    assert_eq!(
+        dump.records.len(),
+        3,
+        "all 3 durable records recovered via fresh-open reads"
+    );
     assert_eq!(dump.head, 3, "head recovered correctly through the CTO fs");
 }
 
@@ -869,9 +1039,22 @@ fn f_compound_crash_snap_then_wal() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "c".into(), durable: true },
-                Op::Append { name: "c".into(), data: "1".into(), tag: Some("a".into()), node: None },
-                Op::Append { name: "c".into(), data: "2".into(), tag: Some("a".into()), node: None },
+                Op::PutBox {
+                    name: "c".into(),
+                    durable: true,
+                },
+                Op::Append {
+                    name: "c".into(),
+                    data: "1".into(),
+                    tag: Some("a".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "c".into(),
+                    data: "2".into(),
+                    tag: Some("a".into()),
+                    node: None,
+                },
             ],
         );
         sync_dirs(&disk);
@@ -883,8 +1066,18 @@ fn f_compound_crash_snap_then_wal() {
             &engine,
             &mut model,
             &[
-                Op::Append { name: "c".into(), data: "3".into(), tag: Some("b".into()), node: None },
-                Op::Append { name: "c".into(), data: "4".into(), tag: None, node: Some("n4".into()) },
+                Op::Append {
+                    name: "c".into(),
+                    data: "3".into(),
+                    tag: Some("b".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "c".into(),
+                    data: "4".into(),
+                    tag: None,
+                    node: Some("n4".into()),
+                },
             ],
         );
         sync_dirs(&disk);
@@ -940,7 +1133,10 @@ fn f_compound_crash_snap_then_wal() {
     drop(engine2);
     let engine3 = open_engine(&disk);
     let d3 = dump_box(&engine3, "c");
-    assert_eq!(d2, d3, "recovery converges (idempotent) after the compound crash");
+    assert_eq!(
+        d2, d3,
+        "recovery converges (idempotent) after the compound crash"
+    );
 }
 
 // ===========================================================================
@@ -966,10 +1162,28 @@ fn f_compound_oom_in_error_path() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "o".into(), durable: true },
-                Op::Append { name: "o".into(), data: "1".into(), tag: None, node: None },
-                Op::Append { name: "o".into(), data: "2".into(), tag: Some("t".into()), node: None },
-                Op::Append { name: "o".into(), data: "3".into(), tag: None, node: Some("n".into()) },
+                Op::PutBox {
+                    name: "o".into(),
+                    durable: true,
+                },
+                Op::Append {
+                    name: "o".into(),
+                    data: "1".into(),
+                    tag: None,
+                    node: None,
+                },
+                Op::Append {
+                    name: "o".into(),
+                    data: "2".into(),
+                    tag: Some("t".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "o".into(),
+                    data: "3".into(),
+                    tag: None,
+                    node: Some("n".into()),
+                },
             ],
         );
         sync_dirs(&disk);
@@ -1012,6 +1226,10 @@ fn f_compound_oom_in_error_path() {
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
     let dump = dump_box(&engine, "o").expect("o present after a clean recovery");
-    assert_eq!(dump.records.len(), 3, "complete state after a clean recovery");
+    assert_eq!(
+        dump.records.len(),
+        3,
+        "complete state after a clean recovery"
+    );
     let _ = recovered_clean_on_first; // informational; both outcomes are valid.
 }

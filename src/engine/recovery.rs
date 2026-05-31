@@ -49,7 +49,10 @@ fn list_wal_files(fs: &Arc<dyn Fs>, wal_dir: &Path) -> std::io::Result<Vec<WalFi
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if let Some(rest) = name.strip_prefix("wal-").and_then(|s| s.strip_suffix(".log")) {
+        if let Some(rest) = name
+            .strip_prefix("wal-")
+            .and_then(|s| s.strip_suffix(".log"))
+        {
             if let Ok(idx) = rest.parse::<u64>() {
                 files.push(WalFile { idx, path });
             }
@@ -163,6 +166,14 @@ pub fn recover_and_open_with(
         active_idx = active_idx.max(1);
         active_valid_len = 0;
     }
+
+    // 4) Apply durable head reservations (R3). Every Append has now replayed, so
+    //    any box whose fsynced `HeadWatermark` reserved a seq BEYOND its replayed
+    //    head lost the un-fsynced `disk` tail to the crash: advance its head to the
+    //    reservation and pad the reserved-but-unwritten seqs as silent deleted gaps
+    //    so the seq counter never regresses and an already-acked `disk` seq is
+    //    never re-handed (disk-class seq monotonicity across restart).
+    engine.apply_head_watermarks();
 
     // 5) Re-derive droppable/orphan segments and reclaim them idempotently
     //    (ARCHITECTURE §4 step 5): a cap/TTL/delete reclaim interrupted by a crash
@@ -339,19 +350,25 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
         WalRecord::EvictWatermark {
             box_id,
             evict_floor,
+            expiry_floor,
             ..
         } => {
-            // Restore the involuntary loss floor monotonically (codex P0 #2): the
-            // `evict_floor` field carries `max(cap_floor, ttl_floor)` (the
-            // involuntary floor), so a relaxed cap or a backward clock can never
-            // resurrect a record below a durably-logged floor after restart. The
-            // floor only ever advances (`>`), never regresses, regardless of replay
-            // order. (The cap-vs-ttl reason fidelity after restart is best-effort —
-            // the gap *range* is authoritative — and is not encoded in this frame.)
+            // Restore the involuntary loss floors monotonically (R7 / codex P0 #2).
+            // The `evict_floor` (cap-records / byte-cap) and `expiry_floor` (TTL)
+            // are restored into their OWN floor fields so a relaxed cap or a
+            // backward clock can never resurrect a record below a durably-logged
+            // floor after restart AND the from-0 tombstone reason (ttl / cap /
+            // mixed) is preserved. Each floor only ever advances (`>`), never
+            // regresses, regardless of replay order. A legacy frame carries
+            // `expiry_floor: 0` (folds into `evict_floor` only — the prior
+            // best-effort behavior, reason fidelity not preserved for old logs).
             if let Some(b) = engine.get_box_by_id(box_id) {
                 let mut floors = b.floors.write();
                 if evict_floor > floors.evict_floor {
                     floors.evict_floor = evict_floor;
+                }
+                if expiry_floor > floors.expiry_floor {
+                    floors.expiry_floor = expiry_floor;
                 }
             }
         }
@@ -382,6 +399,23 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
                 } else if let Some(q) = &b.queue {
                     let mut q = q.lock();
                     q.apply_lease_event(event, seq, node, lease_id, deadline as i64, deliveries);
+                }
+            }
+        }
+        WalRecord::HeadWatermark {
+            box_id, head_seq, ..
+        } => {
+            // Record the durable head reservation (R3). We DON'T pad the index
+            // here: a later Append frame in the log may legitimately fill seqs
+            // below this reservation, and padding now would make
+            // `apply_append_for_recovery` skip them as `seq <= head`. Instead we
+            // only raise the (monotone) reservation ceiling; the final
+            // `apply_head_watermarks` pass (after every Append replayed) pads any
+            // reserved-but-unwritten tail as deleted gaps and advances head, so an
+            // already-acked `disk` seq is never re-handed.
+            if let Some(b) = engine.get_box_by_id(box_id) {
+                if !b.config.read().is_memory() {
+                    b.set_reserved_head(head_seq);
                 }
             }
         }

@@ -286,6 +286,62 @@ impl StagedAppend {
             (self.start..=self.start + self.count - 1).collect()
         }
     }
+
+    /// The head seq this batch will publish (its last reserved seq) — used to
+    /// reserve the durable disk head ceiling BEFORE making the batch visible
+    /// (R3 / codex P0 #3). `0` for an empty batch (never published).
+    pub fn publish_head(&self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.start + self.count - 1
+        }
+    }
+}
+
+/// A lightweight deleted-hole slot: a tombstone with no payload, used to keep
+/// `seq - base_seq` indexing dense across seq gaps (a reclaimed-but-not-popped
+/// middle delete, or a reserved-but-unwritten `disk` seq restored by a head
+/// watermark on recovery, R3). Carries `0` bytes and is never delivered.
+pub(crate) fn deleted_hole() -> StoredRecord {
+    StoredRecord {
+        ts: 0,
+        node: None,
+        tag: None,
+        data: Value::Null,
+        meta: None,
+        bytes: 0,
+        deleted: true,
+        payload_resident: true,
+    }
+}
+
+/// The outcome of one [`BoxState::enforce_retention`] pass: whether the
+/// involuntary loss floor advanced, whether a NON-RE-DERIVABLE cause (TTL or
+/// byte-cap) drove it (so the engine must durably persist the resolved floor,
+/// R7), and the resolved involuntary floor `max(evict_floor, expiry_floor)`.
+#[derive(Debug, Clone, Copy)]
+pub struct RetentionAdvance {
+    /// The involuntary loss floor advanced this pass (any cause).
+    pub floor_advanced: bool,
+    /// A non-re-derivable cause (TTL expiry or byte-cap eviction) advanced the
+    /// floor: the engine must durably log the watermark (R7).
+    pub durable_advance: bool,
+    /// The cap-records / byte-cap floor after this pass (for the durable frame).
+    pub evict_floor: u64,
+    /// The TTL expiry floor after this pass (carried SEPARATELY so the durable
+    /// watermark preserves the cap-vs-ttl tombstone reason across restart, R7).
+    pub expiry_floor: u64,
+}
+
+impl RetentionAdvance {
+    /// No floor moved (the common hot-path / empty-box case).
+    pub const NONE: RetentionAdvance = RetentionAdvance {
+        floor_advanced: false,
+        durable_advance: false,
+        evict_floor: 0,
+        expiry_floor: 0,
+    };
 }
 
 /// The full in-memory state of one box.
@@ -317,6 +373,12 @@ pub struct BoxState {
 
     /// Highest assigned seq (`0` for a fresh empty box).
     pub head_seq: AtomicU64,
+    /// Highest seq this box has DURABLY reserved via a fsynced `HeadWatermark`
+    /// (R3). A `disk`-class write may only ack seqs `<= reserved_head`; crossing
+    /// it forces a fresh fsynced reservation so a crash can never re-hand an
+    /// already-acked `disk` seq. `0` ⇒ nothing reserved yet (the first disk write
+    /// reserves the first block). Always `>= head_seq`.
+    pub reserved_head: AtomicU64,
     /// First seq this box instance will ever assign (`seq_base`, default 1).
     pub seq_base: u64,
     /// Bumped on create; detects delete+recreate (DESIGN §5.5).
@@ -411,6 +473,7 @@ impl BoxState {
             dedupe: RwLock::new(HashMap::new()),
             dedupe_gates: Mutex::new(HashMap::new()),
             head_seq: AtomicU64::new(seq_base.saturating_sub(1)),
+            reserved_head: AtomicU64::new(seq_base.saturating_sub(1)),
             seq_base,
             epoch: AtomicU64::new(epoch),
             bytes_retained: AtomicU64::new(0),
@@ -467,6 +530,45 @@ impl BoxState {
 
     pub fn head_seq(&self) -> u64 {
         self.head_seq.load(Ordering::Acquire)
+    }
+
+    /// The highest seq durably reserved via a fsynced `HeadWatermark` (R3).
+    pub fn reserved_head(&self) -> u64 {
+        self.reserved_head.load(Ordering::Acquire)
+    }
+
+    /// Monotonically raise the durable reservation ceiling after a `HeadWatermark`
+    /// is fsynced (R3). Never regresses.
+    pub fn set_reserved_head(&self, reserved: u64) {
+        self.reserved_head.fetch_max(reserved, Ordering::AcqRel);
+    }
+
+    /// **Recovery only**: restore a durable head reservation (R3). If `reserved`
+    /// is beyond the seqs actually replayed, advance `head_seq` to it and PAD the
+    /// index with deleted-hole tombstones so the next live append assigns
+    /// `reserved + 1` (the seq counter never regresses and an already-acked
+    /// `disk` seq is never re-handed). The padded seqs read as silent deleted
+    /// gaps — exactly the "lost un-fsynced tail" the `disk` class contracts for.
+    /// Monotone: a watermark `<=` the recovered head is a no-op. The reservation
+    /// ceiling is also restored so post-recovery disk writes resume past it.
+    pub fn restore_head_watermark(&self, reserved: u64) {
+        self.set_reserved_head(reserved);
+        let head = self.head_seq();
+        if reserved <= head {
+            return; // already covered by replayed appends.
+        }
+        {
+            let mut index = self.index.write();
+            // Pad the deque so `base_seq + len == reserved + 1`; the next
+            // `stage_append` reserves from the tail and so assigns `reserved + 1`.
+            let tail = index.base_seq + index.records.len() as u64; // next free seq.
+            let mut next = tail;
+            while next <= reserved {
+                index.records.push_back(deleted_hole());
+                next += 1;
+            }
+        }
+        self.head_seq.store(reserved, Ordering::Release);
     }
 
     /// Acquire the in-flight gate for an idempotency `key`, serializing all
@@ -686,22 +788,30 @@ impl BoxState {
         }
     }
 
-    /// Reserve the next commit ticket for this writer. MUST be called while
-    /// holding `append_lock` (immediately after `stage_append`), so tickets are
-    /// handed out in exactly the same order seqs were assigned + WAL frames
-    /// enqueued. The returned ticket is later passed to [`Self::publish_wait_turn`]
-    /// to enforce in-order publish off the lock (codex P0 #1).
-    pub fn next_publish_ticket(&self) -> u64 {
-        self.publish_ticket.fetch_add(1, Ordering::Relaxed)
+    /// Reserve the next commit ticket for this writer, wrapped in an RAII
+    /// [`PublishGuard`] (R14). MUST be called while holding `append_lock`
+    /// (immediately after `stage_append`), so tickets are handed out in exactly
+    /// the same order seqs were assigned + WAL frames enqueued. The guard's
+    /// [`PublishGuard::wait_turn`]/[`PublishGuard::done`] enforce in-order publish
+    /// off the lock (codex P0 #1); crucially, if the writer PANICS (or returns
+    /// early) between taking the ticket and calling `done`, the guard's `Drop`
+    /// advances the gate on unwind so a panicking ticketed writer can never hang
+    /// [`Self::quiesce_publishes`] or strand every later writer behind a ticket
+    /// that is never released.
+    pub fn next_publish_ticket(&self) -> PublishGuard<'_> {
+        let ticket = self.publish_ticket.fetch_add(1, Ordering::Relaxed);
+        PublishGuard {
+            box_state: self,
+            ticket,
+            waited: false,
+            done: false,
+            on_unwind: UnwindAction::None,
+        }
     }
 
-    /// Block until it is this writer's turn to publish/rollback (its `ticket`
-    /// equals `publish_next`). Called AFTER the off-lock fsync `wait()`, so many
-    /// writers' fsyncs overlap (one group commit) yet publish strictly in seq
-    /// order. The single ordered WAL writer's prefix-commit guarantee then makes
-    /// ordered publish durable: when this writer's frames are committed, every
-    /// earlier writer's lower-seq frames are committed too.
-    pub fn publish_wait_turn(&self, ticket: u64) {
+    /// Block until it is `ticket`'s turn to publish/rollback (its value equals
+    /// `publish_next`). Used by the [`PublishGuard`] and its `Drop` path.
+    fn publish_wait_turn(&self, ticket: u64) {
         let mut next = self.publish_gate.lock().unwrap();
         while *next != ticket {
             next = self.publish_cv.wait(next).unwrap();
@@ -709,10 +819,9 @@ impl BoxState {
     }
 
     /// Advance the publish gate past `ticket`, waking the next writer in line.
-    /// MUST be called exactly once after this writer finished publishing or
-    /// rolling back, by the writer that owns `ticket` (after its
-    /// [`Self::publish_wait_turn`] returned).
-    pub fn publish_done(&self, ticket: u64) {
+    /// Called exactly once per ticket (by the [`PublishGuard`] or its `Drop`),
+    /// only after this ticket's turn arrived (`*next == ticket`).
+    fn publish_done(&self, ticket: u64) {
         let mut next = self.publish_gate.lock().unwrap();
         debug_assert_eq!(*next, ticket, "publish gate advanced out of order");
         *next = ticket.wrapping_add(1);
@@ -882,7 +991,54 @@ impl BoxState {
     ///
     /// Idempotent: safe to call on both the write and read paths. After it runs,
     /// the physically-present records equal the logically-retained set.
-    pub fn enforce_retention(&self, now_ms: i64) {
+    ///
+    /// Returns a [`RetentionAdvance`] describing whether the involuntary loss
+    /// floor advanced this pass and, if so, whether a NON-RE-DERIVABLE cause drove
+    /// it (R7): a `cap_records` floor is a pure function of `head - cap_records`
+    /// and is re-derived for free on restart, but a TTL expiry (clock-driven) or a
+    /// byte-cap eviction (depends on physically-retained bytes at the time) is NOT
+    /// reconstructible from the recovered head alone, so the caller must DURABLY
+    /// persist the resolved floor or a relaxed cap / backward clock could resurrect
+    /// an evicted record after a crash.
+    pub fn enforce_retention(&self, now_ms: i64) -> RetentionAdvance {
+        // Default path: no durable hardening hook. Commits the planned floors and
+        // reclaims unconditionally. Used by recovery/internal callers and the
+        // engine's best-effort path; the DURABLE non-re-derivable hazard (R7 /
+        // codex P0 #4) is handled by `enforce_retention_hardened`, which fsyncs the
+        // EvictWatermark BEFORE committing/reclaiming.
+        self.enforce_retention_hardened(now_ms, |_| Ok::<(), crate::error::Error>(()))
+            .expect("no-op harden never fails")
+    }
+
+    /// As [`Self::enforce_retention`], but `harden` is invoked with the PLANNED
+    /// [`RetentionAdvance`] **before** any floor is committed or any record is
+    /// physically reclaimed, and ONLY when a NON-RE-DERIVABLE cause (TTL expiry or
+    /// byte-cap eviction) drove the advance (`durable_advance`). This is the R7 /
+    /// codex P0 #4 fix: the eviction watermark must be durable BEFORE the in-memory
+    /// floor advances and the records are reclaimed, otherwise a watermark fsync
+    /// failure (or a crash in the window) would leave the floor advanced in memory
+    /// (consumers saw `earliest_seq` move) but not durable, so a restart would
+    /// regress the floor and resurrect the evicted records.
+    ///
+    /// If `harden` returns an error, NOTHING is committed: the floors are left
+    /// exactly as they were and no record is reclaimed, and the error is returned
+    /// so the caller can propagate it (instead of silently serving a tombstone for
+    /// an un-hardened floor). A re-derivable advance (records-cap only) or no
+    /// advance never calls `harden` and always commits.
+    ///
+    /// Plan→harden→commit is race-safe because the involuntary floors are
+    /// MONOTONIC: the plan computes a target floor from a consistent snapshot, the
+    /// commit re-takes the lock and raises the floor to `max(current, planned)`, so
+    /// a concurrent advance (which hardened its own watermark) is never lowered and
+    /// the committed floor never exceeds what was durably hardened.
+    pub fn enforce_retention_hardened<F, E>(
+        &self,
+        now_ms: i64,
+        harden: F,
+    ) -> std::result::Result<RetentionAdvance, E>
+    where
+        F: FnOnce(&RetentionAdvance) -> std::result::Result<(), E>,
+    {
         let config = self.config.read();
         let ttl_ms = config.ttl_ms;
         let cap_records = config.cap_records;
@@ -891,7 +1047,7 @@ impl BoxState {
 
         let head = self.head_seq();
         if head == 0 {
-            return; // empty box, nothing retained.
+            return Ok(RetentionAdvance::NONE); // empty box, nothing retained.
         }
 
         // Hot read-path fast path (codex P2 #11): a box with NO TTL and NO caps
@@ -899,95 +1055,130 @@ impl BoxState {
         // already reclaims its own dead front (`delete_*`/`delete_seqs` call
         // `reclaim_front` directly), so there is no pending front prefix for this
         // call to drain either. Skip the index read + floors write lock entirely.
-        // This makes `diff()`/SSE on an uncapped, non-expiring box pay nothing for
-        // retention maintenance instead of taking two more locks on every pass.
         if ttl_ms == 0 && cap_records == 0 && cap_bytes == 0 {
-            return;
+            return Ok(RetentionAdvance::NONE);
         }
 
-        let index = self.index.read();
-        let mut floors = self.floors.write();
-        // Track whether an involuntary floor advanced this pass: only then can a
-        // whole sealed segment have newly fallen below the live floor, so segment
-        // reclaim is skipped on the (common) read where nothing was evicted — the
-        // hot read path pays nothing for boxes with no cap/TTL pressure.
-        let mut floor_advanced = false;
+        // --- PLAN (no mutation): compute the target floors from a consistent
+        // snapshot under a READ lock, without advancing anything yet (R7 / codex
+        // P0 #4). The durable watermark (if any) is hardened before we commit.
+        let plan = {
+            let index = self.index.read();
+            let floors = self.floors.read();
+            let mut floor_advanced = false;
+            let mut durable_advance = false;
+            let mut evict_floor = floors.evict_floor;
+            let mut expiry_floor = floors.expiry_floor;
 
-        // --- TTL: advance expiry_floor past every expired record. -----------
-        // `$ts` is non-decreasing in seq, so all seqs <= X expired is a prefix
-        // predicate; scan the index front (bounded by the number of newly
-        // expired records, amortized O(1) under steady state).
-        if ttl_ms > 0 {
-            let ttl = ttl_ms as i64;
-            let base = index.base_seq;
-            let mut expired_upto = floors.expiry_floor;
-            for (i, rec) in index.records.iter().enumerate() {
-                if now_ms.saturating_sub(rec.ts) > ttl {
-                    expired_upto = base + i as u64;
-                } else {
-                    // First non-expired record; the rest are younger still.
-                    break;
-                }
-            }
-            if expired_upto > floors.expiry_floor {
-                floors.expiry_floor = expired_upto;
-                floor_advanced = true;
-            }
-        }
-
-        // --- Cap (records): keep at most cap_records retained. --------------
-        if cap_records > 0 && head > cap_records {
-            let want_floor = head - cap_records; // highest seq to evict.
-            if want_floor > floors.evict_floor {
-                floors.evict_floor = want_floor;
-                floor_advanced = true;
-            }
-        }
-
-        // --- Cap (bytes): evict oldest physically-present records until the
-        // retained byte total is within cap_bytes. Walk the front, summing the
-        // bytes that must drop. -------------------------------------------
-        if cap_bytes > 0 {
-            let retained_bytes = self.bytes_retained.load(Ordering::Relaxed);
-            if retained_bytes > cap_bytes {
-                let mut over = retained_bytes - cap_bytes;
+            // --- TTL: advance expiry_floor past every expired record. -----------
+            // `$ts` is non-decreasing in seq, so all seqs <= X expired is a prefix
+            // predicate; scan the index front (amortized O(1) under steady state).
+            if ttl_ms > 0 {
+                let ttl = ttl_ms as i64;
                 let base = index.base_seq;
-                // Only consider records that aren't already below the floor.
-                let current_floor = floors.evict_floor.max(floors.expiry_floor);
-                let mut evict_to = floors.evict_floor;
+                let mut expired_upto = expiry_floor;
                 for (i, rec) in index.records.iter().enumerate() {
-                    let seq = base + i as u64;
-                    if seq <= current_floor {
-                        continue; // already logically gone.
-                    }
-                    if over == 0 {
-                        break;
-                    }
-                    over = over.saturating_sub(rec.bytes);
-                    evict_to = seq;
-                    if over == 0 {
-                        break;
+                    if now_ms.saturating_sub(rec.ts) > ttl {
+                        expired_upto = base + i as u64;
+                    } else {
+                        break; // first non-expired; the rest are younger.
                     }
                 }
-                if evict_to > floors.evict_floor {
-                    floors.evict_floor = evict_to;
+                if expired_upto > expiry_floor {
+                    expiry_floor = expired_upto;
                     floor_advanced = true;
+                    // TTL is clock-driven and NOT re-derivable from the recovered
+                    // head: the floor must be durably persisted (R7).
+                    durable_advance = true;
                 }
             }
-        }
 
-        drop(floors);
-        drop(index);
-        // --- Lazy front reclaim: pop the dead prefix (evicted/expired/deleted)
-        // physically, advancing base_seq. Deleted holes carry 0 bytes (already
-        // subtracted on delete), so this never double-counts. -----------------
-        self.reclaim_front(head);
-        // Segment-granular physical reclaim: drop whole sealed segment files now
-        // fully below the live floor (cap/TTL). Only when a floor advanced this
-        // pass, so a quiet read (no eviction) never touches the segment store.
-        if floor_advanced {
+            // --- Cap (records): keep at most cap_records retained. --------------
+            if cap_records > 0 && head > cap_records {
+                let want_floor = head - cap_records; // highest seq to evict.
+                if want_floor > evict_floor {
+                    evict_floor = want_floor;
+                    floor_advanced = true;
+                    // A records-cap floor is `head - cap_records`, re-derived for
+                    // free on restart, so it needs no durable watermark of its own.
+                }
+            }
+
+            // --- Cap (bytes): evict oldest physically-present records until the
+            // retained byte total is within cap_bytes. ---------------------------
+            if cap_bytes > 0 {
+                let retained_bytes = self.bytes_retained.load(Ordering::Relaxed);
+                if retained_bytes > cap_bytes {
+                    let mut over = retained_bytes - cap_bytes;
+                    let base = index.base_seq;
+                    let current_floor = evict_floor.max(expiry_floor);
+                    let mut evict_to = evict_floor;
+                    for (i, rec) in index.records.iter().enumerate() {
+                        let seq = base + i as u64;
+                        if seq <= current_floor {
+                            continue; // already logically gone.
+                        }
+                        if over == 0 {
+                            break;
+                        }
+                        over = over.saturating_sub(rec.bytes);
+                        evict_to = seq;
+                        if over == 0 {
+                            break;
+                        }
+                    }
+                    if evict_to > evict_floor {
+                        evict_floor = evict_to;
+                        floor_advanced = true;
+                        // A byte-cap eviction depends on the physically-retained
+                        // bytes at this instant, NOT on the head, so it is not
+                        // re-derivable and must be durably persisted (R7).
+                        durable_advance = true;
+                    }
+                }
+            }
+
+            RetentionAdvance {
+                floor_advanced,
+                durable_advance,
+                evict_floor,
+                expiry_floor,
+            }
+        };
+
+        // When a NEW floor advanced this pass:
+        //   * HARDEN (off the floors lock) the durable watermark BEFORE committing
+        //     the floor / reclaiming (R7 / codex P0 #4). On failure, commit nothing
+        //     and propagate the error.
+        //   * COMMIT the floors monotonically (never lower a concurrently advanced
+        //     floor), then segment-reclaim (only a NEW advance can drop a whole
+        //     sealed segment below the floor).
+        // The lazy FRONT reclaim then ALWAYS runs (below), regardless of whether a
+        // new floor advanced this pass: the index front may already sit below the
+        // CURRENT floor — e.g. a floor restored by recovery's `EvictWatermark`
+        // replay, where this is the first retention pass and `plan.floor_advanced`
+        // is false (the clock may be rewound) — and that dead prefix must still be
+        // popped so `count`/`earliest_seq` reflect the durable floor.
+        if plan.floor_advanced {
+            if plan.durable_advance {
+                harden(&plan)?;
+            }
+            {
+                let mut floors = self.floors.write();
+                if plan.evict_floor > floors.evict_floor {
+                    floors.evict_floor = plan.evict_floor;
+                }
+                if plan.expiry_floor > floors.expiry_floor {
+                    floors.expiry_floor = plan.expiry_floor;
+                }
+            }
             self.reclaim_segments();
         }
+        // Lazy front reclaim: pop the dead prefix physically (below the current
+        // floor), advancing base_seq. Cheap no-op (`drop_n == 0`) when the front is
+        // already clean.
+        self.reclaim_front(head);
+        Ok(plan)
     }
 
     /// Physically pop the fully-dead front prefix (below `earliest_seq` or a run
@@ -1076,8 +1267,8 @@ impl BoxState {
         {
             let index = self.index.read();
             for seg in &sealed {
-                let dead = seg.end_seq < earliest
-                    || index.range_all_dead(seg.start_seq, seg.end_seq);
+                let dead =
+                    seg.end_seq < earliest || index.range_all_dead(seg.start_seq, seg.end_seq);
                 if dead {
                     to_drop.push(seg.start_seq);
                 }
@@ -1274,5 +1465,317 @@ impl BoxState {
         self.reclaim_segments();
         let _ = now_ms;
         deleted
+    }
+}
+
+/// RAII guard for a publish ticket (R14). Created by
+/// [`BoxState::next_publish_ticket`] under the append lock; the writer calls
+/// [`Self::wait_turn`] then publishes/rolls back and finally [`Self::done`].
+///
+/// The guard exists to make the ticket release **panic-safe**: the publish gate
+/// is a strict-order baton (`publish_next` must reach exactly `ticket` before the
+/// gate advances), so if a ticketed writer panics — or returns early on an error
+/// path — without releasing its ticket, every later writer parks forever on
+/// [`BoxState::publish_wait_turn`] and [`BoxState::quiesce_publishes`] (snapshot
+/// capture) hangs. The `Drop` impl closes that hole: on unwind it waits for this
+/// ticket's turn (so the baton is advanced strictly in order, preserving the
+/// prefix-durability invariant) and then advances the gate, releasing every
+/// blocked successor. A normally-completing writer calls [`Self::done`] (which
+/// disarms the `Drop` release), so the guard adds nothing to the happy path.
+/// What a [`PublishGuard`] must do on an UNEXPECTED unwind (a panic between
+/// taking the ticket and calling [`PublishGuard::done`]) so a not-acked batch can
+/// never become visible and a committed-but-unapplied op can never be silently
+/// dropped (R14 / codex P0 #2). Releasing the gate alone is NOT enough: a later
+/// writer that advances `head_seq` past leaked staged seqs would expose them
+/// without their WAL frame ever being durable.
+enum UnwindAction {
+    /// No staged mutation is attached yet, or the operation already completed and
+    /// the guard was disarmed. `Drop` only releases the gate.
+    None,
+    /// A staged APPEND batch is in flight. On unwind, mark its seqs deleted in
+    /// place (exactly like `rollback_staged_by_seqs`) BEFORE releasing the gate, so
+    /// a later writer advancing head past them reads a deleted gap rather than a
+    /// not-durable record. Carries `(start, count)` of the staged batch.
+    RollbackAppend(u64, u64),
+    /// A durable op (a WAL-first delete) committed its frame but had not yet
+    /// applied it in memory. There is no safe way to reconstruct the correct
+    /// visibility on the unwind path (the in-memory state would diverge from the
+    /// durable log, and a snapshot taken after this point could checkpoint past
+    /// the unapplied frame and lose it). Abort the process so recovery rebuilds a
+    /// consistent state from the durable WAL (codex P0 #2).
+    AbortProcess,
+}
+
+#[must_use = "a publish ticket must be waited on and released in order"]
+pub struct PublishGuard<'a> {
+    box_state: &'a BoxState,
+    ticket: u64,
+    /// Whether [`Self::wait_turn`] already advanced this ticket to the front of
+    /// the gate (so `Drop` need not wait again before releasing).
+    waited: bool,
+    /// Whether [`Self::done`] already released the ticket (disarms `Drop`).
+    done: bool,
+    /// What `Drop` must do on an unexpected unwind to keep visibility consistent
+    /// (R14 / codex P0 #2).
+    on_unwind: UnwindAction,
+}
+
+impl PublishGuard<'_> {
+    /// The underlying ticket value (observability / debug only).
+    pub fn ticket(&self) -> u64 {
+        self.ticket
+    }
+
+    /// Attach a staged APPEND batch to this guard so an unexpected unwind rolls it
+    /// back (marks its seqs deleted) before releasing the gate (R14 / codex P0 #2).
+    /// Call immediately after `next_publish_ticket`, with the batch this writer
+    /// staged. Disarmed by `done`.
+    pub fn arm_append(&mut self, staged: &StagedAppend) {
+        self.on_unwind = UnwindAction::RollbackAppend(staged.start, staged.count);
+    }
+
+    /// Mark this guard as guarding a durable op whose WAL frame is already committed
+    /// but whose in-memory apply has not yet run (a WAL-first delete). An unexpected
+    /// unwind here aborts the process so recovery rebuilds a consistent state from
+    /// the durable log (R14 / codex P0 #2). Disarmed by `done`.
+    pub fn arm_abort_on_unwind(&mut self) {
+        self.on_unwind = UnwindAction::AbortProcess;
+    }
+
+    /// Block until it is this ticket's turn to publish/rollback. See
+    /// [`BoxState::publish_wait_turn`].
+    pub fn wait_turn(&mut self) {
+        self.box_state.publish_wait_turn(self.ticket);
+        self.waited = true;
+    }
+
+    /// Release this ticket, advancing the gate to the next writer. MUST be
+    /// called after [`Self::wait_turn`] returned and the writer finished
+    /// publishing/rolling back. Disarms the `Drop` fallback (both the gate-leak
+    /// release and any armed unwind action).
+    pub fn done(mut self) {
+        self.box_state.publish_done(self.ticket);
+        self.done = true;
+    }
+}
+
+impl Drop for PublishGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // The writer never released this ticket (a panic, or an early return that
+        // skipped `done`). Advance the gate so successors are not stranded — but
+        // STRICTLY IN ORDER: if we have not yet reached the front of the baton,
+        // wait for our turn first, so `publish_next` only ever advances through
+        // `ticket` (the prefix-order invariant snapshot capture relies on holds
+        // even on the unwind path). Reaching the front also means every earlier
+        // ticketed writer already published/rolled back, so the in-place rollback
+        // below targets exactly our (still-unpublished) seqs.
+        if !self.waited {
+            self.box_state.publish_wait_turn(self.ticket);
+        }
+        // Complete the in-flight operation's required cleanup BEFORE releasing the
+        // gate (R14 / codex P0 #2), so a later writer / a quiescing snapshot never
+        // observes a not-acked batch as visible or skips a committed delete.
+        match self.on_unwind {
+            UnwindAction::None => {}
+            UnwindAction::RollbackAppend(start, count) => {
+                // Mark this batch's staged-but-unpublished seqs deleted in place.
+                // `head_seq` was never advanced to include them by this (failed)
+                // writer, so they were never visible; a later writer that advances
+                // head past them now reads a deleted gap instead of a record whose
+                // WAL frame may never have been durable.
+                let mut index = self.box_state.index.write();
+                for i in 0..count {
+                    index.mark_deleted_pub(start + i);
+                }
+            }
+            UnwindAction::AbortProcess => {
+                // A durable delete's frame is committed but its in-memory apply did
+                // not run, and we cannot safely reconcile visibility on the unwind
+                // path. Abort so recovery rebuilds consistent state from the WAL.
+                tracing::error!(
+                    box_id = self.box_state.box_id,
+                    ticket = self.ticket,
+                    "publish guard unwound with a committed-but-unapplied durable op; aborting for crash-consistent recovery"
+                );
+                std::process::abort();
+            }
+        }
+        self.box_state.publish_done(self.ticket);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn box_for_test() -> Arc<BoxState> {
+        Arc::new(BoxState::new(
+            "t".to_string(),
+            1,
+            BoxConfig::default(),
+            1,
+            1,
+        ))
+    }
+
+    /// R14: a ticketed writer that PANICS between taking its publish ticket and
+    /// releasing it must not strand the gate — the RAII `PublishGuard`'s `Drop`
+    /// releases the ticket on unwind, so a later writer's `wait_turn` and a
+    /// concurrent snapshot's `quiesce_publishes` both make progress instead of
+    /// blocking forever on a ticket that is never advanced.
+    #[test]
+    fn publish_guard_releases_gate_on_panic() {
+        let b = box_for_test();
+
+        // Writer A takes ticket 0 (under the would-be append lock), waits its turn
+        // (it is first, so immediate), then PANICS without calling `done`. The
+        // guard's Drop must advance the gate to ticket 1.
+        let ba = b.clone();
+        let a = std::thread::spawn(move || {
+            let mut t = ba.next_publish_ticket();
+            t.wait_turn();
+            panic!("simulated writer panic with the publish ticket held");
+        });
+        // A panics; its guard's Drop runs during unwind and releases the gate.
+        assert!(a.join().is_err(), "writer A panicked as designed");
+
+        // Writer B (ticket 1) must now be able to take its turn and finish — it
+        // would block forever if A's ticket had leaked. Run it on a thread bounded
+        // by a watchdog so a regression FAILS (hangs are caught) rather than wedges
+        // the suite.
+        let bb = b.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = done.clone();
+        let bw = std::thread::spawn(move || {
+            let mut t = bb.next_publish_ticket(); // ticket 1
+            t.wait_turn(); // reachable iff A's ticket 0 was released on its panic.
+            t.done();
+            d2.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            done.load(Ordering::SeqCst),
+            "later writer (ticket 1) hung — the panicked ticket 0 leaked the gate"
+        );
+        bw.join().unwrap();
+
+        // And snapshot capture's `quiesce_publishes` (no ticket outstanding now)
+        // returns promptly rather than hanging on the once-leaked ticket.
+        let bq = b.clone();
+        let qdone = Arc::new(AtomicBool::new(false));
+        let q2 = qdone.clone();
+        let q = std::thread::spawn(move || {
+            bq.quiesce_publishes();
+            q2.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        while !qdone.load(Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            qdone.load(Ordering::SeqCst),
+            "quiesce_publishes hung after the panic"
+        );
+        q.join().unwrap();
+    }
+
+    /// The happy path is unchanged: a guard whose `done()` is called advances the
+    /// gate exactly once and a subsequent `quiesce_publishes` sees a quiescent box.
+    #[test]
+    fn publish_guard_done_advances_gate_once() {
+        let b = box_for_test();
+        {
+            let mut t = b.next_publish_ticket();
+            t.wait_turn();
+            t.done();
+        }
+        // Gate is quiescent (no outstanding ticket): quiesce returns immediately.
+        b.quiesce_publishes();
+        // The next ticket is the following integer and completes in order.
+        let mut t = b.next_publish_ticket();
+        t.wait_turn();
+        t.done();
+        b.quiesce_publishes();
+    }
+
+    /// R14 / codex P0 #2: a writer that stages an append, ARMS its guard, and then
+    /// PANICS before publishing must not leave the staged (not-acked) records
+    /// visible. The guard's `Drop` rolls the staged seqs back IN PLACE (marks them
+    /// deleted); when a LATER writer publishes and advances `head_seq` past them,
+    /// they read as a deleted gap rather than as live, never-durable records.
+    #[test]
+    fn publish_guard_rolls_back_staged_append_on_panic() {
+        let b = box_for_test();
+
+        // Writer A stages one record, takes ticket 0, ARMS the guard with the
+        // staged batch, then panics before publishing. `head_seq` stays 0.
+        let ba = b.clone();
+        let staged_start = std::thread::spawn(move || {
+            let _g = ba.append_lock.lock();
+            let staged = ba.stage_append(vec![StoredRecord {
+                ts: 1,
+                node: None,
+                tag: None,
+                data: serde_json::json!({"unacked": true}),
+                meta: None,
+                bytes: 16,
+                deleted: false,
+                payload_resident: true,
+            }]);
+            let start = staged.start;
+            let mut t = ba.next_publish_ticket();
+            t.arm_append(&staged);
+            t.wait_turn();
+            // Panic with the staged batch unpublished and the guard armed.
+            std::panic::panic_any(start);
+        })
+        .join();
+        let staged_seq = *staged_start
+            .err()
+            .and_then(|e| e.downcast::<u64>().ok())
+            .expect("A panicked carrying its staged start seq");
+
+        // The record was never published.
+        assert_eq!(b.head_seq(), 0, "panicked writer never advanced head");
+
+        // Writer B stages + publishes its own record. Its head advances PAST the
+        // leaked seq. The leaked seq must read as deleted (rolled back on unwind),
+        // not as a live record.
+        {
+            let _g = b.append_lock.lock();
+            let staged = b.stage_append(vec![StoredRecord {
+                ts: 2,
+                node: None,
+                tag: None,
+                data: serde_json::json!({"acked": true}),
+                meta: None,
+                bytes: 16,
+                deleted: false,
+                payload_resident: true,
+            }]);
+            let mut t = b.next_publish_ticket();
+            t.wait_turn();
+            b.publish_staged(staged, 2);
+            t.done();
+        }
+        assert!(
+            b.head_seq() > staged_seq,
+            "B's head advanced past the leaked seq"
+        );
+
+        // The leaked seq is a deleted hole: reading it yields no live record.
+        let index = b.index.read();
+        let rec = index.get(staged_seq);
+        assert!(
+            rec.map(|r| r.deleted).unwrap_or(true),
+            "leaked staged seq must be a deleted hole, never a visible not-acked record"
+        );
     }
 }

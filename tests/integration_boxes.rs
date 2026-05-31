@@ -30,10 +30,7 @@ fn assert_error_code(body: &Value, expected_code: &str) {
     let err = body
         .get("error")
         .unwrap_or_else(|| panic!("expected an `error` envelope, got {body}"));
-    assert_eq!(
-        err["code"], expected_code,
-        "error.code mismatch in {body}"
-    );
+    assert_eq!(err["code"], expected_code, "error.code mismatch in {body}");
     assert!(
         err.get("message").and_then(Value::as_str).is_some(),
         "error.message must be a string in {body}"
@@ -69,7 +66,9 @@ fn default_config() -> Value {
 fn assert_performance(body: &Value) {
     let perf = &body["performance"];
     assert!(
-        perf.get("server_total_ms").and_then(Value::as_f64).is_some(),
+        perf.get("server_total_ms")
+            .and_then(Value::as_f64)
+            .is_some(),
         "performance.server_total_ms must be a number in {body}"
     );
 }
@@ -138,7 +137,10 @@ fn put_changed_config_updates_in_place_200_not_409() {
 
     // A *changed* PUT applies the diff going forward — 200, created:false. /v0
     // has no immutable fields, so this is never `409 box_exists_incompatible`.
-    let (s2, b2) = h.put("/v0/boxes/jobs", json!({ "cap_records": 999, "discard": "reject" }));
+    let (s2, b2) = h.put(
+        "/v0/boxes/jobs",
+        json!({ "cap_records": 999, "discard": "reject" }),
+    );
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(b2["created"], false);
     assert_eq!(b2["config"]["cap_records"], 999);
@@ -174,7 +176,11 @@ fn get_state_on_missing_box_is_404_and_never_creates() {
     // The failed state read must NOT have created the box.
     let (ls, lb) = h.get("/v0/boxes");
     assert_eq!(ls, StatusCode::OK);
-    assert_eq!(lb["boxes"].as_array().unwrap().len(), 0, "state read must not auto-create");
+    assert_eq!(
+        lb["boxes"].as_array().unwrap().len(),
+        0,
+        "state read must not auto-create"
+    );
 }
 
 #[test]
@@ -193,11 +199,17 @@ fn get_state_fresh_box_watermarks_and_shape() {
     assert_eq!(body["count"], 0);
     assert_eq!(body["bytes"], 0);
     assert_eq!(body["config"], default_config());
-    assert!(body["effective_priority"].is_number(), "effective_priority numeric");
+    assert!(
+        body["effective_priority"].is_number(),
+        "effective_priority numeric"
+    );
     // Recency clocks are null until first write/read; this is the first read,
     // so last_write_ts is still null but last_read_ts is now set (touch=true).
     assert_eq!(body["last_write_ts"], Value::Null);
-    assert!(body["last_read_ts"].is_number(), "this read set last_read_ts");
+    assert!(
+        body["last_read_ts"].is_number(),
+        "this read set last_read_ts"
+    );
     assert_performance(&body);
 }
 
@@ -218,8 +230,14 @@ fn get_state_reflects_writes_head_earliest_count_bytes() {
     assert_eq!(body["earliest_seq"], 1);
     assert_eq!(body["next_seq"], 4, "next_seq = head + 1");
     assert_eq!(body["count"], 3);
-    assert!(body["bytes"].as_u64().unwrap() > 0, "bytes accounted after writes");
-    assert!(body["last_write_ts"].is_number(), "last_write_ts set after a write");
+    assert!(
+        body["bytes"].as_u64().unwrap() > 0,
+        "bytes accounted after writes"
+    );
+    assert!(
+        body["last_write_ts"].is_number(),
+        "last_write_ts set after a write"
+    );
 }
 
 #[test]
@@ -231,13 +249,17 @@ fn get_state_touch_false_does_not_bump_last_read() {
     let (status, body) = h.get("/v0/boxes/jobs?touch=false");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body["last_read_ts"], Value::Null,
+        body["last_read_ts"],
+        Value::Null,
         "touch=false must not bump last_read_ts"
     );
 
     // A default (touch=true) read does set it.
     let (_s2, body2) = h.get("/v0/boxes/jobs");
-    assert!(body2["last_read_ts"].is_number(), "default touch=true sets last_read_ts");
+    assert!(
+        body2["last_read_ts"].is_number(),
+        "default touch=true sets last_read_ts"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +297,15 @@ fn list_summary_shape_and_prefix_filter() {
 
     // Summary entry shape (API §1.3): the documented per-box fields are present.
     let a = &boxes[0];
-    for field in ["box", "head_seq", "earliest_seq", "count", "bytes", "durable", "effective_priority"] {
+    for field in [
+        "box",
+        "head_seq",
+        "earliest_seq",
+        "count",
+        "bytes",
+        "durable",
+        "effective_priority",
+    ] {
         assert!(a.get(field).is_some(), "summary missing `{field}` in {a}");
     }
     assert_eq!(a["box"], "jobs:a");
@@ -312,7 +342,9 @@ fn list_paginates_with_opaque_cursor() {
         .map(|b| b["box"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(page1, vec!["box0", "box1"], "first page, sorted");
-    let cursor1 = p1["next_cursor"].as_str().expect("next_cursor present mid-pagination");
+    let cursor1 = p1["next_cursor"]
+        .as_str()
+        .expect("next_cursor present mid-pagination");
     assert!(!cursor1.is_empty(), "cursor is a non-empty opaque token");
 
     // Page 2 via ?cursor=...
@@ -388,7 +420,11 @@ fn delete_existing_box_returns_deleted_true() {
 fn delete_absent_box_is_idempotent_deleted_false() {
     let h = Harness::start();
     let (status, body) = h.delete("/v0/boxes/never");
-    assert_eq!(status, StatusCode::OK, "delete of absent box is idempotent 200");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "delete of absent box is idempotent 200"
+    );
     assert_eq!(body["deleted"], false);
     assert_eq!(body["routers_removed"].as_array().unwrap().len(), 0);
 }
@@ -492,7 +528,11 @@ fn write_create_false_on_absent_box_is_404() {
         "/v0/boxes/jobs",
         json!({ "create": false, "records": [{ "data": 1 }] }),
     );
-    assert_eq!(status, StatusCode::NOT_FOUND, "create:false + absent box → 404");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "create:false + absent box → 404"
+    );
     assert_error_code(&body, "box_not_found");
 
     // The box must not have been created by the rejected write.
@@ -524,7 +564,10 @@ fn write_inline_config_applied_only_on_create() {
     );
     assert_eq!(s1, StatusCode::CREATED);
     let (_gs, gb) = h.get("/v0/boxes/jobs");
-    assert_eq!(gb["config"]["cap_records"], 7, "inline config applied on create");
+    assert_eq!(
+        gb["config"]["cap_records"], 7,
+        "inline config applied on create"
+    );
     assert_eq!(gb["config"]["durable"], true);
 
     // Inline config on a write to an EXISTING box is ignored (config goes via PUT).

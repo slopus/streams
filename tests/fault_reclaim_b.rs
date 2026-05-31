@@ -25,7 +25,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -39,9 +44,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{
-    BoxConfig, BoxType, DeleteRequest, DiffRequest, RecordIn, WriteRequest,
-};
+use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Plumbing (mirrors tests/crash_oracle.rs — reused, not reinvented)
@@ -378,14 +381,23 @@ fn f_evict_floor_crash() {
     //    at = u64::MAX ⇒ never fires; just count) so the sweep covers every FS
     //    boundary of the small workload.
     let probe_disk = FakeDisk::new();
-    let probe = FaultFs::new(probe_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, u64::MAX, true);
+    let probe = FaultFs::new(
+        probe_disk.arc(),
+        FaultOp::WriteAt,
+        FaultKind::Eio,
+        u64::MAX,
+        true,
+    );
     {
         let engine = Engine::with_data_dir_fs(cfg(), clock_at(T0), probe.arc()).expect("probe");
         evict_workload(&engine);
         drop(engine);
     }
     let total_writes = probe.calls_seen();
-    assert!(total_writes >= 4, "workload issues several write_at calls (M={total_writes})");
+    assert!(
+        total_writes >= 4,
+        "workload issues several write_at calls (M={total_writes})"
+    );
 
     // Cap the sweep so it stays fast (each durable append blocks on a real group
     // fsync). Crash AFTER every write_at index in 0..=cap, recover, assert the
@@ -444,7 +456,10 @@ fn f_evict_floor_crash() {
                 drop(engine);
                 let engine2 = open_engine(&disk);
                 let dump2 = dump_box(&engine2, "cap").expect("cap present on recovery #2");
-                assert_eq!(dump2, dump, "recovery idempotent at crash_point {crash_point}");
+                assert_eq!(
+                    dump2, dump,
+                    "recovery idempotent at crash_point {crash_point}"
+                );
                 assert_cap_recovered(&dump2);
             }
         }
@@ -497,7 +512,10 @@ fn f_clock_forward_ttl() {
         assert!(engine
             .delete(
                 "ttl",
-                DeleteRequest { before_seq: Some(2), match_: None },
+                DeleteRequest {
+                    before_seq: Some(2),
+                    match_: None
+                },
             )
             .is_ok());
         assert_eq!(append(&engine, "ttl", "r4", None), Some(4));
@@ -552,7 +570,10 @@ fn f_clock_forward_ttl() {
 
     // (b) HEAD/SEQ MONOTONE: head never regresses (it is a logical counter, not a
     //     wall-clock value), and never fabricates a future seq.
-    assert_eq!(after.head, 5, "head is logical; a forward jump never regresses or inflates it");
+    assert_eq!(
+        after.head, 5,
+        "head is logical; a forward jump never regresses or inflates it"
+    );
 
     // (c) FLOORS ONLY ADVANCE: every surviving record is below the (now far
     //     larger) TTL horizon ⇒ all 2..=5 expire. The earliest_seq advances to
@@ -600,7 +621,10 @@ fn f_clock_forward_ttl() {
     //     `now`, so it is fresh): the new record is live, proving the floor only
     //     advanced for the OLD records, never globally poisoned the box.
     let new_seq = append(&engine2, "ttl", "r6", None).expect("post-recovery append succeeds");
-    assert_eq!(new_seq, 6, "a post-recovery append continues at head+1 — no gap, no seq reuse");
+    assert_eq!(
+        new_seq, 6,
+        "a post-recovery append continues at head+1 — no gap, no seq reuse"
+    );
     let final_dump = dump_box(&engine2, "ttl").expect("ttl box after the fresh append");
     assert!(
         final_dump.records.contains_key(&6),

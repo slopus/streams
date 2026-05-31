@@ -359,10 +359,7 @@ mod tests {
             Scope::READ.union(Scope::WRITE)
         );
         assert_eq!(Scope::parse("rw").unwrap(), Scope::READ.union(Scope::WRITE));
-        assert_eq!(
-            Scope::parse("read+write+delete+admin").unwrap(),
-            Scope::ALL
-        );
+        assert_eq!(Scope::parse("read+write+delete+admin").unwrap(), Scope::ALL);
         assert!(Scope::parse("bogus").is_err());
     }
 
@@ -398,7 +395,10 @@ mod tests {
         // Only the FIRST `:` after the secret splits scopes; the prefixes field is
         // the remainder, so a `:` inside a prefix (e.g. `tenant42:`) is preserved.
         assert_eq!(k.effective_scopes(), Scope::READ.union(Scope::WRITE));
-        assert_eq!(k.prefixes(), &["tenant42:".to_string(), "shared.".to_string()]);
+        assert_eq!(
+            k.prefixes(),
+            &["tenant42:".to_string(), "shared.".to_string()]
+        );
     }
 
     #[test]

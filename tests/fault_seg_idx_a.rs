@@ -25,7 +25,12 @@
 //!   F-SEG-DATA-WITHOUT-IDX-LISTED       stray .data, no matching .idx
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,7 +115,7 @@ fn f_seg_crash_after_data_before_idx() {
     fs.sync_dir(Path::new(ROOT)).unwrap(); // tmp name durable
     fs.rename(&dtmp, &data_path(id)).unwrap();
     fs.sync_dir(Path::new(ROOT)).unwrap(); // final .data name durable
-    // (No .idx written at all — this is the crash point.)
+                                           // (No .idx written at all — this is the crash point.)
     disk.crash(TornDamage::None);
     disk.reset_power();
 
@@ -128,7 +133,11 @@ fn f_seg_crash_after_data_before_idx() {
     // ORACLE 1: list() requires the .data part, so the segment is reported — but as
     // an incomplete unit (no .idx). The engine treats a missing .idx as
     // non-authoritative; the WAL/snapshot remains the source of truth.
-    assert_eq!(store.list().unwrap(), vec![id], "list() reports the lone .data");
+    assert_eq!(
+        store.list().unwrap(),
+        vec![id],
+        "list() reports the lone .data"
+    );
 
     // ORACLE 2: a read that needs the .idx (bulk-read it to locate any seq) gets a
     // clean NotFound, never a panic, never neighbor bytes decoded as an index.
@@ -140,7 +149,9 @@ fn f_seg_crash_after_data_before_idx() {
     // ORACLE 3: orphan reclaim handles the stray .data — delete() is idempotent and
     // tolerant of the absent .idx, leaving the store clean. (No live record is lost
     // because the WAL/snapshot still has them; recovery re-materializes.)
-    store.delete(id).expect("incomplete segment reclaims cleanly");
+    store
+        .delete(id)
+        .expect("incomplete segment reclaims cleanly");
     assert!(store.list().unwrap().is_empty(), "stray .data reclaimed");
     assert!(!store.exists(id, SegmentPart::Data));
 }
@@ -209,7 +220,9 @@ fn f_seg_crash_idx_tmp_not_renamed() {
 
     // Idempotent reclaim of the incomplete segment (recovery would rebuild it from
     // the WAL/snapshot).
-    store.delete(id).expect("incomplete segment reclaims cleanly");
+    store
+        .delete(id)
+        .expect("incomplete segment reclaims cleanly");
     assert!(store.list().unwrap().is_empty());
 }
 
@@ -261,7 +274,11 @@ fn f_seg_idx_torn_stride() {
     disk.reset_power();
 
     let store = open_store(&disk);
-    assert_eq!(store.list().unwrap(), vec![id], "segment still lists (has .data)");
+    assert_eq!(
+        store.list().unwrap(),
+        vec![id],
+        "segment still lists (has .data)"
+    );
 
     // Read the torn .idx back; it is a non-stride length on disk.
     let idx_buf = store.read_all(id, SegmentPart::Idx).unwrap();
@@ -287,8 +304,14 @@ fn f_seg_idx_torn_stride() {
     // there falls back to the WAL (modeled here as "no index entry ⇒ None").
     assert!(idx_entry_at(&idx_buf, 3).is_none(), "partial entry ⇒ None");
     assert!(idx_entry_at(&idx_buf, 4).is_none());
-    assert!(lookup(&idx_buf, id, id + 3).is_none(), "seq 4 → WAL fallback");
-    assert!(lookup(&idx_buf, id, id + 4).is_none(), "seq 5 → WAL fallback");
+    assert!(
+        lookup(&idx_buf, id, id + 3).is_none(),
+        "seq 4 → WAL fallback"
+    );
+    assert!(
+        lookup(&idx_buf, id, id + 4).is_none(),
+        "seq 5 → WAL fallback"
+    );
 }
 
 // ===========================================================================
@@ -342,7 +365,11 @@ fn f_seg_idx_offset_past_data() {
     let store = open_store(&disk);
     assert_eq!(store.list().unwrap(), vec![id]);
     let data_len = store.len(id, SegmentPart::Data).unwrap();
-    assert_eq!(data_len, stale_data.len() as u64, "the .data is the stale short copy");
+    assert_eq!(
+        data_len,
+        stale_data.len() as u64,
+        "the .data is the stale short copy"
+    );
 
     let idx_buf = store.read_all(id, SegmentPart::Idx).unwrap();
 

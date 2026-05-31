@@ -43,6 +43,10 @@ pub struct AppState {
     /// (SSE connections, per-key in-flight requests; see [`crate::limits`]). The
     /// box/router/session caps are checked against the registries directly.
     pub live: Arc<crate::limits::LiveCounts>,
+    /// Graceful-shutdown coordination shared with the serve loop (M11): on
+    /// shutdown the serve loop triggers this and every open SSE stream winds down
+    /// and closes, so the bounded drain completes promptly.
+    pub shutdown: Arc<crate::serve::ShutdownSignal>,
 }
 
 /// Build the full `/v0` axum router with middleware applied.
@@ -58,8 +62,23 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
 }
 
 /// Like [`build_router`] but returns the key-parse error instead of panicking, so
-/// the binary can fail closed with a clear message at startup.
+/// the binary can fail closed with a clear message at startup. Creates a private
+/// [`ShutdownSignal`](crate::serve::ShutdownSignal); use
+/// [`build_router_with_shutdown`] when the serve loop must share the same signal
+/// to wind down SSE streams on shutdown (M11).
 pub fn build_router_checked(engine: Arc<Engine>) -> std::result::Result<Router, String> {
+    build_router_with_shutdown(engine, Arc::new(crate::serve::ShutdownSignal::new()))
+}
+
+/// As [`build_router_checked`], but the caller supplies the
+/// [`ShutdownSignal`](crate::serve::ShutdownSignal) it will also hand to
+/// [`serve_with_signal`](crate::serve::serve_with_signal), so the serve loop can
+/// actively wind down this router's in-flight SSE streams within the bounded
+/// drain (M11).
+pub fn build_router_with_shutdown(
+    engine: Arc<Engine>,
+    shutdown: Arc<crate::serve::ShutdownSignal>,
+) -> std::result::Result<Router, String> {
     let max_body = engine.config.max_body_bytes;
     let keys = engine.config.key_store()?;
     let state = AppState {
@@ -68,6 +87,7 @@ pub fn build_router_checked(engine: Arc<Engine>) -> std::result::Result<Router, 
         coordinator: Arc::new(ClaimCoordinator::new()),
         keys: Arc::new(keys),
         live: Arc::new(crate::limits::LiveCounts::new()),
+        shutdown,
     };
 
     let v0 = Router::new()
@@ -303,10 +323,10 @@ fn route_requirement<'a>(method: &Method, path: &'a str) -> Option<(Scope, Optio
         let router = seg.strip_prefix('/')?;
         // Router path is a single `:router` segment (no sub-actions).
         let scope = match *method {
-            Method::PUT => Scope::ADMIN,      // create/configure
-            Method::GET => Scope::READ,       // read
-            Method::DELETE => Scope::DELETE,  // delete
-            _ => Scope::ADMIN,                // fail-closed default
+            Method::PUT => Scope::ADMIN,     // create/configure
+            Method::GET => Scope::READ,      // read
+            Method::DELETE => Scope::DELETE, // delete
+            _ => Scope::ADMIN,               // fail-closed default
         };
         return Some((scope, Some(router)));
     }
@@ -351,10 +371,7 @@ fn is_sse_stream_path(path: &str) -> bool {
 /// `STREAMS_PROBE_AUTH` to additionally require auth on the liveness/readiness
 /// probes, or scrape `/v0/metrics` with a read-scoped key.
 fn is_probe_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/healthz" | "/readyz" | "/v0/health" | "/v0/ready"
-    )
+    matches!(path, "/healthz" | "/readyz" | "/v0/health" | "/v0/ready")
 }
 
 /// True for the SSE stream path `GET /v0/watch/:wid` (exactly one path segment
@@ -395,8 +412,8 @@ fn query_token(query: Option<&str>) -> Option<String> {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.http_status())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status =
+            StatusCode::from_u16(self.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut resp = (status, Json(self.envelope())).into_response();
         if let Some(secs) = self.retry_after_s {
             if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
@@ -410,7 +427,10 @@ impl IntoResponse for Error {
 /// Validate the `Content-Type` of a request body as JSON (API §0.3); used by
 /// handlers with bodies to return `415 unsupported_media_type`.
 pub fn require_json_content_type(headers: &HeaderMap) -> Result<(), Error> {
-    match headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+    match headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
         Some(ct) if ct.trim_start().starts_with("application/json") => Ok(()),
         _ => Err(Error::new(
             ErrorCode::UnsupportedMediaType,
@@ -529,7 +549,10 @@ mod tests {
     fn query_token_basic_and_decoded() {
         assert_eq!(query_token(None), None);
         assert_eq!(query_token(Some("token=abc")), Some("abc".to_string()));
-        assert_eq!(query_token(Some("x=1&token=abc&y=2")), Some("abc".to_string()));
+        assert_eq!(
+            query_token(Some("x=1&token=abc&y=2")),
+            Some("abc".to_string())
+        );
         // Percent-escapes and `+` are decoded (a real form parser, not `strip_prefix`).
         assert_eq!(
             query_token(Some("token=a%2Bb%3Dc")),

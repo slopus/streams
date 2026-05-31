@@ -89,10 +89,16 @@ fn claim_ack_full_lifecycle() {
     assert_eq!(body["count"], json!(4));
     assert_eq!(body["ready"], json!(6));
     let claimed = body["claimed"].as_array().unwrap();
-    let seqs: Vec<u64> = claimed.iter().map(|c| c["$seq"].as_u64().unwrap()).collect();
+    let seqs: Vec<u64> = claimed
+        .iter()
+        .map(|c| c["$seq"].as_u64().unwrap())
+        .collect();
     assert_eq!(seqs, vec![1, 2, 3, 4]);
     assert!(claimed.iter().all(|c| c["deliveries"] == json!(1)));
-    assert!(claimed[0]["lease_id"].as_str().unwrap().starts_with("lease_"));
+    assert!(claimed[0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("lease_"));
     assert!(claimed[0]["deadline"].as_i64().unwrap() > 0);
 
     // in_flight is now 4.
@@ -100,7 +106,10 @@ fn claim_ack_full_lifecycle() {
     assert_eq!(st["queue"]["in_flight"], json!(4));
 
     // Ack 2 of them (ack-is-delete): they leave the jobs log.
-    let (s, body) = h.post("/v0/boxes/jobs/ack", json!({ "node": "w1", "seqs": [1, 2] }));
+    let (s, body) = h.post(
+        "/v0/boxes/jobs/ack",
+        json!({ "node": "w1", "seqs": [1, 2] }),
+    );
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["acked"], json!(2));
     assert_eq!(body["skipped"], json!([]));
@@ -109,7 +118,10 @@ fn claim_ack_full_lifecycle() {
     assert_eq!(st["queue"]["in_flight"], json!(2)); // seqs 3,4 still leased.
 
     // Acking a seq not held by this node is silently skipped.
-    let (_, body) = h.post("/v0/boxes/jobs/ack", json!({ "node": "w1", "seqs": [1, 99] }));
+    let (_, body) = h.post(
+        "/v0/boxes/jobs/ack",
+        json!({ "node": "w1", "seqs": [1, 99] }),
+    );
     assert_eq!(body["acked"], json!(0));
     assert_eq!(body["skipped"], json!([1, 99]));
 }
@@ -413,12 +425,7 @@ fn ack_does_not_redeliver() {
 fn extend_prevents_expiry() {
     // Drive time with an injected TestClock so the deadline math is deterministic.
     let h = Harness::start_with_test_clock();
-    make_queue_cfg(
-        &h,
-        "jobs",
-        1,
-        json!({ "type": "queue", "lease_ms": 1000 }),
-    );
+    make_queue_cfg(&h, "jobs", 1, json!({ "type": "queue", "lease_ms": 1000 }));
 
     let (_, body) = h.post(
         "/v0/boxes/jobs/claim",
@@ -469,7 +476,11 @@ fn lease_expiry_redelivers_to_another_worker() {
     let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 1 }));
     assert_eq!(body["count"], json!(1), "expired lease is reclaimable");
     assert_eq!(body["claimed"][0]["$seq"].as_u64().unwrap(), seq);
-    assert_eq!(body["claimed"][0]["deliveries"], json!(2), "redelivery bumps counter");
+    assert_eq!(
+        body["claimed"][0]["deliveries"],
+        json!(2),
+        "redelivery bumps counter"
+    );
 }
 
 #[test]
@@ -526,7 +537,11 @@ fn dead_letter_after_max_deliveries() {
     // The next claim would be delivery 3 > max_deliveries(2) ⇒ dead-lettered,
     // not redelivered. The claim returns empty (the job left the queue).
     let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w", "max": 1 }));
-    assert_eq!(body["count"], json!(0), "job dead-lettered, not redelivered");
+    assert_eq!(
+        body["count"],
+        json!(0),
+        "job dead-lettered, not redelivered"
+    );
 
     // The source queue is empty with dead_lettered==1; the DL box holds the job
     // with provenance meta.
@@ -637,7 +652,11 @@ fn queue_survives_restart_and_leases_self_heal() {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["count"], json!(1));
         let (ready, in_flight, _dl) = queue_counters(&h, "jobs");
-        assert_eq!((ready, in_flight), (2, 1), "1 in-flight, 2 ready before restart");
+        assert_eq!(
+            (ready, in_flight),
+            (2, 1),
+            "1 in-flight, 2 ready before restart"
+        );
         // Explicit shutdown joins the WAL writer so the durable jobs log is on
         // disk before we re-boot on the same dir.
         h.shutdown();

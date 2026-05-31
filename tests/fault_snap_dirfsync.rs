@@ -29,7 +29,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::io;
@@ -41,9 +46,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::storage::snapshot::{
-    load_latest_with, write_snapshot_with, Checkpoint, Snapshot,
-};
+use streams::storage::snapshot::{load_latest_with, write_snapshot_with, Checkpoint, Snapshot};
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
 use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
@@ -318,7 +321,8 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     // Confirm snapshot #1 is durably on disk before we model snapshot #2's torn
     // rename.
     assert!(
-        disk.durable_bytes(&meta_dir().join(snapshot_file(1))).is_some(),
+        disk.durable_bytes(&meta_dir().join(snapshot_file(1)))
+            .is_some(),
         "snapshot #1 is durably installed"
     );
 
@@ -333,8 +337,8 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     let fs = disk.arc();
     fs.sync_dir(&meta_dir()).unwrap(); // tmp NAME durable (the create is hardened)...
     fs.rename(&tmp, &fin).unwrap(); // rename issued...
-    // ...but NO sync_dir of meta here. Crash: the un-hardened rename rolls back to
-    // the durable namespace (which still lists snapshot-1.bin, not snapshot-2.bin).
+                                    // ...but NO sync_dir of meta here. Crash: the un-hardened rename rolls back to
+                                    // the durable namespace (which still lists snapshot-1.bin, not snapshot-2.bin).
     disk.crash(TornDamage::None);
     disk.reset_power();
 
@@ -360,7 +364,10 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     let engine = open_engine(&disk);
     let recs = dump_records(&engine, "jobs").expect("jobs box recovers");
     let seqs: Vec<u64> = recs.keys().copied().collect();
-    assert!(!seqs.is_empty(), "records recover via snapshot + WAL replay");
+    assert!(
+        !seqs.is_empty(),
+        "records recover via snapshot + WAL replay"
+    );
     // Dense, contiguous, no gap: survivors are exactly [1..=head].
     let head = *seqs.last().unwrap();
     assert_eq!(
@@ -369,7 +376,10 @@ fn f_snap_crash_after_rename_before_dirfsync() {
         "survivors are a dense prefix [1..={head}] — snapshot+WAL covers the gap, no hole"
     );
     // The post-snapshot tail (seqs 4..=8) was all acked-durable ⇒ must be present.
-    assert!(head >= 8, "the post-snapshot acked tail survives (head={head})");
+    assert!(
+        head >= 8,
+        "the post-snapshot acked tail survives (head={head})"
+    );
     drop(engine);
 }
 
@@ -413,7 +423,13 @@ fn f_snap_eio_dirfsync() {
         drop(engine);
         probe.calls_seen()
     };
-    let faulty = FaultFs::new(disk.arc(), FaultOp::SyncDir, FaultKind::Eio, n_open_syncdirs, true);
+    let faulty = FaultFs::new(
+        disk.arc(),
+        FaultOp::SyncDir,
+        FaultKind::Eio,
+        n_open_syncdirs,
+        true,
+    );
     {
         let engine = open_engine_fs(faulty.arc());
         let recs = dump_records(&engine, "p").expect("p recovered from snapshot #1");
@@ -426,7 +442,7 @@ fn f_snap_eio_dirfsync() {
         // fsync (sync_data, not sync_dir), so the EIO planned for sync_dir does not
         // touch them.
         append_durable(&engine, "p", 3); // re-appends data "1".."3" as seqs 4..=6
-        // The snapshot write's post-rename dir fsync EIOs ⇒ write_snapshot errors.
+                                         // The snapshot write's post-rename dir fsync EIOs ⇒ write_snapshot errors.
         let res = engine.write_snapshot();
         assert!(
             res.is_err(),
@@ -458,7 +474,10 @@ fn f_snap_eio_dirfsync() {
     let loaded = load_latest_with(&disk.arc(), &data_dir())
         .unwrap()
         .expect("a valid snapshot still loads after the dir-fsync EIO");
-    assert!(loaded.id >= 1, "the loaded snapshot is a real, valid candidate");
+    assert!(
+        loaded.id >= 1,
+        "the loaded snapshot is a real, valid candidate"
+    );
 }
 
 // ===========================================================================
@@ -494,7 +513,10 @@ fn f_nfs_dirfsync_unsupported() {
         let wrote = engine
             .write_snapshot()
             .expect("write_snapshot tolerates a best-effort no-op dir fsync");
-        assert!(wrote, "a snapshot is written even though sync_dir is a no-op");
+        assert!(
+            wrote,
+            "a snapshot is written even though sync_dir is a no-op"
+        );
         // More durable appends after the snapshot (seqs 5..=7).
         append_durable(&engine, "q", 3);
         drop(engine);

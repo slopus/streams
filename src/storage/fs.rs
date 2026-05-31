@@ -389,10 +389,7 @@ mod tests {
         fs.remove_file(&b).unwrap();
         assert!(!fs.exists(&b));
         // A missing directory lists as empty, not an error.
-        assert!(fs
-            .read_dir(&dir.path().join("nope"))
-            .unwrap()
-            .is_empty());
+        assert!(fs.read_dir(&dir.path().join("nope")).unwrap().is_empty());
     }
 
     /// `create_dir_all` is idempotent.

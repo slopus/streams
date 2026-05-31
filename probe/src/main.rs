@@ -406,17 +406,30 @@ impl Report {
     fn status(&mut self, name: &str, r: &Result<Resp, String>, want: u16) {
         match r {
             Ok(resp) => self.check(name, resp.status == want, || {
-                format!("expected HTTP {want}, got {} (body {})", resp.status, resp.body)
+                format!(
+                    "expected HTTP {want}, got {} (body {})",
+                    resp.status, resp.body
+                )
             }),
             Err(e) => self.check(name, false, || format!("request failed: {e}")),
         }
     }
 
     /// Assert status AND that the error envelope code matches.
-    fn error_code(&mut self, name: &str, r: &Result<Resp, String>, want_status: u16, want_code: &str) {
+    fn error_code(
+        &mut self,
+        name: &str,
+        r: &Result<Resp, String>,
+        want_status: u16,
+        want_code: &str,
+    ) {
         match r {
             Ok(resp) => {
-                let code = resp.body.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str());
+                let code = resp
+                    .body
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str());
                 let ok = resp.status == want_status && code == Some(want_code);
                 self.check(name, ok, || {
                     format!(
@@ -565,7 +578,9 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
     {
         Ok(c) => c,
         Err(e) => {
-            rep.check("h2c: build prior-knowledge client", false, || format!("build failed: {e}"));
+            rep.check("h2c: build prior-knowledge client", false, || {
+                format!("build failed: {e}")
+            });
             return;
         }
     };
@@ -589,7 +604,9 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
                 || format!("status={status} version={ver:?} body={body}"),
             );
         }
-        Err(e) => rep.check("h2c prior-knowledge: GET /v0/health", false, || format!("request failed: {e}")),
+        Err(e) => rep.check("h2c prior-knowledge: GET /v0/health", false, || {
+            format!("request failed: {e}")
+        }),
     }
 
     // Write + diff over h2c.
@@ -598,7 +615,9 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
     let wrote_ok = match auth(
         h2.post(&path)
             .header("content-type", "application/json")
-            .body(json!({ "records": [{ "data": { "v": 1 } }, { "data": { "v": 2 } }] }).to_string()),
+            .body(
+                json!({ "records": [{ "data": { "v": 1 } }, { "data": { "v": 2 } }] }).to_string(),
+            ),
     )
     .send()
     .await
@@ -616,7 +635,9 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
             ok
         }
         Err(e) => {
-            rep.check("h2c prior-knowledge: write", false, || format!("request failed: {e}"));
+            rep.check("h2c prior-knowledge: write", false, || {
+                format!("request failed: {e}")
+            });
             false
         }
     };
@@ -634,17 +655,25 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
                 let body: Value = resp.json().await.unwrap_or(Value::Null);
                 rep.check(
                     "h2c prior-knowledge: diff over HTTP/2 returns both records",
-                    is_h2 && diff_seqs(&body) == vec![1, 2] && bool_of(&body, "caught_up") == Some(true),
+                    is_h2
+                        && diff_seqs(&body) == vec![1, 2]
+                        && bool_of(&body, "caught_up") == Some(true),
                     || format!("version_h2={is_h2} body={body}"),
                 );
             }
-            Err(e) => rep.check("h2c prior-knowledge: diff", false, || format!("request failed: {e}")),
+            Err(e) => rep.check("h2c prior-knowledge: diff", false, || {
+                format!("request failed: {e}")
+            }),
         }
     }
 
     // A plain HTTP/1.1 client must still be served over the SAME port (the
     // default conformance `Client` is h1, but make the version assertion explicit).
-    match reqwest::Client::builder().http1_only().timeout(Duration::from_secs(30)).build() {
+    match reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
         Ok(h1) => match auth(h1.get(format!("{base}/v0/health"))).send().await {
             Ok(resp) => {
                 let ver = resp.version();
@@ -655,9 +684,13 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
                     || format!("status={status} version={ver:?}"),
                 );
             }
-            Err(e) => rep.check("h1 client on dual-protocol listener", false, || format!("request failed: {e}")),
+            Err(e) => rep.check("h1 client on dual-protocol listener", false, || {
+                format!("request failed: {e}")
+            }),
         },
-        Err(e) => rep.check("h1: build http1-only client", false, || format!("build failed: {e}")),
+        Err(e) => rep.check("h1: build http1-only client", false, || {
+            format!("build failed: {e}")
+        }),
     }
 }
 
@@ -667,7 +700,10 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
 
     // PUT create -> 201 created:true, config echoed with defaults merged.
     let put = c
-        .put(&path, &json!({ "ttl_ms": 60000, "cap_records": 1000, "discard": "old" }))
+        .put(
+            &path,
+            &json!({ "ttl_ms": 60000, "cap_records": 1000, "discard": "old" }),
+        )
         .await;
     rep.status("PUT /v0/boxes/:box create -> 201", &put, 201);
     if let Ok(r) = &put {
@@ -687,13 +723,18 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
 
     // Identical PUT -> 200 created:false (idempotent).
     let put2 = c
-        .put(&path, &json!({ "ttl_ms": 60000, "cap_records": 1000, "discard": "old" }))
+        .put(
+            &path,
+            &json!({ "ttl_ms": 60000, "cap_records": 1000, "discard": "old" }),
+        )
         .await;
     rep.status("PUT identical -> 200 (idempotent)", &put2, 200);
     if let Ok(r) = &put2 {
-        rep.check("PUT identical: created=false", bool_of(&r.body, "created") == Some(false), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "PUT identical: created=false",
+            bool_of(&r.body, "created") == Some(false),
+            || format!("body {}", r.body),
+        );
     }
 
     // Changed PUT -> 200, config updated.
@@ -726,38 +767,62 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
             .body
             .get("boxes")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().any(|x| x.get("box").and_then(|v| v.as_str()) == Some(b.as_str())))
+            .map(|a| {
+                a.iter()
+                    .any(|x| x.get("box").and_then(|v| v.as_str()) == Some(b.as_str()))
+            })
             .unwrap_or(false);
-        rep.check("list boxes: created box present", found, || format!("body {}", r.body));
+        rep.check("list boxes: created box present", found, || {
+            format!("body {}", r.body)
+        });
     }
 
     // GET missing box -> 404 box_not_found (no auto-create on state read).
     let miss = c.get(&format!("/v0/boxes/{ns}-doesnotexist")).await;
-    rep.error_code("GET missing box -> 404 box_not_found", &miss, 404, "box_not_found");
+    rep.error_code(
+        "GET missing box -> 404 box_not_found",
+        &miss,
+        404,
+        "box_not_found",
+    );
 
     // DELETE box -> 200 deleted:true.
     let del = c.delete(&path).await;
     rep.status("DELETE /v0/boxes/:box -> 200", &del, 200);
     if let Ok(r) = &del {
-        rep.check("DELETE: deleted=true", bool_of(&r.body, "deleted") == Some(true), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "DELETE: deleted=true",
+            bool_of(&r.body, "deleted") == Some(true),
+            || format!("body {}", r.body),
+        );
     }
 
     // DELETE absent box -> 200 deleted:false (idempotent).
     let del2 = c.delete(&path).await;
     rep.status("DELETE absent box -> 200", &del2, 200);
     if let Ok(r) = &del2 {
-        rep.check("DELETE absent: deleted=false", bool_of(&r.body, "deleted") == Some(false), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "DELETE absent: deleted=false",
+            bool_of(&r.body, "deleted") == Some(false),
+            || format!("body {}", r.body),
+        );
     }
 
     // if_empty on a non-empty box -> 409 box_not_empty.
     let b2 = format!("{ns}-ifempty");
-    let _ = c.post(&format!("/v0/boxes/{b2}"), &json!({ "records": [{ "data": 1 }] })).await;
+    let _ = c
+        .post(
+            &format!("/v0/boxes/{b2}"),
+            &json!({ "records": [{ "data": 1 }] }),
+        )
+        .await;
     let ife = c.delete(&format!("/v0/boxes/{b2}?if_empty=true")).await;
-    rep.error_code("DELETE ?if_empty=true non-empty -> 409 box_not_empty", &ife, 409, "box_not_empty");
+    rep.error_code(
+        "DELETE ?if_empty=true non-empty -> 409 box_not_empty",
+        &ife,
+        409,
+        "box_not_empty",
+    );
 }
 
 async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
@@ -792,7 +857,9 @@ async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
     }
 
     // Second write -> 200 created:false, seqs continue at 3.
-    let w2 = c.post(&path, &json!({ "records": [{ "data": { "n": 3 } }] })).await;
+    let w2 = c
+        .post(&path, &json!({ "records": [{ "data": { "n": 3 } }] }))
+        .await;
     rep.status("POST second write -> 200", &w2, 200);
     if let Ok(r) = &w2 {
         rep.check(
@@ -813,7 +880,10 @@ async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
             .map(|a| a.iter().any(|x| x.get("$tag").is_some()))
             .unwrap_or(true);
         let has_node = recs
-            .map(|a| a.iter().any(|x| x.get("$node").and_then(|v| v.as_str()) == Some("wA")))
+            .map(|a| {
+                a.iter()
+                    .any(|x| x.get("$node").and_then(|v| v.as_str()) == Some("wA"))
+            })
             .unwrap_or(false);
         let has_meta = recs
             .map(|a| a.first().map(|x| x.get("meta").is_some()).unwrap_or(false))
@@ -834,7 +904,10 @@ async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
 
     // include_tags=true surfaces $tag; include_meta=false drops meta.
     let dt = c
-        .post(&dpath, &json!({ "from_seq": 0, "include_tags": true, "include_meta": false }))
+        .post(
+            &dpath,
+            &json!({ "from_seq": 0, "include_tags": true, "include_meta": false }),
+        )
         .await;
     if let Ok(r) = &dt {
         let recs = r.body.get("records").and_then(|v| v.as_array());
@@ -846,9 +919,11 @@ async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
         let no_meta = recs
             .map(|a| a.iter().all(|x| x.get("meta").is_none()))
             .unwrap_or(false);
-        rep.check("diff include_tags=true / include_meta=false honored", tag_ok && no_meta, || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "diff include_tags=true / include_meta=false honored",
+            tag_ok && no_meta,
+            || format!("body {}", r.body),
+        );
     }
 
     // Diff with limit clamps the batch; cursor advances.
@@ -876,7 +951,10 @@ async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
 
     // ?return_seqs=false suppresses seqs.
     let wns = c
-        .post(&format!("{path}?return_seqs=false"), &json!({ "records": [{ "data": 9 }] }))
+        .post(
+            &format!("{path}?return_seqs=false"),
+            &json!({ "records": [{ "data": 9 }] }),
+        )
         .await;
     if let Ok(r) = &wns {
         rep.check(
@@ -895,11 +973,26 @@ async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
             &json!({ "records": [{ "data": 1 }], "create": false }),
         )
         .await;
-    rep.error_code("write create:false on absent -> 404 box_not_found", &nomk, 404, "box_not_found");
+    rep.error_code(
+        "write create:false on absent -> 404 box_not_found",
+        &nomk,
+        404,
+        "box_not_found",
+    );
 
     // diff on absent box -> 404.
-    let dmiss = c.post(&format!("/v0/boxes/{ns}-nodiff/diff"), &json!({ "from_seq": 0 })).await;
-    rep.error_code("diff on absent box -> 404 box_not_found", &dmiss, 404, "box_not_found");
+    let dmiss = c
+        .post(
+            &format!("/v0/boxes/{ns}-nodiff/diff"),
+            &json!({ "from_seq": 0 }),
+        )
+        .await;
+    rep.error_code(
+        "diff on absent box -> 404 box_not_found",
+        &dmiss,
+        404,
+        "box_not_found",
+    );
 }
 
 async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
@@ -908,16 +1001,28 @@ async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
 
     let key = "probe-idem-1";
     let w1 = c
-        .post(&path, &json!({ "records": [{ "data": "a" }, { "data": "b" }], "idempotency_key": key }))
+        .post(
+            &path,
+            &json!({ "records": [{ "data": "a" }, { "data": "b" }], "idempotency_key": key }),
+        )
         .await;
-    let first_seqs = w1.as_ref().ok().map(|r| seqs_of(&r.body)).unwrap_or_default();
-    rep.check("idempotency: first write succeeded with seqs", !first_seqs.is_empty(), || {
-        format!("w1 {w1:?}", w1 = w1.as_ref().map(|r| r.body.clone()))
-    });
+    let first_seqs = w1
+        .as_ref()
+        .ok()
+        .map(|r| seqs_of(&r.body))
+        .unwrap_or_default();
+    rep.check(
+        "idempotency: first write succeeded with seqs",
+        !first_seqs.is_empty(),
+        || format!("w1 {w1:?}", w1 = w1.as_ref().map(|r| r.body.clone())),
+    );
 
     // Retry with the same key -> deduped:true, same seqs, no new append.
     let w2 = c
-        .post(&path, &json!({ "records": [{ "data": "a" }, { "data": "b" }], "idempotency_key": key }))
+        .post(
+            &path,
+            &json!({ "records": [{ "data": "a" }, { "data": "b" }], "idempotency_key": key }),
+        )
         .await;
     if let Ok(r) = &w2 {
         rep.check(
@@ -926,15 +1031,19 @@ async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
             || format!("body {}", r.body),
         );
     } else {
-        rep.check("idempotency retry request", false, || "request failed".into());
+        rep.check("idempotency retry request", false, || {
+            "request failed".into()
+        });
     }
 
     // Head must not have advanced: still 2 records.
     let st = c.get(&path).await;
     if let Ok(r) = &st {
-        rep.check("idempotency: head not advanced (count=2)", u64_of(&r.body, "count") == Some(2), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "idempotency: head not advanced (count=2)",
+            u64_of(&r.body, "count") == Some(2),
+            || format!("body {}", r.body),
+        );
     }
 
     // Header-based idempotency key (body omits it) is honored.
@@ -959,9 +1068,11 @@ async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
         )
         .await;
     if let Ok(r) = &hr2 {
-        rep.check("idempotency via header: retry deduped=true", bool_of(&r.body, "deduped") == Some(true), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "idempotency via header: retry deduped=true",
+            bool_of(&r.body, "deduped") == Some(true),
+            || format!("body {}", r.body),
+        );
     }
 }
 
@@ -971,19 +1082,39 @@ async fn conformance_errors(c: &Client, rep: &mut Report, ns: &str) {
 
     // 415: non-JSON content type on a write.
     let r415 = c.post_raw_ct(&path, "text/plain", "{}").await;
-    rep.error_code("write wrong content-type -> 415", &r415, 415, "unsupported_media_type");
+    rep.error_code(
+        "write wrong content-type -> 415",
+        &r415,
+        415,
+        "unsupported_media_type",
+    );
 
     // 415: missing content type entirely.
     let r415b = c.post_no_ct(&path, "{}").await;
-    rep.error_code("write missing content-type -> 415", &r415b, 415, "unsupported_media_type");
+    rep.error_code(
+        "write missing content-type -> 415",
+        &r415b,
+        415,
+        "unsupported_media_type",
+    );
 
     // 400: malformed JSON.
     let r400 = c.post_raw_ct(&path, "application/json", "{bad json").await;
-    rep.error_code("write malformed JSON -> 400 invalid_request", &r400, 400, "invalid_request");
+    rep.error_code(
+        "write malformed JSON -> 400 invalid_request",
+        &r400,
+        400,
+        "invalid_request",
+    );
 
     // 400: empty records array.
     let rempty = c.post(&path, &json!({ "records": [] })).await;
-    rep.error_code("write empty records -> 400 invalid_request", &rempty, 400, "invalid_request");
+    rep.error_code(
+        "write empty records -> 400 invalid_request",
+        &rempty,
+        400,
+        "invalid_request",
+    );
 
     // Error envelope shape: error.code + error.message present.
     if let Ok(r) = &r400 {
@@ -994,12 +1125,21 @@ async fn conformance_errors(c: &Client, rep: &mut Report, ns: &str) {
             .and_then(|m| m.as_str())
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        rep.check("error envelope has error.code + error.message", has_msg, || format!("body {}", r.body));
+        rep.check(
+            "error envelope has error.code + error.message",
+            has_msg,
+            || format!("body {}", r.body),
+        );
     }
 
     // 405: wrong method for a path (PUT on /diff which only accepts POST -> 405).
     let r405 = c.put(&format!("{path}/diff"), &json!({})).await;
-    rep.error_code("PUT on /diff (POST-only) -> 405 method_not_allowed", &r405, 405, "method_not_allowed");
+    rep.error_code(
+        "PUT on /diff (POST-only) -> 405 method_not_allowed",
+        &r405,
+        405,
+        "method_not_allowed",
+    );
 
     // 404: unknown route under /v0.
     let r404 = c.get("/v0/nonexistent/route").await;
@@ -1007,16 +1147,39 @@ async fn conformance_errors(c: &Client, rep: &mut Report, ns: &str) {
 
     // 400: invalid box name (PUT). A '.' leading char is invalid.
     let rname = c.put("/v0/boxes/.bad", &json!({})).await;
-    rep.error_code("PUT invalid box name -> 400 invalid_request", &rname, 400, "invalid_request");
+    rep.error_code(
+        "PUT invalid box name -> 400 invalid_request",
+        &rname,
+        400,
+        "invalid_request",
+    );
 
     // 422: write to a full discard:"reject" box.
     let rb = format!("{ns}-reject");
     let _ = c
-        .put(&format!("/v0/boxes/{rb}"), &json!({ "cap_records": 1, "discard": "reject" }))
+        .put(
+            &format!("/v0/boxes/{rb}"),
+            &json!({ "cap_records": 1, "discard": "reject" }),
+        )
         .await;
-    let _ = c.post(&format!("/v0/boxes/{rb}"), &json!({ "records": [{ "data": 1 }] })).await;
-    let full = c.post(&format!("/v0/boxes/{rb}"), &json!({ "records": [{ "data": 2 }] })).await;
-    rep.error_code("write to full discard:reject box -> 422 box_full", &full, 422, "box_full");
+    let _ = c
+        .post(
+            &format!("/v0/boxes/{rb}"),
+            &json!({ "records": [{ "data": 1 }] }),
+        )
+        .await;
+    let full = c
+        .post(
+            &format!("/v0/boxes/{rb}"),
+            &json!({ "records": [{ "data": 2 }] }),
+        )
+        .await;
+    rep.error_code(
+        "write to full discard:reject box -> 422 box_full",
+        &full,
+        422,
+        "box_full",
+    );
 }
 
 async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
@@ -1063,14 +1226,18 @@ async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
     // Tag exact match delete of tenant:job-5 (the bare-string shorthand).
     let me = c.post(&delpath, &json!({ "match": "tenant:job-5" })).await;
     if let Ok(r) = &me {
-        rep.check("delete match exact (shorthand): deleted=1", u64_of(&r.body, "deleted") == Some(1), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "delete match exact (shorthand): deleted=1",
+            u64_of(&r.body, "deleted") == Some(1),
+            || format!("body {}", r.body),
+        );
     }
 
     // Tag prefix glob delete of tenant:* — but only existing matching records (job-2 already deleted).
     // Only seq 2 was tenant:* but it's gone; nothing left matches tenant:* now.
-    let mg = c.post(&delpath, &json!({ "match": ["tag", "Glob", "tenant:*"] })).await;
+    let mg = c
+        .post(&delpath, &json!({ "match": ["tag", "Glob", "tenant:*"] }))
+        .await;
     if let Ok(r) = &mg {
         rep.check(
             "delete match Glob tuple: deleted=0 (all tenant:* already gone)",
@@ -1082,10 +1249,21 @@ async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
     // Point-in-time: a NEW record with a matching tag after a tag delete survives.
     let b2 = format!("{ns}-pit");
     let p2 = format!("/v0/boxes/{b2}");
-    let _ = c.post(&p2, &json!({ "records": [{ "data": 1, "tag": "a:1" }] })).await;
-    let _ = c.post(&format!("{p2}/delete"), &json!({ "match": ["tag", "Glob", "a:*"] })).await;
-    let _ = c.post(&p2, &json!({ "records": [{ "data": 2, "tag": "a:2" }] })).await;
-    let dp = c.post(&format!("{p2}/diff"), &json!({ "from_seq": 0 })).await;
+    let _ = c
+        .post(&p2, &json!({ "records": [{ "data": 1, "tag": "a:1" }] }))
+        .await;
+    let _ = c
+        .post(
+            &format!("{p2}/delete"),
+            &json!({ "match": ["tag", "Glob", "a:*"] }),
+        )
+        .await;
+    let _ = c
+        .post(&p2, &json!({ "records": [{ "data": 2, "tag": "a:2" }] }))
+        .await;
+    let dp = c
+        .post(&format!("{p2}/diff"), &json!({ "from_seq": 0 }))
+        .await;
     if let Ok(r) = &dp {
         rep.check(
             "delete point-in-time: future matching record survives ([2])",
@@ -1096,15 +1274,37 @@ async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
 
     // delete with neither selector -> 400.
     let dn = c.post(&delpath, &json!({})).await;
-    rep.error_code("delete with no selector -> 400 invalid_request", &dn, 400, "invalid_request");
+    rep.error_code(
+        "delete with no selector -> 400 invalid_request",
+        &dn,
+        400,
+        "invalid_request",
+    );
 
     // Glob without trailing '*' -> 400.
-    let dg = c.post(&delpath, &json!({ "match": ["tag", "Glob", "noasterisk"] })).await;
-    rep.error_code("delete Glob without trailing '*' -> 400", &dg, 400, "invalid_request");
+    let dg = c
+        .post(&delpath, &json!({ "match": ["tag", "Glob", "noasterisk"] }))
+        .await;
+    rep.error_code(
+        "delete Glob without trailing '*' -> 400",
+        &dg,
+        400,
+        "invalid_request",
+    );
 
     // delete on absent box -> 404.
-    let da = c.post(&format!("/v0/boxes/{ns}-noxdel/delete"), &json!({ "before_seq": 1 })).await;
-    rep.error_code("delete on absent box -> 404 box_not_found", &da, 404, "box_not_found");
+    let da = c
+        .post(
+            &format!("/v0/boxes/{ns}-noxdel/delete"),
+            &json!({ "before_seq": 1 }),
+        )
+        .await;
+    rep.error_code(
+        "delete on absent box -> 404 box_not_found",
+        &da,
+        404,
+        "box_not_found",
+    );
 }
 
 async fn conformance_cap_tombstone(c: &Client, rep: &mut Report, ns: &str) {
@@ -1146,7 +1346,9 @@ async fn conformance_cap_tombstone(c: &Client, rep: &mut Report, ns: &str) {
             reason == Some("cap")
                 && gap_from == Some(1)
                 && resumes_at_earliest
-                && t.and_then(|x| x.get("earliest_seq")).and_then(|v| v.as_u64()) == earliest,
+                && t.and_then(|x| x.get("earliest_seq"))
+                    .and_then(|v| v.as_u64())
+                    == earliest,
             || format!("body {}", r.body),
         );
     }
@@ -1171,7 +1373,9 @@ async fn conformance_node_loop(c: &Client, rep: &mut Report, ns: &str) {
         .await;
 
     // Reader presents node=self: drops 1 and 3, delivers only 2, but advances to head.
-    let d = c.post(&dpath, &json!({ "from_seq": 0, "node": "self" })).await;
+    let d = c
+        .post(&dpath, &json!({ "from_seq": 0, "node": "self" }))
+        .await;
     if let Ok(r) = &d {
         rep.check(
             "node loop-prevention: own records skipped, only [2] delivered, caught_up at head",
@@ -1183,7 +1387,9 @@ async fn conformance_node_loop(c: &Client, rep: &mut Report, ns: &str) {
     }
 
     // Multi-id node filter ["self","other"] drops all -> 0 records, caught_up.
-    let d2 = c.post(&dpath, &json!({ "from_seq": 0, "node": ["self", "other"] })).await;
+    let d2 = c
+        .post(&dpath, &json!({ "from_seq": 0, "node": ["self", "other"] }))
+        .await;
     if let Ok(r) = &d2 {
         rep.check(
             "node filter set: all dropped, 0 records, caught_up (cursor advanced past)",
@@ -1203,7 +1409,10 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
 
     // PUT router -> 201, fields echoed.
     let put = c
-        .put(&rpath, &json!({ "source": src, "dest": dst, "preserve_node": true, "preserve_tag": true }))
+        .put(
+            &rpath,
+            &json!({ "source": src, "dest": dst, "preserve_node": true, "preserve_tag": true }),
+        )
         .await;
     rep.status("PUT /v0/routers/:router create -> 201", &put, 201);
     if let Ok(r) = &put {
@@ -1228,7 +1437,10 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
         )
         .await;
     let dd = c
-        .post(&format!("/v0/boxes/{dst}/diff"), &json!({ "from_seq": 0, "include_tags": true }))
+        .post(
+            &format!("/v0/boxes/{dst}/diff"),
+            &json!({ "from_seq": 0, "include_tags": true }),
+        )
         .await;
     if let Ok(r) = &dd {
         let recs = r.body.get("records").and_then(|v| v.as_array());
@@ -1255,14 +1467,21 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
     if let Ok(r) = &g {
         rep.check(
             "router get: forwarded_total >= 1",
-            u64_of(&r.body, "forwarded_total").map(|n| n >= 1).unwrap_or(false),
+            u64_of(&r.body, "forwarded_total")
+                .map(|n| n >= 1)
+                .unwrap_or(false),
             || format!("body {}", r.body),
         );
     }
 
     // GET missing router -> 404 router_not_found.
     let gm = c.get(&format!("/v0/routers/{ns}-nope")).await;
-    rep.error_code("GET missing router -> 404 router_not_found", &gm, 404, "router_not_found");
+    rep.error_code(
+        "GET missing router -> 404 router_not_found",
+        &gm,
+        404,
+        "router_not_found",
+    );
 
     // List routers (filtered by source).
     let l = c.get(&format!("/v0/routers?source={src}")).await;
@@ -1272,20 +1491,43 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
             .body
             .get("routers")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().any(|x| x.get("router").and_then(|v| v.as_str()) == Some(rname.as_str())))
+            .map(|a| {
+                a.iter()
+                    .any(|x| x.get("router").and_then(|v| v.as_str()) == Some(rname.as_str()))
+            })
             .unwrap_or(false);
-        rep.check("list routers: created router present", found, || format!("body {}", r.body));
+        rep.check("list routers: created router present", found, || {
+            format!("body {}", r.body)
+        });
     }
 
     // source == dest -> 400.
-    let sd = c.put(&format!("/v0/routers/{ns}-rsd"), &json!({ "source": src, "dest": src })).await;
-    rep.error_code("router source==dest -> 400 invalid_request", &sd, 400, "invalid_request");
+    let sd = c
+        .put(
+            &format!("/v0/routers/{ns}-rsd"),
+            &json!({ "source": src, "dest": src }),
+        )
+        .await;
+    rep.error_code(
+        "router source==dest -> 400 invalid_request",
+        &sd,
+        400,
+        "invalid_request",
+    );
 
     // Cycle: create dst->src (closing src->dst) -> 409 router_cycle with detail.cycle.
     let cyc = c
-        .put(&format!("/v0/routers/{ns}-rcyc"), &json!({ "source": dst, "dest": src }))
+        .put(
+            &format!("/v0/routers/{ns}-rcyc"),
+            &json!({ "source": dst, "dest": src }),
+        )
         .await;
-    rep.error_code("router cycle -> 409 router_cycle", &cyc, 409, "router_cycle");
+    rep.error_code(
+        "router cycle -> 409 router_cycle",
+        &cyc,
+        409,
+        "router_cycle",
+    );
     if let Ok(r) = &cyc {
         let has_cycle = r
             .body
@@ -1295,7 +1537,11 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
             .and_then(|v| v.as_array())
             .map(|a| !a.is_empty())
             .unwrap_or(false);
-        rep.check("router cycle: error.detail.cycle present", has_cycle, || format!("body {}", r.body));
+        rep.check(
+            "router cycle: error.detail.cycle present",
+            has_cycle,
+            || format!("body {}", r.body),
+        );
     }
 
     // allow_cycle:true permits dst->src and terminates via hop cap (no error).
@@ -1305,13 +1551,28 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
             &json!({ "source": dst, "dest": src, "allow_cycle": true }),
         )
         .await;
-    rep.status("router allow_cycle:true -> 201/200 (permitted)", &ac, if matches!(ac.as_ref().map(|r| r.status), Ok(200)) { 200 } else { 201 });
+    rep.status(
+        "router allow_cycle:true -> 201/200 (permitted)",
+        &ac,
+        if matches!(ac.as_ref().map(|r| r.status), Ok(200)) {
+            200
+        } else {
+            201
+        },
+    );
     // A write into the cycle must terminate (no hang) — the timeout on the client
     // guards against an infinite loop; we just confirm the write returns.
     let cyclic_write = c
-        .post(&format!("/v0/boxes/{src}"), &json!({ "records": [{ "data": "cycle", "node": "n9" }] }))
+        .post(
+            &format!("/v0/boxes/{src}"),
+            &json!({ "records": [{ "data": "cycle", "node": "n9" }] }),
+        )
         .await;
-    rep.status("write into allow_cycle topology terminates (returns 200)", &cyclic_write, 200);
+    rep.status(
+        "write into allow_cycle topology terminates (returns 200)",
+        &cyclic_write,
+        200,
+    );
 
     // create_dest:false to a missing dest -> 404.
     let cdf = c
@@ -1320,21 +1581,30 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
             &json!({ "source": src, "dest": format!("{ns}-rmissing"), "create_dest": false }),
         )
         .await;
-    rep.error_code("router create_dest:false missing dest -> 404 box_not_found", &cdf, 404, "box_not_found");
+    rep.error_code(
+        "router create_dest:false missing dest -> 404 box_not_found",
+        &cdf,
+        404,
+        "box_not_found",
+    );
 
     // DELETE router -> 200 deleted:true; idempotent -> deleted:false.
     let dr = c.delete(&rpath).await;
     rep.status("DELETE /v0/routers/:router -> 200", &dr, 200);
     if let Ok(r) = &dr {
-        rep.check("router delete: deleted=true", bool_of(&r.body, "deleted") == Some(true), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "router delete: deleted=true",
+            bool_of(&r.body, "deleted") == Some(true),
+            || format!("body {}", r.body),
+        );
     }
     let dr2 = c.delete(&rpath).await;
     if let Ok(r) = &dr2 {
-        rep.check("router delete idempotent: deleted=false", bool_of(&r.body, "deleted") == Some(false), || {
-            format!("body {}", r.body)
-        });
+        rep.check(
+            "router delete idempotent: deleted=false",
+            bool_of(&r.body, "deleted") == Some(false),
+            || format!("body {}", r.body),
+        );
     }
 }
 
@@ -1358,9 +1628,16 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     if let Ok(r) = &put {
         rep.check(
             "queue create: config.type=queue, lease_ms/max_deliveries echoed",
-            r.body.get("config").and_then(|c| c.get("type")).and_then(|v| v.as_str()) == Some("queue")
+            r.body
+                .get("config")
+                .and_then(|c| c.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("queue")
                 && u64_of(r.body.get("config").unwrap_or(&Value::Null), "lease_ms") == Some(30000)
-                && u64_of(r.body.get("config").unwrap_or(&Value::Null), "max_deliveries") == Some(5),
+                && u64_of(
+                    r.body.get("config").unwrap_or(&Value::Null),
+                    "max_deliveries",
+                ) == Some(5),
             || format!("body {}", r.body),
         );
     }
@@ -1380,26 +1657,41 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
             r.body.get("type").and_then(|v| v.as_str()) == Some("queue")
                 && qs.and_then(|x| x.get("ready")).and_then(|v| v.as_u64()) == Some(5)
                 && qs.and_then(|x| x.get("in_flight")).and_then(|v| v.as_u64()) == Some(0)
-                && qs.and_then(|x| x.get("dead_lettered")).and_then(|v| v.as_u64()) == Some(0),
+                && qs
+                    .and_then(|x| x.get("dead_lettered"))
+                    .and_then(|v| v.as_u64())
+                    == Some(0),
             || format!("body {}", r.body),
         );
     }
 
     // POST /claim {node, max:2} -> 200 with claimed[] (ascending $seq + lease_id /
     // deadline / deliveries), count=2, ready=3.
-    let claim = c.post(&format!("{path}/claim"), &json!({ "node": "w1", "max": 2 })).await;
+    let claim = c
+        .post(&format!("{path}/claim"), &json!({ "node": "w1", "max": 2 }))
+        .await;
     rep.status("POST /claim -> 200", &claim, 200);
     let mut claimed_seqs: Vec<u64> = Vec::new();
     if let Ok(r) = &claim {
         let arr = r.body.get("claimed").and_then(|v| v.as_array());
         claimed_seqs = arr
-            .map(|a| a.iter().filter_map(|j| j.get("$seq").and_then(|s| s.as_u64())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|j| j.get("$seq").and_then(|s| s.as_u64()))
+                    .collect()
+            })
             .unwrap_or_default();
         let shapes_ok = arr
             .map(|a| {
                 a.iter().all(|j| {
-                    j.get("lease_id").and_then(|v| v.as_str()).map(|s| s.starts_with("lease_")).unwrap_or(false)
-                        && j.get("deadline").and_then(|v| v.as_i64()).map(|d| d > 0).unwrap_or(false)
+                    j.get("lease_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.starts_with("lease_"))
+                        .unwrap_or(false)
+                        && j.get("deadline")
+                            .and_then(|v| v.as_i64())
+                            .map(|d| d > 0)
+                            .unwrap_or(false)
                         && j.get("deliveries").and_then(|v| v.as_u64()) == Some(1)
                         && j.get("data").is_some()
                 })
@@ -1418,7 +1710,10 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     // POST /extend {node, seqs:[seq0], lease_ms} -> 200, extended=1, deadlines map.
     if let Some(&seq0) = claimed_seqs.first() {
         let ext = c
-            .post(&format!("{path}/extend"), &json!({ "node": "w1", "seqs": [seq0], "lease_ms": 60000 }))
+            .post(
+                &format!("{path}/extend"),
+                &json!({ "node": "w1", "seqs": [seq0], "lease_ms": 60000 }),
+            )
             .await;
         rep.status("POST /extend -> 200", &ext, 200);
         if let Ok(r) = &ext {
@@ -1441,14 +1736,16 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     if claimed_seqs.len() >= 2 {
         let seq1 = claimed_seqs[1];
         let nack = c
-            .post(&format!("{path}/nack"), &json!({ "node": "w1", "seqs": [seq1], "delay_ms": 0 }))
+            .post(
+                &format!("{path}/nack"),
+                &json!({ "node": "w1", "seqs": [seq1], "delay_ms": 0 }),
+            )
             .await;
         rep.status("POST /nack -> 200", &nack, 200);
         if let Ok(r) = &nack {
             rep.check(
                 "nack: nacked=1, in_flight=1 (seq0 still held), seq1 back to ready",
-                u64_of(&r.body, "nacked") == Some(1)
-                    && u64_of(&r.body, "in_flight") == Some(1),
+                u64_of(&r.body, "nacked") == Some(1) && u64_of(&r.body, "in_flight") == Some(1),
                 || format!("body {}", r.body),
             );
         }
@@ -1457,7 +1754,10 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     // POST /ack {node, seqs:[seq0]} -> 200, acked=1 (ack-is-delete), skipped=[].
     if let Some(&seq0) = claimed_seqs.first() {
         let ack = c
-            .post(&format!("{path}/ack"), &json!({ "node": "w1", "seqs": [seq0] }))
+            .post(
+                &format!("{path}/ack"),
+                &json!({ "node": "w1", "seqs": [seq0] }),
+            )
             .await;
         rep.status("POST /ack -> 200", &ack, 200);
         if let Ok(r) = &ack {
@@ -1475,7 +1775,10 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
         }
         // Acking a seq this node no longer holds is silently skipped (idempotent).
         let ack2 = c
-            .post(&format!("{path}/ack"), &json!({ "node": "w1", "seqs": [seq0] }))
+            .post(
+                &format!("{path}/ack"),
+                &json!({ "node": "w1", "seqs": [seq0] }),
+            )
             .await;
         if let Ok(r) = &ack2 {
             rep.check(
@@ -1492,8 +1795,15 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     }
 
     // claim with an empty node -> 400 invalid_request.
-    let badnode = c.post(&format!("{path}/claim"), &json!({ "node": "", "max": 1 })).await;
-    rep.error_code("claim empty node -> 400 invalid_request", &badnode, 400, "invalid_request");
+    let badnode = c
+        .post(&format!("{path}/claim"), &json!({ "node": "", "max": 1 }))
+        .await;
+    rep.error_code(
+        "claim empty node -> 400 invalid_request",
+        &badnode,
+        400,
+        "invalid_request",
+    );
 
     // 409 not_a_queue: every queue endpoint on a plain LOG box.
     let logb = format!("{ns}-qlog");
@@ -1521,27 +1831,54 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
                 .header("accept", "text/event-stream"),
         )
         .await;
-    rep.error_code("GET /work on a log box -> 409 not_a_queue", &worklog, 409, "not_a_queue");
+    rep.error_code(
+        "GET /work on a log box -> 409 not_a_queue",
+        &worklog,
+        409,
+        "not_a_queue",
+    );
 
     // queue op on an ABSENT box -> 404 box_not_found (not 409).
     let missing = c
-        .post(&format!("/v0/boxes/{ns}-qmiss/claim"), &json!({ "node": "w1" }))
+        .post(
+            &format!("/v0/boxes/{ns}-qmiss/claim"),
+            &json!({ "node": "w1" }),
+        )
         .await;
-    rep.error_code("claim on absent box -> 404 box_not_found", &missing, 404, "box_not_found");
+    rep.error_code(
+        "claim on absent box -> 404 box_not_found",
+        &missing,
+        404,
+        "box_not_found",
+    );
 
     // /work with a non-SSE Accept -> 406 not_acceptable.
     let na = c
-        .send(c.http.get(c.url(&format!("{path}/work?node=w1"))).header("accept", "application/json"))
+        .send(
+            c.http
+                .get(c.url(&format!("{path}/work?node=w1")))
+                .header("accept", "application/json"),
+        )
         .await;
-    rep.error_code("GET /work Accept!=event-stream -> 406 not_acceptable", &na, 406, "not_acceptable");
+    rep.error_code(
+        "GET /work Accept!=event-stream -> 406 not_acceptable",
+        &na,
+        406,
+        "not_acceptable",
+    );
 
     // /work SSE delivers a job frame. Produce a couple of fresh jobs on a clean
     // queue so the stream has work to push, then collect the first job frame.
     let wq = format!("{ns}-qwork");
     let wpath = format!("/v0/boxes/{wq}");
-    let _ = c.put(&wpath, &json!({ "type": "queue", "lease_ms": 30000 })).await;
     let _ = c
-        .post(&wpath, &json!({ "records": [{ "data": { "j": 1 } }, { "data": { "j": 2 } }] }))
+        .put(&wpath, &json!({ "type": "queue", "lease_ms": 30000 }))
+        .await;
+    let _ = c
+        .post(
+            &wpath,
+            &json!({ "records": [{ "data": { "j": 1 } }, { "data": { "j": 2 } }] }),
+        )
         .await;
     let frames = collect_sse(
         c,
@@ -1559,13 +1896,27 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
         job.map(|f| {
             let d: Value = serde_json::from_str(&f.data).unwrap_or(Value::Null);
             d.get("box").and_then(|v| v.as_str()) == Some(wq.as_str())
-                && d.get("$seq").and_then(|v| v.as_u64()).map(|s| s >= 1).unwrap_or(false)
-                && d.get("lease_id").and_then(|v| v.as_str()).map(|s| s.starts_with("lease_")).unwrap_or(false)
+                && d.get("$seq")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| s >= 1)
+                    .unwrap_or(false)
+                && d.get("lease_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.starts_with("lease_"))
+                    .unwrap_or(false)
                 && d.get("deliveries").and_then(|v| v.as_u64()) == Some(1)
                 && !f.id.is_empty()
         })
         .unwrap_or(false),
-        || format!("frames: {:?}", frames.iter().map(|f| (&f.event, &f.data)).collect::<Vec<_>>()),
+        || {
+            format!(
+                "frames: {:?}",
+                frames
+                    .iter()
+                    .map(|f| (&f.event, &f.data))
+                    .collect::<Vec<_>>()
+            )
+        },
     );
 
     // type is immutable: re-PUT the queue as a log -> 409 box_exists_incompatible.
@@ -1584,18 +1935,26 @@ async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
 
     // Seed a couple of records so the stream has backlog + a caught-up transition.
     let _ = c
-        .post(&path, &json!({ "records": [{ "data": "r1", "tag": "x1" }, { "data": "r2" }] }))
+        .post(
+            &path,
+            &json!({ "records": [{ "data": "r1", "tag": "x1" }, { "data": "r2" }] }),
+        )
         .await;
 
     // POST /v0/watch -> 200 with wid + stream_url + per-box head/earliest.
     let watch = c
-        .post("/v0/watch", &json!({ "boxes": { b.clone(): { "from_seq": 0 } }, "include_tags": true }))
+        .post(
+            "/v0/watch",
+            &json!({ "boxes": { b.clone(): { "from_seq": 0 } }, "include_tags": true }),
+        )
         .await;
     rep.status("POST /v0/watch -> 200", &watch, 200);
-    let stream_url = watch
-        .as_ref()
-        .ok()
-        .and_then(|r| r.body.get("stream_url").and_then(|v| v.as_str()).map(String::from));
+    let stream_url = watch.as_ref().ok().and_then(|r| {
+        r.body
+            .get("stream_url")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
     if let Ok(r) = &watch {
         rep.check(
             "watch create: wid + stream_url + per-box head/earliest",
@@ -1612,36 +1971,74 @@ async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
 
     // POST /v0/watch missing boxes -> 400.
     let wbad = c.post("/v0/watch", &json!({ "boxes": {} })).await;
-    rep.error_code("watch create empty boxes -> 400 invalid_request", &wbad, 400, "invalid_request");
+    rep.error_code(
+        "watch create empty boxes -> 400 invalid_request",
+        &wbad,
+        400,
+        "invalid_request",
+    );
 
     // POST /v0/watch unknown box -> 404.
-    let wmiss = c.post("/v0/watch", &json!({ "boxes": { format!("{ns}-ssemiss"): {} } })).await;
-    rep.error_code("watch create unknown box -> 404 box_not_found", &wmiss, 404, "box_not_found");
+    let wmiss = c
+        .post(
+            "/v0/watch",
+            &json!({ "boxes": { format!("{ns}-ssemiss"): {} } }),
+        )
+        .await;
+    rep.error_code(
+        "watch create unknown box -> 404 box_not_found",
+        &wmiss,
+        404,
+        "box_not_found",
+    );
 
     let Some(stream_url) = stream_url else {
-        rep.check("SSE stream available", false, || "no stream_url from watch create".into());
+        rep.check("SSE stream available", false, || {
+            "no stream_url from watch create".into()
+        });
         return;
     };
 
     // GET the stream with a non-SSE Accept -> 406.
     let na = c
-        .send(c.http.get(c.url(&stream_url)).header("accept", "application/json"))
+        .send(
+            c.http
+                .get(c.url(&stream_url))
+                .header("accept", "application/json"),
+        )
         .await;
-    rep.error_code("GET stream Accept!=event-stream -> 406 not_acceptable", &na, 406, "not_acceptable");
+    rep.error_code(
+        "GET stream Accept!=event-stream -> 406 not_acceptable",
+        &na,
+        406,
+        "not_acceptable",
+    );
 
     // GET an unknown wid -> 404.
     let nf = c
-        .send(c.http.get(c.url("/v0/watch/wid_doesnotexist")).header("accept", "text/event-stream"))
+        .send(
+            c.http
+                .get(c.url("/v0/watch/wid_doesnotexist"))
+                .header("accept", "text/event-stream"),
+        )
         .await;
     rep.status("GET unknown wid -> 404", &nf, 404);
 
     // Open the SSE stream and collect frames: expect a `record` frame for the
     // backlog and a `caught-up` frame; then write a live record and observe a
     // second `record` frame; then verify resume via Last-Event-ID.
-    let frames = collect_sse(c, &stream_url, None, 3, Duration::from_secs(5), || {
-        // Trigger a live append shortly after connecting so we see a live record.
-        Some(json!({ "records": [{ "data": "live", "tag": "x3" }] }))
-    }, &path)
+    let frames = collect_sse(
+        c,
+        &stream_url,
+        None,
+        3,
+        Duration::from_secs(5),
+        || {
+            // Trigger a live append shortly after connecting so we see a live record.
+            Some(json!({ "records": [{ "data": "live", "tag": "x3" }] }))
+        },
+        &path,
+    )
     .await;
 
     let events: Vec<&str> = frames.iter().map(|f| f.event.as_str()).collect();
@@ -1658,20 +2055,34 @@ async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
     // The live write should appear as another record frame mentioning "live".
     rep.check(
         "SSE delivers the live-written record after caught-up",
-        frames.iter().any(|f| f.event == "record" && f.data.contains("live")),
-        || format!("events seen: {events:?}; datas: {:?}", frames.iter().map(|f| &f.data).collect::<Vec<_>>()),
+        frames
+            .iter()
+            .any(|f| f.event == "record" && f.data.contains("live")),
+        || {
+            format!(
+                "events seen: {events:?}; datas: {:?}",
+                frames.iter().map(|f| &f.data).collect::<Vec<_>>()
+            )
+        },
     );
     // Frames carry composite `id:` cursors.
     rep.check(
         "SSE data frames carry an `id:` cursor",
-        frames.iter().filter(|f| f.event == "record").all(|f| !f.id.is_empty()),
+        frames
+            .iter()
+            .filter(|f| f.event == "record")
+            .all(|f| !f.id.is_empty()),
         || "a record frame had an empty id".into(),
     );
 
     // Resume: reconnect with Last-Event-ID set to the FIRST record frame's id
     // (which encodes the cursor after the backlog). With that resume the server
     // should NOT redeliver the backlog records before "live".
-    if let Some(first_rec_id) = frames.iter().find(|f| f.event == "record").map(|f| f.id.clone()) {
+    if let Some(first_rec_id) = frames
+        .iter()
+        .find(|f| f.event == "record")
+        .map(|f| f.id.clone())
+    {
         let resume_frames = collect_sse(
             c,
             &stream_url,
@@ -1691,7 +2102,12 @@ async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
         rep.check(
             "SSE resume via Last-Event-ID does not redeliver acked backlog",
             !redelivered_backlog,
-            || format!("resume datas: {:?}", resume_frames.iter().map(|f| &f.data).collect::<Vec<_>>()),
+            || {
+                format!(
+                    "resume datas: {:?}",
+                    resume_frames.iter().map(|f| &f.data).collect::<Vec<_>>()
+                )
+            },
         );
     }
 }
@@ -1711,14 +2127,22 @@ async fn conformance_auth(base_url: &str, c: &Client, rep: &mut Report, ns: &str
     let authed = c.post(&path, &json!({ "records": [{ "data": 1 }] })).await;
     rep.check(
         "auth: request WITH valid token is accepted",
-        authed.as_ref().map(|r| r.status == 200 || r.status == 201).unwrap_or(false),
+        authed
+            .as_ref()
+            .map(|r| r.status == 200 || r.status == 201)
+            .unwrap_or(false),
         || format!("authed write: {:?}", authed.as_ref().map(|r| r.status)),
     );
 
     let anon_resp = anon.get(&path).await;
     match &anon_resp {
         Ok(r) if r.status == 401 => {
-            rep.error_code("auth: request WITHOUT token -> 401 unauthorized", &anon_resp, 401, "unauthorized");
+            rep.error_code(
+                "auth: request WITHOUT token -> 401 unauthorized",
+                &anon_resp,
+                401,
+                "unauthorized",
+            );
         }
         Ok(r) => {
             // Server likely started without keys; auth disabled. Don't fail.
@@ -1728,7 +2152,9 @@ async fn conformance_auth(base_url: &str, c: &Client, rep: &mut Report, ns: &str
                 || format!("anon status {}", r.status),
             );
         }
-        Err(e) => rep.check("auth anon request", false, || format!("request failed: {e}")),
+        Err(e) => rep.check("auth anon request", false, || {
+            format!("request failed: {e}")
+        }),
     }
 
     // Probe endpoints remain open without a token (default probe_auth=false).
@@ -1760,7 +2186,10 @@ async fn collect_sse(
     trigger: impl FnOnce() -> Option<Value>,
     trigger_path: &str,
 ) -> Vec<SseFrame> {
-    let mut rb = c.http.get(c.url(stream_url)).header("accept", "text/event-stream");
+    let mut rb = c
+        .http
+        .get(c.url(stream_url))
+        .header("accept", "text/event-stream");
     if let Some(t) = &c.token {
         rb = rb.header("authorization", format!("Bearer {t}"));
     }
@@ -1862,12 +2291,20 @@ async fn cleanup(c: &Client, ns: &str) {
             .body
             .get("boxes")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.get("box").and_then(|v| v.as_str()).map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("box").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         for n in &names {
             let _ = c.delete(&format!("/v0/boxes/{n}")).await;
         }
-        cursor = r.body.get("next_cursor").and_then(|v| v.as_str()).map(String::from);
+        cursor = r
+            .body
+            .get("next_cursor")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         if cursor.is_none() || names.is_empty() {
             break;
         }
@@ -1914,13 +2351,23 @@ async fn run_bench(cmd: BenchCmd) -> ExitCode {
     let c = Client::new(&cmd.base_url, cmd.token.clone());
 
     // Verify the server is reachable before benching.
-    if c.get("/v0/health").await.map(|r| r.status != 200).unwrap_or(true) {
-        eprintln!("error: server at {} did not return 200 on /v0/health", cmd.base_url);
+    if c.get("/v0/health")
+        .await
+        .map(|r| r.status != 200)
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "error: server at {} did not return 200 on /v0/health",
+            cmd.base_url
+        );
         return ExitCode::FAILURE;
     }
 
     let ns = format!("bench{}", std::process::id());
-    eprintln!("benchmarking {} (writes={}, watchers={})", cmd.base_url, cmd.writes, cmd.watchers);
+    eprintln!(
+        "benchmarking {} (writes={}, watchers={})",
+        cmd.base_url, cmd.writes, cmd.watchers
+    );
 
     let write_bench = bench_write(&c, &ns, cmd.writes).await;
     let diff_bench = bench_diff(&c, &ns).await;
@@ -1959,13 +2406,27 @@ async fn run_bench(cmd: BenchCmd) -> ExitCode {
 /// the per-write fsync gate.
 async fn run_bench_durable(cmd: BenchDurableCmd) -> ExitCode {
     let c = Client::new(&cmd.base_url, cmd.token.clone());
-    if c.get("/v0/health").await.map(|r| r.status != 200).unwrap_or(true) {
-        eprintln!("error: server at {} did not return 200 on /v0/health", cmd.base_url);
+    if c.get("/v0/health")
+        .await
+        .map(|r| r.status != 200)
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "error: server at {} did not return 200 on /v0/health",
+            cmd.base_url
+        );
         return ExitCode::FAILURE;
     }
     // Require the server be ready (recovery complete) before benchmarking.
-    if c.get("/v0/ready").await.map(|r| r.status != 200).unwrap_or(true) {
-        eprintln!("error: server at {} is not ready (/v0/ready != 200)", cmd.base_url);
+    if c.get("/v0/ready")
+        .await
+        .map(|r| r.status != 200)
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "error: server at {} is not ready (/v0/ready != 200)",
+            cmd.base_url
+        );
         return ExitCode::FAILURE;
     }
 
@@ -2013,7 +2474,10 @@ async fn bench_one_durability_class(
     // --- Single-record write-ack latency (one in-flight at a time). ----------
     let lat_box = format!("{ns}-{label}-lat");
     let _ = c
-        .put(&format!("/v0/boxes/{lat_box}"), &json!({ "durable": durable }))
+        .put(
+            &format!("/v0/boxes/{lat_box}"),
+            &json!({ "durable": durable }),
+        )
         .await;
     let lat_path = format!("/v0/boxes/{lat_box}");
     let n = samples.max(1);
@@ -2025,7 +2489,12 @@ async fn bench_one_durability_class(
         if let Ok(r) = c.post(&lat_path, &body).await {
             if r.status == 200 || r.status == 201 {
                 latencies.push(t.elapsed().as_secs_f64() * 1000.0);
-                if let Some(f) = r.body.get("performance").and_then(|p| p.get("fsync_ms")).and_then(|v| v.as_f64()) {
+                if let Some(f) = r
+                    .body
+                    .get("performance")
+                    .and_then(|p| p.get("fsync_ms"))
+                    .and_then(|v| v.as_f64())
+                {
                     fsync_ms_samples.push(f);
                 }
             }
@@ -2037,7 +2506,10 @@ async fn bench_one_durability_class(
     // --- Concurrent batched throughput. --------------------------------------
     let tput_box = format!("{ns}-{label}-tput");
     let _ = c
-        .put(&format!("/v0/boxes/{tput_box}"), &json!({ "durable": durable }))
+        .put(
+            &format!("/v0/boxes/{tput_box}"),
+            &json!({ "durable": durable }),
+        )
         .await;
     let tput_path = Arc::new(format!("/v0/boxes/{tput_box}"));
     let writers = 16usize;
@@ -2075,7 +2547,11 @@ async fn bench_one_durability_class(
     }
     let elapsed = start.elapsed().as_secs_f64();
     let acked = done.load(Ordering::Relaxed);
-    let throughput = if elapsed > 0.0 { acked as f64 / elapsed } else { 0.0 };
+    let throughput = if elapsed > 0.0 {
+        acked as f64 / elapsed
+    } else {
+        0.0
+    };
 
     json!({
         "durable": durable,
@@ -2134,7 +2610,9 @@ async fn bench_write(c: &Client, ns: &str, total_writes: u64) -> Value {
     for _ in 0..lat_samples_n {
         let t = Instant::now();
         let r = c.post(&lat_path, &body).await;
-        if r.map(|r| r.status == 200 || r.status == 201).unwrap_or(false) {
+        if r.map(|r| r.status == 200 || r.status == 201)
+            .unwrap_or(false)
+        {
             latencies.push(t.elapsed().as_secs_f64() * 1000.0);
         }
     }
@@ -2168,7 +2646,9 @@ async fn bench_write(c: &Client, ns: &str, total_writes: u64) -> Value {
         handles.push(tokio::spawn(async move {
             for _ in 0..per_worker {
                 let r = cc.post(&format!("{}?return_seqs=false", path), &pl).await;
-                if r.map(|r| r.status == 200 || r.status == 201).unwrap_or(false) {
+                if r.map(|r| r.status == 200 || r.status == 201)
+                    .unwrap_or(false)
+                {
                     done.fetch_add(batch, Ordering::Relaxed);
                 }
             }
@@ -2179,7 +2659,11 @@ async fn bench_write(c: &Client, ns: &str, total_writes: u64) -> Value {
     }
     let elapsed = start.elapsed().as_secs_f64();
     let recs_acked = done.load(Ordering::Relaxed);
-    let throughput = if elapsed > 0.0 { recs_acked as f64 / elapsed } else { 0.0 };
+    let throughput = if elapsed > 0.0 {
+        recs_acked as f64 / elapsed
+    } else {
+        0.0
+    };
 
     json!({
         "single_record_ack_latency": lat_summary,
@@ -2203,7 +2687,9 @@ async fn bench_diff(c: &Client, ns: &str) -> Value {
     // Seed ~20k records so deep reads have something to chew on.
     let seed_total = 20_000u64;
     let batch = 500u64;
-    let recs: Vec<Value> = (0..batch).map(|i| json!({ "data": { "i": i, "p": "padpadpadpadpad" } })).collect();
+    let recs: Vec<Value> = (0..batch)
+        .map(|i| json!({ "data": { "i": i, "p": "padpadpadpadpad" } }))
+        .collect();
     let body = json!({ "records": recs, "return_seqs": false });
     for _ in 0..(seed_total / batch) {
         let _ = c.post(&format!("{path}?return_seqs=false"), &body).await;
@@ -2221,11 +2707,20 @@ async fn bench_diff(c: &Client, ns: &str) -> Value {
             let t = Instant::now();
             if let Ok(r) = c.post(&dpath, &req).await {
                 lat.push(t.elapsed().as_secs_f64() * 1000.0);
-                total_records += r.body.get("records").and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+                total_records += r
+                    .body
+                    .get("records")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
             }
         }
         let elapsed = start.elapsed().as_secs_f64();
-        let recs_per_s = if elapsed > 0.0 { total_records as f64 / elapsed } else { 0.0 };
+        let recs_per_s = if elapsed > 0.0 {
+            total_records as f64 / elapsed
+        } else {
+            0.0
+        };
         out.insert(
             format!("limit_{limit}"),
             json!({
@@ -2238,7 +2733,12 @@ async fn bench_diff(c: &Client, ns: &str) -> Value {
     }
 
     // Tail-read latency (caught-up near head): cheapest path.
-    let head = c.get(&path).await.ok().and_then(|r| u64_of(&r.body, "head_seq")).unwrap_or(seed_total);
+    let head = c
+        .get(&path)
+        .await
+        .ok()
+        .and_then(|r| u64_of(&r.body, "head_seq"))
+        .unwrap_or(seed_total);
     let mut tail_lat = Vec::with_capacity(2000);
     let treq = json!({ "from_seq": head });
     for _ in 0..2000 {
@@ -2266,7 +2766,9 @@ async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Val
         let b = format!("{ns}-sse{n}");
         let path = format!("/v0/boxes/{b}");
         // Create + seed one record so the box exists and watchers tail the head.
-        let _ = c.post(&path, &json!({ "records": [{ "data": "seed" }] })).await;
+        let _ = c
+            .post(&path, &json!({ "records": [{ "data": "seed" }] }))
+            .await;
 
         let pulses = 50usize; // number of timed writes
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
@@ -2275,9 +2777,17 @@ async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Val
         for _ in 0..n {
             // Create a session tailing the box (only records after subscribe).
             let watch = c
-                .post("/v0/watch", &json!({ "boxes": { b.clone(): { "tail": true } }, "heartbeat_ms": 1000 }))
+                .post(
+                    "/v0/watch",
+                    &json!({ "boxes": { b.clone(): { "tail": true } }, "heartbeat_ms": 1000 }),
+                )
                 .await;
-            let Some(stream_url) = watch.ok().and_then(|r| r.body.get("stream_url").and_then(|v| v.as_str()).map(String::from)) else {
+            let Some(stream_url) = watch.ok().and_then(|r| {
+                r.body
+                    .get("stream_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            }) else {
                 continue;
             };
             let cc = c.clone();
@@ -2298,7 +2808,10 @@ async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Val
         for i in 0..pulses {
             let stamp = epoch.elapsed().as_nanos() as u64;
             let _ = c
-                .post(&path, &json!({ "records": [{ "data": { "pulse": i, "t": stamp } }] }))
+                .post(
+                    &path,
+                    &json!({ "records": [{ "data": { "pulse": i, "t": stamp } }] }),
+                )
                 .await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2345,7 +2858,10 @@ async fn watcher_loop(
     tx: tokio::sync::mpsc::UnboundedSender<f64>,
     epoch: Arc<Instant>,
 ) {
-    let mut rb = c.http.get(c.url(&stream_url)).header("accept", "text/event-stream");
+    let mut rb = c
+        .http
+        .get(c.url(&stream_url))
+        .header("accept", "text/event-stream");
     if let Some(t) = &c.token {
         rb = rb.header("authorization", format!("Bearer {t}"));
     }
@@ -2363,15 +2879,21 @@ async fn watcher_loop(
         buf.push_str(&String::from_utf8_lossy(&bytes));
         while let Some(idx) = buf.find("\n\n") {
             let block: String = buf.drain(..idx + 2).collect();
-            let Some(frame) = parse_sse_block(&block) else { continue };
+            let Some(frame) = parse_sse_block(&block) else {
+                continue;
+            };
             if frame.event != "record" {
                 continue;
             }
             // The frame's `data` is a JSON object with a `records` array; each
             // record carries `data.t`. Parse and time-stamp on arrival.
             let recv_ns = epoch.elapsed().as_nanos() as u64;
-            let Ok(payload): Result<Value, _> = serde_json::from_str(&frame.data) else { continue };
-            let Some(records) = payload.get("records").and_then(|v| v.as_array()) else { continue };
+            let Ok(payload): Result<Value, _> = serde_json::from_str(&frame.data) else {
+                continue;
+            };
+            let Some(records) = payload.get("records").and_then(|v| v.as_array()) else {
+                continue;
+            };
             for rec in records {
                 let stamp = rec
                     .get("data")
@@ -2399,7 +2921,10 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
     let _ = c.put(&format!("/v0/boxes/{src}"), &json!({})).await;
     let _ = c.put(&format!("/v0/boxes/{dst}"), &json!({})).await;
     let _ = c
-        .put(&format!("/v0/routers/{rname}"), &json!({ "source": src, "dest": dst }))
+        .put(
+            &format!("/v0/routers/{rname}"),
+            &json!({ "source": src, "dest": dst }),
+        )
         .await;
 
     let iters = 1_000usize;
@@ -2411,9 +2936,16 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
     let dst_diff = format!("/v0/boxes/{dst}/diff");
     for i in 0..iters {
         // current dst head
-        let dst_head = c.get(&format!("/v0/boxes/{dst}")).await.ok().and_then(|r| u64_of(&r.body, "head_seq")).unwrap_or(0);
+        let dst_head = c
+            .get(&format!("/v0/boxes/{dst}"))
+            .await
+            .ok()
+            .and_then(|r| u64_of(&r.body, "head_seq"))
+            .unwrap_or(0);
         let t = Instant::now();
-        let _ = c.post(&src_path, &json!({ "records": [{ "data": { "i": i } }] })).await;
+        let _ = c
+            .post(&src_path, &json!({ "records": [{ "data": { "i": i } }] }))
+            .await;
         // Poll dst until the forwarded record is visible (synchronous forwarding
         // means it should already be there on the first read).
         loop {
@@ -2437,17 +2969,30 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
     let ddiff = format!("/v0/boxes/{direct_box}/diff");
     let mut direct = Vec::with_capacity(iters);
     for i in 0..iters {
-        let head = c.get(&dpath).await.ok().and_then(|r| u64_of(&r.body, "head_seq")).unwrap_or(0);
+        let head = c
+            .get(&dpath)
+            .await
+            .ok()
+            .and_then(|r| u64_of(&r.body, "head_seq"))
+            .unwrap_or(0);
         let t = Instant::now();
-        let _ = c.post(&dpath, &json!({ "records": [{ "data": { "i": i } }] })).await;
+        let _ = c
+            .post(&dpath, &json!({ "records": [{ "data": { "i": i } }] }))
+            .await;
         let _ = c.post(&ddiff, &json!({ "from_seq": head })).await;
         direct.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
     let fwd_summary = summarize(fwd.clone());
     let direct_summary = summarize(direct.clone());
-    let fwd_p50 = fwd_summary.get("p50_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let direct_p50 = direct_summary.get("p50_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let fwd_p50 = fwd_summary
+        .get("p50_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let direct_p50 = direct_summary
+        .get("p50_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
     json!({
         "forwarded_write_to_visible": fwd_summary,
@@ -2457,7 +3002,10 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
 }
 
 fn print_bench_table(s: &Value) {
-    println!("\n=== streams-probe bench: {} ===", s.get("base_url").and_then(|v| v.as_str()).unwrap_or("?"));
+    println!(
+        "\n=== streams-probe bench: {} ===",
+        s.get("base_url").and_then(|v| v.as_str()).unwrap_or("?")
+    );
 
     let pr = |label: &str, v: &Value| {
         let g = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
@@ -2479,7 +3027,9 @@ fn print_bench_table(s: &Value) {
         if let Some(t) = w.get("throughput") {
             println!(
                 "  throughput: {:.0} records/s  ({} writers x batch {}, {} records in {:.3}s)",
-                t.get("records_per_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                t.get("records_per_s")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
                 t.get("writers").and_then(|v| v.as_u64()).unwrap_or(0),
                 t.get("batch_size").and_then(|v| v.as_u64()).unwrap_or(0),
                 t.get("records_acked").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -2497,8 +3047,12 @@ fn print_bench_table(s: &Value) {
                 }
                 println!(
                     "      -> {:.0} records/s, {:.0} calls/s",
-                    dl.get("records_per_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    dl.get("calls_per_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    dl.get("records_per_s")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                    dl.get("calls_per_s")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
                 );
             }
         }
@@ -2510,12 +3064,19 @@ fn print_bench_table(s: &Value) {
     println!("\n-- SSE fan-out (write -> deliver) --");
     if let Some(sse) = s.get("sse_fanout").and_then(|v| v.as_object()) {
         let mut keys: Vec<&String> = sse.keys().collect();
-        keys.sort_by_key(|k| k.trim_start_matches("watchers_").parse::<usize>().unwrap_or(0));
+        keys.sort_by_key(|k| {
+            k.trim_start_matches("watchers_")
+                .parse::<usize>()
+                .unwrap_or(0)
+        });
         for k in keys {
             let v = &sse[k];
             if let Some(lat) = v.get("write_to_deliver_latency") {
                 pr(
-                    &format!("{} watcher(s)", v.get("watchers").and_then(|x| x.as_u64()).unwrap_or(0)),
+                    &format!(
+                        "{} watcher(s)",
+                        v.get("watchers").and_then(|x| x.as_u64()).unwrap_or(0)
+                    ),
                     lat,
                 );
             }
@@ -2532,7 +3093,9 @@ fn print_bench_table(s: &Value) {
         }
         println!(
             "  added forwarding latency (p50): {:.3} ms",
-            r.get("added_p50_ms").and_then(|v| v.as_f64()).unwrap_or(0.0)
+            r.get("added_p50_ms")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
         );
     }
     println!();
@@ -2545,7 +3108,11 @@ fn print_bench_table(s: &Value) {
 /// Confirm the server answers `/v0/health` 200 before a workload run; otherwise
 /// print an error and signal the caller to bail with a nonzero exit.
 async fn preflight(c: &Client, base_url: &str) -> bool {
-    if c.get("/v0/health").await.map(|r| r.status != 200).unwrap_or(true) {
+    if c.get("/v0/health")
+        .await
+        .map(|r| r.status != 200)
+        .unwrap_or(true)
+    {
         eprintln!("error: server at {base_url} did not return 200 on /v0/health");
         return false;
     }
@@ -2562,7 +3129,11 @@ fn distribution_stats(counts: &[u64]) -> Value {
     let n = counts.len() as f64;
     let sum: u64 = counts.iter().sum();
     let mean = sum as f64 / n;
-    let var = counts.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n;
+    let var = counts
+        .iter()
+        .map(|&x| (x as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n;
     let stddev = var.sqrt();
     let cv = if mean > 0.0 { stddev / mean } else { 0.0 };
     json!({
@@ -2618,7 +3189,9 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
         let b = format!("{ns}-w{n}");
         let path = format!("/v0/boxes/{b}");
         // Create + seed so the box exists; watchers then tail the head.
-        let _ = c.post(&path, &json!({ "records": [{ "data": "seed" }] })).await;
+        let _ = c
+            .post(&path, &json!({ "records": [{ "data": "seed" }] }))
+            .await;
 
         // Per-watcher delivery latencies arrive on this channel.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
@@ -2626,11 +3199,17 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
         for _ in 0..n {
             // One shared session per watcher, tailing the box (records after subscribe).
             let watch = c
-                .post("/v0/watch", &json!({ "boxes": { b.clone(): { "tail": true } }, "heartbeat_ms": 2000 }))
+                .post(
+                    "/v0/watch",
+                    &json!({ "boxes": { b.clone(): { "tail": true } }, "heartbeat_ms": 2000 }),
+                )
                 .await;
-            let Some(stream_url) =
-                watch.ok().and_then(|r| r.body.get("stream_url").and_then(|v| v.as_str()).map(String::from))
-            else {
+            let Some(stream_url) = watch.ok().and_then(|r| {
+                r.body
+                    .get("stream_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            }) else {
                 continue;
             };
             let cc = c.clone();
@@ -2655,7 +3234,10 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
             let stamp = epoch.elapsed().as_nanos() as u64;
             let wt = Instant::now();
             let _ = c
-                .post(&path, &json!({ "records": [{ "data": { "pulse": i, "t": stamp } }] }))
+                .post(
+                    &path,
+                    &json!({ "records": [{ "data": { "pulse": i, "t": stamp } }] }),
+                )
                 .await;
             write_lat.push(wt.elapsed().as_secs_f64() * 1000.0);
             if cmd.pulse_gap_ms > 0 {
@@ -2679,7 +3261,11 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
         let deliveries = samples.len() as u64;
         // Aggregate deliveries/sec: total deliveries observed across all watchers
         // over the send window (the fan-out rate the read layer sustained).
-        let deliveries_per_s = if send_elapsed > 0.0 { deliveries as f64 / send_elapsed } else { 0.0 };
+        let deliveries_per_s = if send_elapsed > 0.0 {
+            deliveries as f64 / send_elapsed
+        } else {
+            0.0
+        };
         tiers.insert(
             format!("watchers_{n}"),
             json!({
@@ -2704,7 +3290,11 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
         println!("\n=== streams-probe broadcast: {} ===", cmd.base_url);
         println!("one source box -> N SSE watchers (shared zero-copy frame fan-out):");
         let mut keys: Vec<&String> = tiers.keys().collect();
-        keys.sort_by_key(|k| k.trim_start_matches("watchers_").parse::<usize>().unwrap_or(0));
+        keys.sort_by_key(|k| {
+            k.trim_start_matches("watchers_")
+                .parse::<usize>()
+                .unwrap_or(0)
+        });
         for k in keys {
             let v = &tiers[k];
             println!(
@@ -2746,7 +3336,9 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
 
     // Pre-build a reusable batch payload (return_seqs=false to keep responses tiny).
     let payload = {
-        let recs: Vec<Value> = (0..batch).map(|i| json!({ "data": { "i": i, "p": "evt" } })).collect();
+        let recs: Vec<Value> = (0..batch)
+            .map(|i| json!({ "data": { "i": i, "p": "evt" } }))
+            .collect();
         Arc::new(json!({ "records": recs, "return_seqs": false }))
     };
 
@@ -2801,8 +3393,17 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
     let elapsed = start.elapsed().as_secs_f64();
     let recs = done_records.load(Ordering::Relaxed);
     let batches_ok = done_batches.load(Ordering::Relaxed);
-    let appends_per_s = if elapsed > 0.0 { recs as f64 / elapsed } else { 0.0 };
-    let lat_summary = summarize(Arc::try_unwrap(lat).ok().and_then(|m| m.into_inner().ok()).unwrap_or_default());
+    let appends_per_s = if elapsed > 0.0 {
+        recs as f64 / elapsed
+    } else {
+        0.0
+    };
+    let lat_summary = summarize(
+        Arc::try_unwrap(lat)
+            .ok()
+            .and_then(|m| m.into_inner().ok())
+            .unwrap_or_default(),
+    );
 
     cleanup(&c, &ns).await;
 
@@ -2832,7 +3433,10 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
             "  {:.0} appends/s  ({} records into {} boxes in {:.3}s)",
             appends_per_s, recs, batches_ok, elapsed
         );
-        println!("  per-request append latency: {}", fmt_latency(&lat_summary));
+        println!(
+            "  per-request append latency: {}",
+            fmt_latency(&lat_summary)
+        );
         if appends_per_s < 1_000_000.0 {
             println!(
                 "  NOTE: {:.0} appends/s is below the 1M/s target. Single-process HTTP probe is\n        the ceiling here — per-request overhead (TCP/HTTP/JSON parse) dominates over\n        a localhost loopback. Raise --batch and --writers, and run the probe on a\n        separate host/core set, to push closer; the write path itself is sharded\n        and lock-free per box (ARCHITECTURE §8).",
@@ -2878,9 +3482,14 @@ async fn run_queue(cmd: QueueCmd) -> ExitCode {
         let mut produced = 0u64;
         while produced < jobs {
             let n = produce_batch.min(jobs - produced);
-            let recs: Vec<Value> = (0..n).map(|i| json!({ "data": { "j": produced + i } })).collect();
+            let recs: Vec<Value> = (0..n)
+                .map(|i| json!({ "data": { "j": produced + i } }))
+                .collect();
             let _ = c
-                .post(&format!("{path}?return_seqs=false"), &json!({ "records": recs, "return_seqs": false }))
+                .post(
+                    &format!("{path}?return_seqs=false"),
+                    &json!({ "records": recs, "return_seqs": false }),
+                )
                 .await;
             produced += n;
         }
@@ -2914,7 +3523,10 @@ async fn run_queue(cmd: QueueCmd) -> ExitCode {
                 }
                 let t = Instant::now();
                 let claim = cc
-                    .post(&format!("{path}/claim"), &json!({ "node": node, "max": claim_max }))
+                    .post(
+                        &format!("{path}/claim"),
+                        &json!({ "node": node, "max": claim_max }),
+                    )
                     .await;
                 local_lat.push(t.elapsed().as_secs_f64() * 1000.0);
                 let seqs: Vec<u64> = match &claim {
@@ -2922,7 +3534,11 @@ async fn run_queue(cmd: QueueCmd) -> ExitCode {
                         .body
                         .get("claimed")
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|j| j.get("$seq").and_then(|s| s.as_u64())).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|j| j.get("$seq").and_then(|s| s.as_u64()))
+                                .collect()
+                        })
                         .unwrap_or_default(),
                     Err(_) => Vec::new(),
                 };
@@ -2938,7 +3554,10 @@ async fn run_queue(cmd: QueueCmd) -> ExitCode {
                 empty_streak = 0;
                 let n = seqs.len() as u64;
                 let ack = cc
-                    .post(&format!("{path}/ack"), &json!({ "node": node, "seqs": seqs }))
+                    .post(
+                        &format!("{path}/ack"),
+                        &json!({ "node": node, "seqs": seqs }),
+                    )
                     .await;
                 let acked = ack.ok().and_then(|r| u64_of(&r.body, "acked")).unwrap_or(0);
                 if acked > 0 {
@@ -2960,14 +3579,29 @@ async fn run_queue(cmd: QueueCmd) -> ExitCode {
     let work_elapsed = work_start.elapsed().as_secs_f64();
 
     let acked = total_acked.load(Ordering::Relaxed);
-    let jobs_per_s = if work_elapsed > 0.0 { acked as f64 / work_elapsed } else { 0.0 };
-    let counts: Vec<u64> = per_worker.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    let jobs_per_s = if work_elapsed > 0.0 {
+        acked as f64 / work_elapsed
+    } else {
+        0.0
+    };
+    let counts: Vec<u64> = per_worker
+        .iter()
+        .map(|a| a.load(Ordering::Relaxed))
+        .collect();
     let dist = distribution_stats(&counts);
-    let claim_summary = summarize(Arc::try_unwrap(claim_lat).ok().and_then(|m| m.into_inner().ok()).unwrap_or_default());
+    let claim_summary = summarize(
+        Arc::try_unwrap(claim_lat)
+            .ok()
+            .and_then(|m| m.into_inner().ok())
+            .unwrap_or_default(),
+    );
 
     // Leftover (if any) for transparency.
     let leftover = c.get(&path).await.ok().and_then(|r| {
-        r.body.get("queue").and_then(|x| x.get("ready")).and_then(|v| v.as_u64())
+        r.body
+            .get("queue")
+            .and_then(|x| x.get("ready"))
+            .and_then(|v| v.as_u64())
     });
 
     cleanup(&c, &ns).await;
@@ -3110,9 +3744,22 @@ async fn run_actors(cmd: ActorsCmd) -> ExitCode {
 
     let events = events_done.load(Ordering::Relaxed);
     let snaps = snapshots_done.load(Ordering::Relaxed);
-    let events_per_s = if elapsed > 0.0 { events as f64 / elapsed } else { 0.0 };
-    let inferences_per_s = if elapsed > 0.0 { (actors * inferences) as f64 / elapsed } else { 0.0 };
-    let lat_summary = summarize(Arc::try_unwrap(append_lat).ok().and_then(|m| m.into_inner().ok()).unwrap_or_default());
+    let events_per_s = if elapsed > 0.0 {
+        events as f64 / elapsed
+    } else {
+        0.0
+    };
+    let inferences_per_s = if elapsed > 0.0 {
+        (actors * inferences) as f64 / elapsed
+    } else {
+        0.0
+    };
+    let lat_summary = summarize(
+        Arc::try_unwrap(append_lat)
+            .ok()
+            .and_then(|m| m.into_inner().ok())
+            .unwrap_or_default(),
+    );
 
     cleanup(&c, &ns).await;
 
@@ -3142,7 +3789,11 @@ async fn run_actors(cmd: ActorsCmd) -> ExitCode {
         );
         println!(
             "  {:.0} events/s ({} events, {} chains, {} snapshot-compactions in {:.3}s)",
-            events_per_s, events, actors * inferences, snaps, elapsed
+            events_per_s,
+            events,
+            actors * inferences,
+            snaps,
+            elapsed
         );
         println!("  {:.0} inferences/s", inferences_per_s);
         println!("  per-chain append latency: {}", fmt_latency(&lat_summary));

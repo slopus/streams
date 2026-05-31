@@ -174,7 +174,10 @@ fn snapshot_with_inflight_same_box_writers_loses_no_acked_write() {
     let acked = acked.lock().unwrap();
 
     let max_acked = acked.keys().copied().max().unwrap_or(0);
-    assert!(!acked.is_empty(), "the workload acked at least one durable write");
+    assert!(
+        !acked.is_empty(),
+        "the workload acked at least one durable write"
+    );
 
     // (1) NO ACKED WRITE MISSING: every acked durable write recovered, with its
     //     exact value (no checkpoint excluded a covered frame).

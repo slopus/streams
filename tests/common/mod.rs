@@ -162,9 +162,13 @@ impl Harness {
                     .build()
                     .expect("build harness runtime");
                 rt.block_on(async move {
-                    let engine =
-                        Engine::with_data_dir(config, clock).expect("open durable engine");
-                    let app = http::build_router(engine);
+                    let engine = Engine::with_data_dir(config, clock).expect("open durable engine");
+                    // Share the shutdown signal with the serve loop so in-flight SSE
+                    // streams are wound down on shutdown, exactly as the binary does
+                    // (M11). The harness exercises the production drain path.
+                    let sse_shutdown = std::sync::Arc::new(streams::serve::ShutdownSignal::new());
+                    let app = http::build_router_with_shutdown(engine, sse_shutdown.clone())
+                        .expect("build router");
 
                     let listener = tokio::net::TcpListener::bind(addr)
                         .await
@@ -173,9 +177,14 @@ impl Harness {
                     // Same dual-protocol (HTTP/1.1 keep-alive + h2c prior-knowledge)
                     // serve loop the binary uses, so the harness exercises the exact
                     // production path under both protocols.
-                    let _ = streams::serve::serve(listener, app, async {
-                        let _ = shutdown_rx.await;
-                    })
+                    let _ = streams::serve::serve_with_signal(
+                        listener,
+                        app,
+                        async {
+                            let _ = shutdown_rx.await;
+                        },
+                        sse_shutdown,
+                    )
                     .await;
                 });
             })
@@ -272,7 +281,12 @@ impl Harness {
 
     /// `POST path` with a JSON body and a bearer token header.
     pub fn post_auth(&self, path: &str, body: Value, token: &str) -> (StatusCode, Value) {
-        self.send(self.client.post(self.url(path)).bearer_auth(token).json(&body))
+        self.send(
+            self.client
+                .post(self.url(path))
+                .bearer_auth(token)
+                .json(&body),
+        )
     }
 
     /// `GET path` with a bearer token header.
@@ -282,7 +296,12 @@ impl Harness {
 
     /// `PUT path` with a JSON body and a bearer token header.
     pub fn put_auth(&self, path: &str, body: Value, token: &str) -> (StatusCode, Value) {
-        self.send(self.client.put(self.url(path)).bearer_auth(token).json(&body))
+        self.send(
+            self.client
+                .put(self.url(path))
+                .bearer_auth(token)
+                .json(&body),
+        )
     }
 
     /// `DELETE path` (no body) with a bearer token header.
@@ -301,6 +320,19 @@ impl Harness {
             other => panic!("send_auth: unsupported method {other}"),
         };
         self.send(req.bearer_auth(token))
+    }
+
+    /// `GET path` returning the raw body as a string (for non-JSON responses like
+    /// the Prometheus text exposition). `token` is sent as a bearer when `Some`.
+    pub fn get_text(&self, path: &str, token: Option<&str>) -> (StatusCode, String) {
+        let mut req = self.client.get(self.url(path));
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().expect("request failed to send");
+        let status = resp.status();
+        let body = resp.text().expect("read response body as text");
+        (status, body)
     }
 
     /// Send a prepared request, returning `(status, body-as-json-or-Null)`.

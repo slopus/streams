@@ -16,18 +16,14 @@
 
 use std::sync::Arc;
 
-use criterion::{
-    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use serde_json::{json, Value};
 
 use streams::clock::{Clock, SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::box_state::{BoxIndex, BoxState, StoredRecord};
 use streams::engine::{Engine, SEQ_BASE};
-use streams::types::{
-    BoxConfig, Discard, DiffRequest, Filter, FilterOp, RecordIn, WriteRequest,
-};
+use streams::types::{BoxConfig, DiffRequest, Discard, Filter, FilterOp, RecordIn, WriteRequest};
 
 const BOX: &str = "bench";
 
@@ -120,21 +116,17 @@ fn bench_diff(c: &mut Criterion) {
     for &limit in &[1u32, 256, 1000] {
         // The number of records actually returned per call is min(limit, WARM).
         g.throughput(Throughput::Elements(limit.min(WARM as u32) as u64));
-        g.bench_with_input(
-            BenchmarkId::from_parameter(limit),
-            &limit,
-            |b, &limit| {
-                b.iter(|| {
-                    let req = DiffRequest {
-                        from_seq: 0,
-                        limit,
-                        ..Default::default()
-                    };
-                    let resp = engine.diff(BOX, req).unwrap();
-                    resp.records.len()
-                });
-            },
-        );
+        g.bench_with_input(BenchmarkId::from_parameter(limit), &limit, |b, &limit| {
+            b.iter(|| {
+                let req = DiffRequest {
+                    from_seq: 0,
+                    limit,
+                    ..Default::default()
+                };
+                let resp = engine.diff(BOX, req).unwrap();
+                resp.records.len()
+            });
+        });
     }
     g.finish();
 }
@@ -236,19 +228,13 @@ fn bench_cap_evict(c: &mut Criterion) {
     // of front records. Measures the per-batch evict + append cost.
     for &batch in &[1usize, 100] {
         g.throughput(Throughput::Elements(batch as u64));
-        g.bench_with_input(
-            BenchmarkId::from_parameter(batch),
-            &batch,
-            |b, &batch| {
-                let engine = full_capped_engine(CAP, 64);
-                let data = payload(64);
-                b.iter(|| {
-                    engine
-                        .write(BOX, write_req(batch, &data), false)
-                        .unwrap();
-                });
-            },
-        );
+        g.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch| {
+            let engine = full_capped_engine(CAP, 64);
+            let data = payload(64);
+            b.iter(|| {
+                engine.write(BOX, write_req(batch, &data), false).unwrap();
+            });
+        });
     }
     g.finish();
 }

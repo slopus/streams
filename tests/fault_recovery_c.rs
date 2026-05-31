@@ -34,7 +34,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -368,7 +373,10 @@ fn f_rec_crash_before_truncate() {
             );
         }
         // The 6 acked durable frames always survive; the 7th may or may not.
-        assert!(d.count >= 6 && d.count <= 7, "6 acked survive, the 7th is optional");
+        assert!(
+            d.count >= 6 && d.count <= 7,
+            "6 acked survive, the 7th is optional"
+        );
         if let Some(&hi) = seqs.last() {
             assert_eq!(d.head, hi, "head == high-water of the prefix");
         }
@@ -449,9 +457,15 @@ fn f_rec_eio_truncate() {
     let engine = open_engine(&disk);
     let d = dump(&engine, "b").expect("b recovers on retry");
     assert_dense_prefix(&d, &acked);
-    assert_eq!(d.count, 5, "all 5 durable writes recover after the truncate retry");
+    assert_eq!(
+        d.count, 5,
+        "all 5 durable writes recover after the truncate retry"
+    );
     let next = append(&engine, "b", "six");
-    assert_eq!(next, 6, "post-recovery append continues at head+1, never after garbage");
+    assert_eq!(
+        next, 6,
+        "post-recovery append continues at head+1, never after garbage"
+    );
     drop(engine);
 }
 
@@ -496,7 +510,10 @@ fn f_rec_eio_truncate_fsync() {
     let engine = open_engine(&disk);
     let d = dump(&engine, "b").expect("b recovers on retry");
     assert_dense_prefix(&d, &acked);
-    assert_eq!(d.count, 5, "all 5 durable writes recover after the truncate-fsync retry");
+    assert_eq!(
+        d.count, 5,
+        "all 5 durable writes recover after the truncate-fsync retry"
+    );
 
     // Idempotent: a second recovery is byte-identical (re-truncate is a no-op).
     drop(engine);
@@ -591,10 +608,17 @@ fn f_rec_idx_bulkload_eio() {
         let store = LocalSegmentStore::open_with(&root, faulty.arc()).unwrap();
         // First read faults (consumes the once); the retry reads clean.
         let _ = store.read_all(1, SegmentPart::Idx);
-        let again = store.read_all(1, SegmentPart::Idx).expect("retry reads clean");
-        assert_eq!(again, idx, "re-read after a transient .idx EIO yields the original bytes");
+        let again = store
+            .read_all(1, SegmentPart::Idx)
+            .expect("retry reads clean");
+        assert_eq!(
+            again, idx,
+            "re-read after a transient .idx EIO yields the original bytes"
+        );
         // A `.data` read range still works (the fault was scoped to the once).
-        let head = store.read_range(1, SegmentPart::Data, 0, 8).expect("data read");
+        let head = store
+            .read_range(1, SegmentPart::Data, 0, 8)
+            .expect("data read");
         assert_eq!(head, &data[..8]);
         // And the `.idx` length matches what we wrote.
         assert_eq!(again.len() as u64, idx_len);
@@ -606,6 +630,9 @@ fn f_rec_idx_bulkload_eio() {
     let engine = open_engine(&disk);
     let d = dump(&engine, "b").expect("b recovers from the WAL");
     assert_dense_prefix(&d, &acked);
-    assert_eq!(d.count, 5, "all 5 records remain available from the WAL (no live record lost)");
+    assert_eq!(
+        d.count, 5,
+        "all 5 records remain available from the WAL (no live record lost)"
+    );
     drop(engine);
 }

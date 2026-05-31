@@ -202,8 +202,13 @@ fn eio_on_fsync_fails_batch_not_prior_state() {
     // Phase 2: wrap the disk in a FaultFs that fails EVERY sync_data (dead device).
     let faulty: Arc<dyn Fs> =
         FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, false).arc();
-    let wal = Wal::open_at_with(faulty.clone(), fast_cfg(&data_dir), 1, pos_len(&disk, &data_dir))
-        .unwrap();
+    let wal = Wal::open_at_with(
+        faulty.clone(),
+        fast_cfg(&data_dir),
+        1,
+        pos_len(&disk, &data_dir),
+    )
+    .unwrap();
     let w = wal.writer();
     // A durable append must FAIL (the fsync errors ⇒ the batch is not acked).
     let res = w.append(ap(4), true);
@@ -278,8 +283,13 @@ fn failpoint_wal_after_write_then_crash() {
     // fire-and-forget via `submit` + drop, exactly the non-durable-crash path.)
     fail::cfg("wal::after_write", "panic").unwrap();
     {
-        let wal =
-            Wal::open_at_with(disk.arc(), fast_cfg(&data_dir), 1, pos_len(&disk, &data_dir)).unwrap();
+        let wal = Wal::open_at_with(
+            disk.arc(),
+            fast_cfg(&data_dir),
+            1,
+            pos_len(&disk, &data_dir),
+        )
+        .unwrap();
         let w = wal.writer();
         // The batch is written, then the writer panics at the failpoint before the
         // fsync — so frame 3 is never durable. Drop the token (do not wait on it).
@@ -351,8 +361,13 @@ fn sweep_durable_append_crash_points() {
 
     // Probe: how many write_at calls does the workload make? (Run once, count.)
     let probe_disk = FakeDisk::new();
-    let probe: FaultFs =
-        FaultFs::new(probe_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, u64::MAX, true);
+    let probe: FaultFs = FaultFs::new(
+        probe_disk.arc(),
+        FaultOp::WriteAt,
+        FaultKind::Eio,
+        u64::MAX,
+        true,
+    );
     {
         let wal = Wal::open_at_with(probe.arc(), fast_cfg(&data_dir), 1, 0).unwrap();
         let w = wal.writer();
@@ -362,7 +377,10 @@ fn sweep_durable_append_crash_points() {
         wal.shutdown();
     }
     let total_writes = probe.calls_seen();
-    assert!(total_writes >= 4, "the workload issues several write_at calls");
+    assert!(
+        total_writes >= 4,
+        "the workload issues several write_at calls"
+    );
 
     // Sweep: crash after each of the first N pending writes is buffered. Because a
     // durable `append` blocks on its own fsync, crashing mid-stream (via a fresh

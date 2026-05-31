@@ -475,7 +475,10 @@ impl Fs for FakeDisk {
         }
         let mut st = self.state.lock().unwrap();
         let Some(id) = st.live_dir.remove(from) else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "rename src missing"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "rename src missing",
+            ));
         };
         // Point the new name at the same inode in the LIVE view (bytes carry over).
         // Both the removal of `from` and the install of `to` are durable only after
@@ -1079,7 +1082,10 @@ mod tests {
             f.sync_all().unwrap(); // bytes promoted, but dir entry still pending.
         }
         disk.crash(TornDamage::None);
-        assert!(disk.durable_bytes(&p).is_none(), "create not dir-fsynced ⇒ gone");
+        assert!(
+            disk.durable_bytes(&p).is_none(),
+            "create not dir-fsynced ⇒ gone"
+        );
     }
 
     /// A rename is durable only after `sync_dir`; a crash before it rolls back.
@@ -1130,8 +1136,8 @@ mod tests {
             // No fsync; the write is pending and will be torn.
         }
         disk.sync_dir(Path::new("/d")).unwrap(); // make the file exist durably.
-        // We need a durable existence; the create+dir-fsync above did that, but the
-        // bytes are still pending. Crash with a prefix-truncate tear.
+                                                 // We need a durable existence; the create+dir-fsync above did that, but the
+                                                 // bytes are still pending. Crash with a prefix-truncate tear.
         disk.crash(TornDamage::PrefixTruncate);
         let durable = disk.durable_bytes(&p).unwrap();
         assert!(
@@ -1201,7 +1207,10 @@ mod tests {
         let p = PathBuf::from("/d/f");
         let mut f = fs.open(&p, OpenOpts::create_truncate()).unwrap();
         let n = f.write_at(0, b"hello").unwrap();
-        assert!((1..5).contains(&n), "short write returns a partial count, got {n}");
+        assert!(
+            (1..5).contains(&n),
+            "short write returns a partial count, got {n}"
+        );
     }
 
     /// `calls_seen` counts the chosen op class for sizing a sweep.
@@ -1393,9 +1402,16 @@ mod tests {
         // The recovered seqs are a dense prefix of 1..=6 and never contain a
         // bogus/garbled seq: the torn frame 6 truncates, the 5 fsynced ones survive.
         for (i, s) in seqs.iter().enumerate() {
-            assert_eq!(*s, i as u64 + 1, "dense prefix, no torn frame misread: {seqs:?}");
+            assert_eq!(
+                *s,
+                i as u64 + 1,
+                "dense prefix, no torn frame misread: {seqs:?}"
+            );
         }
-        assert!(seqs.len() >= 5, "the 5 fsynced-before-the-torn frames survive");
+        assert!(
+            seqs.len() >= 5,
+            "the 5 fsynced-before-the-torn frames survive"
+        );
     }
 
     /// ORACLE (snapshot atomic swap): the real `write_snapshot_with` through

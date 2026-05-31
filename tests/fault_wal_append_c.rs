@@ -23,7 +23,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -371,7 +376,10 @@ fn f_nfs_eagain_retry() {
         let resp = engine
             .write("q", one_write("3b"), true)
             .expect("post-glitch durable append acks on success");
-        assert_eq!(resp.last_seq, 3, "fresh append continues at head+1 (=3), no gap");
+        assert_eq!(
+            resp.last_seq, 3,
+            "fresh append continues at head+1 (=3), no gap"
+        );
         sync_wal_dir(&disk);
         drop(engine);
     }
@@ -387,7 +395,10 @@ fn f_nfs_eagain_retry() {
         vec![1, 2, 3],
         "the post-glitch acked append survives; dense [1..=3], no gap, no resurrection"
     );
-    assert_eq!(recs[&3], "3b", "seq 3 holds the post-glitch record, not the refused one");
+    assert_eq!(
+        recs[&3], "3b",
+        "seq 3 holds the post-glitch record, not the refused one"
+    );
 }
 
 // ===========================================================================
@@ -426,7 +437,11 @@ fn f_psow_outside_range_damage() {
     let path = active_wal_path(&disk);
     let bytes = durable_wal_bytes(&disk, &path);
     let spans = frame_spans(&bytes);
-    assert!(spans.len() >= 6, "all 6 frames laid down, got {} spans", spans.len());
+    assert!(
+        spans.len() >= 6,
+        "all 6 frames laid down, got {} spans",
+        spans.len()
+    );
 
     // Pick a MID-LOG neighbor: frame index 3 (the 4th frame, seq 4). A psow write
     // to frame index 4's range garbles a byte in frame index 3's body sector —
@@ -456,8 +471,15 @@ fn f_psow_outside_range_damage() {
 
     // Explicit-loss guarantee: the garbled seq 4 is NOT present (no garbage record),
     // and there is no gap among survivors — they are a contiguous prefix [1..=3].
-    assert!(!seqs.contains(&4), "corrupt neighbor frame is never decoded as a record");
+    assert!(
+        !seqs.contains(&4),
+        "corrupt neighbor frame is never decoded as a record"
+    );
     for (i, s) in seqs.iter().enumerate() {
-        assert_eq!(*s, i as u64 + 1, "survivors are a dense contiguous prefix: {seqs:?}");
+        assert_eq!(
+            *s,
+            i as u64 + 1,
+            "survivors are a dense contiguous prefix: {seqs:?}"
+        );
     }
 }

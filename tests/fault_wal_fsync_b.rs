@@ -29,7 +29,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::io;
@@ -107,8 +112,16 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox { name: String, durable: bool },
-    Append { name: String, data: String, tag: Option<String>, node: Option<String> },
+    PutBox {
+        name: String,
+        durable: bool,
+    },
+    Append {
+        name: String,
+        data: String,
+        tag: Option<String>,
+        node: Option<String>,
+    },
 }
 
 /// Drive `ops` against a real engine, mirroring acked effects into `model`. A
@@ -127,7 +140,12 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ensure_box(name, *durable);
                 }
             }
-            Op::Append { name, data, tag, node } => {
+            Op::Append {
+                name,
+                data,
+                tag,
+                node,
+            } => {
                 if !model.boxes.contains_key(name) {
                     model.ensure_box(name, false);
                 }
@@ -268,7 +286,10 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         let m = model.ever_acked.get(seq).unwrap_or_else(|| {
             panic!("{name}: recovered seq {seq} was never acked (fabricated/torn): {rec:?}")
         });
-        assert_eq!(m, rec, "{name}: recovered record at seq {seq} differs from the model");
+        assert_eq!(
+            m, rec,
+            "{name}: recovered record at seq {seq} differs from the model"
+        );
     }
 
     // (2) NO SILENT LOSS of acked-durable when the whole tail was durable.
@@ -314,20 +335,49 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE: recovered head ≤ model head; equal when durable + whole.
-    assert!(
-        dump.head <= model.head,
-        "{name}: recovered head {} exceeds model head {} (future seq?)",
-        dump.head,
-        model.head
-    );
-    if model.durable && whole_tail_durable && !live.is_empty() {
-        assert_eq!(dump.head, model.head, "{name}: durable head must match model");
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box (`model.durable`) has
+    //     no head reservation: its head matches the acked head exactly (never a
+    //     future seq). A `disk` box (acked before fsync) recovers at its durable
+    //     head RESERVATION, so its head may sit ABOVE the acked head by up to
+    //     `DISK_HEAD_RESERVE_AHEAD` (dropped un-fsynced seqs become silent gaps) and
+    //     never regresses below an acked seq when the whole tail was durable.
+    if model.durable {
+        assert!(
+            dump.head <= model.head,
+            "{name}: fsync recovered head {} exceeds model head {} (future seq?)",
+            dump.head,
+            model.head
+        );
+        if whole_tail_durable && !live.is_empty() {
+            assert_eq!(
+                dump.head, model.head,
+                "{name}: durable head must match model"
+            );
+        }
+    } else {
+        if whole_tail_durable && model.head > 0 {
+            assert!(
+                dump.head >= model.head,
+                "{name}: disk recovered head {} REGRESSED below acked head {} (reuse!)",
+                dump.head,
+                model.head
+            );
+        }
+        assert!(
+            dump.head <= model.head + streams::config::DISK_HEAD_RESERVE_AHEAD,
+            "{name}: disk recovered head {} exceeds reservation ceiling {}",
+            dump.head,
+            model.head + streams::config::DISK_HEAD_RESERVE_AHEAD
+        );
     }
 
     // (5) EARLIEST: when the whole durable tail survived, earliest matches.
     if model.durable && whole_tail_durable && !live.is_empty() {
-        assert_eq!(dump.earliest, model.earliest(), "{name}: earliest_seq must match model");
+        assert_eq!(
+            dump.earliest,
+            model.earliest(),
+            "{name}: earliest_seq must match model"
+        );
     }
 
     // No involuntary loss ⇒ no tombstone should appear (these workloads have no cap).
@@ -584,7 +634,10 @@ impl File for CrashAfterFile {
 impl Fs for CrashAfter {
     fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<Box<dyn File>> {
         let inner = self.disk.open(path, opts)?;
-        Ok(Box::new(CrashAfterFile { inner, owner: self.clone() }))
+        Ok(Box::new(CrashAfterFile {
+            inner,
+            owner: self.clone(),
+        }))
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let r = self.disk.rename(from, to);
@@ -634,15 +687,41 @@ fn f_wal_crash_during_shutdown_drain() {
     // non-durable burst that is only queued (its durability rides the shutdown
     // drain — which the crash interrupts).
     let mut ops = vec![
-        Op::PutBox { name: "drain".into(), durable: true },
-        Op::Append { name: "drain".into(), data: "d1".into(), tag: Some("a".into()), node: None },
-        Op::Append { name: "drain".into(), data: "d2".into(), tag: Some("a".into()), node: Some("n".into()) },
-        Op::Append { name: "drain".into(), data: "d3".into(), tag: Some("b".into()), node: None },
+        Op::PutBox {
+            name: "drain".into(),
+            durable: true,
+        },
+        Op::Append {
+            name: "drain".into(),
+            data: "d1".into(),
+            tag: Some("a".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "drain".into(),
+            data: "d2".into(),
+            tag: Some("a".into()),
+            node: Some("n".into()),
+        },
+        Op::Append {
+            name: "drain".into(),
+            data: "d3".into(),
+            tag: Some("b".into()),
+            node: None,
+        },
     ];
     // A non-durable box whose tail is only flushed (if at all) by the drain.
-    ops.push(Op::PutBox { name: "fast".into(), durable: false });
+    ops.push(Op::PutBox {
+        name: "fast".into(),
+        durable: false,
+    });
     for i in 0..8 {
-        ops.push(Op::Append { name: "fast".into(), data: format!("f{i}"), tag: None, node: None });
+        ops.push(Op::Append {
+            name: "fast".into(),
+            data: format!("f{i}"),
+            tag: None,
+            node: None,
+        });
     }
 
     {
@@ -661,7 +740,11 @@ fn f_wal_crash_during_shutdown_drain() {
     // The durable box's acked writes all survived the drain crash.
     let dump_d = dump_box(&engine, "drain").expect("durable box survives drain crash");
     assert_box_contract("drain", &model.boxes["drain"], &dump_d, true);
-    assert_eq!(dump_d.records.len(), 3, "all 3 acked durable frames survive the shutdown-drain crash");
+    assert_eq!(
+        dump_d.records.len(),
+        3,
+        "all 3 acked durable frames survive the shutdown-drain crash"
+    );
 
     // The non-durable box: whatever survived is a clean dense prefix — no torn
     // tail, no fabricated frame. (Its queued tail may legitimately be gone.)
@@ -689,10 +772,28 @@ fn f_snap_checkpoint_flush_crash() {
     // small so the bounded crash-point sweep stays well under a minute (each
     // durable append blocks on a real group fsync).
     let ops = vec![
-        Op::PutBox { name: "snap".into(), durable: true },
-        Op::Append { name: "snap".into(), data: "s1".into(), tag: Some("a".into()), node: None },
-        Op::Append { name: "snap".into(), data: "s2".into(), tag: Some("a".into()), node: Some("n".into()) },
-        Op::Append { name: "snap".into(), data: "s3".into(), tag: Some("b".into()), node: None },
+        Op::PutBox {
+            name: "snap".into(),
+            durable: true,
+        },
+        Op::Append {
+            name: "snap".into(),
+            data: "s1".into(),
+            tag: Some("a".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "snap".into(),
+            data: "s2".into(),
+            tag: Some("a".into()),
+            node: Some("n".into()),
+        },
+        Op::Append {
+            name: "snap".into(),
+            data: "s3".into(),
+            tag: Some("b".into()),
+            node: None,
+        },
     ];
 
     // Probe: how many write_at calls does the snapshot path itself issue? We only
@@ -706,7 +807,13 @@ fn f_snap_checkpoint_flush_crash() {
         stop(engine);
     }
     let snap_writes = {
-        let probe = FaultFs::new(probe_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, u64::MAX, true);
+        let probe = FaultFs::new(
+            probe_disk.arc(),
+            FaultOp::WriteAt,
+            FaultKind::Eio,
+            u64::MAX,
+            true,
+        );
         let engine = open_engine_fs(probe.arc());
         let before = probe.calls_seen();
         engine.write_snapshot().expect("probe snapshot writes");
@@ -757,7 +864,11 @@ fn f_snap_checkpoint_flush_crash() {
         if crash_point % 5 == 0 {
             let again = open_engine(&disk);
             let d2 = dump_box(&again, "snap");
-            assert_eq!(Some(dump.clone()), d2, "recovery idempotent at crash_point {crash_point}");
+            assert_eq!(
+                Some(dump.clone()),
+                d2,
+                "recovery idempotent at crash_point {crash_point}"
+            );
             stop(again);
         }
         stop(engine);
@@ -790,16 +901,32 @@ fn f_nfs_fsync_lies() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "nfs".into(), durable: true },
-                Op::Append { name: "nfs".into(), data: "h1".into(), tag: Some("a".into()), node: None },
-                Op::Append { name: "nfs".into(), data: "h2".into(), tag: Some("a".into()), node: Some("n".into()) },
+                Op::PutBox {
+                    name: "nfs".into(),
+                    durable: true,
+                },
+                Op::Append {
+                    name: "nfs".into(),
+                    data: "h1".into(),
+                    tag: Some("a".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "nfs".into(),
+                    data: "h2".into(),
+                    tag: Some("a".into()),
+                    node: Some("n".into()),
+                },
             ],
         );
         sync_dirs(&disk.arc());
         stop(engine);
     }
     let honest_prefix = model.boxes["nfs"].acked.len();
-    assert_eq!(honest_prefix, 2, "two honest-durable frames form the guaranteed prefix");
+    assert_eq!(
+        honest_prefix, 2,
+        "two honest-durable frames form the guaranteed prefix"
+    );
 
     // Phase 2: flip the disk to LYING fsync. Reopen, append more "durable" writes
     // that the engine acks but whose bytes never promote. Mirror them into the
@@ -811,9 +938,24 @@ fn f_nfs_fsync_lies() {
             &engine,
             &mut model,
             &[
-                Op::Append { name: "nfs".into(), data: "l3".into(), tag: Some("b".into()), node: None },
-                Op::Append { name: "nfs".into(), data: "l4".into(), tag: None, node: Some("n2".into()) },
-                Op::Append { name: "nfs".into(), data: "l5".into(), tag: Some("c".into()), node: None },
+                Op::Append {
+                    name: "nfs".into(),
+                    data: "l3".into(),
+                    tag: Some("b".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "nfs".into(),
+                    data: "l4".into(),
+                    tag: None,
+                    node: Some("n2".into()),
+                },
+                Op::Append {
+                    name: "nfs".into(),
+                    data: "l5".into(),
+                    tag: Some("c".into()),
+                    node: None,
+                },
             ],
         );
         sync_dirs(&disk.arc());
@@ -839,7 +981,11 @@ fn f_nfs_fsync_lies() {
     // Whatever survived is a contiguous prefix starting at 1 — never a gap.
     let surv: Vec<u64> = dump.records.keys().copied().collect();
     for (i, s) in surv.iter().enumerate() {
-        assert_eq!(*s, i as u64 + 1, "survivors are a dense prefix, no gap: {surv:?}");
+        assert_eq!(
+            *s,
+            i as u64 + 1,
+            "survivors are a dense prefix, no gap: {surv:?}"
+        );
     }
     stop(engine);
 }
@@ -861,12 +1007,40 @@ fn f_nfs_delayed_durability() {
     let mut model = RefModel::default();
 
     let ops = vec![
-        Op::PutBox { name: "dly".into(), durable: true },
-        Op::Append { name: "dly".into(), data: "1".into(), tag: Some("a".into()), node: None },
-        Op::Append { name: "dly".into(), data: "2".into(), tag: Some("a".into()), node: Some("n".into()) },
-        Op::Append { name: "dly".into(), data: "3".into(), tag: Some("b".into()), node: None },
-        Op::Append { name: "dly".into(), data: "4".into(), tag: None, node: None },
-        Op::Append { name: "dly".into(), data: "5".into(), tag: Some("c".into()), node: None },
+        Op::PutBox {
+            name: "dly".into(),
+            durable: true,
+        },
+        Op::Append {
+            name: "dly".into(),
+            data: "1".into(),
+            tag: Some("a".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "dly".into(),
+            data: "2".into(),
+            tag: Some("a".into()),
+            node: Some("n".into()),
+        },
+        Op::Append {
+            name: "dly".into(),
+            data: "3".into(),
+            tag: Some("b".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "dly".into(),
+            data: "4".into(),
+            tag: None,
+            node: None,
+        },
+        Op::Append {
+            name: "dly".into(),
+            data: "5".into(),
+            tag: Some("c".into()),
+            node: None,
+        },
     ];
 
     {
@@ -889,7 +1063,11 @@ fn f_nfs_delayed_durability() {
         assert_box_contract("dly", &model.boxes["dly"], &dump, false);
         let surv: Vec<u64> = dump.records.keys().copied().collect();
         for (i, s) in surv.iter().enumerate() {
-            assert_eq!(*s, i as u64 + 1, "delayed-durability survivors are a dense prefix: {surv:?}");
+            assert_eq!(
+                *s,
+                i as u64 + 1,
+                "delayed-durability survivors are a dense prefix: {surv:?}"
+            );
         }
         // The crash was inside the window, so a strict prefix (not the whole tail)
         // is the lost case — but a clean recovery (no torn frame) is the must-hold.
@@ -920,10 +1098,28 @@ fn f_compound_fsync_fail_then_crash() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "cmp".into(), durable: true },
-                Op::Append { name: "cmp".into(), data: "1".into(), tag: Some("a".into()), node: None },
-                Op::Append { name: "cmp".into(), data: "2".into(), tag: None, node: Some("n".into()) },
-                Op::Append { name: "cmp".into(), data: "3".into(), tag: Some("b".into()), node: None },
+                Op::PutBox {
+                    name: "cmp".into(),
+                    durable: true,
+                },
+                Op::Append {
+                    name: "cmp".into(),
+                    data: "1".into(),
+                    tag: Some("a".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "cmp".into(),
+                    data: "2".into(),
+                    tag: None,
+                    node: Some("n".into()),
+                },
+                Op::Append {
+                    name: "cmp".into(),
+                    data: "3".into(),
+                    tag: Some("b".into()),
+                    node: None,
+                },
             ],
         );
         sync_dirs(&disk.arc());
@@ -938,7 +1134,12 @@ fn f_compound_fsync_fail_then_crash() {
             FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, true).arc();
         let engine = open_engine_fs(faulty);
         let req = WriteRequest {
-            records: vec![RecordIn { data: json!({ "v": "4" }), tag: None, node: None, meta: None }],
+            records: vec![RecordIn {
+                data: json!({ "v": "4" }),
+                tag: None,
+                node: None,
+                meta: None,
+            }],
             node: None,
             idempotency_key: None,
             create: Some(true),
@@ -946,7 +1147,10 @@ fn f_compound_fsync_fail_then_crash() {
             disable_backpressure: true,
         };
         let res = engine.write("cmp", req, true);
-        assert!(res.is_err(), "durable append must fail when the group-commit fsync EIOs");
+        assert!(
+            res.is_err(),
+            "durable append must fail when the group-commit fsync EIOs"
+        );
         // NOT mirrored (unacked). Its bytes were buffered but the fsync errored, so
         // they are not durable. Power loss BEFORE the next batch: freeze, then drop.
         disk.crash(TornDamage::None);
@@ -964,6 +1168,9 @@ fn f_compound_fsync_fail_then_crash() {
         vec![1, 2, 3],
         "failed batch left no trace; prior 3 acked frames intact and contiguous"
     );
-    assert_eq!(dump.head, 3, "head did not advance for the unacked failed batch");
+    assert_eq!(
+        dump.head, 3,
+        "head did not advance for the unacked failed batch"
+    );
     stop(engine);
 }

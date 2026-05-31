@@ -38,12 +38,7 @@ use serde_json::{json, Value};
 
 /// `POST path` with a raw body and an optional explicit `Content-Type`.
 /// `ct = None` sends no content-type header at all. Returns `(status, body)`.
-fn post_raw(
-    h: &Harness,
-    path: &str,
-    body: &[u8],
-    ct: Option<&str>,
-) -> (StatusCode, Value) {
+fn post_raw(h: &Harness, path: &str, body: &[u8], ct: Option<&str>) -> (StatusCode, Value) {
     let client = reqwest::blocking::Client::new();
     let mut req = client
         .post(format!("{}{}", h.base_url(), path))
@@ -79,10 +74,7 @@ fn assert_error_envelope(body: &Value) -> String {
     let err = body
         .get("error")
         .unwrap_or_else(|| panic!("error body must have a top-level `error` key, got {body}"));
-    assert!(
-        err.is_object(),
-        "`error` must be an object, got {err}"
-    );
+    assert!(err.is_object(), "`error` must be an object, got {err}");
     let code = err["code"]
         .as_str()
         .unwrap_or_else(|| panic!("error.code must be a string, got {err}"));
@@ -381,7 +373,12 @@ fn wrong_content_type_is_415() {
 fn diff_wrong_content_type_is_415() {
     let h = Harness::start();
     // The 415 guard is shared by every body endpoint; verify on diff too.
-    let (status, body) = post_raw(&h, "/v0/boxes/jobs/diff", b"{\"from_seq\":0}", Some("text/plain"));
+    let (status, body) = post_raw(
+        &h,
+        "/v0/boxes/jobs/diff",
+        b"{\"from_seq\":0}",
+        Some("text/plain"),
+    );
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(assert_error_envelope(&body), "unsupported_media_type");
 }

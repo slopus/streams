@@ -26,7 +26,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -272,7 +277,10 @@ fn f_sweep_durable_append() {
 
     // Probe M = total write_at + sync_data calls over the whole durable workload.
     let total = probe_batch_fs_calls(N);
-    assert!(total >= 4, "a durable append issues several FS calls (M={total})");
+    assert!(
+        total >= 4,
+        "a durable append issues several FS calls (M={total})"
+    );
 
     // Cap so the sweep stays well under a minute (each durable append blocks on a
     // real group fsync). The small workload's M is itself tiny; cap defensively.
@@ -617,12 +625,7 @@ fn assert_box_mix_contract(
     //     surviving high-water mark (a crash drops only a tail, never punches a hole
     //     into the middle). Applies to durable and non-durable boxes alike.
     if let Some(&hi) = survivor_seqs.last() {
-        let expected_prefix: Vec<u64> = model
-            .acked
-            .keys()
-            .copied()
-            .filter(|s| *s <= hi)
-            .collect();
+        let expected_prefix: Vec<u64> = model.acked.keys().copied().filter(|s| *s <= hi).collect();
         assert_eq!(
             survivor_seqs, expected_prefix,
             "{name}: survivors must be a dense prefix of the acked set up to {hi} \

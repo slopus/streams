@@ -114,6 +114,20 @@ pub const SNAPSHOT_INTERVAL_MS: u64 = 60_000; // 60 s
 /// How often the background snapshotter checks the snapshot triggers (ms).
 pub const SNAPSHOT_CHECK_INTERVAL_MS: u64 = 5_000;
 
+/// How many seqs ahead of the in-use head a `disk`-class box durably RESERVES
+/// per fsynced `HeadWatermark` (R3). A `disk` write acks before its frame is
+/// fsynced, so to guarantee an already-acked seq is never re-handed after a
+/// crash that dropped the un-fsynced frame, the box fsyncs a reservation ceiling
+/// ahead of use; crossing it forces one fresh fsync. Larger ⇒ fewer reservation
+/// fsyncs but a bigger unused-seq gap after a crash; smaller ⇒ the reverse.
+/// Recovery sets `head = max(replayed head, reservation)`. NOTE: because the
+/// reservation is fsynced ahead of use, a `disk` box that recovers WITHOUT an
+/// intervening snapshot (which would re-capture the exact head and absorb the
+/// watermark) resumes at the reservation ceiling — the unwritten reserved seqs
+/// become silent deleted gaps. The periodic snapshot collapses this gap in
+/// steady state; the bound keeps any one gap small.
+pub const DISK_HEAD_RESERVE_AHEAD: u64 = 256;
+
 /// How often the background relocator sweeps boxes for sealed segments beyond the
 /// hot-retention bound and relocates them HOT → COLD (ms). Only runs when a cold
 /// tier is configured; the copy I/O runs on the blocking pool off the hot path.
@@ -403,9 +417,7 @@ impl ServerConfig {
         keys.shrink_to_fit();
     }
 
-    fn parse_store(
-        entries: &[String],
-    ) -> std::result::Result<crate::auth::KeyStore, String> {
+    fn parse_store(entries: &[String]) -> std::result::Result<crate::auth::KeyStore, String> {
         let mut keys = Vec::new();
         for entry in entries {
             if let Some(k) = crate::auth::ApiKey::parse_entry(entry)? {
@@ -513,9 +525,9 @@ pub fn is_valid_name(name: &str) -> bool {
     if !first.is_ascii_alphanumeric() {
         return false;
     }
-    bytes.iter().all(|&b| {
-        b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b':' || b == b'-'
-    })
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b':' || b == b'-')
 }
 
 /// Validate a router name. Routers use the box-name charset plus `>` so the
@@ -531,12 +543,7 @@ pub fn is_valid_router_name(name: &str) -> bool {
         return false;
     }
     bytes.iter().all(|&b| {
-        b.is_ascii_alphanumeric()
-            || b == b'.'
-            || b == b'_'
-            || b == b':'
-            || b == b'-'
-            || b == b'>'
+        b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b':' || b == b'-' || b == b'>'
     })
 }
 
@@ -591,7 +598,7 @@ mod tests {
         assert!(!c.key_matches("alph")); // prefix must not match
         assert!(!c.key_matches("alphax")); // superstring must not match
         assert!(!c.key_matches("")); // empty must not match a non-empty key
-        // No keys configured ⇒ nothing matches (auth is disabled separately).
+                                     // No keys configured ⇒ nothing matches (auth is disabled separately).
         assert!(!cfg("127.0.0.1:4000", &[], false).key_matches("alpha"));
     }
 }

@@ -29,7 +29,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -235,9 +240,11 @@ fn f_wal_eio_fsync() {
     // MUST fail (the writer signals the whole batch Failed ⇒ token.wait returns
     // WriterGone ⇒ engine.write rolls back the staged batch and returns Err) and
     // MUST NOT ack. fail-always so any retried fsync also fails.
-    let faulty: Arc<dyn Fs> = FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, false).arc();
+    let faulty: Arc<dyn Fs> =
+        FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, false).arc();
     {
-        let engine = Engine::with_data_dir_fs(cfg(), clock(), faulty).expect("reopen through faultfs");
+        let engine =
+            Engine::with_data_dir_fs(cfg(), clock(), faulty).expect("reopen through faultfs");
         assert!(
             durable_write(&engine, "p", "4").is_err(),
             "durable append must FAIL when the group-commit sync_data EIOs (no silent ack)"
@@ -254,8 +261,15 @@ fn f_wal_eio_fsync() {
     // Recovery: exactly the 3 prior durable frames, no trace of the failed 4th.
     let engine = open_engine(&disk);
     let (seqs, head) = recovered_seqs(&engine, "p");
-    assert_eq!(seqs, vec![1, 2, 3], "the fsync-EIO batch left no frame; prior 3 intact");
-    assert_eq!(head, 3, "head did not advance past the unacked failed batch");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3],
+        "the fsync-EIO batch left no frame; prior 3 intact"
+    );
+    assert_eq!(
+        head, 3,
+        "head did not advance past the unacked failed batch"
+    );
     assert_dense_prefix(&seqs);
 }
 
@@ -320,7 +334,10 @@ fn f_wal_fsync_eio_persist() {
     // the result is contiguous with no hole.
     let engine = open_engine(&disk);
     let (seqs, head) = recovered_seqs(&engine, "q");
-    assert!(seqs.len() >= 2, "the two acked phase-1 durable writes survive: {seqs:?}");
+    assert!(
+        seqs.len() >= 2,
+        "the two acked phase-1 durable writes survive: {seqs:?}"
+    );
     assert_eq!(&seqs[..2], &[1, 2], "the acked prefix survives intact");
     assert_dense_prefix(&seqs);
     assert!(head >= 2, "head covers at least the acked prefix");
@@ -368,7 +385,11 @@ fn f_wal_crash_after_write_pre_fsync() {
 
     let seqs = replay_wal_seqs(&disk, &data_dir);
     // The 5 fsynced (acked) frames survive; the un-fsynced frame 6 vanished.
-    assert_eq!(seqs, vec![1, 2, 3, 4, 5], "un-promoted pre-fsync write dropped; acked prefix survives");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3, 4, 5],
+        "un-promoted pre-fsync write dropped; acked prefix survives"
+    );
     assert_dense_prefix(&seqs);
 }
 
@@ -402,7 +423,11 @@ fn f_wal_crash_after_fsync() {
         drop(wal);
 
         let seqs = replay_wal_seqs(&disk, &data_dir);
-        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6, 7, 8], "every acked-after-fsync seq survives");
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "every acked-after-fsync seq survives"
+        );
         assert_dense_prefix(&seqs);
     }
 
@@ -415,7 +440,10 @@ fn f_wal_crash_after_fsync() {
             for i in 1..=5 {
                 // engine.write blocks on the durable commit token ⇒ returns Ok only
                 // after sync_data returned ⇒ acked & durable.
-                assert_eq!(durable_write(&engine, "k", &i.to_string()).unwrap(), vec![i]);
+                assert_eq!(
+                    durable_write(&engine, "k", &i.to_string()).unwrap(),
+                    vec![i]
+                );
             }
             sync_wal_dir(&disk);
             disk.crash(TornDamage::None);
@@ -425,7 +453,11 @@ fn f_wal_crash_after_fsync() {
 
         let engine = open_engine(&disk);
         let (seqs, head) = recovered_seqs(&engine, "k");
-        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "all acked durable writes survive the crash");
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5],
+            "all acked durable writes survive the crash"
+        );
         assert_eq!(head, 5, "head monotone, covers every acked write");
         assert_dense_prefix(&seqs);
     }

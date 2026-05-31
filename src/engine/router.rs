@@ -57,11 +57,9 @@ impl RouterGraph {
         // Temporarily ignore any existing edge under this name so re-PUTs of an
         // unchanged router don't false-positive on their own edge.
         if !router.allow_cycle {
-            if let Some(cycle) = self.would_create_cycle_excluding(
-                &router.source,
-                &router.dest,
-                Some(&router.name),
-            ) {
+            if let Some(cycle) =
+                self.would_create_cycle_excluding(&router.source, &router.dest, Some(&router.name))
+            {
                 return Err(Error::new(
                     crate::types::ErrorCode::RouterCycle,
                     format!(
@@ -230,7 +228,9 @@ impl RouterGraph {
             if exclude == Some(r.name.as_str()) {
                 continue;
             }
-            adj.entry(r.source.as_str()).or_default().push(r.dest.as_str());
+            adj.entry(r.source.as_str())
+                .or_default()
+                .push(r.dest.as_str());
         }
         // DFS from `dest`, seeking a path back to `source`.
         let mut stack: Vec<&str> = vec![dest];

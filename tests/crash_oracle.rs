@@ -42,7 +42,9 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
-use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest};
+use streams::types::{
+    BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+};
 
 // ===========================================================================
 // The pure-Rust reference model (the oracle)
@@ -93,11 +95,7 @@ impl ModelBox {
     /// evicted) — the lower bound of the survivor set.
     fn live_seqs(&self) -> Vec<u64> {
         let floor = self.delete_floor.max(self.evict_floor);
-        self.acked
-            .keys()
-            .copied()
-            .filter(|s| *s >= floor)
-            .collect()
+        self.acked.keys().copied().filter(|s| *s >= floor).collect()
     }
 
     /// The earliest live seq the model expects (the recovered `earliest_seq` lower
@@ -176,11 +174,24 @@ impl RefModel {
 #[derive(Debug, Clone)]
 enum Op {
     /// Create a box (durable flag + optional record cap).
-    PutBox { name: String, durable: bool, cap: u64 },
+    PutBox {
+        name: String,
+        durable: bool,
+        cap: u64,
+    },
     /// Append one record `(data, tag, node)`.
-    Append { name: String, data: String, tag: Option<String>, node: Option<String> },
+    Append {
+        name: String,
+        data: String,
+        tag: Option<String>,
+        node: Option<String>,
+    },
     /// Voluntary delete: a `before_seq` prefix and/or a tag-Eq match.
-    Delete { name: String, before_seq: Option<u64>, tag_eq: Option<String> },
+    Delete {
+        name: String,
+        before_seq: Option<u64>,
+        tag_eq: Option<String>,
+    },
 }
 
 /// Drive `ops` against a real engine, mirroring acked effects into `model`. A
@@ -201,7 +212,12 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ensure_box(name, *durable, *cap);
                 }
             }
-            Op::Append { name, data, tag, node } => {
+            Op::Append {
+                name,
+                data,
+                tag,
+                node,
+            } => {
                 let req = WriteRequest {
                     records: vec![RecordIn {
                         data: json!({ "v": data }),
@@ -234,7 +250,11 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ack_append(name, &seqs, std::slice::from_ref(&rec));
                 }
             }
-            Op::Delete { name, before_seq, tag_eq } => {
+            Op::Delete {
+                name,
+                before_seq,
+                tag_eq,
+            } => {
                 let req = DeleteRequest {
                     before_seq: *before_seq,
                     match_: tag_eq.as_ref().map(|t| Filter::from_shorthand(t)),
@@ -400,8 +420,7 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
             // Clean stop / all-durable crash: survivors == the model's live set up
             // to the surviving high-water mark, exactly (no acked-durable loss, no
             // resurrection — delete/evict floors took effect durably).
-            let expected_prefix: Vec<u64> =
-                live.iter().copied().filter(|s| *s <= hi).collect();
+            let expected_prefix: Vec<u64> = live.iter().copied().filter(|s| *s <= hi).collect();
             assert_eq!(
                 survivors, expected_prefix,
                 "{name}: survivors must be a dense prefix of the model's live set \
@@ -426,16 +445,58 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE: recovered head never exceeds the model head, and (durable,
-    //     whole tail) equals it.
-    assert!(
-        dump.head <= model.head,
-        "{name}: recovered head {} exceeds model head {} (future seq?)",
-        dump.head,
-        model.head
-    );
-    if model.durable && whole_tail_durable && !live.is_empty() {
-        assert_eq!(dump.head, model.head, "{name}: durable head must match model");
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). The recovered head never REGRESSES
+    //     below the highest acked seq — an already-acked seq is never re-handed.
+    //     For an `fsync`-class box (`model.durable`) the head equals the acked head
+    //     exactly (each frame is fsynced before its ack, so the replayed head is
+    //     the acked head). For a `disk`-class box (acked before fsync) the head may
+    //     legitimately exceed the acked head by up to the durable reservation block
+    //     (`DISK_HEAD_RESERVE_AHEAD`): the box fsyncs a head reservation AHEAD of
+    //     use, so a crash that drops the un-fsynced disk tail recovers a head at the
+    //     reservation ceiling (the lost seqs become silent deleted gaps) rather than
+    //     regressing and re-handing a used seq. The reserved-but-unwritten seqs are
+    //     deleted holes — absent from `survivors` — so (1)/(2)/(3) are unaffected.
+    // The no-regression floor only binds when the WHOLE tail is durable (a clean
+    // stop / all-durable crash): in a mid-stream crash the model's acked head is an
+    // UPPER allowance (an in-process `Ok` may not have truly hardened before the
+    // device froze), so head may legitimately sit below it — the same relaxation
+    // (3) applies to. R3's dedicated test asserts no-reuse precisely.
+    if whole_tail_durable && !model.acked.is_empty() {
+        assert!(
+            dump.head >= model.head,
+            "{name}: recovered head {} REGRESSED below acked head {} (seq reuse!)",
+            dump.head,
+            model.head
+        );
+    }
+    if model.durable {
+        // fsync class: no head reservation, so the head matches the acked head
+        // exactly (head never exceeds the model head, no future seq).
+        assert!(
+            dump.head <= model.head,
+            "{name}: fsync-class recovered head {} exceeds model head {} (future seq?)",
+            dump.head,
+            model.head
+        );
+        if whole_tail_durable && !live.is_empty() {
+            assert_eq!(
+                dump.head, model.head,
+                "{name}: durable head must match model"
+            );
+        }
+    } else {
+        // disk class: the head may sit at the durable reservation ceiling, but
+        // never beyond it (no unbounded future seq).
+        let ceiling = model.head + streams::config::DISK_HEAD_RESERVE_AHEAD;
+        assert!(
+            dump.head <= ceiling,
+            "{name}: disk-class recovered head {} exceeds the reservation ceiling {} \
+             (acked head {} + reserve-ahead {})",
+            dump.head,
+            ceiling,
+            model.head,
+            streams::config::DISK_HEAD_RESERVE_AHEAD
+        );
     }
 
     // (5) FLOORS PRESERVED: a voluntary delete stays SILENT (no tombstone); an
@@ -462,11 +523,7 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
 }
 
 /// Diff the WHOLE recovered engine against the model for every modeled box.
-fn assert_recovered_matches_model(
-    engine: &Engine,
-    model: &RefModel,
-    whole_tail_durable: bool,
-) {
+fn assert_recovered_matches_model(engine: &Engine, model: &RefModel, whole_tail_durable: bool) {
     for (name, mbox) in &model.boxes {
         // A box that never got an acked create AND never an acked write need not
         // exist; skip empty non-durable phantoms.
@@ -505,12 +562,40 @@ fn durable_workload_recovers_to_model() {
     let mut model = RefModel::default();
 
     let ops = vec![
-        Op::PutBox { name: "jobs".into(), durable: true, cap: 0 },
-        Op::Append { name: "jobs".into(), data: "a".into(), tag: Some("t1".into()), node: Some("nA".into()) },
-        Op::Append { name: "jobs".into(), data: "b".into(), tag: Some("t2".into()), node: Some("nA".into()) },
-        Op::Append { name: "jobs".into(), data: "c".into(), tag: Some("t3".into()), node: None },
-        Op::Append { name: "jobs".into(), data: "d".into(), tag: None, node: Some("nB".into()) },
-        Op::Delete { name: "jobs".into(), before_seq: Some(2), tag_eq: None },
+        Op::PutBox {
+            name: "jobs".into(),
+            durable: true,
+            cap: 0,
+        },
+        Op::Append {
+            name: "jobs".into(),
+            data: "a".into(),
+            tag: Some("t1".into()),
+            node: Some("nA".into()),
+        },
+        Op::Append {
+            name: "jobs".into(),
+            data: "b".into(),
+            tag: Some("t2".into()),
+            node: Some("nA".into()),
+        },
+        Op::Append {
+            name: "jobs".into(),
+            data: "c".into(),
+            tag: Some("t3".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "jobs".into(),
+            data: "d".into(),
+            tag: None,
+            node: Some("nB".into()),
+        },
+        Op::Delete {
+            name: "jobs".into(),
+            before_seq: Some(2),
+            tag_eq: None,
+        },
     ];
 
     {
@@ -526,7 +611,10 @@ fn durable_workload_recovers_to_model() {
 
     // Spot-check the concrete survivors (seq 1 deleted, 2..=4 intact + fidelity).
     let dump = dump_box(&engine, "jobs").expect("jobs survived");
-    assert_eq!(dump.records.keys().copied().collect::<Vec<_>>(), vec![2, 3, 4]);
+    assert_eq!(
+        dump.records.keys().copied().collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
     assert_eq!(dump.records[&2].data, "b");
     assert_eq!(dump.records[&2].tag.as_deref(), Some("t2"));
     assert_eq!(dump.records[&3].tag.as_deref(), Some("t3"));
@@ -539,11 +627,34 @@ fn recovery_is_idempotent() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
     let ops = vec![
-        Op::PutBox { name: "b".into(), durable: true, cap: 0 },
-        Op::Append { name: "b".into(), data: "x".into(), tag: Some("g".into()), node: None },
-        Op::Append { name: "b".into(), data: "y".into(), tag: None, node: Some("n".into()) },
-        Op::Append { name: "b".into(), data: "z".into(), tag: Some("g".into()), node: None },
-        Op::Delete { name: "b".into(), before_seq: None, tag_eq: Some("g".into()) },
+        Op::PutBox {
+            name: "b".into(),
+            durable: true,
+            cap: 0,
+        },
+        Op::Append {
+            name: "b".into(),
+            data: "x".into(),
+            tag: Some("g".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "b".into(),
+            data: "y".into(),
+            tag: None,
+            node: Some("n".into()),
+        },
+        Op::Append {
+            name: "b".into(),
+            data: "z".into(),
+            tag: Some("g".into()),
+            node: None,
+        },
+        Op::Delete {
+            name: "b".into(),
+            before_seq: None,
+            tag_eq: Some("g".into()),
+        },
     ];
     {
         let engine = open_engine(&disk);
@@ -580,10 +691,29 @@ fn crash_after_durable_acked_preserves_all() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
     let ops = vec![
-        Op::PutBox { name: "k".into(), durable: true, cap: 0 },
-        Op::Append { name: "k".into(), data: "1".into(), tag: Some("a".into()), node: None },
-        Op::Append { name: "k".into(), data: "2".into(), tag: Some("a".into()), node: None },
-        Op::Append { name: "k".into(), data: "3".into(), tag: Some("b".into()), node: None },
+        Op::PutBox {
+            name: "k".into(),
+            durable: true,
+            cap: 0,
+        },
+        Op::Append {
+            name: "k".into(),
+            data: "1".into(),
+            tag: Some("a".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "k".into(),
+            data: "2".into(),
+            tag: Some("a".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "k".into(),
+            data: "3".into(),
+            tag: Some("b".into()),
+            node: None,
+        },
     ];
     {
         let engine = open_engine(&disk);
@@ -610,17 +740,39 @@ fn crash_after_durable_acked_preserves_all() {
 /// a clean dense prefix (no gap, no torn frame misread, no fabrication).
 #[test]
 fn crash_mid_nondurable_tail_is_clean_prefix() {
-    for &damage in &[TornDamage::None, TornDamage::PrefixTruncate, TornDamage::Garble] {
+    for &damage in &[
+        TornDamage::None,
+        TornDamage::PrefixTruncate,
+        TornDamage::Garble,
+    ] {
         let disk = FakeDisk::with_seed(0xBADC0DE ^ damage as u64);
         let mut model = RefModel::default();
 
         // Two durable boxes: a durable-acked one (must fully survive) and a
         // non-durable one (a clean prefix may survive).
         let mut ops = vec![
-            Op::PutBox { name: "durable".into(), durable: true, cap: 0 },
-            Op::PutBox { name: "fast".into(), durable: false, cap: 0 },
-            Op::Append { name: "durable".into(), data: "d1".into(), tag: None, node: None },
-            Op::Append { name: "durable".into(), data: "d2".into(), tag: Some("x".into()), node: None },
+            Op::PutBox {
+                name: "durable".into(),
+                durable: true,
+                cap: 0,
+            },
+            Op::PutBox {
+                name: "fast".into(),
+                durable: false,
+                cap: 0,
+            },
+            Op::Append {
+                name: "durable".into(),
+                data: "d1".into(),
+                tag: None,
+                node: None,
+            },
+            Op::Append {
+                name: "durable".into(),
+                data: "d2".into(),
+                tag: Some("x".into()),
+                node: None,
+            },
         ];
         for i in 0..15 {
             ops.push(Op::Append {
@@ -644,7 +796,11 @@ fn crash_mid_nondurable_tail_is_clean_prefix() {
         // The durable box's acked writes ALL survive (whole_tail_durable for it).
         let dump_d = dump_box(&engine, "durable").expect("durable box survives");
         assert_box_contract("durable", &model.boxes["durable"], &dump_d, true);
-        assert_eq!(dump_d.records.len(), 2, "both durable acked writes survive {damage:?}");
+        assert_eq!(
+            dump_d.records.len(),
+            2,
+            "both durable acked writes survive {damage:?}"
+        );
 
         // The non-durable box: whatever survived is a clean dense prefix of the
         // model's live set — no gap, no fabricated/torn record.
@@ -676,10 +832,29 @@ fn fsync_eio_fails_batch_prior_state_intact() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "p".into(), durable: true, cap: 0 },
-                Op::Append { name: "p".into(), data: "1".into(), tag: None, node: None },
-                Op::Append { name: "p".into(), data: "2".into(), tag: None, node: None },
-                Op::Append { name: "p".into(), data: "3".into(), tag: None, node: None },
+                Op::PutBox {
+                    name: "p".into(),
+                    durable: true,
+                    cap: 0,
+                },
+                Op::Append {
+                    name: "p".into(),
+                    data: "1".into(),
+                    tag: None,
+                    node: None,
+                },
+                Op::Append {
+                    name: "p".into(),
+                    data: "2".into(),
+                    tag: None,
+                    node: None,
+                },
+                Op::Append {
+                    name: "p".into(),
+                    data: "3".into(),
+                    tag: None,
+                    node: None,
+                },
             ],
         );
         sync_wal_dir(&disk);
@@ -691,9 +866,15 @@ fn fsync_eio_fails_batch_prior_state_intact() {
     let faulty: Arc<dyn Fs> =
         FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, false).arc();
     {
-        let engine = Engine::with_data_dir_fs(cfg(), clock(), faulty).expect("reopen through faultfs");
+        let engine =
+            Engine::with_data_dir_fs(cfg(), clock(), faulty).expect("reopen through faultfs");
         let req = WriteRequest {
-            records: vec![RecordIn { data: json!({ "v": "4" }), tag: None, node: None, meta: None }],
+            records: vec![RecordIn {
+                data: json!({ "v": "4" }),
+                tag: None,
+                node: None,
+                meta: None,
+            }],
             node: None,
             idempotency_key: None,
             create: Some(true),
@@ -717,7 +898,11 @@ fn fsync_eio_fails_batch_prior_state_intact() {
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
     let dump = dump_box(&engine, "p").unwrap();
-    assert_eq!(dump.records.len(), 3, "failed batch left no trace; prior 3 intact");
+    assert_eq!(
+        dump.records.len(),
+        3,
+        "failed batch left no trace; prior 3 intact"
+    );
 }
 
 // ===========================================================================
@@ -731,9 +916,18 @@ fn fsync_eio_fails_batch_prior_state_intact() {
 fn cap_evict_floor_survives_crash_with_tombstone() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
-    let mut ops = vec![Op::PutBox { name: "cap".into(), durable: true, cap: 3 }];
+    let mut ops = vec![Op::PutBox {
+        name: "cap".into(),
+        durable: true,
+        cap: 3,
+    }];
     for i in 1..=6 {
-        ops.push(Op::Append { name: "cap".into(), data: i.to_string(), tag: None, node: None });
+        ops.push(Op::Append {
+            name: "cap".into(),
+            data: i.to_string(),
+            tag: None,
+            node: None,
+        });
     }
     {
         let engine = open_engine(&disk);
@@ -775,27 +969,63 @@ fn cap_evict_floor_survives_crash_with_tombstone() {
 fn sweep_durable_append_crash_points_oracle() {
     // The op stream under test (small, fixed).
     let ops = vec![
-        Op::PutBox { name: "s".into(), durable: true, cap: 0 },
-        Op::Append { name: "s".into(), data: "1".into(), tag: Some("a".into()), node: None },
-        Op::Append { name: "s".into(), data: "2".into(), tag: Some("a".into()), node: Some("n".into()) },
-        Op::Append { name: "s".into(), data: "3".into(), tag: Some("b".into()), node: None },
-        Op::Delete { name: "s".into(), before_seq: Some(2), tag_eq: None },
-        Op::Append { name: "s".into(), data: "4".into(), tag: None, node: None },
+        Op::PutBox {
+            name: "s".into(),
+            durable: true,
+            cap: 0,
+        },
+        Op::Append {
+            name: "s".into(),
+            data: "1".into(),
+            tag: Some("a".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "s".into(),
+            data: "2".into(),
+            tag: Some("a".into()),
+            node: Some("n".into()),
+        },
+        Op::Append {
+            name: "s".into(),
+            data: "3".into(),
+            tag: Some("b".into()),
+            node: None,
+        },
+        Op::Delete {
+            name: "s".into(),
+            before_seq: Some(2),
+            tag_eq: None,
+        },
+        Op::Append {
+            name: "s".into(),
+            data: "4".into(),
+            tag: None,
+            node: None,
+        },
     ];
 
     // Probe M: count write_at calls over the whole workload (at = u64::MAX ⇒ never
     // fires; just counts).
     let probe_disk = FakeDisk::new();
-    let probe = FaultFs::new(probe_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, u64::MAX, true);
+    let probe = FaultFs::new(
+        probe_disk.arc(),
+        FaultOp::WriteAt,
+        FaultKind::Eio,
+        u64::MAX,
+        true,
+    );
     {
         let mut throwaway = RefModel::default();
-        let engine =
-            Engine::with_data_dir_fs(cfg(), clock(), probe.arc()).expect("probe engine");
+        let engine = Engine::with_data_dir_fs(cfg(), clock(), probe.arc()).expect("probe engine");
         run_ops(&engine, &mut throwaway, &ops);
         stop(engine);
     }
     let total_writes = probe.calls_seen();
-    assert!(total_writes >= 4, "workload issues several write_at calls (M={total_writes})");
+    assert!(
+        total_writes >= 4,
+        "workload issues several write_at calls (M={total_writes})"
+    );
 
     // Cap the sweep so the test stays fast but still covers every interesting
     // boundary of the small workload (each durable append blocks on a real group
@@ -808,8 +1038,8 @@ fn sweep_durable_append_crash_points_oracle() {
         let trip = CrashAfter::new(disk.clone(), FaultOp::WriteAt, crash_point);
         let mut model = RefModel::default();
         {
-            let engine = Engine::with_data_dir_fs(cfg(), clock(), trip.arc())
-                .expect("sweep engine opens");
+            let engine =
+                Engine::with_data_dir_fs(cfg(), clock(), trip.arc()).expect("sweep engine opens");
             // Run the ops; some appends past the crash point land on the (now
             // frozen) device and are dropped — but only writes whose fsync returned
             // before the crash count as acked-durable. The `whole_tail_durable=false`
@@ -994,14 +1224,51 @@ fn multi_box_durable_recovers_to_model() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
     let ops = vec![
-        Op::PutBox { name: "alpha".into(), durable: true, cap: 0 },
-        Op::PutBox { name: "beta".into(), durable: true, cap: 0 },
-        Op::Append { name: "alpha".into(), data: "a1".into(), tag: Some("keep".into()), node: None },
-        Op::Append { name: "beta".into(), data: "b1".into(), tag: None, node: Some("n1".into()) },
-        Op::Append { name: "alpha".into(), data: "a2".into(), tag: Some("drop".into()), node: None },
-        Op::Append { name: "beta".into(), data: "b2".into(), tag: None, node: Some("n2".into()) },
-        Op::Append { name: "alpha".into(), data: "a3".into(), tag: Some("keep".into()), node: None },
-        Op::Delete { name: "alpha".into(), before_seq: None, tag_eq: Some("drop".into()) },
+        Op::PutBox {
+            name: "alpha".into(),
+            durable: true,
+            cap: 0,
+        },
+        Op::PutBox {
+            name: "beta".into(),
+            durable: true,
+            cap: 0,
+        },
+        Op::Append {
+            name: "alpha".into(),
+            data: "a1".into(),
+            tag: Some("keep".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "beta".into(),
+            data: "b1".into(),
+            tag: None,
+            node: Some("n1".into()),
+        },
+        Op::Append {
+            name: "alpha".into(),
+            data: "a2".into(),
+            tag: Some("drop".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "beta".into(),
+            data: "b2".into(),
+            tag: None,
+            node: Some("n2".into()),
+        },
+        Op::Append {
+            name: "alpha".into(),
+            data: "a3".into(),
+            tag: Some("keep".into()),
+            node: None,
+        },
+        Op::Delete {
+            name: "alpha".into(),
+            before_seq: None,
+            tag_eq: Some("drop".into()),
+        },
     ];
     {
         let engine = open_engine(&disk);
@@ -1018,7 +1285,10 @@ fn multi_box_durable_recovers_to_model() {
 
     // alpha: the 'drop'-tagged a2 is gone, a1 & a3 ('keep') remain.
     let alpha = dump_box(&engine, "alpha").unwrap();
-    assert_eq!(alpha.records.keys().copied().collect::<Vec<_>>(), vec![1, 3]);
+    assert_eq!(
+        alpha.records.keys().copied().collect::<Vec<_>>(),
+        vec![1, 3]
+    );
     assert_eq!(alpha.records[&1].data, "a1");
     assert_eq!(alpha.records[&3].data, "a3");
     // beta: untouched, both records with their nodes.

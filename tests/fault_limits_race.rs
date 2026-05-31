@@ -32,7 +32,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 #![allow(clippy::needless_range_loop)]
 
 mod common;
@@ -514,12 +519,17 @@ fn l_session_gc_race_open_no_use_after_gc() {
         }));
     }
     for hd in handles {
-        hd.join().expect("no GC/open racer panicked (no use-after-GC)");
+        hd.join()
+            .expect("no GC/open racer panicked (no use-after-GC)");
     }
 
     // The server is still healthy after the race (no crash / deadlock).
     let (s, _) = h.get("/v0/health");
-    assert_eq!(s, StatusCode::OK, "server healthy after the GC-vs-open race");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "server healthy after the GC-vs-open race"
+    );
 }
 
 // ===========================================================================
@@ -568,7 +578,10 @@ fn l_total_bytes_quota_race_stays_under_cap() {
     // quota must refuse the rest under the race. The cap is an exact multiple of the
     // per-record cost, so a correct atomic reserve admits exactly `cap_records`.
     let cap_records: u64 = 10;
-    assert!((cap_records as usize) < RACERS, "cap must bite under the race");
+    assert!(
+        (cap_records as usize) < RACERS,
+        "cap must bite under the race"
+    );
     let cap = per_record_bytes * cap_records;
 
     let disk = FakeDisk::new();
@@ -748,7 +761,10 @@ fn l_total_bytes_quota_crash_recovers_acked_dense_prefix() {
     }
     // (3) Recovered head == highest acked seq; no fabrication.
     let max_acked = acked.iter().copied().max().unwrap_or(0);
-    assert_eq!(st.head_seq, max_acked, "recovered head == highest acked seq");
+    assert_eq!(
+        st.head_seq, max_acked,
+        "recovered head == highest acked seq"
+    );
     assert_eq!(
         st.count as usize,
         survivors.len(),
@@ -784,7 +800,11 @@ fn l_scope_consistent_under_concurrency() {
     const ITERS: usize = 12;
 
     let h = Arc::new(Harness::start_with(ServerConfig {
-        api_keys: vec!["wonly:write".into(), "ronly:read".into(), "admin:admin".into()],
+        api_keys: vec![
+            "wonly:write".into(),
+            "ronly:read".into(),
+            "admin:admin".into(),
+        ],
         ..Default::default()
     }));
     // Admin creates the shared box (write/read keys lack admin scope).
@@ -829,7 +849,11 @@ fn l_scope_consistent_under_concurrency() {
             start.wait();
             for _ in 0..ITERS {
                 let (sr, _) = h.get_auth("/v0/boxes/shared", "ronly");
-                assert_eq!(sr, StatusCode::OK, "read-scoped key read must succeed, got {sr}");
+                assert_eq!(
+                    sr,
+                    StatusCode::OK,
+                    "read-scoped key read must succeed, got {sr}"
+                );
                 let (sw, _) = h.post_auth(
                     "/v0/boxes/shared",
                     json!({ "records": [{ "data": 1 }] }),
@@ -844,7 +868,8 @@ fn l_scope_consistent_under_concurrency() {
         }));
     }
     for hd in handles {
-        hd.join().expect("no scope racer panicked / no scope escalation");
+        hd.join()
+            .expect("no scope racer panicked / no scope escalation");
     }
 
     let (s, _) = h.get("/v0/health");

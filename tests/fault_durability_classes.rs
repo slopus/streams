@@ -31,7 +31,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -151,8 +156,17 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox { name: String, class: Class, cap: u64 },
-    Append { name: String, data: String, tag: Option<String>, node: Option<String> },
+    PutBox {
+        name: String,
+        class: Class,
+        cap: u64,
+    },
+    Append {
+        name: String,
+        data: String,
+        tag: Option<String>,
+        node: Option<String>,
+    },
 }
 
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
@@ -169,7 +183,12 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ensure_box(name, *class, *cap);
                 }
             }
-            Op::Append { name, data, tag, node } => {
+            Op::Append {
+                name,
+                data,
+                tag,
+                node,
+            } => {
                 let req = WriteRequest {
                     records: vec![RecordIn {
                         data: json!({ "v": data }),
@@ -310,9 +329,14 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
     // (1) NO FABRICATION: survivors ⊆ ever_acked, byte-for-byte.
     for (seq, rec) in &dump.records {
         let m = model.ever_acked.get(seq).unwrap_or_else(|| {
-            panic!("{name}: recovered seq {seq} never acked by the model (fabricated/torn): {rec:?}")
+            panic!(
+                "{name}: recovered seq {seq} never acked by the model (fabricated/torn): {rec:?}"
+            )
         });
-        assert_eq!(m, rec, "{name}: recovered record at seq {seq} differs from the model");
+        assert_eq!(
+            m, rec,
+            "{name}: recovered record at seq {seq} differs from the model"
+        );
     }
 
     // (2) NO SILENT LOSS for an `fsync` box when the whole tail was durable.
@@ -348,15 +372,52 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE: recovered head never exceeds the model head.
-    assert!(
-        dump.head <= model.head,
-        "{name}: recovered head {} exceeds model head {} (future seq?)",
-        dump.head,
-        model.head
-    );
-    if model.class == Class::Fsync && whole_tail_durable && !live.is_empty() {
-        assert_eq!(dump.head, model.head, "{name}: fsync head must match model");
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). The recovered head never REGRESSES
+    //     below the highest acked seq when the whole tail is durable (a clean stop /
+    //     all-fsync crash) — an already-acked seq is never re-handed. A `disk`-class
+    //     box (acked before fsync) recovers at its durable head RESERVATION, so its
+    //     head may sit ABOVE the acked head by up to `DISK_HEAD_RESERVE_AHEAD` (the
+    //     dropped un-fsynced tail becomes silent deleted gaps); an `fsync` box has
+    //     no reservation, so its head matches the acked head exactly. A `memory` box
+    //     resets to head 0 on restart (RAM-only), so no floor binds.
+    match model.class {
+        Class::Fsync => {
+            assert!(
+                dump.head <= model.head,
+                "{name}: fsync recovered head {} exceeds model head {} (future seq?)",
+                dump.head,
+                model.head
+            );
+            if whole_tail_durable && !live.is_empty() {
+                assert_eq!(dump.head, model.head, "{name}: fsync head must match model");
+            }
+        }
+        Class::Disk => {
+            if whole_tail_durable && !model.acked.is_empty() {
+                assert!(
+                    dump.head >= model.head,
+                    "{name}: disk recovered head {} REGRESSED below acked head {} (seq reuse!)",
+                    dump.head,
+                    model.head
+                );
+            }
+            let ceiling = model.head + streams::config::DISK_HEAD_RESERVE_AHEAD;
+            assert!(
+                dump.head <= ceiling,
+                "{name}: disk recovered head {} exceeds reservation ceiling {}",
+                dump.head,
+                ceiling
+            );
+        }
+        Class::Memory => {
+            // RAM-only: the box reappears empty; head resets to 0.
+            assert!(
+                dump.head <= model.head,
+                "{name}: memory recovered head {} exceeds model head {}",
+                dump.head,
+                model.head
+            );
+        }
     }
 }
 
@@ -433,7 +494,10 @@ impl File for CrashAfterFile {
 impl Fs for CrashAfter {
     fn open(&self, path: &std::path::Path, opts: OpenOpts) -> std::io::Result<Box<dyn File>> {
         let inner = self.disk.open(path, opts)?;
-        Ok(Box::new(CrashAfterFile { inner, owner: self.clone() }))
+        Ok(Box::new(CrashAfterFile {
+            inner,
+            owner: self.clone(),
+        }))
     }
     fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
         self.disk.rename(from, to)
@@ -471,10 +535,29 @@ fn memory_box_records_vanish_on_clean_restart() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
     let ops = vec![
-        Op::PutBox { name: "mem".into(), class: Class::Memory, cap: 0 },
-        Op::Append { name: "mem".into(), data: "a".into(), tag: Some("t".into()), node: None },
-        Op::Append { name: "mem".into(), data: "b".into(), tag: None, node: Some("n".into()) },
-        Op::Append { name: "mem".into(), data: "c".into(), tag: None, node: None },
+        Op::PutBox {
+            name: "mem".into(),
+            class: Class::Memory,
+            cap: 0,
+        },
+        Op::Append {
+            name: "mem".into(),
+            data: "a".into(),
+            tag: Some("t".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "mem".into(),
+            data: "b".into(),
+            tag: None,
+            node: Some("n".into()),
+        },
+        Op::Append {
+            name: "mem".into(),
+            data: "c".into(),
+            tag: None,
+            node: None,
+        },
     ];
     {
         let engine = open_engine(&disk);
@@ -485,7 +568,12 @@ fn memory_box_records_vanish_on_clean_restart() {
         assert_eq!(pre.count, 3);
         // A memory write is RAM-only: never fsync-gated.
         let req = WriteRequest {
-            records: vec![RecordIn { data: json!({ "v": "d" }), tag: None, node: None, meta: None }],
+            records: vec![RecordIn {
+                data: json!({ "v": "d" }),
+                tag: None,
+                node: None,
+                meta: None,
+            }],
             node: None,
             idempotency_key: None,
             create: Some(true),
@@ -493,8 +581,16 @@ fn memory_box_records_vanish_on_clean_restart() {
             disable_backpressure: true,
         };
         let resp = engine.write("mem", req, true).unwrap();
-        assert_eq!(resp.performance.fsync_ms.unwrap_or(0.0), 0.0, "memory write is never fsync-gated");
-        assert_eq!(resp.performance.wal_append_ms.unwrap_or(0.0), 0.0, "memory write never touches the WAL");
+        assert_eq!(
+            resp.performance.fsync_ms.unwrap_or(0.0),
+            0.0,
+            "memory write is never fsync-gated"
+        );
+        assert_eq!(
+            resp.performance.wal_append_ms.unwrap_or(0.0),
+            0.0,
+            "memory write never touches the WAL"
+        );
         sync_wal_dir(&disk);
         drop(engine);
     }
@@ -504,10 +600,17 @@ fn memory_box_records_vanish_on_clean_restart() {
     let dump = dump_box(&engine, "mem").expect("memory box config persists across restart");
     assert_eq!(dump.head, 0, "memory box head_seq RESETS to 0 on restart");
     assert_eq!(dump.count, 0, "no memory records persisted");
-    assert!(dump.records.is_empty(), "memory records are RAM-only and gone");
+    assert!(
+        dump.records.is_empty(),
+        "memory records are RAM-only and gone"
+    );
     // The config is back as `memory`.
     let st = engine.box_state("mem", false).unwrap();
-    assert_eq!(st.config.durability_class(), Durability::Memory, "memory class config persisted");
+    assert_eq!(
+        st.config.durability_class(),
+        Durability::Memory,
+        "memory class config persisted"
+    );
 }
 
 /// A `memory` box survives a CRASH MID-WRITE leaving nothing on disk: even when
@@ -523,12 +626,30 @@ fn memory_box_crash_mid_write_persists_nothing() {
         let trip = CrashAfter::new(disk.clone(), crash_at);
         let mut model = RefModel::default();
         let mut ops = vec![
-            Op::PutBox { name: "mem".into(), class: Class::Memory, cap: 0 },
-            Op::PutBox { name: "dsk".into(), class: Class::Disk, cap: 0 },
+            Op::PutBox {
+                name: "mem".into(),
+                class: Class::Memory,
+                cap: 0,
+            },
+            Op::PutBox {
+                name: "dsk".into(),
+                class: Class::Disk,
+                cap: 0,
+            },
         ];
         for i in 0..6 {
-            ops.push(Op::Append { name: "mem".into(), data: format!("m{i}"), tag: None, node: None });
-            ops.push(Op::Append { name: "dsk".into(), data: format!("d{i}"), tag: None, node: None });
+            ops.push(Op::Append {
+                name: "mem".into(),
+                data: format!("m{i}"),
+                tag: None,
+                node: None,
+            });
+            ops.push(Op::Append {
+                name: "dsk".into(),
+                data: format!("d{i}"),
+                tag: None,
+                node: None,
+            });
         }
         {
             let engine = open_engine_fs(trip.arc());
@@ -541,7 +662,10 @@ fn memory_box_crash_mid_write_persists_nothing() {
         // The memory box NEVER persists, regardless of the crash point.
         if let Some(dump) = dump_box(&engine, "mem") {
             assert_eq!(dump.head, 0, "memory box head 0 after crash@{crash_at}");
-            assert!(dump.records.is_empty(), "memory box empty after crash@{crash_at}");
+            assert!(
+                dump.records.is_empty(),
+                "memory box empty after crash@{crash_at}"
+            );
         }
         // The disk box recovers a dense prefix (subset contract) — no fabrication.
         if let Some(dump) = dump_box(&engine, "dsk") {
@@ -561,9 +685,18 @@ fn memory_box_crash_mid_write_persists_nothing() {
 fn disk_box_survives_clean_restart() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
-    let mut ops = vec![Op::PutBox { name: "d".into(), class: Class::Disk, cap: 0 }];
+    let mut ops = vec![Op::PutBox {
+        name: "d".into(),
+        class: Class::Disk,
+        cap: 0,
+    }];
     for i in 1..=8 {
-        ops.push(Op::Append { name: "d".into(), data: i.to_string(), tag: Some("t".into()), node: None });
+        ops.push(Op::Append {
+            name: "d".into(),
+            data: i.to_string(),
+            tag: Some("t".into()),
+            node: None,
+        });
     }
     {
         let engine = open_engine(&disk);
@@ -574,7 +707,11 @@ fn disk_box_survives_clean_restart() {
     let engine = open_engine(&disk);
     let dump = dump_box(&engine, "d").expect("disk box survives clean restart");
     // A clean teardown hardens the whole tail ⇒ all 8 acked records recover.
-    assert_eq!(dump.records.len(), 8, "disk box recovers all acked writes on a clean restart");
+    assert_eq!(
+        dump.records.len(),
+        8,
+        "disk box recovers all acked writes on a clean restart"
+    );
     assert_box_contract("d", &model.boxes["d"], &dump, true);
 }
 
@@ -590,15 +727,27 @@ fn disk_box_crash_loses_only_unfsynced_tail() {
         let probe = CrashAfter::new(probe_disk.clone(), u64::MAX);
         let mut throwaway = RefModel::default();
         let engine = open_engine_fs(probe.arc());
-        let mut ops = vec![Op::PutBox { name: "d".into(), class: Class::Disk, cap: 0 }];
+        let mut ops = vec![Op::PutBox {
+            name: "d".into(),
+            class: Class::Disk,
+            cap: 0,
+        }];
         for i in 1..=6 {
-            ops.push(Op::Append { name: "d".into(), data: i.to_string(), tag: None, node: None });
+            ops.push(Op::Append {
+                name: "d".into(),
+                data: i.to_string(),
+                tag: None,
+                node: None,
+            });
         }
         run_ops(&engine, &mut throwaway, &ops);
         drop(engine);
         probe.seen.load(Ordering::SeqCst)
     };
-    assert!(total_writes >= 4, "disk workload issues several writes (M={total_writes})");
+    assert!(
+        total_writes >= 4,
+        "disk workload issues several writes (M={total_writes})"
+    );
 
     // Bounded sweep: cap the crash points well below the full call space so the
     // file stays fast + deterministic while still hitting the interesting
@@ -609,9 +758,18 @@ fn disk_box_crash_loses_only_unfsynced_tail() {
         let disk = FakeDisk::with_seed(0xD15C_0000 ^ crash_at);
         let trip = CrashAfter::new(disk.clone(), crash_at);
         let mut model = RefModel::default();
-        let mut ops = vec![Op::PutBox { name: "d".into(), class: Class::Disk, cap: 0 }];
+        let mut ops = vec![Op::PutBox {
+            name: "d".into(),
+            class: Class::Disk,
+            cap: 0,
+        }];
         for i in 1..=6 {
-            ops.push(Op::Append { name: "d".into(), data: i.to_string(), tag: None, node: None });
+            ops.push(Op::Append {
+                name: "d".into(),
+                data: i.to_string(),
+                tag: None,
+                node: None,
+            });
         }
         {
             let engine = open_engine_fs(trip.arc());
@@ -647,12 +805,25 @@ fn disk_box_crash_loses_only_unfsynced_tail() {
 /// set survives intact, seq monotone, no gap, across torn-damage modes.
 #[test]
 fn fsync_box_acked_writes_survive_kill9() {
-    for &damage in &[TornDamage::None, TornDamage::PrefixTruncate, TornDamage::Garble] {
+    for &damage in &[
+        TornDamage::None,
+        TornDamage::PrefixTruncate,
+        TornDamage::Garble,
+    ] {
         let disk = FakeDisk::with_seed(0xF59C ^ damage as u64);
         let mut model = RefModel::default();
-        let mut ops = vec![Op::PutBox { name: "f".into(), class: Class::Fsync, cap: 0 }];
+        let mut ops = vec![Op::PutBox {
+            name: "f".into(),
+            class: Class::Fsync,
+            cap: 0,
+        }];
         for i in 1..=6 {
-            ops.push(Op::Append { name: "f".into(), data: i.to_string(), tag: Some("k".into()), node: None });
+            ops.push(Op::Append {
+                name: "f".into(),
+                data: i.to_string(),
+                tag: Some("k".into()),
+                node: None,
+            });
         }
         {
             let engine = open_engine(&disk);
@@ -666,7 +837,11 @@ fn fsync_box_acked_writes_survive_kill9() {
         disk.reset_power();
         let engine = open_engine(&disk);
         let dump = dump_box(&engine, "f").expect("fsync box survives kill-9");
-        assert_eq!(dump.records.len(), 6, "all 6 acked fsync writes survive kill-9 ({damage:?})");
+        assert_eq!(
+            dump.records.len(),
+            6,
+            "all 6 acked fsync writes survive kill-9 ({damage:?})"
+        );
         assert_box_contract("f", &model.boxes["f"], &dump, true);
         assert_eq!(dump.head, 6, "fsync head fully recovered ({damage:?})");
     }
@@ -685,9 +860,18 @@ fn fsync_box_sweep_acked_always_durable() {
         let probe = CrashAfter::new(probe_disk.clone(), u64::MAX);
         let mut throwaway = RefModel::default();
         let engine = open_engine_fs(probe.arc());
-        let mut ops = vec![Op::PutBox { name: "f".into(), class: Class::Fsync, cap: 0 }];
+        let mut ops = vec![Op::PutBox {
+            name: "f".into(),
+            class: Class::Fsync,
+            cap: 0,
+        }];
         for i in 1..=6 {
-            ops.push(Op::Append { name: "f".into(), data: i.to_string(), tag: None, node: None });
+            ops.push(Op::Append {
+                name: "f".into(),
+                data: i.to_string(),
+                tag: None,
+                node: None,
+            });
         }
         run_ops(&engine, &mut throwaway, &ops);
         drop(engine);
@@ -699,9 +883,18 @@ fn fsync_box_sweep_acked_always_durable() {
         let disk = FakeDisk::with_seed(0x5EE0 ^ crash_at);
         let trip = CrashAfter::new(disk.clone(), crash_at);
         let mut model = RefModel::default();
-        let mut ops = vec![Op::PutBox { name: "f".into(), class: Class::Fsync, cap: 0 }];
+        let mut ops = vec![Op::PutBox {
+            name: "f".into(),
+            class: Class::Fsync,
+            cap: 0,
+        }];
         for i in 1..=6 {
-            ops.push(Op::Append { name: "f".into(), data: i.to_string(), tag: None, node: None });
+            ops.push(Op::Append {
+                name: "f".into(),
+                data: i.to_string(),
+                tag: None,
+                node: None,
+            });
         }
         {
             let engine = open_engine_fs(trip.arc());
@@ -736,11 +929,23 @@ fn router_into_memory_dest_does_not_persist() {
         let engine = open_engine(&disk);
         // Durable source.
         engine
-            .put_box("src", BoxConfig { durability: Some(Durability::Fsync), ..Default::default() })
+            .put_box(
+                "src",
+                BoxConfig {
+                    durability: Some(Durability::Fsync),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         // Memory destination.
         engine
-            .put_box("mem_dst", BoxConfig { durability: Some(Durability::Memory), ..Default::default() })
+            .put_box(
+                "mem_dst",
+                BoxConfig {
+                    durability: Some(Durability::Memory),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         engine
             .put_router(
@@ -758,7 +963,12 @@ fn router_into_memory_dest_does_not_persist() {
             .unwrap();
         for i in 1..=4 {
             let req = WriteRequest {
-                records: vec![RecordIn { data: json!({ "v": i.to_string() }), tag: None, node: None, meta: None }],
+                records: vec![RecordIn {
+                    data: json!({ "v": i.to_string() }),
+                    tag: None,
+                    node: None,
+                    meta: None,
+                }],
                 node: None,
                 idempotency_key: None,
                 create: Some(true),
@@ -769,7 +979,10 @@ fn router_into_memory_dest_does_not_persist() {
         }
         // Pre-restart: the forwarded copies are visible in the memory dest (RAM).
         let dst = dump_box(&engine, "mem_dst").expect("mem dest live pre-restart");
-        assert_eq!(dst.count, 4, "router forwarded 4 copies into the memory dest (RAM)");
+        assert_eq!(
+            dst.count, 4,
+            "router forwarded 4 copies into the memory dest (RAM)"
+        );
         sync_wal_dir(&disk);
         drop(engine);
     }
@@ -780,8 +993,14 @@ fn router_into_memory_dest_does_not_persist() {
     let src = dump_box(&engine, "src").expect("durable source recovers");
     assert_eq!(src.records.len(), 4, "durable router source fully recovers");
     let dst = dump_box(&engine, "mem_dst").expect("memory dest config persists");
-    assert_eq!(dst.head, 0, "memory dest head resets to 0 (forwarded copies not persisted)");
-    assert_eq!(dst.count, 0, "router forwarding into a memory dest does not persist");
+    assert_eq!(
+        dst.head, 0,
+        "memory dest head resets to 0 (forwarded copies not persisted)"
+    );
+    assert_eq!(
+        dst.count, 0,
+        "router forwarding into a memory dest does not persist"
+    );
     assert!(dst.records.is_empty());
 }
 
@@ -802,7 +1021,13 @@ fn fsync_concurrent_writers_commit_sequencer_no_loss_across_restart() {
     {
         let engine = open_engine(&disk);
         engine
-            .put_box("hot", BoxConfig { durability: Some(Durability::Fsync), ..Default::default() })
+            .put_box(
+                "hot",
+                BoxConfig {
+                    durability: Some(Durability::Fsync),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let mut handles = Vec::new();
         for w in 0..writers {
@@ -842,7 +1067,10 @@ fn fsync_concurrent_writers_commit_sequencer_no_loss_across_restart() {
     // with no acked-durable loss and no fabricated/duplicate seq.
     let engine = open_engine(&disk);
     let st = engine.box_state("hot", false).unwrap();
-    assert_eq!(st.head_seq, total, "no acked fsync write lost across restart");
+    assert_eq!(
+        st.head_seq, total,
+        "no acked fsync write lost across restart"
+    );
     assert_eq!(st.earliest_seq, 1);
     assert_eq!(st.count, total);
 
@@ -850,7 +1078,14 @@ fn fsync_concurrent_writers_commit_sequencer_no_loss_across_restart() {
     let mut from = 0u64;
     loop {
         let d = engine
-            .diff("hot", DiffRequest { from_seq: from, limit: 1000, ..DiffRequest::default() })
+            .diff(
+                "hot",
+                DiffRequest {
+                    from_seq: from,
+                    limit: 1000,
+                    ..DiffRequest::default()
+                },
+            )
             .unwrap();
         if d.records.is_empty() {
             break;
@@ -863,5 +1098,9 @@ fn fsync_concurrent_writers_commit_sequencer_no_loss_across_restart() {
             break;
         }
     }
-    assert_eq!(seqs, (1..=total).collect::<Vec<_>>(), "contiguous [1..=N], no gap, no dup");
+    assert_eq!(
+        seqs,
+        (1..=total).collect::<Vec<_>>(),
+        "contiguous [1..=N], no gap, no dup"
+    );
 }

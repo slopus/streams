@@ -32,7 +32,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -366,7 +371,10 @@ fn durable_ack_delete_fsync_fail_requeues_not_stranded() {
     // And the job is still physically present in the jobs log (the delete never
     // committed) — it was not double-acked-then-lost.
     let live = live_seqs(&engine, "jobs");
-    assert!(live.contains(&1), "seq 1 still present (delete never committed): {live:?}");
+    assert!(
+        live.contains(&1),
+        "seq 1 still present (delete never committed): {live:?}"
+    );
 }
 
 /// The same failed-ack scenario, then a CLEAN reopen on a healthy disk: the job
@@ -388,7 +396,10 @@ fn durable_ack_fail_then_recovery_preserves_job() {
 
         // ARM the fault and ack seq 1: the durable delete fsync EIOs.
         gate.arm();
-        assert!(engine.ack("jobs", "w1", &[1]).is_err(), "faulted ack errors");
+        assert!(
+            engine.ack("jobs", "w1", &[1]).is_err(),
+            "faulted ack errors"
+        );
         // POWER LOSS after the failed fsync: the delete frame's bytes were buffered
         // (write_at landed in the pending image) but its fsync EIO'd, so the delete
         // is NOT durable. Freeze the device BEFORE dropping so the writer's Drop
@@ -415,7 +426,10 @@ fn durable_ack_fail_then_recovery_preserves_job() {
     assert_eq!(c, vec![1, 2]);
     let r = engine.ack("jobs", "wA", &[1, 2]).expect("clean ack ok");
     assert_eq!(r.acked, 2);
-    assert!(live_seqs(&engine, "jobs").is_empty(), "both acked & deleted");
+    assert!(
+        live_seqs(&engine, "jobs").is_empty(),
+        "both acked & deleted"
+    );
 }
 
 // ===========================================================================
@@ -463,7 +477,10 @@ fn dead_letter_then_crash_preserves_job_in_dl_or_source() {
         // The source is empty; the DL box has it exactly once.
         let (_r, _inf, dl) = counters(&engine, "jobs");
         assert_eq!(dl, 1, "one dead-letter recorded");
-        assert!(live_seqs(&engine, "jobs").is_empty(), "job removed from source");
+        assert!(
+            live_seqs(&engine, "jobs").is_empty(),
+            "job removed from source"
+        );
         let dl_live = live_seqs(&engine, "dlq");
         assert_eq!(dl_live.len(), 1, "the poison job is in the DL box");
 
@@ -486,7 +503,10 @@ fn dead_letter_then_crash_preserves_job_in_dl_or_source() {
     );
     // It was durably dead-lettered before the crash ⇒ in DL, not source.
     assert_eq!(dl_live.len(), 1, "DL copy recovered via WAL replay");
-    assert!(!src_live.contains(&1), "source delete recovered (job not duplicated)");
+    assert!(
+        !src_live.contains(&1),
+        "source delete recovered (job not duplicated)"
+    );
     // The DL record carries provenance from the source.
     let d = engine
         .diff(
@@ -828,18 +848,29 @@ fn sweep_durable_claim_ack_crash_points_no_loss() {
 
     // Probe the write_at count of the produce+claim+ack workload.
     let probe_disk = FakeDisk::new();
-    let probe = FaultFs::new(probe_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, u64::MAX, true);
+    let probe = FaultFs::new(
+        probe_disk.arc(),
+        FaultOp::WriteAt,
+        FaultKind::Eio,
+        u64::MAX,
+        true,
+    );
     {
         let (shared, _tc) = test_clock();
         let engine = open_engine_fs(probe.arc(), shared);
-        engine.put_box("s", queue_cfg(false, 0, None)).expect("queue");
+        engine
+            .put_box("s", queue_cfg(false, 0, None))
+            .expect("queue");
         produce(&engine, "s", N);
         let c = claim_seqs(&engine, "s", "w1", N as u32);
         let _ = engine.ack("s", "w1", &c[..2]); // ack a prefix
         drop(engine);
     }
     let total_writes = probe.calls_seen();
-    assert!(total_writes >= 2, "workload issues several write_at calls (M={total_writes})");
+    assert!(
+        total_writes >= 2,
+        "workload issues several write_at calls (M={total_writes})"
+    );
     // Cap the sweep so it stays fast but still covers every interesting boundary of
     // this tiny workload (box-config frame, each durable produce frame, the claim
     // lease frames, the ack-delete frame). Each crash point pays one recovery
@@ -906,10 +937,16 @@ fn sweep_durable_claim_ack_crash_points_no_loss() {
         let Some(live) = live_seqs_opt(&engine, "s") else {
             continue;
         };
-        let head = engine.box_state("s", false).map(|st| st.head_seq).unwrap_or(0);
+        let head = engine
+            .box_state("s", false)
+            .map(|st| st.head_seq)
+            .unwrap_or(0);
 
         // (a) NO FABRICATION: every survivor is a produced seq ≤ head ≤ N.
-        assert!(head <= N as u64, "head {head} never exceeds produced N={N} @cp{crash_point}");
+        assert!(
+            head <= N as u64,
+            "head {head} never exceeds produced N={N} @cp{crash_point}"
+        );
         for &s in &live {
             assert!(
                 s >= 1 && s <= head,
@@ -940,7 +977,11 @@ fn sweep_durable_claim_ack_crash_points_no_loss() {
                 break;
             }
             let r = engine.ack("s", "drainer", &c).expect("drain ack ok");
-            assert_eq!(r.acked, c.len() as u64, "all claimed drained @cp{crash_point}");
+            assert_eq!(
+                r.acked,
+                c.len() as u64,
+                "all claimed drained @cp{crash_point}"
+            );
             drained.extend(c);
         }
         assert_eq!(
@@ -1033,7 +1074,11 @@ fn concurrent_claim_ack_drains_each_job_once() {
         "queue fully drained under concurrent claim/ack"
     );
     let (ready, in_flight, _dl) = counters(&engine, "jobs");
-    assert_eq!((ready, in_flight), (0, 0), "no ready or in-flight jobs remain");
+    assert_eq!(
+        (ready, in_flight),
+        (0, 0),
+        "no ready or in-flight jobs remain"
+    );
 }
 
 /// A tiny thread-safe "seen once" set so the stress test can assert no seq is

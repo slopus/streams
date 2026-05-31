@@ -34,7 +34,12 @@
 //! the FS seam injected.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -147,9 +152,17 @@ fn f_cold_crash_after_flip_before_delete() {
     for seq in 1..=4u64 {
         seg_append(&mut w, seq);
     }
-    assert_eq!(w.sealed_count(), 3, "three sealed segments (1,2,3); seq 4 active");
+    assert_eq!(
+        w.sealed_count(),
+        3,
+        "three sealed segments (1,2,3); seq 4 active"
+    );
     let plan: Vec<u64> = w.relocation_plan().into_iter().map(|(id, _)| id).collect();
-    assert_eq!(plan, vec![1, 2], "the two oldest sealed segments spill to cold");
+    assert_eq!(
+        plan,
+        vec![1, 2],
+        "the two oldest sealed segments spill to cold"
+    );
 
     // Drive the relocation of segment 1 the way the engine does, but STOP at the
     // crash point: copy hot→cold (fsync'd + dir-fsync'd ⇒ durable on the fake), the
@@ -200,13 +213,19 @@ fn f_cold_crash_after_flip_before_delete() {
     );
 
     // NO LOSS: the record bytes are byte-identical from the surviving copies.
-    let hot_data = tier2.hot().read_all(1, SegmentPart::Data).expect("hot .data readable");
+    let hot_data = tier2
+        .hot()
+        .read_all(1, SegmentPart::Data)
+        .expect("hot .data readable");
     let cold_data = tier2
         .cold()
         .unwrap()
         .read_all(1, SegmentPart::Data)
         .expect("cold .data readable");
-    assert_eq!(hot_data, cold_data, "hot and cold copies are byte-identical");
+    assert_eq!(
+        hot_data, cold_data,
+        "hot and cold copies are byte-identical"
+    );
     assert!(!hot_data.is_empty(), "the segment payload survived");
 
     // The relocator RE-RUNS idempotently: the copy is a no-op (cold exists), then
@@ -215,10 +234,17 @@ fn f_cold_crash_after_flip_before_delete() {
     copy_segment_to_cold(&tier2, 1).expect("idempotent re-copy is a no-op");
     let _ = tier2.hot().delete(1); // the deferred hot drop the relocator re-runs.
     sync_seg_dirs(&disk);
-    assert!(!tier2.hot().exists(1, SegmentPart::Data), "hot copy dropped on re-run");
+    assert!(
+        !tier2.hot().exists(1, SegmentPart::Data),
+        "hot copy dropped on re-run"
+    );
     assert_eq!(tier2.resolve(1), Some(Tier::Cold), "now resolves to cold");
     assert_eq!(
-        tier2.cold().unwrap().read_all(1, SegmentPart::Data).unwrap(),
+        tier2
+            .cold()
+            .unwrap()
+            .read_all(1, SegmentPart::Data)
+            .unwrap(),
         cold_data,
         "still byte-identical after the drop (no loss)"
     );
@@ -249,7 +275,10 @@ fn f_cold_eio_delete_hot() {
     let tier = w.tier();
     copy_segment_to_cold(&tier, 1).expect("cold copy of segment 1");
     sync_seg_dirs(&disk);
-    assert!(tier.hot().exists(1, SegmentPart::Data), "hot copy present pre-delete");
+    assert!(
+        tier.hot().exists(1, SegmentPart::Data),
+        "hot copy present pre-delete"
+    );
     assert!(
         tier.cold().unwrap().exists(1, SegmentPart::Data),
         "cold copy durable pre-delete"
@@ -284,7 +313,10 @@ fn f_cold_eio_delete_hot() {
         tier2.cold().unwrap().exists(1, SegmentPart::Data),
         "the cold copy remains authoritative"
     );
-    assert!(tier2.resolve(1).is_some(), "segment 1 still readable (no loss)");
+    assert!(
+        tier2.resolve(1).is_some(),
+        "segment 1 still readable (no loss)"
+    );
     assert_eq!(
         w2.resolve_sealed(1).expect("record readable").data,
         json!({ "v": 1 }),

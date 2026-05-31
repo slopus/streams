@@ -34,7 +34,12 @@
 //! functions, so the assertions test real crash-consistency behaviour.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -165,7 +170,7 @@ fn f_cold_crash_after_copy_before_flip() {
         let tier = open_tier(&disk);
         copy_to_cold(&tier, id);
         sync_all_dirs(&disk); // cold copy's name becomes durable.
-        // ... crash here, before flip_drop_hot ...
+                              // ... crash here, before flip_drop_hot ...
         disk.crash(TornDamage::None);
     }
     disk.reset_power();
@@ -191,8 +196,15 @@ fn f_cold_crash_after_copy_before_flip() {
     copy_to_cold(&tier, id); // idempotent no-op (cold exists).
     flip_drop_hot(&tier, id);
     sync_all_dirs(&disk);
-    assert!(!tier.hot().exists(id, SegmentPart::Data), "hot dropped after re-run");
-    assert_eq!(tier.resolve(id), Some(Tier::Cold), "now authoritatively cold");
+    assert!(
+        !tier.hot().exists(id, SegmentPart::Data),
+        "hot dropped after re-run"
+    );
+    assert_eq!(
+        tier.resolve(id),
+        Some(Tier::Cold),
+        "now authoritatively cold"
+    );
     assert_eq!(
         read_record(&tier, id, id + 1),
         br#"{"v":2}"#.to_vec(),
@@ -260,11 +272,7 @@ fn f_cold_resolve_prefers_hot() {
     // The cold `.data` is present-but-torn (a strict prefix of the good bytes) and
     // has NO `.idx` — so it is an incomplete/damaged cold copy. The hot copy is
     // complete. resolve must prefer the complete HOT copy.
-    let cold_data_len = tier
-        .cold()
-        .unwrap()
-        .len(id, SegmentPart::Data)
-        .unwrap_or(0);
+    let cold_data_len = tier.cold().unwrap().len(id, SegmentPart::Data).unwrap_or(0);
     assert!(
         cold_data_len < good_data.len() as u64,
         "cold .data is torn (strict prefix): {cold_data_len} < {}",
@@ -342,15 +350,26 @@ fn f_compound_relocate_during_recovery() {
     {
         let tier = open_tier(&disk);
         // resolve prefers hot in the both-copies window.
-        assert_eq!(tier.resolve(id), Some(Tier::Hot), "boot1: resolve prefers HOT");
-        assert_eq!(read_record(&tier, id, id), br#"{"v":1}"#.to_vec(), "boot1: readable");
+        assert_eq!(
+            tier.resolve(id),
+            Some(Tier::Hot),
+            "boot1: resolve prefers HOT"
+        );
+        assert_eq!(
+            read_record(&tier, id, id),
+            br#"{"v":1}"#.to_vec(),
+            "boot1: readable"
+        );
 
         // Simulate recovery's reclaim_segments_on_recovery: a live floor at/below
         // the segment start means the segment is NOT below-floor ⇒ it is kept. We
         // drive the real sweep through a SegmentWriter to use the genuine
         // `reclaim_orphans_below`. Then crash mid-recovery (before any dir fsync).
         let dropped = run_orphan_sweep(&tier, /*live_floor=*/ id);
-        assert_eq!(dropped, 0, "boot1: the live segment is not an orphan, nothing dropped");
+        assert_eq!(
+            dropped, 0,
+            "boot1: the live segment is not an orphan, nothing dropped"
+        );
         disk.crash(TornDamage::None); // crash DURING recovery (post-sweep, pre-fsync).
     }
     disk.reset_power();
@@ -361,13 +380,24 @@ fn f_compound_relocate_during_recovery() {
     let tier = open_tier(&disk);
     // Still both copies (the sweep correctly left the live segment alone, and the
     // crash dropped no durable state since nothing dead was reclaimed).
-    assert!(tier.hot().exists(id, SegmentPart::Data), "boot2: hot survives");
+    assert!(
+        tier.hot().exists(id, SegmentPart::Data),
+        "boot2: hot survives"
+    );
     assert!(
         tier.cold().unwrap().exists(id, SegmentPart::Data),
         "boot2: cold survives"
     );
-    assert_eq!(tier.resolve(id), Some(Tier::Hot), "boot2: resolve still prefers HOT");
-    assert_eq!(read_record(&tier, id, id + 2), br#"{"v":3}"#.to_vec(), "boot2: readable");
+    assert_eq!(
+        tier.resolve(id),
+        Some(Tier::Hot),
+        "boot2: resolve still prefers HOT"
+    );
+    assert_eq!(
+        read_record(&tier, id, id + 2),
+        br#"{"v":3}"#.to_vec(),
+        "boot2: readable"
+    );
 
     // Re-running the sweep is idempotent (a live segment is still not an orphan).
     let dropped = run_orphan_sweep(&tier, id);
@@ -379,9 +409,16 @@ fn f_compound_relocate_during_recovery() {
     flip_drop_hot(&tier, id);
     sync_all_dirs(&disk);
     let tier = rederive(&disk);
-    assert!(!tier.hot().exists(id, SegmentPart::Data), "exactly one copy: cold");
+    assert!(
+        !tier.hot().exists(id, SegmentPart::Data),
+        "exactly one copy: cold"
+    );
     assert_eq!(tier.resolve(id), Some(Tier::Cold));
-    assert_eq!(read_record(&tier, id, id + 1), br#"{"v":2}"#.to_vec(), "no segment lost");
+    assert_eq!(
+        read_record(&tier, id, id + 1),
+        br#"{"v":2}"#.to_vec(),
+        "no segment lost"
+    );
 }
 
 /// Drive the REAL on-recovery orphan sweep (`SegmentWriter::reclaim_orphans_below`)
@@ -438,7 +475,10 @@ fn f_sweep_cold_relocation() {
         flip_drop_hot(&tier, id);
         counter.count()
     };
-    assert!(probe_m >= 3, "a full relocation issues several FS mutating calls (M={probe_m})");
+    assert!(
+        probe_m >= 3,
+        "a full relocation issues several FS mutating calls (M={probe_m})"
+    );
 
     // Cap the sweep so it stays well under a minute but still covers every FS
     // boundary of this small relocation.
@@ -480,8 +520,8 @@ fn f_sweep_cold_relocation() {
             tier.cold().unwrap().exists(id, SegmentPart::Data),
         );
         // If both complete copies exist, HOT is preferred.
-        let hot_complete = tier.hot().exists(id, SegmentPart::Data)
-            && tier.hot().exists(id, SegmentPart::Idx);
+        let hot_complete =
+            tier.hot().exists(id, SegmentPart::Data) && tier.hot().exists(id, SegmentPart::Idx);
         let cold_complete = tier.cold().unwrap().exists(id, SegmentPart::Data)
             && tier.cold().unwrap().exists(id, SegmentPart::Idx);
         if hot_complete && cold_complete {

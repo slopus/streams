@@ -25,7 +25,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -316,7 +321,10 @@ fn f_wal_eio_write() {
     {
         let engine = Engine::with_data_dir_fs(cfg(), clock(), faulty).expect("reopen via faultfs");
         let res = engine.write("p", one_write("4"), true);
-        assert!(res.is_err(), "durable append must fail when its batch write EIOs");
+        assert!(
+            res.is_err(),
+            "durable append must fail when its batch write EIOs"
+        );
         // Power loss: the EIO'd batch never wrote any pending bytes (the write_at
         // itself errored), so nothing to drop beyond the already-clean image.
         disk.crash(TornDamage::None);
@@ -333,7 +341,11 @@ fn f_wal_eio_write() {
         "EIO-on-write batch never acked ⇒ never recovered; prior 3 intact, no gap"
     );
     // The on-disk WAL replay agrees (dense prefix, no fabricated frame).
-    assert_eq!(recover_seqs(&disk), vec![1, 2, 3], "WAL replay is a dense prefix");
+    assert_eq!(
+        recover_seqs(&disk),
+        vec![1, 2, 3],
+        "WAL replay is a dense prefix"
+    );
 }
 
 // ===========================================================================
@@ -373,7 +385,10 @@ fn f_wal_enospc_write() {
         // Every durable append now fails cleanly (ENOSPC on the batch write).
         for v in ["3", "4"] {
             let res = engine.write("q", one_write(v), true);
-            assert!(res.is_err(), "append on a full disk must fail, never corrupt");
+            assert!(
+                res.is_err(),
+                "append on a full disk must fail, never corrupt"
+            );
         }
         disk.crash(TornDamage::None);
         drop(engine);
@@ -436,7 +451,10 @@ fn f_wal_short_write() {
         vec![1, 2, 3],
         "the short-written frame completed and recovered; no half-frame"
     );
-    assert_eq!(recs[&3], "3", "the short-written frame's payload is whole + correct");
+    assert_eq!(
+        recs[&3], "3",
+        "the short-written frame's payload is whole + correct"
+    );
 
     // Raw WAL replay: frame 3 decodes fully (CRC valid ⇒ never a torn misread).
     // The body is the engine's own JSON encoding of the record; the load-bearing
@@ -449,7 +467,10 @@ fn f_wal_short_write() {
         vec![1, 2, 3],
         "raw WAL replay yields the complete frame 3 (looped to full length)"
     );
-    let (_, data3) = frames.iter().find(|(s, _)| *s == 3).expect("frame 3 on disk");
+    let (_, data3) = frames
+        .iter()
+        .find(|(s, _)| *s == 3)
+        .expect("frame 3 on disk");
     assert!(
         !data3.is_empty() && data3.windows(3).any(|w| w == b"\"3\""),
         "frame 3 body is whole + carries the record's data (no truncation): {data3:?}"

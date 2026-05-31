@@ -23,7 +23,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -138,7 +143,10 @@ fn f_clock_backward_lease() {
     // the durable deadline T0 + LEASE_MS, so a correctly-stored absolute deadline
     // is still in the future at the second boot (the lease is genuinely live).
     let t_back = T0 - 60_000; // one minute before the first boot.
-    assert!(t_back < T0 + LEASE_MS as i64, "deadline stays in the future after the jump");
+    assert!(
+        t_back < T0 + LEASE_MS as i64,
+        "deadline stays in the future after the jump"
+    );
 
     // ---- Boot 1 @ T0: durable queue, 3 durable jobs, claim job seq=1. --------
     let (claimed_seq, deadline, head_before) = {
@@ -158,7 +166,11 @@ fn f_clock_backward_lease() {
         assert_eq!(resp.count, 1, "exactly one job leased");
         let job = &resp.claimed[0];
         assert_eq!(job.seq, 1, "the oldest claimable seq is leased first");
-        assert_eq!(job.deadline, T0 + LEASE_MS as i64, "absolute deadline = T0 + lease");
+        assert_eq!(
+            job.deadline,
+            T0 + LEASE_MS as i64,
+            "absolute deadline = T0 + lease"
+        );
         assert_eq!(resp.ready, 2, "2 jobs remain claimable");
 
         let head = engine.box_state("q", false).unwrap().head_seq;
@@ -178,7 +190,10 @@ fn f_clock_backward_lease() {
 
     // (1) SEQ MONOTONIC: head is the logical counter, untouched by the clock jump.
     let st = engine.box_state("q", false).expect("queue recovered");
-    assert_eq!(st.head_seq, head_before, "head_seq monotonic across a backward clock jump");
+    assert_eq!(
+        st.head_seq, head_before,
+        "head_seq monotonic across a backward clock jump"
+    );
     assert_eq!(st.head_seq, 3);
 
     // (2) NO LOSS / NO FABRICATION: all 3 acked durable job records survive, and
@@ -210,14 +225,22 @@ fn f_clock_backward_lease() {
         "past the durable absolute deadline {deadline} the lease expires — proving \
          recovery restored the ABSOLUTE deadline, not a boot-relative one"
     );
-    assert_eq!(q_expired.ready, 3, "all 3 jobs claimable once the lease truly expired");
+    assert_eq!(
+        q_expired.ready, 3,
+        "all 3 jobs claimable once the lease truly expired"
+    );
     tc2.set(t_back); // rewind to the backward-jumped time for the remaining oracle.
 
     // The expiry sweep above released seq=1 onto the reclaim freelist; re-claim it
     // for w1 so the held-lease invariants below continue against a held job.
-    let reclaim = engine.claim("q", "w1", 1, None).expect("w1 re-claims the expired job");
+    let reclaim = engine
+        .claim("q", "w1", 1, None)
+        .expect("w1 re-claims the expired job");
     assert_eq!(reclaim.claimed.len(), 1);
-    assert_eq!(reclaim.claimed[0].seq, claimed_seq, "the expired job is re-handed to w1 first");
+    assert_eq!(
+        reclaim.claimed[0].seq, claimed_seq,
+        "the expired job is re-handed to w1 first"
+    );
 
     // (3b) NO DOUBLE-CLAIM: a different worker claiming now must NOT be handed the
     //      held seq=1 — only the 2 free jobs (seqs 2,3) are claimable.
@@ -231,21 +254,34 @@ fn f_clock_backward_lease() {
 
     // (4) FRESH APPEND continues at head+1 — logical, clock-independent.
     let s4 = append_job(&engine, "q", "j4");
-    assert_eq!(s4, 4, "a post-recovery append continues at head+1, not affected by the clock");
+    assert_eq!(
+        s4, 4,
+        "a post-recovery append continues at head+1, not affected by the clock"
+    );
 
     // (5) The original holder can still ack its job (lease identity survived the
     //     backward jump); the ack deletes the job deterministically (no
     //     resurrection on a further recovery).
-    let ack = engine.ack("q", "w1", &[claimed_seq]).expect("w1 acks its held job");
-    assert_eq!(ack.acked, 1, "the durably-held lease is ackable by its original holder");
+    let ack = engine
+        .ack("q", "w1", &[claimed_seq])
+        .expect("w1 acks its held job");
+    assert_eq!(
+        ack.acked, 1,
+        "the durably-held lease is ackable by its original holder"
+    );
     assert_eq!(ack.skipped, Vec::<u64>::new());
 
     drop(engine);
 
     // ---- Boot 3 (recover again, clock still earlier): convergent + no revival.
     let (engine2, _tc3) = open_engine_at(&disk, t_back);
-    let st2 = engine2.box_state("q", false).expect("queue recovered again");
-    assert_eq!(st2.head_seq, 4, "head still monotonic after the ack + re-recovery");
+    let st2 = engine2
+        .box_state("q", false)
+        .expect("queue recovered again");
+    assert_eq!(
+        st2.head_seq, 4,
+        "head still monotonic after the ack + re-recovery"
+    );
     // seq 1 was acked (deleted) before this boot; it must NOT resurrect.
     let d = engine2
         .diff(
@@ -267,5 +303,9 @@ fn f_clock_backward_lease() {
         "the acked/deleted job (seq {claimed_seq}) must not resurrect after a backward-clock reboot"
     );
     // The remaining jobs (2,3,4) are intact and contiguous (no gap punched).
-    assert_eq!(surviving, vec![2, 3, 4], "survivors are a dense set, no gap, no fabrication");
+    assert_eq!(
+        surviving,
+        vec![2, 3, 4],
+        "survivors are a dense set, no gap, no fabrication"
+    );
 }

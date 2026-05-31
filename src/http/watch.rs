@@ -8,6 +8,7 @@
 
 use super::AppState;
 use crate::config;
+use crate::engine::broadcast::FrameVariant;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::types::*;
@@ -17,7 +18,6 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Json, Response},
 };
-use crate::engine::broadcast::FrameVariant;
 use base64::Engine as _;
 use dashmap::DashMap;
 use futures::stream::Stream;
@@ -123,11 +123,7 @@ impl Session {
     /// anyone, or replayed under a *different valid* key, is rejected (codex HIGH
     /// #3). An unbound session (dev mode, `key_id == None`) is always allowed —
     /// there is no key to bind to.
-    pub fn authorize(
-        &self,
-        presented_bearer: Option<&str>,
-        keys: &crate::auth::KeyStore,
-    ) -> bool {
+    pub fn authorize(&self, presented_bearer: Option<&str>, keys: &crate::auth::KeyStore) -> bool {
         match (&self.key_id, presented_bearer) {
             // Unbound (dev mode): the wid alone authorizes.
             (None, _) => true,
@@ -196,10 +192,12 @@ impl SessionStore {
                 if cur >= cap {
                     return None;
                 }
-                match self
-                    .count
-                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
-                {
+                match self.count.compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
                     Err(c) => cur = c,
                 }
@@ -452,11 +450,10 @@ pub async fn stream_watch(
     {
         Some(g) => g,
         None => {
-            return Err(Error::new(
-                ErrorCode::Throttled,
-                "too many concurrent SSE connections",
-            )
-            .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S));
+            return Err(
+                Error::new(ErrorCode::Throttled, "too many concurrent SSE connections")
+                    .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S),
+            );
         }
     };
 
@@ -496,7 +493,8 @@ pub async fn stream_watch(
     }
 
     let engine = state.engine.clone();
-    let stream = build_stream(engine, session, sse_guard, Some(stream_handle));
+    let shutdown = state.shutdown.clone();
+    let stream = build_stream(engine, session, sse_guard, Some(stream_handle), shutdown);
 
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -521,6 +519,7 @@ fn build_stream(
     session: Arc<Session>,
     sse_guard: crate::limits::SseGuard,
     stream_handle: Option<StreamHandle>,
+    shutdown: Arc<crate::serve::ShutdownSignal>,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
     let heartbeat_ms = session.req.heartbeat_ms;
     // The projection variant for this session's record frames (drives which
@@ -557,6 +556,20 @@ fn build_stream(
             box_names.iter().cloned().collect();
 
         loop {
+            // Graceful shutdown (M11): if the server is winding down, emit a
+            // terminal `error` frame (the client will reconnect after the `retry:`
+            // backoff to whatever instance is up) and end the stream so the bounded
+            // drain completes promptly instead of waiting on this tailing stream.
+            if shutdown.is_shutting_down() {
+                let id = encode_session_id(&session);
+                let data = serde_json::json!({
+                    "code": "server_shutting_down",
+                    "message": "server is shutting down; reconnect",
+                });
+                yield Ok(Event::default().id(id).event("error").data(data.to_string()));
+                break;
+            }
+
             // Hold the live box `Arc`s for this pass so the `Notified` futures
             // we build at the end (which borrow each box's `Notify`) outlive the
             // per-box loop body.
@@ -715,11 +728,16 @@ fn build_stream(
             // `KeepAlive` layer emits the `: hb` comment on its own cadence.
             let notifies: Vec<_> = live.iter().map(|b| Box::pin(b.notify.notified())).collect();
             if notifies.is_empty() {
-                // No live boxes to wait on; just honor the heartbeat tick.
-                tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
+                // No live boxes to wait on; honor the heartbeat tick, but wake at
+                // once on shutdown so the next loop pass emits the close frame (M11).
+                tokio::select! {
+                    _ = shutdown.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(heartbeat_ms)) => {}
+                }
             } else {
                 let wake = futures::future::select_all(notifies);
                 tokio::select! {
+                    _ = shutdown.notified() => {}
                     _ = wake => {}
                     _ = tokio::time::sleep(Duration::from_millis(heartbeat_ms)) => {}
                 }
@@ -883,14 +901,19 @@ mod tests {
     fn alloc_wid_is_prefixed_random_and_unique() {
         let a = SessionStore::alloc_wid();
         let b = SessionStore::alloc_wid();
-        assert!(a.starts_with("wid_"), "wid keeps the documented prefix: {a}");
+        assert!(
+            a.starts_with("wid_"),
+            "wid keeps the documented prefix: {a}"
+        );
         assert_ne!(a, b, "wids must be unique/random, not monotonic");
         // 16 random bytes ⇒ 22 base64url chars (no pad). Total len = 4 + 22 = 26.
         assert_eq!(a.len(), 26, "wid carries >=128 bits of randomness: {a}");
         // Path-safe (base64url + the `_` from the prefix), no `/` or `+` or `=`.
         let suffix = a.strip_prefix("wid_").unwrap();
         assert!(
-            suffix.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            suffix
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
             "suffix is base64url: {suffix}"
         );
     }

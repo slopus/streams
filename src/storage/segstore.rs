@@ -227,9 +227,7 @@ impl SegmentStore for LocalSegmentStore {
         let path = self.part_path(id, part);
         let f = match self.fs.open(&path, OpenOpts::read_only()) {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(StoreError::NotFound(id))
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(StoreError::NotFound(id)),
             Err(e) => return Err(e.into()),
         };
         let file_len = f.metadata_len()?;
@@ -273,7 +271,10 @@ impl SegmentStore for LocalSegmentStore {
             };
             // A segment is counted once; require the `.data` part so a stray/torn
             // `.idx` alone is not reported as a complete segment.
-            if let Some(rest) = name.strip_prefix("seg-").and_then(|s| s.strip_suffix(".data")) {
+            if let Some(rest) = name
+                .strip_prefix("seg-")
+                .and_then(|s| s.strip_suffix(".data"))
+            {
                 if let Ok(id) = rest.parse::<SegmentId>() {
                     ids.insert(id);
                 }

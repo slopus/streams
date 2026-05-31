@@ -55,5 +55,5 @@ pub use snapshot::{
 };
 pub use wal::{
     BoxConfigOp, CommitToken, LeaseEvent, MatchSel, RouterOp, Wal, WalConfig, WalError, WalFrame,
-    WalReader, WalRecord, WalWriter, FRAME_CRC_LEN, FRAME_HEADER_LEN,
+    WalMetrics, WalReader, WalRecord, WalWriter, FRAME_CRC_LEN, FRAME_HEADER_LEN, FSYNC_BUCKETS_US,
 };

@@ -24,7 +24,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -143,9 +148,22 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox { name: String, durable: bool, cap: u64 },
-    Append { name: String, data: String, tag: Option<String>, node: Option<String> },
-    Delete { name: String, before_seq: Option<u64>, tag_eq: Option<String> },
+    PutBox {
+        name: String,
+        durable: bool,
+        cap: u64,
+    },
+    Append {
+        name: String,
+        data: String,
+        tag: Option<String>,
+        node: Option<String>,
+    },
+    Delete {
+        name: String,
+        before_seq: Option<u64>,
+        tag_eq: Option<String>,
+    },
 }
 
 /// Drive `ops` against a real engine, mirroring acked effects into `model`. A
@@ -164,7 +182,12 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ensure_box(name, *durable, *cap);
                 }
             }
-            Op::Append { name, data, tag, node } => {
+            Op::Append {
+                name,
+                data,
+                tag,
+                node,
+            } => {
                 let req = WriteRequest {
                     records: vec![RecordIn {
                         data: json!({ "v": data }),
@@ -192,7 +215,11 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ack_append(name, &seqs, std::slice::from_ref(&rec));
                 }
             }
-            Op::Delete { name, before_seq, tag_eq } => {
+            Op::Delete {
+                name,
+                before_seq,
+                tag_eq,
+            } => {
                 let req = DeleteRequest {
                     before_seq: *before_seq,
                     match_: tag_eq.as_ref().map(|t| Filter::from_shorthand(t)),
@@ -357,15 +384,41 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE: never exceeds the model head; equals it when durable+whole.
-    assert!(
-        dump.head <= model.head,
-        "{name}: recovered head {} exceeds model head {} (future seq?)",
-        dump.head,
-        model.head
-    );
-    if model.durable && whole_tail_durable && !live.is_empty() {
-        assert_eq!(dump.head, model.head, "{name}: durable head must match model");
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box (`model.durable`) has
+    //     no head reservation, so its head matches the acked head exactly (never a
+    //     future seq) and equals it when the whole tail is durable. A `disk` box
+    //     (acked before fsync) recovers at its durable head RESERVATION — its head
+    //     may sit ABOVE the acked head by up to `DISK_HEAD_RESERVE_AHEAD` (the
+    //     dropped un-fsynced tail becomes silent deleted gaps) but NEVER regresses
+    //     below an acked seq (no reuse) when the whole tail was durable.
+    if model.durable {
+        assert!(
+            dump.head <= model.head,
+            "{name}: fsync recovered head {} exceeds model head {} (future seq?)",
+            dump.head,
+            model.head
+        );
+        if whole_tail_durable && !live.is_empty() {
+            assert_eq!(
+                dump.head, model.head,
+                "{name}: durable head must match model"
+            );
+        }
+    } else {
+        if whole_tail_durable && model.head > 0 {
+            assert!(
+                dump.head >= model.head,
+                "{name}: disk recovered head {} REGRESSED below acked head {} (reuse!)",
+                dump.head,
+                model.head
+            );
+        }
+        assert!(
+            dump.head <= model.head + streams::config::DISK_HEAD_RESERVE_AHEAD,
+            "{name}: disk recovered head {} exceeds reservation ceiling {}",
+            dump.head,
+            model.head + streams::config::DISK_HEAD_RESERVE_AHEAD
+        );
     }
 
     // (5) FLOORS PRESERVED: an involuntary cap eviction still tombstones.
@@ -434,7 +487,9 @@ fn durably_tear_wal_tail(disk: &FakeDisk, path: &PathBuf) {
     let fs = disk.arc();
     // Find the offset where the last CRC-valid frame ends (the reader's own framing).
     let valid = {
-        let f = fs.open(path, OpenOpts::read_only()).expect("open wal to size");
+        let f = fs
+            .open(path, OpenOpts::read_only())
+            .expect("open wal to size");
         let mut buf = Vec::new();
         f.read_to_end_from(0, &mut buf).expect("read wal bytes");
         WalReader::new(buf).count_valid_len()
@@ -442,12 +497,17 @@ fn durably_tear_wal_tail(disk: &FakeDisk, path: &PathBuf) {
     let mut junk = Vec::new();
     junk.extend_from_slice(&9999u32.to_le_bytes()); // frame_len far past EOF ⇒ overrun
     junk.extend_from_slice(&[0xAB; 16]); // a few garbage bytes
-    let mut f = fs.open(path, OpenOpts::rw_existing()).expect("open wal to tear");
+    let mut f = fs
+        .open(path, OpenOpts::rw_existing())
+        .expect("open wal to tear");
     let mut w = 0;
     while w < junk.len() {
-        w += f.write_at(valid as u64 + w as u64, &junk[w..]).expect("tear write");
+        w += f
+            .write_at(valid as u64 + w as u64, &junk[w..])
+            .expect("tear write");
     }
-    f.sync_data().expect("harden the torn tail (durable partial frame)");
+    f.sync_data()
+        .expect("harden the torn tail (durable partial frame)");
 }
 
 /// The newest `snapshot-<n>.bin` path under `/data/meta` (highest id).
@@ -475,7 +535,9 @@ fn newest_snapshot_path(disk: &FakeDisk) -> Option<PathBuf> {
 /// it so the body CRC fails (header parse still succeeds, body decode is rejected).
 fn durably_garble_body(disk: &FakeDisk, path: &PathBuf, body_off: u64) {
     let fs = disk.arc();
-    let mut f = fs.open(path, OpenOpts::rw_existing()).expect("open to garble");
+    let mut f = fs
+        .open(path, OpenOpts::rw_existing())
+        .expect("open to garble");
     let mut one = [0u8; 1];
     let n = f.read_at(body_off, &mut one).expect("read byte to garble");
     assert_eq!(n, 1, "snapshot body byte must exist at off {body_off}");
@@ -484,7 +546,8 @@ fn durably_garble_body(disk: &FakeDisk, path: &PathBuf, body_off: u64) {
     while w < 1 {
         w += f.write_at(body_off, &one[..]).expect("garble write");
     }
-    f.sync_data().expect("harden the corruption (durable bit-rot)");
+    f.sync_data()
+        .expect("harden the corruption (durable bit-rot)");
 }
 
 /// F-COMPOUND-TORN-SNAP-AND-TORN-WAL: the newest snapshot body is garbled AND the
@@ -506,14 +569,36 @@ fn f_compound_torn_snap_and_torn_wal() {
             &engine,
             &mut model,
             &[
-                Op::PutBox { name: "jobs".into(), durable: true, cap: 0 },
-                Op::Append { name: "jobs".into(), data: "a".into(), tag: Some("t1".into()), node: Some("nA".into()) },
-                Op::Append { name: "jobs".into(), data: "b".into(), tag: Some("t2".into()), node: None },
-                Op::Append { name: "jobs".into(), data: "c".into(), tag: None, node: Some("nB".into()) },
+                Op::PutBox {
+                    name: "jobs".into(),
+                    durable: true,
+                    cap: 0,
+                },
+                Op::Append {
+                    name: "jobs".into(),
+                    data: "a".into(),
+                    tag: Some("t1".into()),
+                    node: Some("nA".into()),
+                },
+                Op::Append {
+                    name: "jobs".into(),
+                    data: "b".into(),
+                    tag: Some("t2".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "jobs".into(),
+                    data: "c".into(),
+                    tag: None,
+                    node: Some("nB".into()),
+                },
             ],
         );
         sync_dirs(&disk);
-        assert!(engine.write_snapshot().expect("snapshot #1 writes"), "snap #1");
+        assert!(
+            engine.write_snapshot().expect("snapshot #1 writes"),
+            "snap #1"
+        );
         sync_dirs(&disk);
 
         // Phase B: three more durable acked writes, then snapshot #2 (the NEWEST,
@@ -522,13 +607,31 @@ fn f_compound_torn_snap_and_torn_wal() {
             &engine,
             &mut model,
             &[
-                Op::Append { name: "jobs".into(), data: "d".into(), tag: Some("t4".into()), node: None },
-                Op::Append { name: "jobs".into(), data: "e".into(), tag: None, node: Some("nC".into()) },
-                Op::Append { name: "jobs".into(), data: "f".into(), tag: Some("t6".into()), node: None },
+                Op::Append {
+                    name: "jobs".into(),
+                    data: "d".into(),
+                    tag: Some("t4".into()),
+                    node: None,
+                },
+                Op::Append {
+                    name: "jobs".into(),
+                    data: "e".into(),
+                    tag: None,
+                    node: Some("nC".into()),
+                },
+                Op::Append {
+                    name: "jobs".into(),
+                    data: "f".into(),
+                    tag: Some("t6".into()),
+                    node: None,
+                },
             ],
         );
         sync_dirs(&disk);
-        assert!(engine.write_snapshot().expect("snapshot #2 writes"), "snap #2");
+        assert!(
+            engine.write_snapshot().expect("snapshot #2 writes"),
+            "snap #2"
+        );
         sync_dirs(&disk);
 
         // Stop the engine FIRST so its WAL writer thread is fully drained/joined and
@@ -576,7 +679,10 @@ fn f_compound_torn_snap_and_torn_wal() {
     stop(engine);
     let engine2 = open_engine(&disk);
     let dump2 = dump_box(&engine2, "jobs").expect("jobs present on recovery #2");
-    assert_eq!(dump, dump2, "recover(recover(x)) == recover(x) after compound fault");
+    assert_eq!(
+        dump, dump2,
+        "recover(recover(x)) == recover(x) after compound fault"
+    );
     stop(engine2);
 }
 
@@ -591,31 +697,38 @@ use proptest::prelude::*;
 /// match. Kept bounded so each case (which spins a real engine + recovery) is fast.
 fn op_strategy() -> impl Strategy<Value = Op> {
     let names = prop::sample::select(vec!["a".to_string(), "b".to_string()]);
-    let tags = prop::sample::select(vec![
-        None,
-        Some("x".to_string()),
-        Some("y".to_string()),
-    ]);
+    let tags = prop::sample::select(vec![None, Some("x".to_string()), Some("y".to_string())]);
     prop_oneof![
         // PutBox: durable bias toward true (the must-survive case) + small caps.
-        (names.clone(), any::<bool>(), prop::sample::select(vec![0u64, 0, 3]))
+        (
+            names.clone(),
+            any::<bool>(),
+            prop::sample::select(vec![0u64, 0, 3])
+        )
             .prop_map(|(name, durable, cap)| Op::PutBox { name, durable, cap }),
         // Append: a small payload + optional tag/node.
-        (names.clone(), 0u8..16, tags.clone())
-            .prop_map(|(name, d, tag)| Op::Append {
-                name,
-                data: format!("v{d}"),
-                tag,
-                node: None,
-            }),
+        (names.clone(), 0u8..16, tags.clone()).prop_map(|(name, d, tag)| Op::Append {
+            name,
+            data: format!("v{d}"),
+            tag,
+            node: None,
+        }),
         // Delete: a before_seq prefix OR a tag match (never both, to keep the model
         // simple and the intent clear).
         (names, prop::option::of(1u64..6), tags).prop_map(|(name, before_seq, tag_eq)| {
             // Bias toward a prefix delete; fall back to a tag delete when no prefix.
             if before_seq.is_some() {
-                Op::Delete { name, before_seq, tag_eq: None }
+                Op::Delete {
+                    name,
+                    before_seq,
+                    tag_eq: None,
+                }
             } else {
-                Op::Delete { name, before_seq: None, tag_eq }
+                Op::Delete {
+                    name,
+                    before_seq: None,
+                    tag_eq,
+                }
             }
         }),
     ]
@@ -725,10 +838,18 @@ enum FuzzInput {
     Garbage(Vec<u8>),
     /// A valid frame followed by trailing arbitrary bytes (exercises the
     /// frame-then-torn-tail path the recovery reader actually walks).
-    ValidThenGarbage { seq: u64, payload: Vec<u8>, tail: Vec<u8> },
+    ValidThenGarbage {
+        seq: u64,
+        payload: Vec<u8>,
+        tail: Vec<u8>,
+    },
     /// A valid frame with a single byte flipped at a chosen index (CRC mismatch /
     /// internal-length / header garble — all must be `Torn`, never a panic).
-    FlippedFrame { seq: u64, payload: Vec<u8>, flip_at: u16 },
+    FlippedFrame {
+        seq: u64,
+        payload: Vec<u8>,
+        flip_at: u16,
+    },
 }
 
 /// Build the byte buffer the decoder will be fed from a structured `FuzzInput`.
@@ -754,7 +875,11 @@ fn build_fuzz_buf(input: &FuzzInput) -> Vec<u8> {
             buf.extend_from_slice(tail);
             buf
         }
-        FuzzInput::FlippedFrame { seq, payload, flip_at } => {
+        FuzzInput::FlippedFrame {
+            seq,
+            payload,
+            flip_at,
+        } => {
             let mut frame = Vec::new();
             encode_frame(
                 &mut frame,
@@ -853,6 +978,9 @@ fn f_fuzz_wal_decoder() {
         let total = ec.len();
         let valid = drain_decoder(ec);
         // None of these encode a valid frame ⇒ nothing is consumed.
-        assert_eq!(valid, 0, "edge case (len {total}) must decode to zero valid bytes");
+        assert_eq!(
+            valid, 0,
+            "edge case (len {total}) must decode to zero valid bytes"
+        );
     }
 }

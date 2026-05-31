@@ -348,7 +348,9 @@ fn read_snapshot_file(fs: &Arc<dyn Fs>, path: &Path) -> Result<Snapshot, Snapsho
         .checked_add(body_len)
         .ok_or_else(|| SnapshotError::Framing("body_len overflow".into()))?;
     if buf.len() < body_end {
-        return Err(SnapshotError::Framing("body overruns file (torn write)".into()));
+        return Err(SnapshotError::Framing(
+            "body overruns file (torn write)".into(),
+        ));
     }
     let body = &buf[body_start..body_end];
     if xxhash_rust::xxh3::xxh3_64(body) != stored_crc {
@@ -473,7 +475,7 @@ mod tests {
         write_snapshot(dir.path(), &s2).unwrap();
         // write_snapshot pruned s1 (id<2); re-create s1 so a valid older exists.
         write_snapshot(dir.path(), &s1).unwrap(); // id=1 again; prunes nothing (1<1 false)
-        // Now corrupt s2.
+                                                  // Now corrupt s2.
         let s2_path = meta_dir(dir.path()).join(snapshot_name(2));
         let mut bytes = std::fs::read(&s2_path).unwrap();
         let last = bytes.len() - 1;
@@ -481,7 +483,9 @@ mod tests {
         std::fs::write(&s2_path, &bytes).unwrap();
 
         // load_latest must skip the corrupt id=2 and return the valid id=1.
-        let loaded = load_latest(dir.path()).unwrap().expect("falls back to valid");
+        let loaded = load_latest(dir.path())
+            .unwrap()
+            .expect("falls back to valid");
         assert_eq!(loaded.id, 1);
     }
 

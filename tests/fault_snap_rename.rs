@@ -39,7 +39,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -355,7 +360,11 @@ fn f_snap_crash_after_tmp_before_rename() {
         sync_dirs(&disk);
         drop(engine);
     }
-    assert_eq!(snapshot_file_count(&disk), 1, "snapshot #1 durably installed");
+    assert_eq!(
+        snapshot_file_count(&disk),
+        1,
+        "snapshot #1 durably installed"
+    );
     let snap1_id = next_snapshot_id_with(&disk.arc(), Path::new(DATA_DIR)) - 1;
 
     // Phase 2: write a SECOND snapshot directly, but freeze the device after the
@@ -377,7 +386,10 @@ fn f_snap_crash_after_tmp_before_rename() {
     let loaded = load_latest_with(&disk.arc(), Path::new(DATA_DIR))
         .expect("load ok")
         .expect("a previous valid snapshot remains");
-    assert_eq!(loaded.id, snap1_id, "stray .tmp ignored; previous snapshot loads");
+    assert_eq!(
+        loaded.id, snap1_id,
+        "stray .tmp ignored; previous snapshot loads"
+    );
 
     // Full engine recovery: old snapshot + WAL replay restores every acked record.
     let engine = open_engine(&disk);
@@ -489,8 +501,12 @@ fn f_snap_crash_before_prune() {
     {
         // Seed the probe disk with a prior snapshot so the prune step has an old
         // file to remove (matching Phase 1's single old snapshot).
-        write_snapshot_with(&probe_disk.arc(), Path::new(DATA_DIR), &mk_snapshot(snap1_id, 1))
-            .expect("seed old snapshot");
+        write_snapshot_with(
+            &probe_disk.arc(),
+            Path::new(DATA_DIR),
+            &mk_snapshot(snap1_id, 1),
+        )
+        .expect("seed old snapshot");
         probe_disk.arc().sync_dir(&meta_dir()).unwrap();
     }
     let probe = CrashAfterSnap::new(probe_disk.clone(), u64::MAX);
@@ -575,7 +591,11 @@ fn f_sweep_snapshot_write() {
         let d = FakeDisk::new();
         build_preop(&d).1
     };
-    assert_eq!(expected_recs, vec!["a", "b"], "pre-op image is deterministic");
+    assert_eq!(
+        expected_recs,
+        vec!["a", "b"],
+        "pre-op image is deterministic"
+    );
 
     // Probe M: count the snapshot-path FS calls of one snapshot #2 write.
     let total_calls = {

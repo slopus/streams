@@ -46,9 +46,7 @@ impl FrameVariant {
     pub fn new(include_data: bool, include_tags: bool, include_meta: bool) -> Self {
         FrameVariant {
             include_data,
-            bits: (include_data as u8)
-                | ((include_tags as u8) << 1)
-                | ((include_meta as u8) << 2),
+            bits: (include_data as u8) | ((include_tags as u8) << 1) | ((include_meta as u8) << 2),
         }
     }
     fn idx(self) -> usize {
@@ -141,9 +139,8 @@ fn serialize_frame(rec: &RecordOut, include_data: bool) -> Arc<RawValue> {
     // (its serializer round-trips through the textual form). Errors are
     // impossible for a well-formed JSON object; fall back to `null` defensively.
     let s = serde_json::to_string(&val).unwrap_or_else(|_| "null".to_string());
-    let boxed: Box<RawValue> = RawValue::from_string(s).unwrap_or_else(|_| {
-        RawValue::from_string("null".to_string()).expect("null is valid json")
-    });
+    let boxed: Box<RawValue> = RawValue::from_string(s)
+        .unwrap_or_else(|_| RawValue::from_string("null".to_string()).expect("null is valid json"));
     Arc::from(boxed)
 }
 
@@ -198,6 +195,11 @@ mod tests {
         }
         assert!(cache.ring.lock().len() <= RING_CAP);
         // The oldest seqs were evicted (front-dropped).
-        assert!(cache.ring.lock().front().map(|f| f.seq > 1).unwrap_or(false));
+        assert!(cache
+            .ring
+            .lock()
+            .front()
+            .map(|f| f.seq > 1)
+            .unwrap_or(false));
     }
 }

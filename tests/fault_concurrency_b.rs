@@ -56,7 +56,12 @@
 //! The stress tests below assert the identical invariants in the meantime.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -186,9 +191,13 @@ fn f_ct_commit_token_handoff() {
             for i in 0..PER_THREAD {
                 let seq = (t as u64) * PER_THREAD + i + 1;
                 // submit returns a token; wait() blocks on the CommitState handoff.
-                let token = w.submit(ap(1, seq), true).expect("submit ok (writer alive)");
+                let token = w
+                    .submit(ap(1, seq), true)
+                    .expect("submit ok (writer alive)");
                 // Every durable token resolves to Ok exactly once (after the fsync).
-                token.wait().expect("commit token resolved Ok (no lost wakeup / hang)");
+                token
+                    .wait()
+                    .expect("commit token resolved Ok (no lost wakeup / hang)");
                 oks.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -212,7 +221,8 @@ fn f_ct_commit_token_handoff() {
     };
 
     for h in handles {
-        h.join().expect("a submitter thread panicked (token did not resolve cleanly)");
+        h.join()
+            .expect("a submitter thread panicked (token did not resolve cleanly)");
     }
     assert!(
         watchdog.join().unwrap(),
@@ -508,7 +518,10 @@ fn f_pub_rollback_invisible() {
     let engine = Engine::with_data_dir_fs(cfg(), clock(), faulty).expect("reopen through faultfs");
 
     let head_before = engine.box_state("roll", false).unwrap().head_seq;
-    assert_eq!(head_before, 3, "the 3 acked durable writes are the visible prefix");
+    assert_eq!(
+        head_before, 3,
+        "the 3 acked durable writes are the visible prefix"
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let violated = Arc::new(AtomicU64::new(0));

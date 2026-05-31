@@ -38,7 +38,12 @@ fn code(body: &Value) -> &str {
 fn full_access_bare_key_unchanged() {
     // Back-compat: a bare key (no scopes/prefixes) does everything.
     let h = scoped_harness(&["full"]);
-    let (s, _) = post(&h, "/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }), "full");
+    let (s, _) = post(
+        &h,
+        "/v0/boxes/jobs",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
     assert_eq!(s, StatusCode::CREATED);
     let (s, _) = h.get_auth("/v0/boxes/jobs", "full");
     assert_eq!(s, StatusCode::OK);
@@ -52,7 +57,12 @@ fn full_access_bare_key_unchanged() {
 fn read_only_key_can_read_not_write() {
     // Seed with an admin/full key, then probe a read-only key.
     let h = scoped_harness(&["full", "ro:read"]);
-    post(&h, "/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }), "full");
+    post(
+        &h,
+        "/v0/boxes/jobs",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
 
     // Read paths: GET state, GET list, POST diff — all allowed.
     let (s, _) = h.get_auth("/v0/boxes/jobs", "ro");
@@ -63,7 +73,12 @@ fn read_only_key_can_read_not_write() {
     assert_eq!(s, StatusCode::OK);
 
     // Write path: POST records — forbidden (lacks write).
-    let (s, b) = post(&h, "/v0/boxes/jobs", json!({ "records": [{ "data": 2 }] }), "ro");
+    let (s, b) = post(
+        &h,
+        "/v0/boxes/jobs",
+        json!({ "records": [{ "data": 2 }] }),
+        "ro",
+    );
     assert_eq!(s, StatusCode::FORBIDDEN);
     assert_eq!(code(&b), "forbidden");
 
@@ -85,12 +100,27 @@ fn write_key_can_write_not_admin_or_delete() {
     let (s, _) = h.put_auth("/v0/boxes/jobs", json!({}), "wo");
     assert_eq!(s, StatusCode::FORBIDDEN);
     // ...so create the box with the full key.
-    post(&h, "/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }), "full");
+    post(
+        &h,
+        "/v0/boxes/jobs",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
     // Write a record with the write key — allowed.
-    let (s, _) = post(&h, "/v0/boxes/jobs", json!({ "records": [{ "data": 2 }] }), "wo");
+    let (s, _) = post(
+        &h,
+        "/v0/boxes/jobs",
+        json!({ "records": [{ "data": 2 }] }),
+        "wo",
+    );
     assert_eq!(s, StatusCode::OK);
     // Delete records — forbidden (lacks delete).
-    let (s, b) = post(&h, "/v0/boxes/jobs/delete", json!({ "before_seq": 2 }), "wo");
+    let (s, b) = post(
+        &h,
+        "/v0/boxes/jobs/delete",
+        json!({ "before_seq": 2 }),
+        "wo",
+    );
     assert_eq!(s, StatusCode::FORBIDDEN);
     assert_eq!(code(&b), "forbidden");
 }
@@ -107,15 +137,28 @@ fn admin_scope_required_for_put_box_and_router() {
         json!({ "source": "jobs", "dest": "audit" }),
         "adm",
     );
-    assert!(s == StatusCode::CREATED || s == StatusCode::OK, "router put status {s}");
+    assert!(
+        s == StatusCode::CREATED || s == StatusCode::OK,
+        "router put status {s}"
+    );
 }
 
 #[test]
 fn delete_scope_gates_box_and_record_delete() {
     let h = scoped_harness(&["full", "del:read+delete"]);
-    post(&h, "/v0/boxes/jobs", json!({ "records": [{ "data": 1 }, { "data": 2 }] }), "full");
+    post(
+        &h,
+        "/v0/boxes/jobs",
+        json!({ "records": [{ "data": 1 }, { "data": 2 }] }),
+        "full",
+    );
     // POST .../delete — allowed with delete scope.
-    let (s, _) = post(&h, "/v0/boxes/jobs/delete", json!({ "before_seq": 2 }), "del");
+    let (s, _) = post(
+        &h,
+        "/v0/boxes/jobs/delete",
+        json!({ "before_seq": 2 }),
+        "del",
+    );
     assert_eq!(s, StatusCode::OK);
     // DELETE box — allowed with delete scope.
     let (s, _) = h.send_auth("DELETE", "/v0/boxes/jobs", "del");
@@ -128,12 +171,27 @@ fn queue_claim_requires_read_and_write() {
     let h = scoped_harness(&["full", "ro:read", "rw:read+write"]);
     // Configure the box as a queue (PUT) then enqueue one job (POST).
     h.put_auth("/v0/boxes/q", json!({ "type": "queue" }), "full");
-    post(&h, "/v0/boxes/q", json!({ "records": [{ "data": 1 }] }), "full");
-    let (s, b) = post(&h, "/v0/boxes/q/claim", json!({ "node": "w1", "max": 1 }), "ro");
+    post(
+        &h,
+        "/v0/boxes/q",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
+    let (s, b) = post(
+        &h,
+        "/v0/boxes/q/claim",
+        json!({ "node": "w1", "max": 1 }),
+        "ro",
+    );
     assert_eq!(s, StatusCode::FORBIDDEN, "read-only cannot claim");
     assert_eq!(code(&b), "forbidden");
     // A read+write key can claim.
-    let (s, _) = post(&h, "/v0/boxes/q/claim", json!({ "node": "w1", "max": 1 }), "rw");
+    let (s, _) = post(
+        &h,
+        "/v0/boxes/q/claim",
+        json!({ "node": "w1", "max": 1 }),
+        "rw",
+    );
     assert_eq!(s, StatusCode::OK);
 }
 
@@ -168,7 +226,12 @@ fn prefix_allowlist_gates_box_names() {
 #[test]
 fn watch_create_requires_read_scope() {
     let h = scoped_harness(&["full", "wo:write"]);
-    post(&h, "/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }), "full");
+    post(
+        &h,
+        "/v0/boxes/jobs",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
     // A write-only key cannot create a watch (it is a read subscription).
     let (s, b) = post(
         &h,
@@ -202,8 +265,18 @@ fn prefix_key_cannot_watch_box_outside_allowlist() {
     // not just the route. A read key limited to `tenant42:` cannot watch a box
     // outside its prefix even though POST /v0/watch only needs `read`.
     let h = scoped_harness(&["full", "t42:read:tenant42:"]);
-    post(&h, "/v0/boxes/tenant42:jobs", json!({ "records": [{ "data": 1 }] }), "full");
-    post(&h, "/v0/boxes/secret", json!({ "records": [{ "data": 1 }] }), "full");
+    post(
+        &h,
+        "/v0/boxes/tenant42:jobs",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
+    post(
+        &h,
+        "/v0/boxes/secret",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
 
     // In-allowlist box: allowed.
     let (s, _) = post(
@@ -221,7 +294,11 @@ fn prefix_key_cannot_watch_box_outside_allowlist() {
         json!({ "boxes": { "secret": { "from_seq": 0 } } }),
         "t42",
     );
-    assert_eq!(s, StatusCode::FORBIDDEN, "watch outside prefix is forbidden");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "watch outside prefix is forbidden"
+    );
     assert_eq!(code(&b), "forbidden");
 
     // A watch naming BOTH an allowed and a forbidden box is rejected wholesale.
@@ -231,7 +308,11 @@ fn prefix_key_cannot_watch_box_outside_allowlist() {
         json!({ "boxes": { "tenant42:jobs": { "from_seq": 0 }, "secret": { "from_seq": 0 } } }),
         "t42",
     );
-    assert_eq!(s, StatusCode::FORBIDDEN, "any forbidden box rejects the watch");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "any forbidden box rejects the watch"
+    );
 }
 
 #[test]
@@ -247,7 +328,11 @@ fn prefix_key_cannot_route_to_box_outside_allowlist() {
         json!({ "source": "tenant42:jobs", "dest": "audit" }),
         "adm",
     );
-    assert_eq!(s, StatusCode::FORBIDDEN, "router dest outside prefix is forbidden");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "router dest outside prefix is forbidden"
+    );
     assert_eq!(code(&b), "forbidden");
 
     // source outside the allowlist ⇒ forbidden.
@@ -256,7 +341,11 @@ fn prefix_key_cannot_route_to_box_outside_allowlist() {
         json!({ "source": "other:jobs", "dest": "tenant42:audit" }),
         "adm",
     );
-    assert_eq!(s, StatusCode::FORBIDDEN, "router source outside prefix is forbidden");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "router source outside prefix is forbidden"
+    );
 
     // both in-allowlist ⇒ allowed.
     let (s, _) = h.put_auth(
@@ -264,7 +353,10 @@ fn prefix_key_cannot_route_to_box_outside_allowlist() {
         json!({ "source": "tenant42:jobs", "dest": "tenant42:audit" }),
         "adm",
     );
-    assert!(s == StatusCode::CREATED || s == StatusCode::OK, "in-prefix router allowed: {s}");
+    assert!(
+        s == StatusCode::CREATED || s == StatusCode::OK,
+        "in-prefix router allowed: {s}"
+    );
 }
 
 #[test]
@@ -272,9 +364,24 @@ fn prefix_key_list_is_filtered_to_allowlist() {
     // codex MEDIUM #7: a prefix-limited key must not enumerate cross-tenant box or
     // router names in the list endpoints.
     let h = scoped_harness(&["full", "t42:read:tenant42:"]);
-    post(&h, "/v0/boxes/tenant42:a", json!({ "records": [{ "data": 1 }] }), "full");
-    post(&h, "/v0/boxes/tenant42:b", json!({ "records": [{ "data": 1 }] }), "full");
-    post(&h, "/v0/boxes/other:c", json!({ "records": [{ "data": 1 }] }), "full");
+    post(
+        &h,
+        "/v0/boxes/tenant42:a",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
+    post(
+        &h,
+        "/v0/boxes/tenant42:b",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
+    post(
+        &h,
+        "/v0/boxes/other:c",
+        json!({ "records": [{ "data": 1 }] }),
+        "full",
+    );
 
     let (s, body) = h.get_auth("/v0/boxes", "t42");
     assert_eq!(s, StatusCode::OK);
@@ -284,9 +391,15 @@ fn prefix_key_list_is_filtered_to_allowlist() {
         .iter()
         .map(|e| e["box"].as_str().unwrap())
         .collect();
-    assert!(names.iter().all(|n| n.starts_with("tenant42:")), "only in-prefix boxes listed: {names:?}");
+    assert!(
+        names.iter().all(|n| n.starts_with("tenant42:")),
+        "only in-prefix boxes listed: {names:?}"
+    );
     assert!(names.contains(&"tenant42:a") && names.contains(&"tenant42:b"));
-    assert!(!names.contains(&"other:c"), "cross-tenant box must not be listed");
+    assert!(
+        !names.contains(&"other:c"),
+        "cross-tenant box must not be listed"
+    );
 
     // The full key still sees everything.
     let (_, full_body) = h.get_auth("/v0/boxes", "full");

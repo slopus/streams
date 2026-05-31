@@ -43,14 +43,21 @@ fn write_single_record_auto_creates_and_assigns_seq() {
         "/v0/boxes/jobs",
         json!({ "records": [{ "data": { "url": "s3://b/a.png" } }] }),
     );
-    assert_eq!(status, StatusCode::CREATED, "first write auto-creates -> 201");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "first write auto-creates -> 201"
+    );
     assert_eq!(body["box"], "jobs");
     assert_eq!(body["first_seq"], 1, "seqs start at SEQ_BASE = 1");
     assert_eq!(body["last_seq"], 1);
     assert_eq!(body["seqs"], json!([1]));
     assert_eq!(body["head_seq"], 1);
     assert_eq!(body["count"], 1);
-    assert_eq!(body["created"], true, "this write brought the box into existence");
+    assert_eq!(
+        body["created"], true,
+        "this write brought the box into existence"
+    );
     assert_eq!(body["deduped"], false);
     assert!(body["performance"]["server_total_ms"].is_number());
 
@@ -79,7 +86,11 @@ fn write_many_records_assigns_contiguous_seqs() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["first_seq"], 1);
     assert_eq!(body["last_seq"], 5);
-    assert_eq!(body["seqs"], json!([1, 2, 3, 4, 5]), "contiguous, in array order");
+    assert_eq!(
+        body["seqs"],
+        json!([1, 2, 3, 4, 5]),
+        "contiguous, in array order"
+    );
     assert_eq!(body["head_seq"], 5);
     assert_eq!(body["count"], 5);
 
@@ -132,8 +143,7 @@ fn idempotency_key_header_dedupes_when_body_omits_it() {
 
     // First write carries the key only as the `Idempotency-Key` HTTP header.
     let body = json!({ "records": [{ "data": "x" }] });
-    let (status, first) =
-        post_with_idem_header(&h, "/v0/boxes/qh", body.clone(), "hdr-key-1");
+    let (status, first) = post_with_idem_header(&h, "/v0/boxes/qh", body.clone(), "hdr-key-1");
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(first["seqs"], json!([1]));
     assert_eq!(first["deduped"], false);
@@ -145,7 +155,10 @@ fn idempotency_key_header_dedupes_when_body_omits_it() {
     assert_eq!(second["seqs"], json!([1]));
 
     let (_, state) = h.get("/v0/boxes/qh");
-    assert_eq!(state["head_seq"], 1, "header-keyed retry did not append again");
+    assert_eq!(
+        state["head_seq"], 1,
+        "header-keyed retry did not append again"
+    );
 }
 
 #[test]
@@ -153,7 +166,10 @@ fn idempotency_body_field_wins_over_header() {
     let h = Harness::start();
 
     // Seed key "A" via body.
-    let (_, a) = h.post("/v0/boxes/qw", json!({ "records": [{ "data": 1 }], "idempotency_key": "A" }));
+    let (_, a) = h.post(
+        "/v0/boxes/qw",
+        json!({ "records": [{ "data": 1 }], "idempotency_key": "A" }),
+    );
     assert_eq!(a["seqs"], json!([1]));
 
     // Now send a request whose BODY key is "A" but HEADER key is "B". Body wins,
@@ -188,7 +204,10 @@ fn diff_returns_records_with_cursor_caughtup_and_lag() {
     assert_eq!(recs.len(), 3);
     assert_eq!(recs[0]["$seq"], 1);
     assert_eq!(recs[2]["$seq"], 3);
-    assert!(recs[0].get("$tag").is_none(), "include_tags defaults to false");
+    assert!(
+        recs[0].get("$tag").is_none(),
+        "include_tags defaults to false"
+    );
     assert!(recs[0]["$ts"].is_number(), "$ts always present");
     assert_eq!(body["next_from_seq"], 3);
     assert_eq!(body["head_seq"], 3);
@@ -225,13 +244,19 @@ fn diff_include_tags_and_meta_flags() {
     assert_eq!(status, StatusCode::CREATED);
 
     // include_tags:true surfaces $tag; include_meta:true (default) keeps meta.
-    let (_, body) = h.post("/v0/boxes/im/diff", json!({ "from_seq": 0, "include_tags": true }));
+    let (_, body) = h.post(
+        "/v0/boxes/im/diff",
+        json!({ "from_seq": 0, "include_tags": true }),
+    );
     let rec = &body["records"][0];
     assert_eq!(rec["$tag"], "t1");
     assert_eq!(rec["meta"], json!({ "k": "v" }));
 
     // include_meta:false drops meta; $tag also absent (include_tags default false).
-    let (_, body) = h.post("/v0/boxes/im/diff", json!({ "from_seq": 0, "include_meta": false }));
+    let (_, body) = h.post(
+        "/v0/boxes/im/diff",
+        json!({ "from_seq": 0, "include_meta": false }),
+    );
     let rec = &body["records"][0];
     assert!(rec.get("meta").is_none(), "include_meta:false omits meta");
     assert!(rec.get("$tag").is_none());
@@ -245,14 +270,22 @@ fn diff_default_limit_is_256() {
     // No limit field -> default 256 (API §3). 300 records, so first page = 256.
     let (status, body) = h.post("/v0/boxes/lim/diff", json!({ "from_seq": 0 }));
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["records"].as_array().unwrap().len(), 256, "default limit 256");
+    assert_eq!(
+        body["records"].as_array().unwrap().len(),
+        256,
+        "default limit 256"
+    );
     assert_eq!(body["next_from_seq"], 256);
     assert_eq!(body["caught_up"], false);
     assert_eq!(body["lag"], 44, "head 300 - 256");
 
     // limit:0 is treated as the default too.
     let (_, body) = h.post("/v0/boxes/lim/diff", json!({ "from_seq": 0, "limit": 0 }));
-    assert_eq!(body["records"].as_array().unwrap().len(), 256, "limit:0 => default 256");
+    assert_eq!(
+        body["records"].as_array().unwrap().len(),
+        256,
+        "limit:0 => default 256"
+    );
 }
 
 #[test]
@@ -261,9 +294,20 @@ fn diff_limit_clamped_at_max_1000() {
     seed(&h, "big", 1200);
 
     // limit far above MAX_LIMIT (1000) is clamped, never rejected (API §3).
-    let (status, body) = h.post("/v0/boxes/big/diff", json!({ "from_seq": 0, "limit": 5000 }));
-    assert_eq!(status, StatusCode::OK, "over-max limit is clamped, not a 400");
-    assert_eq!(body["records"].as_array().unwrap().len(), 1000, "clamped to MAX_LIMIT 1000");
+    let (status, body) = h.post(
+        "/v0/boxes/big/diff",
+        json!({ "from_seq": 0, "limit": 5000 }),
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "over-max limit is clamped, not a 400"
+    );
+    assert_eq!(
+        body["records"].as_array().unwrap().len(),
+        1000,
+        "clamped to MAX_LIMIT 1000"
+    );
     assert_eq!(body["next_from_seq"], 1000);
     assert_eq!(body["caught_up"], false);
 
@@ -305,14 +349,23 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
 
     // Reader presenting "self" sees only the "other" record; cursor advances past
     // its own (skipped) records and reaches caught_up; no tombstone (silent).
-    let (status, body) = h.post("/v0/boxes/nb/diff", json!({ "from_seq": 0, "node": "self" }));
+    let (status, body) = h.post(
+        "/v0/boxes/nb/diff",
+        json!({ "from_seq": 0, "node": "self" }),
+    );
     assert_eq!(status, StatusCode::OK);
     let recs = body["records"].as_array().unwrap();
     assert_eq!(recs.len(), 1, "only the other-node record is delivered");
     assert_eq!(recs[0]["$seq"], 3);
-    assert_eq!(recs[0]["$node"], "other", "$node echoed for delivered records");
+    assert_eq!(
+        recs[0]["$node"], "other",
+        "$node echoed for delivered records"
+    );
     assert_eq!(body["next_from_seq"], 3, "cursor advanced past own records");
-    assert_eq!(body["caught_up"], true, "reaches caught_up, not an empty loop");
+    assert_eq!(
+        body["caught_up"], true,
+        "reaches caught_up, not an empty loop"
+    );
     assert_eq!(body["tombstone"], Value::Null, "node filtering is silent");
 
     // A reader of ONLY-own-node records: zero delivered yet caught_up reached and
@@ -338,7 +391,10 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
         ] }),
     );
     assert_eq!(status, StatusCode::CREATED);
-    let (_, body) = h.post("/v0/boxes/multi/diff", json!({ "from_seq": 0, "node": ["a", "b"] }));
+    let (_, body) = h.post(
+        "/v0/boxes/multi/diff",
+        json!({ "from_seq": 0, "node": ["a", "b"] }),
+    );
     let recs = body["records"].as_array().unwrap();
     assert_eq!(recs.len(), 1, "drop if $node in {{a,b}}");
     assert_eq!(recs[0]["$seq"], 3);
@@ -370,7 +426,11 @@ fn diff_cap_eviction_emits_cap_tombstone() {
 
     // A consumer at from_seq=0 fell below the involuntary floor -> cap tombstone.
     let (status, body) = h.post("/v0/boxes/cap/diff", json!({ "from_seq": 0 }));
-    assert_eq!(status, StatusCode::OK, "tombstone is an in-band 200, never an error");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "tombstone is an in-band 200, never an error"
+    );
     let tomb = &body["tombstone"];
     assert!(tomb.is_object(), "expected a tombstone object, got {tomb}");
     assert_eq!(tomb["reason"], "cap");
@@ -382,7 +442,11 @@ fn diff_cap_eviction_emits_cap_tombstone() {
 
     // Records resume at earliest_seq; cursor continues normally to caught_up.
     let recs = body["records"].as_array().unwrap();
-    assert_eq!(recs.first().unwrap()["$seq"], 3, "records begin at earliest_seq");
+    assert_eq!(
+        recs.first().unwrap()["$seq"],
+        3,
+        "records begin at earliest_seq"
+    );
     assert_eq!(recs.len(), 3);
     assert_eq!(body["earliest_seq"], 3);
     assert_eq!(body["caught_up"], true);
@@ -432,7 +496,10 @@ fn diff_ttl_expiry_emits_ttl_tombstone() {
             assert_eq!(state["count"], 1, "only seq 4 remains live");
             break;
         }
-        assert!(Instant::now() < deadline, "TTL did not expire the prefix in time");
+        assert!(
+            Instant::now() < deadline,
+            "TTL did not expire the prefix in time"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 
@@ -482,7 +549,10 @@ fn diff_wait_ms_long_poll_wakes_on_append() {
     // Long-poll from head with a generous wait; it must return after the append,
     // well before the wait_ms ceiling.
     let started = Instant::now();
-    let (status, body) = h.post("/v0/boxes/lp/diff", json!({ "from_seq": 1, "wait_ms": 5000 }));
+    let (status, body) = h.post(
+        "/v0/boxes/lp/diff",
+        json!({ "from_seq": 1, "wait_ms": 5000 }),
+    );
     let elapsed = started.elapsed();
     writer.join().unwrap();
 
@@ -507,7 +577,10 @@ fn diff_wait_ms_returns_at_deadline_when_idle() {
     // Nothing else writes; the long-poll parks then returns caught-up at the
     // (short) deadline. We only assert it returns the correct shape, not exact ms.
     let started = Instant::now();
-    let (status, body) = h.post("/v0/boxes/idle/diff", json!({ "from_seq": 1, "wait_ms": 200 }));
+    let (status, body) = h.post(
+        "/v0/boxes/idle/diff",
+        json!({ "from_seq": 1, "wait_ms": 200 }),
+    );
     let elapsed = started.elapsed();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["records"].as_array().unwrap().len(), 0);

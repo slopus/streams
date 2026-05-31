@@ -44,7 +44,9 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
-use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest};
+use streams::types::{
+    BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+};
 
 const DATA_DIR: &str = "/data";
 
@@ -126,7 +128,10 @@ fn append(engine: &Engine, name: &str, tag: &str) -> u64 {
         config: None,
         disable_backpressure: true,
     };
-    engine.write(name, req, true).expect("durable append acked").last_seq
+    engine
+        .write(name, req, true)
+        .expect("durable append acked")
+        .last_seq
 }
 
 /// DETERMINISTIC (failpoints): pin a delete in its post-commit / pre-apply window
@@ -291,7 +296,10 @@ fn snapshot_during_inflight_delete_does_not_resurrect_deleted_records() {
     let live = live_by_tag(&engine, "msgs");
     let deleted = deleted_seqs.lock().unwrap();
 
-    assert!(!deleted.is_empty(), "the workload acked at least one delete");
+    assert!(
+        !deleted.is_empty(),
+        "the workload acked at least one delete"
+    );
     for seq in deleted.iter() {
         assert!(
             !live.contains_key(seq),

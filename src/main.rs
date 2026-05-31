@@ -135,8 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the router, parsing STREAMS_API_KEYS into the hashed key store. A
     // malformed scope token fails closed here (rather than booting with auth
-    // silently degraded) with a clear message.
-    let app = match http::build_router_checked(engine.clone()) {
+    // silently degraded) with a clear message. The shutdown signal is shared with
+    // the serve loop so in-flight SSE streams are wound down on shutdown (M11).
+    let sse_shutdown = std::sync::Arc::new(streams::serve::ShutdownSignal::new());
+    let app = match http::build_router_with_shutdown(engine.clone(), sse_shutdown.clone()) {
         Ok(app) => app,
         Err(msg) => {
             error!("invalid STREAMS_API_KEYS: {msg}");
@@ -153,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dual-protocol serve loop: auto-detects HTTP/1.1 vs HTTP/2-prior-knowledge
     // per connection (hyper-util auto::Builder) over the same listener, with the
     // tuned keep-alive/HTTP-2 settings and graceful drain (streams::serve).
-    streams::serve::serve(listener, app, shutdown_signal()).await?;
+    streams::serve::serve_with_signal(listener, app, shutdown_signal(), sse_shutdown).await?;
 
     // Graceful shutdown: stop the background snapshotter + relocator and write a
     // final snapshot so a clean restart starts from a current checkpoint.
@@ -176,8 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Initialize the tracing subscriber from `RUST_LOG` (default `info`).
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).init();
 }
 

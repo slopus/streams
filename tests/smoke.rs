@@ -167,7 +167,10 @@ async fn quickstart_end_to_end() {
         0,
         "loop prevention: origin node sees none of its own records"
     );
-    assert_eq!(body["caught_up"], true, "cursor advanced to caught_up, not an empty loop");
+    assert_eq!(
+        body["caught_up"], true,
+        "cursor advanced to caught_up, not an empty loop"
+    );
     assert_eq!(body["next_from_seq"], 2);
 
     // -- §6 Delete a job by exact tag, then a tenant by prefix glob ----------
@@ -258,7 +261,11 @@ async fn quickstart_end_to_end() {
         Some(json!({ "node": "origin-1", "records": [{ "data": { "v": 1 } }] })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "router pre-created feed -> write is 200");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "router pre-created feed -> write is 200"
+    );
     assert_eq!(wbody["created"], false);
 
     // Read the dest as an unrelated node so loop-prevention doesn't hide it.
@@ -323,7 +330,10 @@ async fn quickstart_end_to_end() {
     assert_eq!(data["box"], "sub-a");
     assert_eq!(data["records"][0]["$seq"], 1);
     assert_eq!(data["records"][0]["data"]["v"], 1);
-    assert!(!rec.id.is_empty(), "data-bearing frame carries a composite id");
+    assert!(
+        !rec.id.is_empty(),
+        "data-bearing frame carries a composite id"
+    );
 
     let cu = frames.iter().find(|f| f.event == "caught-up").unwrap();
     let cu_data: Value = serde_json::from_str(&cu.data).unwrap();
@@ -369,9 +379,13 @@ async fn read_sse_frames(
 
     let read = async {
         while frames.len() < max_frames {
-            let Some(chunk) = body.frame().await else { break };
+            let Some(chunk) = body.frame().await else {
+                break;
+            };
             let chunk = chunk.unwrap();
-            let Some(data) = chunk.data_ref() else { continue };
+            let Some(data) = chunk.data_ref() else {
+                continue;
+            };
             buf.extend_from_slice(data);
             drain_frames(&mut buf, &mut frames);
         }

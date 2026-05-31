@@ -205,8 +205,14 @@ mod tests {
         assert_eq!(p, 750);
 
         // Manual clamps to the documented [-1000, 1000] range.
-        assert_eq!(effective_priority_at(now, Some(5000), true, Some(now), None), 1000);
-        assert_eq!(effective_priority_at(now, Some(-5000), true, Some(now), None), -1000);
+        assert_eq!(
+            effective_priority_at(now, Some(5000), true, Some(now), None),
+            1000
+        );
+        assert_eq!(
+            effective_priority_at(now, Some(-5000), true, Some(now), None),
+            -1000
+        );
 
         // Auto-only (manual=None): a fresh consume yields AUTO_MAX (500).
         assert_eq!(effective_priority_at(now, None, true, Some(now), None), 500);
@@ -263,7 +269,7 @@ mod tests {
         sched.mark_dirty("mid", 300); // B2
         sched.mark_dirty("hi2", 900); // B4
         sched.mark_dirty("neg", -50); // B0
-        // Dedupe: re-marking an already-dirty box is a no-op.
+                                      // Dedupe: re-marking an already-dirty box is a no-op.
         sched.mark_dirty("hi", 800);
 
         let order = sched.drain_order();

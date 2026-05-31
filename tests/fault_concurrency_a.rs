@@ -53,7 +53,12 @@
 //! The stress tests below assert the identical invariants in the meantime.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -337,7 +342,11 @@ fn f_idemp_concurrent_retry() {
                 };
                 start.wait();
                 let resp = engine.write("idem", req, true).expect("write ok");
-                (k, resp.seqs.unwrap_or_else(|| vec![resp.last_seq]), resp.deduped)
+                (
+                    k,
+                    resp.seqs.unwrap_or_else(|| vec![resp.last_seq]),
+                    resp.deduped,
+                )
             }));
         }
     }
@@ -436,8 +445,14 @@ fn f_seg_seal_race_append() {
                 if seq > TOTAL {
                     break;
                 }
-                let sealed =
-                    w.append_record(seq, 1_700_000_000_000, None, Some("t"), &json!({ "s": seq }), &None);
+                let sealed = w.append_record(
+                    seq,
+                    1_700_000_000_000,
+                    None,
+                    Some("t"),
+                    &json!({ "s": seq }),
+                    &None,
+                );
                 drop(w);
                 if !sealed.is_empty() {
                     sealed_all.lock().unwrap().extend(sealed);
@@ -446,7 +461,8 @@ fn f_seg_seal_race_append() {
         }));
     }
     for h in handles {
-        h.join().expect("no appender panicked (contiguity invariant held)");
+        h.join()
+            .expect("no appender panicked (contiguity invariant held)");
     }
 
     // Flush the final active segment so every appended seq is materialized.
@@ -463,7 +479,10 @@ fn f_seg_seal_race_append() {
         expected.len(),
         "a record was sealed twice or skipped under the seal/append race"
     );
-    assert_eq!(sealed, expected, "sealed seqs must cover exactly [1..=TOTAL], no gap/dup");
+    assert_eq!(
+        sealed, expected,
+        "sealed seqs must cover exactly [1..=TOTAL], no gap/dup"
+    );
 
     // INVARIANT (dense/gapless/contiguous segments): the sealed segments' ranges
     // tile [1..=last] with no overlap and no gap (each segment is contiguous and
@@ -477,10 +496,17 @@ fn f_seg_seal_race_append() {
             s.start_seq, expect_next,
             "sealed segment is not contiguous with the previous (gap/overlap): {segs:?}",
         );
-        assert!(s.end_seq >= s.start_seq, "empty/inverted sealed segment range");
+        assert!(
+            s.end_seq >= s.start_seq,
+            "empty/inverted sealed segment range"
+        );
         expect_next = s.end_seq + 1;
     }
-    assert_eq!(expect_next, TOTAL + 1, "sealed segments tile exactly [1..=TOTAL]");
+    assert_eq!(
+        expect_next,
+        TOTAL + 1,
+        "sealed segments tile exactly [1..=TOTAL]"
+    );
 }
 
 // ===========================================================================
@@ -619,7 +645,11 @@ fn f_snap_race_write_during_capture() {
 
     // Dense contiguous prefix [1..=k] — no gap, no fabrication.
     for (i, s) in survivors.iter().enumerate() {
-        assert_eq!(*s, i as u64 + 1, "survivors must be a dense prefix: {survivors:?}");
+        assert_eq!(
+            *s,
+            i as u64 + 1,
+            "survivors must be a dense prefix: {survivors:?}"
+        );
     }
     // Every acked durable write present (capture never lost an acked write to the
     // race): acked ⊆ survivors.
@@ -630,7 +660,10 @@ fn f_snap_race_write_during_capture() {
             "acked durable seq {a} LOST across a snapshot-capture race (survivors={survivors:?})"
         );
     }
-    assert_eq!(st.head_seq, max_acked, "recovered head == highest acked seq");
+    assert_eq!(
+        st.head_seq, max_acked,
+        "recovered head == highest acked seq"
+    );
     drop(engine);
 }
 
@@ -722,7 +755,10 @@ fn f_wal_double_writer_fencing() {
             // the attempted range — never a fabricated/garbled record. (The reader
             // itself already validated the CRC; we assert the decoded fields are
             // ones a writer actually attempted.)
-            if let WalRecord::Append { box_id, seq, data, .. } = &frame.record {
+            if let WalRecord::Append {
+                box_id, seq, data, ..
+            } = &frame.record
+            {
                 assert!(
                     *box_id == 1 || *box_id == 2,
                     "decoded a frame for an unattempted box {box_id} (cross-writer garble)"

@@ -88,7 +88,9 @@ pub async fn list_boxes(
     // names (codex MEDIUM #7).
     let allow = principal_prefixes(&extensions);
     Ok(Json(
-        state.engine.list_boxes(prefix, page_size, cursor, touch, &allow)?,
+        state
+            .engine
+            .list_boxes(prefix, page_size, cursor, touch, &allow)?,
     ))
 }
 

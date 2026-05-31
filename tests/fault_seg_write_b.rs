@@ -39,7 +39,12 @@
 //!       mutations of valid frames/indexes (an `arbitrary`-style structured sweep).
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::io;
@@ -48,7 +53,7 @@ use std::sync::{Arc, Mutex};
 
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::{
-    data_name, decode_data_frame, idx_entry_at, idx_name, idx_len, lookup, File, Fs,
+    data_name, decode_data_frame, idx_entry_at, idx_len, idx_name, lookup, File, Fs,
     LocalSegmentStore, OpenOpts, SegmentBuilder, SegmentError, SegmentId, SegmentPart,
     SegmentRecord, SegmentStore, IDX_STRIDE,
 };
@@ -103,7 +108,10 @@ fn idx_path(root: &str, id: SegmentId) -> PathBuf {
 /// dir-fsync final name) so it survives a `crash()`.
 fn install_durable(fs: &Arc<dyn Fs>, root: &str, final_path: &Path, bytes: &[u8]) {
     let tmp = final_path.with_extension({
-        let cur = final_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let cur = final_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         format!("{cur}.tmp")
     });
     write_pending(fs, &tmp, bytes);
@@ -149,8 +157,13 @@ fn f_metadata_vs_data_reorder() {
 
     // The boundary in the .data where the lost tail begins: the offset of the 4th
     // record's frame (records 0..=2 are in the durable prefix; 3..=4 are lost).
-    let split = lookup(&idx, id, id + 3).expect("entry for the 4th record").offset as usize;
-    assert!(split > 0 && split < full_data.len(), "split inside the .data");
+    let split = lookup(&idx, id, id + 3)
+        .expect("entry for the 4th record")
+        .offset as usize;
+    assert!(
+        split > 0 && split < full_data.len(),
+        "split inside the .data"
+    );
 
     // Install the durable .data PREFIX (records 0..=2) at the final name, the
     // normal way (write → fsync → rename → dir-fsync). This is the content that
@@ -163,7 +176,9 @@ fn f_metadata_vs_data_reorder() {
     // stay pending and are dropped on the crash — exactly "size metadata persists
     // before the data blocks". The lost tail reads back as zeros.
     {
-        let mut f = fs.open(&data_path(ROOT, id), OpenOpts::rw_existing()).unwrap();
+        let mut f = fs
+            .open(&data_path(ROOT, id), OpenOpts::rw_existing())
+            .unwrap();
         // 1. Length metadata reaches the platter (durable) ...
         f.set_len(full_data.len() as u64).unwrap();
         f.sync_all().unwrap();
@@ -198,14 +213,22 @@ fn f_metadata_vs_data_reorder() {
     // lost write the metadata already accounted for).
     let on_disk = store.read_all(id, SegmentPart::Data).unwrap();
     assert_eq!(on_disk.len(), full_data.len());
-    assert_eq!(&on_disk[..split], &full_data[..split], "durable prefix intact");
+    assert_eq!(
+        &on_disk[..split],
+        &full_data[..split],
+        "durable prefix intact"
+    );
     assert!(
         on_disk[split..].iter().all(|&b| b == 0),
         "the lost tail (metadata ahead of data) reads back as zeros"
     );
 
     let idx_buf = store.read_all(id, SegmentPart::Idx).unwrap();
-    assert_eq!(idx_len(&idx_buf), n as usize, "the .idx outran the data: full");
+    assert_eq!(
+        idx_len(&idx_buf),
+        n as usize,
+        "the .idx outran the data: full"
+    );
 
     // ORACLE 1: the records wholly inside the DURABLE PREFIX read + decode exactly
     // — the in-bounds, truly-present bytes are served correctly.
@@ -344,8 +367,7 @@ impl File for PageCksumFile {
                 break;
             }
             let data = &framed[rp..rp + PAGE];
-            let stored =
-                u64::from_le_bytes(framed[rp + PAGE..rp + PAGE + CK].try_into().unwrap());
+            let stored = u64::from_le_bytes(framed[rp + PAGE..rp + PAGE + CK].try_into().unwrap());
             if stored != xxhash_rust::xxh3::xxh3_64(data) {
                 st.caught += 1;
                 return Err(io::Error::other(format!(
@@ -438,7 +460,10 @@ impl Fs for PageCksumFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut st = self.inner.lock().unwrap();
         let Some(bytes) = st.files.remove(from) else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "rename src missing"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "rename src missing",
+            ));
         };
         let len = st.lens.remove(from).unwrap_or(0);
         st.files.insert(to.to_path_buf(), bytes);
@@ -504,13 +529,23 @@ fn f_monitor_page_checksum() {
     // Copy hot→cold exactly as the relocator would (read both parts, put to cold).
     let hot_data = hot.read_all(id, SegmentPart::Data).unwrap();
     let hot_idx = hot.read_all(id, SegmentPart::Idx).unwrap();
-    assert_eq!(hot_data, data, "the shim round-trips the .data on a clean copy");
-    assert_eq!(hot_idx, idx, "the shim round-trips the .idx on a clean copy");
+    assert_eq!(
+        hot_data, data,
+        "the shim round-trips the .data on a clean copy"
+    );
+    assert_eq!(
+        hot_idx, idx,
+        "the shim round-trips the .idx on a clean copy"
+    );
     cold.put(id, &hot_data, &hot_idx).unwrap();
     // A clean copy is readable from cold and decodes (no bit-rot ⇒ no catch).
     let cold_data = cold.read_all(id, SegmentPart::Data).unwrap();
     assert_eq!(cold_data, data, "clean cold copy matches the source");
-    assert_eq!(pfs.caught(), 0, "no page-checksum mismatch on a clean relocation");
+    assert_eq!(
+        pfs.caught(),
+        0,
+        "no page-checksum mismatch on a clean relocation"
+    );
 
     // --- Silent bit-rot in the at-rest COLD copy is caught -------------------
     // Flip one data byte of the cold .data WITHOUT updating its page checksum
@@ -540,7 +575,7 @@ fn f_monitor_page_checksum() {
     // the raw flipped data out-of-band and decode the affected frame.
     let mut corrupted = data.clone();
     corrupted[flip_at] ^= 0xFF; // the same silent flip, in a plain buffer.
-    // Locate the frame covering `flip_at` and decode it: XXH3 must reject it.
+                                // Locate the frame covering `flip_at` and decode it: XXH3 must reject it.
     let mut hit_corrupt = false;
     for s in id..id + 6 {
         let e = lookup(&idx, id, s).unwrap();
@@ -723,7 +758,10 @@ fn f_fuzz_segment_decoder() {
             );
             // A gigantic entry index must not overflow the offset multiply (checked
             // arithmetic ⇒ None, never a panic).
-            assert!(idx_entry_at(&ibuf, usize::MAX).is_none(), "usize::MAX ⇒ None");
+            assert!(
+                idx_entry_at(&ibuf, usize::MAX).is_none(),
+                "usize::MAX ⇒ None"
+            );
             // lookup with random start/seq is panic-free and bounded.
             let start = rng.next_u64();
             let seq = rng.next_u64();
@@ -738,11 +776,17 @@ fn f_fuzz_segment_decoder() {
         // Huge frame_len past EOF.
         let mut huge = frame.clone();
         huge[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        assert!(matches!(decode_data_frame(&huge), Err(SegmentError::Corrupt(_))));
+        assert!(matches!(
+            decode_data_frame(&huge),
+            Err(SegmentError::Corrupt(_))
+        ));
         // Sub-minimum frame_len (1).
         let mut tiny = frame.clone();
         tiny[0..4].copy_from_slice(&1u32.to_le_bytes());
-        assert!(matches!(decode_data_frame(&tiny), Err(SegmentError::Corrupt(_))));
+        assert!(matches!(
+            decode_data_frame(&tiny),
+            Err(SegmentError::Corrupt(_))
+        ));
         // All-zeros buffer (a zeroed/lost frame).
         let zeros = vec![0u8; 64];
         assert!(matches!(
@@ -750,7 +794,10 @@ fn f_fuzz_segment_decoder() {
             Err(SegmentError::Corrupt(_))
         ));
         // Empty buffer (shorter than the frame_len prefix).
-        assert!(matches!(decode_data_frame(&[]), Err(SegmentError::Corrupt(_))));
+        assert!(matches!(
+            decode_data_frame(&[]),
+            Err(SegmentError::Corrupt(_))
+        ));
         // A frame_len that claims a valid size but whose internal section lengths
         // overflow: poke node_len/tag_len/data_len to u16/u32 max in the header.
         let mut overflow = frame.clone();

@@ -24,7 +24,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -600,7 +605,10 @@ fn f_rec_partial_checkpoint_overlap() {
         vec![1, 2, 3, 4, 5, 6, 7],
         "overlap is idempotent: 1..=5 from snapshot (not double-applied), 6,7 appended once"
     );
-    assert_eq!(ov.head, 7, "head advanced to the post-overlap tail exactly once");
+    assert_eq!(
+        ov.head, 7,
+        "head advanced to the post-overlap tail exactly once"
+    );
     // The overlapping seqs keep their SNAPSHOT-materialized payloads (the re-read
     // overlapping frames did not overwrite them).
     assert_eq!(ov.records[&1].data, "o1");
@@ -633,7 +641,8 @@ fn f_rec_partial_checkpoint_overlap() {
 fn f_rec_box_missing_for_append() {
     let disk = FakeDisk::new();
     let fs = disk.arc();
-    fs.create_dir_all(&PathBuf::from(DATA_DIR).join("wal")).unwrap();
+    fs.create_dir_all(&PathBuf::from(DATA_DIR).join("wal"))
+        .unwrap();
 
     // A box_id that NO BoxConfig frame creates — only Appends reference it.
     let orphan_box_id: u32 = 7;

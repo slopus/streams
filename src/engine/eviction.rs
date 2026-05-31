@@ -33,7 +33,10 @@ impl Floors {
     /// Combined logical earliest retained (first live) seq, clamped into
     /// `[seq_base, head_seq + 1]`. Driven by all three floors.
     pub fn earliest_seq(&self, seq_base: u64, head_seq: u64) -> u64 {
-        let floor = self.evict_floor.max(self.expiry_floor).max(self.delete_floor);
+        let floor = self
+            .evict_floor
+            .max(self.expiry_floor)
+            .max(self.delete_floor);
         let earliest = floor.saturating_add(1).max(seq_base);
         earliest.min(head_seq.saturating_add(1))
     }

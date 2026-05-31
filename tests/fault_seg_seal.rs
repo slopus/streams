@@ -26,7 +26,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -353,7 +358,11 @@ fn f_seg_enospc_seal() {
     }
     // The active segment now holds seq 4 (the seal failed but the append proceeded
     // onto a fresh active builder), gapless and ready to seal once space returns.
-    assert_eq!(w.active_start(), Some(4), "a fresh active segment holds seq 4");
+    assert_eq!(
+        w.active_start(),
+        Some(4),
+        "a fresh active segment holds seq 4"
+    );
 }
 
 // ===========================================================================
@@ -397,9 +406,16 @@ fn f_clock_forward_seg_age() {
     // Exactly one sealed segment, covering exactly the boundary crossed — gapless,
     // no record lost or duplicated by the off-schedule seal.
     let segs = w.sealed_segments();
-    assert_eq!(segs.len(), 1, "one sealed segment from the age-triggered seal");
+    assert_eq!(
+        segs.len(),
+        1,
+        "one sealed segment from the age-triggered seal"
+    );
     assert_eq!(segs[0].start_seq, 1, "sealed segment starts at seq 1");
-    assert_eq!(segs[0].end_seq, 3, "sealed segment ends at seq 3 (dense 1..=3)");
+    assert_eq!(
+        segs[0].end_seq, 3,
+        "sealed segment ends at seq 3 (dense 1..=3)"
+    );
 
     // The sealed records resolve from the segment/cache (their resident payloads
     // were freed on seal), proving the seal actually materialized them — no loss.
@@ -424,7 +440,12 @@ fn f_clock_forward_seg_age() {
     let segs = w.sealed_segments();
     assert_eq!(segs.len(), 2, "two dense, non-overlapping sealed segments");
     assert_eq!(
-        (segs[0].start_seq, segs[0].end_seq, segs[1].start_seq, segs[1].end_seq),
+        (
+            segs[0].start_seq,
+            segs[0].end_seq,
+            segs[1].start_seq,
+            segs[1].end_seq
+        ),
         (1, 3, 4, 4),
         "sealed segments are contiguous and gapless across the off-schedule seals"
     );

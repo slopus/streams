@@ -23,7 +23,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -122,8 +127,17 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox { name: String, durable: bool, cap: u64 },
-    Append { name: String, data: String, tag: Option<String>, node: Option<String> },
+    PutBox {
+        name: String,
+        durable: bool,
+        cap: u64,
+    },
+    Append {
+        name: String,
+        data: String,
+        tag: Option<String>,
+        node: Option<String>,
+    },
 }
 
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
@@ -140,7 +154,12 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     model.ensure_box(name, *durable, *cap);
                 }
             }
-            Op::Append { name, data, tag, node } => {
+            Op::Append {
+                name,
+                data,
+                tag,
+                node,
+            } => {
                 let req = WriteRequest {
                     records: vec![RecordIn {
                         data: json!({ "v": data }),
@@ -284,7 +303,10 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
                  (fabricated/torn record): {rec:?}"
             )
         });
-        assert_eq!(m, rec, "{name}: recovered record at seq {seq} differs from the model");
+        assert_eq!(
+            m, rec,
+            "{name}: recovered record at seq {seq} differs from the model"
+        );
     }
 
     // (2) NO SILENT LOSS (only when the whole tail was durable — not used for the
@@ -313,17 +335,42 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE: recovered head never exceeds the model head.
-    assert!(
-        dump.head <= model.head,
-        "{name}: recovered head {} exceeds model head {} (future seq?)",
-        dump.head,
-        model.head
-    );
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box's head never exceeds
+    //     the acked head; a `disk` box (acked before fsync) recovers at its durable
+    //     head RESERVATION — its head may sit ABOVE the acked head by up to
+    //     `DISK_HEAD_RESERVE_AHEAD` (dropped un-fsynced seqs become silent gaps),
+    //     never regressing below an acked seq when the whole tail was durable.
+    if model.durable {
+        assert!(
+            dump.head <= model.head,
+            "{name}: fsync recovered head {} exceeds model head {} (future seq?)",
+            dump.head,
+            model.head
+        );
+    } else {
+        if whole_tail_durable && model.head > 0 {
+            assert!(
+                dump.head >= model.head,
+                "{name}: disk recovered head {} REGRESSED below acked head {} (reuse!)",
+                dump.head,
+                model.head
+            );
+        }
+        assert!(
+            dump.head <= model.head + streams::config::DISK_HEAD_RESERVE_AHEAD,
+            "{name}: disk recovered head {} exceeds reservation ceiling {}",
+            dump.head,
+            model.head + streams::config::DISK_HEAD_RESERVE_AHEAD
+        );
+    }
 
     // (6) EARLIEST: when the whole durable tail survived, earliest matches.
     if model.durable && whole_tail_durable && !live.is_empty() {
-        assert_eq!(dump.earliest, model.earliest(), "{name}: earliest must match model");
+        assert_eq!(
+            dump.earliest,
+            model.earliest(),
+            "{name}: earliest must match model"
+        );
     }
 }
 
@@ -381,8 +428,7 @@ fn frame_offsets(buf: &[u8]) -> Vec<usize> {
     let mut offs = Vec::new();
     let mut pos = 0usize;
     while pos + FRAME_LEN_PREFIX <= buf.len() {
-        let frame_len =
-            u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let frame_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         if frame_len < MIN_FRAME_LEN {
             break; // zero/sub-min ⇒ preallocation tail / torn — end of frames.
         }
@@ -398,8 +444,7 @@ fn frame_offsets(buf: &[u8]) -> Vec<usize> {
 
 /// The end offset (exclusive) of the frame that starts at `start`.
 fn frame_end(buf: &[u8], start: usize) -> usize {
-    let frame_len =
-        u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
+    let frame_len = u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
     start + FRAME_LEN_PREFIX + frame_len
 }
 
@@ -413,13 +458,21 @@ fn frame_end(buf: &[u8], start: usize) -> usize {
 /// durable on `disk`.
 fn run_durable_workload(disk: &FakeDisk, n: u64) -> RefModel {
     let mut model = RefModel::default();
-    let mut ops = vec![Op::PutBox { name: "b".into(), durable: true, cap: 0 }];
+    let mut ops = vec![Op::PutBox {
+        name: "b".into(),
+        durable: true,
+        cap: 0,
+    }];
     for i in 1..=n {
         ops.push(Op::Append {
             name: "b".into(),
             data: format!("d{i}"),
             tag: Some(format!("t{i}")),
-            node: if i % 2 == 0 { Some(format!("n{i}")) } else { None },
+            node: if i % 2 == 0 {
+                Some(format!("n{i}"))
+            } else {
+                None
+            },
         });
     }
     let engine = open_engine(disk);
@@ -441,7 +494,11 @@ fn f_wal_len_garbage_huge() {
 
     let mut buf = read_wal_durable(&disk);
     let offs = frame_offsets(&buf);
-    assert!(offs.len() >= 4, "workload wrote >=4 frames, got {}", offs.len());
+    assert!(
+        offs.len() >= 4,
+        "workload wrote >=4 frames, got {}",
+        offs.len()
+    );
 
     // Garble the LAST frame's frame_len to 0xFFFFFFFF (overruns the buffer).
     let last = *offs.last().unwrap();
@@ -456,8 +513,15 @@ fn f_wal_len_garbage_huge() {
     // The 3 frames before the poked last one survive as a dense prefix [1..=3];
     // the overrun frame (seq 4) is truncated, never materialized.
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
-    assert_eq!(survivors, vec![1, 2, 3], "huge-len frame truncated, prior intact");
-    assert!(!dump.records.contains_key(&4), "overrun frame never materialized");
+    assert_eq!(
+        survivors,
+        vec![1, 2, 3],
+        "huge-len frame truncated, prior intact"
+    );
+    assert!(
+        !dump.records.contains_key(&4),
+        "overrun frame never materialized"
+    );
     stop(engine);
 }
 
@@ -488,7 +552,11 @@ fn f_wal_len_below_min() {
     // Sub-min frame_len ⇒ Torn ⇒ the last frame and anything after is dropped;
     // the prior 3 frames are a dense prefix, no underflow/panic.
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
-    assert_eq!(survivors, vec![1, 2, 3], "sub-min frame_len truncated, prior intact");
+    assert_eq!(
+        survivors,
+        vec![1, 2, 3],
+        "sub-min frame_len truncated, prior intact"
+    );
     stop(engine);
 }
 
@@ -511,7 +579,10 @@ fn f_wal_crc_flip_tail() {
     // inside the CRC-protected region). This breaks the XXH3 over [4..crc_start).
     let last = *offs.last().unwrap();
     let flip_at = last + FRAME_LEN_PREFIX + FRAME_HEADER_LEN; // first body byte
-    assert!(flip_at < frame_end(&buf, last) - FRAME_CRC_LEN, "flip is inside the body");
+    assert!(
+        flip_at < frame_end(&buf, last) - FRAME_CRC_LEN,
+        "flip is inside the body"
+    );
     buf[flip_at] ^= 0x01;
     rewrite_wal_durable(&disk, &buf);
 
@@ -521,7 +592,11 @@ fn f_wal_crc_flip_tail() {
 
     // The flipped last frame fails CRC ⇒ truncated; the prior 3 survive intact.
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
-    assert_eq!(survivors, vec![1, 2, 3], "CRC-bad tail truncated, prior intact");
+    assert_eq!(
+        survivors,
+        vec![1, 2, 3],
+        "CRC-bad tail truncated, prior intact"
+    );
     // Fidelity of the survivors (the corruption did not bleed into prior frames).
     assert_eq!(dump.records[&1].data, "d1");
     assert_eq!(dump.records[&3].tag.as_deref(), Some("t3"));
@@ -544,14 +619,21 @@ fn f_wal_crc_flip_midlog() {
 
     let mut buf = read_wal_durable(&disk);
     let offs = frame_offsets(&buf);
-    assert!(offs.len() >= 6, "workload wrote >=6 frames, got {}", offs.len());
+    assert!(
+        offs.len() >= 6,
+        "workload wrote >=6 frames, got {}",
+        offs.len()
+    );
 
     // Flip a bit in the body of a MID-log frame (the 4th of 6+, i.e. seq 4). The
     // create-box frame may be first, so index by the LAST 6 (the appends).
     let appends: Vec<usize> = offs[offs.len() - 6..].to_vec();
     let mid = appends[3]; // the 4th append frame (seq 4)
     let flip_at = mid + FRAME_LEN_PREFIX + FRAME_HEADER_LEN;
-    assert!(flip_at < frame_end(&buf, mid) - FRAME_CRC_LEN, "flip is inside the body");
+    assert!(
+        flip_at < frame_end(&buf, mid) - FRAME_CRC_LEN,
+        "flip is inside the body"
+    );
     buf[flip_at] ^= 0x01;
     rewrite_wal_durable(&disk, &buf);
 
@@ -607,7 +689,14 @@ fn f_wal_zeroed_frame() {
     // frame_len==0 (< MIN_FRAME_LEN) ⇒ Torn ⇒ the zeroed region stops replay; it
     // is NOT decoded as an empty record. Prior 3 frames are a dense prefix.
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
-    assert_eq!(survivors, vec![1, 2, 3], "zeroed frame treated as end-of-data, not a record");
-    assert!(!dump.records.contains_key(&4), "zeroed region never materialized as a record");
+    assert_eq!(
+        survivors,
+        vec![1, 2, 3],
+        "zeroed frame treated as end-of-data, not a record"
+    );
+    assert!(
+        !dump.records.contains_key(&4),
+        "zeroed region never materialized as a record"
+    );
     stop(engine);
 }

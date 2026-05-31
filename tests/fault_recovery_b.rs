@@ -29,7 +29,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -146,7 +151,9 @@ fn dump_seqs(engine: &Engine, name: &str) -> (Vec<u64>, Option<String>) {
         )
         .expect("diff after recovery");
     let seqs = d.records.iter().map(|r| r.seq).collect();
-    let tomb = d.tombstone.map(|t| format!("{:?}", t.reason).to_lowercase());
+    let tomb = d
+        .tombstone
+        .map(|t| format!("{:?}", t.reason).to_lowercase());
     (seqs, tomb)
 }
 
@@ -302,7 +309,11 @@ fn f_wal_eio_open() {
         drop(engine);
     }
     // Sanity: the WAL really holds the 3 frames the recovery would read.
-    assert_eq!(recover_seqs(&disk), vec![1, 2, 3], "WAL holds real durable data");
+    assert_eq!(
+        recover_seqs(&disk),
+        vec![1, 2, 3],
+        "WAL holds real durable data"
+    );
 
     // Phase 2: reopen with EIO on EVERY open of a `wal-*.log` file (a persistently
     // unreadable WAL — the safety-critical case). Recovery reads the WAL via
@@ -491,7 +502,11 @@ fn f_wal_eio_midlog_read_recovery() {
         sync_dirs(&disk);
         drop(engine);
     }
-    assert_eq!(recover_seqs(&disk), vec![1, 2, 3, 4, 5, 6], "WAL holds 6 frames");
+    assert_eq!(
+        recover_seqs(&disk),
+        vec![1, 2, 3, 4, 5, 6],
+        "WAL holds 6 frames"
+    );
 
     // (a) PERSISTENT read fault: every read_at EIOs (a dead device). Recovery must
     //     surface the io error rather than silently committing a partial index.
@@ -544,7 +559,10 @@ fn f_wal_eio_midlog_read_recovery() {
     drop(engine);
     let engine2 = open_engine(&disk);
     let (seqs2, _t2) = dump_seqs(&engine2, "jobs");
-    assert_eq!(seqs, seqs2, "recovery is convergent/idempotent after the glitch");
+    assert_eq!(
+        seqs, seqs2,
+        "recovery is convergent/idempotent after the glitch"
+    );
 }
 
 // ===========================================================================
@@ -606,7 +624,10 @@ fn f_snap_checkpoint_ahead_of_wal() {
          no panic, no gap, no resurrection: {seqs:?}"
     );
     let st = engine.box_state("jobs", false).unwrap();
-    assert_eq!(st.head_seq, 4, "head = snapshot's materialized head, not a phantom");
+    assert_eq!(
+        st.head_seq, 4,
+        "head = snapshot's materialized head, not a phantom"
+    );
     drop(engine);
 
     // Idempotent: a second recovery over the same (checkpoint-ahead) image is
@@ -641,6 +662,8 @@ fn evict_frame(evict_floor: u64, earliest_seq: u64) -> WalRecord {
     WalRecord::EvictWatermark {
         box_id: 1,
         evict_floor,
+        // A cap-eviction frame: no TTL component (R7 split).
+        expiry_floor: 0,
         earliest_seq,
         ts: 1_700_000_000_000,
     }

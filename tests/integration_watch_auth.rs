@@ -60,7 +60,10 @@ fn wid_is_unguessable_random_capability() {
     let h = Harness::start(); // dev mode (no auth)
     h.post("/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }));
 
-    let (status, body) = h.post("/v0/watch", json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
+    let (status, body) = h.post(
+        "/v0/watch",
+        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+    );
     assert_eq!(status, StatusCode::OK);
     let wid = body["wid"].as_str().expect("wid");
 
@@ -77,7 +80,10 @@ fn wid_is_unguessable_random_capability() {
     );
 
     // Two sessions get distinct, non-sequential wids.
-    let (_, body2) = h.post("/v0/watch", json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
+    let (_, body2) = h.post(
+        "/v0/watch",
+        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+    );
     let wid2 = body2["wid"].as_str().unwrap();
     assert_ne!(wid, wid2, "wids are random/unique, not monotonic");
 }
@@ -119,7 +125,10 @@ fn stream_requires_creating_key_not_just_wid_when_auth_on() {
 fn post_watch_still_requires_auth() {
     let h = auth_harness("s3cr3t");
     // Anonymous POST /v0/watch is rejected even though the GET is capability-gated.
-    let (status, body) = h.post("/v0/watch", json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
+    let (status, body) = h.post(
+        "/v0/watch",
+        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+    );
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "unauthorized");
 }

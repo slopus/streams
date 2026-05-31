@@ -35,7 +35,12 @@
 //! assertions test real crash-consistency behaviour.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -48,10 +53,10 @@ use streams::config::{SegmentConfig, ServerConfig};
 use streams::engine::segwriter::SegmentWriter;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
+use streams::storage::Fs;
 use streams::storage::{
     data_name, BoxTier, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, Tier,
 };
-use streams::storage::Fs;
 use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
@@ -175,7 +180,7 @@ fn f_reclaim_crash_between_unlinks() {
         let data_path = PathBuf::from(HOT_DIR).join(data_name(id));
         fs.remove_file(&data_path).unwrap(); // unlink .data ...
         sync_all_dirs(&disk); // ... and make the unlink durable.
-        // ... crash here, before the .idx unlink ...
+                              // ... crash here, before the .idx unlink ...
         disk.crash(TornDamage::None);
     }
     disk.reset_power();
@@ -204,7 +209,9 @@ fn f_reclaim_crash_between_unlinks() {
     // The next reclaim is idempotent and removes the leftover `.idx`: a plain
     // `delete()` tolerates the already-missing `.data` (NotFound) and unlinks the
     // surviving `.idx`.
-    tier.hot().delete(id).expect("delete idempotent over a half-unlinked segment");
+    tier.hot()
+        .delete(id)
+        .expect("delete idempotent over a half-unlinked segment");
     sync_all_dirs(&disk);
     let tier = rederive(&disk);
     assert!(
@@ -219,7 +226,8 @@ fn f_reclaim_crash_between_unlinks() {
         let tier = open_tier(&disk);
         seal_hot(&tier, &disk, id, 3);
         let fs = disk.arc();
-        fs.remove_file(&PathBuf::from(HOT_DIR).join(data_name(id))).unwrap();
+        fs.remove_file(&PathBuf::from(HOT_DIR).join(data_name(id)))
+            .unwrap();
         sync_all_dirs(&disk);
         disk.crash(TornDamage::None);
     }
@@ -234,7 +242,11 @@ fn f_reclaim_crash_between_unlinks() {
         !tier.hot().exists(id, SegmentPart::Idx),
         "orphan sweep removed the below-floor stray .idx (dropped={dropped})"
     );
-    assert_eq!(run_orphan_sweep(&tier, id + 10), 0, "idempotent second sweep finds nothing");
+    assert_eq!(
+        run_orphan_sweep(&tier, id + 10),
+        0,
+        "idempotent second sweep finds nothing"
+    );
 }
 
 // ===========================================================================
@@ -274,20 +286,41 @@ fn f_reclaim_orphan_below_floor() {
     // orphan sweep must drop the two dead below-floor files (in BOTH tiers) and
     // leave the registered live segs 3,4 untouched.
     let tier = rederive(&disk);
-    assert!(tier.hot().exists(1, SegmentPart::Data), "orphan 1 present pre-sweep");
-    assert!(tier.cold().unwrap().exists(2, SegmentPart::Data), "orphan 2 (cold) present");
+    assert!(
+        tier.hot().exists(1, SegmentPart::Data),
+        "orphan 1 present pre-sweep"
+    );
+    assert!(
+        tier.cold().unwrap().exists(2, SegmentPart::Data),
+        "orphan 2 (cold) present"
+    );
 
     let dropped = run_orphan_sweep(&tier, /*live_floor=*/ 3);
     sync_all_dirs(&disk);
-    assert_eq!(dropped, 2, "two orphan segment ids (1,2) reclaimed below floor 3");
+    assert_eq!(
+        dropped, 2,
+        "two orphan segment ids (1,2) reclaimed below floor 3"
+    );
 
     let tier = rederive(&disk);
     assert_eq!(tier.resolve(1), None, "orphan 1 dropped in both tiers");
     assert_eq!(tier.resolve(2), None, "orphan 2 dropped in both tiers");
-    assert_eq!(tier.resolve(3), Some(Tier::Hot), "live registered seg 3 kept");
-    assert_eq!(tier.resolve(4), Some(Tier::Hot), "live registered seg 4 kept");
+    assert_eq!(
+        tier.resolve(3),
+        Some(Tier::Hot),
+        "live registered seg 3 kept"
+    );
+    assert_eq!(
+        tier.resolve(4),
+        Some(Tier::Hot),
+        "live registered seg 4 kept"
+    );
     // Idempotent: a second sweep at the same floor finds nothing.
-    assert_eq!(run_orphan_sweep(&tier, 3), 0, "idempotent second sweep finds nothing");
+    assert_eq!(
+        run_orphan_sweep(&tier, 3),
+        0,
+        "idempotent second sweep finds nothing"
+    );
 }
 
 // ===========================================================================
@@ -340,12 +373,23 @@ fn f_reclaim_eio_unlink() {
     let dropped = run_orphan_sweep(&tier, id + 10);
     sync_all_dirs(&disk);
     let tier = rederive(&disk);
-    assert_eq!(dropped, 1, "the next sweep retries and reclaims the dead segment");
-    assert_eq!(tier.resolve(id), None, "segment gone after the retried unlink");
+    assert_eq!(
+        dropped, 1,
+        "the next sweep retries and reclaims the dead segment"
+    );
+    assert_eq!(
+        tier.resolve(id),
+        None,
+        "segment gone after the retried unlink"
+    );
     assert!(!tier.hot().exists(id, SegmentPart::Data));
     assert!(!tier.hot().exists(id, SegmentPart::Idx));
     // Idempotent: nothing left to reclaim.
-    assert_eq!(run_orphan_sweep(&tier, id + 10), 0, "no resurrection; idempotent");
+    assert_eq!(
+        run_orphan_sweep(&tier, id + 10),
+        0,
+        "no resurrection; idempotent"
+    );
 }
 
 // ===========================================================================
@@ -500,7 +544,13 @@ fn f_reclaim_delete_never_resurrects() {
         append(&engine, "jobs", "e", Some("keep"));
         // Voluntary prefix delete: removes seqs 1,2 (silent, front-prefix).
         engine
-            .delete("jobs", DeleteRequest { before_seq: Some(3), match_: None })
+            .delete(
+                "jobs",
+                DeleteRequest {
+                    before_seq: Some(3),
+                    match_: None,
+                },
+            )
             .expect("prefix delete acks (WAL frame fsync'd)");
         // Tag delete: removes seq 4 ("drop").
         engine
@@ -533,7 +583,10 @@ fn f_reclaim_delete_never_resurrects() {
             "a voluntary delete is SILENT — no tombstone for the deleted prefix"
         );
         // delete_floor preserved: earliest jumps to the prefix-delete boundary (3).
-        assert_eq!(d.earliest, 3, "delete_floor recovered ⇒ earliest at the boundary");
+        assert_eq!(
+            d.earliest, 3,
+            "delete_floor recovered ⇒ earliest at the boundary"
+        );
         d
     };
 
@@ -543,7 +596,10 @@ fn f_reclaim_delete_never_resurrects() {
         let engine = open_engine(&disk);
         dump_box(&engine, "jobs").expect("jobs survives recovery #2")
     };
-    assert_eq!(d1, d2, "recover(recover(x)) == recover(x); deletes never resurrect");
+    assert_eq!(
+        d1, d2,
+        "recover(recover(x)) == recover(x); deletes never resurrect"
+    );
 }
 
 // ===========================================================================
@@ -573,7 +629,13 @@ fn f_reclaim_front_prefix() {
             append(&engine, "jobs", &i.to_string(), None);
         }
         engine
-            .delete("jobs", DeleteRequest { before_seq: Some(4), match_: None })
+            .delete(
+                "jobs",
+                DeleteRequest {
+                    before_seq: Some(4),
+                    match_: None,
+                },
+            )
             .expect("front-prefix delete acks");
         sync_wal_dir(&disk);
         disk.crash(TornDamage::None);
@@ -585,8 +647,15 @@ fn f_reclaim_front_prefix() {
 
     // earliest_seq recovered to the delete boundary (4); the deleted prefix is gone
     // and SILENT (no tombstone); count/head consistent.
-    assert_eq!(d.seqs, vec![4, 5, 6], "the deleted front prefix [1..=3] stays gone");
-    assert_eq!(d.earliest, 4, "earliest_seq recovers to the delete boundary");
+    assert_eq!(
+        d.seqs,
+        vec![4, 5, 6],
+        "the deleted front prefix [1..=3] stays gone"
+    );
+    assert_eq!(
+        d.earliest, 4,
+        "earliest_seq recovers to the delete boundary"
+    );
     assert_eq!(d.head, 6, "head consistent");
     assert_eq!(d.count, 3, "count == surviving live records (4,5,6)");
     assert!(
@@ -599,5 +668,8 @@ fn f_reclaim_front_prefix() {
     // Idempotent recovery: the boundary stays put across a second recovery.
     let engine2 = open_engine(&disk);
     let d2 = dump_box(&engine2, "jobs").expect("jobs survives recovery #2");
-    assert_eq!(d, d2, "front-prefix boundary stable across repeated recovery");
+    assert_eq!(
+        d, d2,
+        "front-prefix boundary stable across repeated recovery"
+    );
 }

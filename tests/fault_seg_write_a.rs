@@ -28,7 +28,12 @@
 //! minute. Self-verify: `cargo test --features test-fs --test fault_seg_write_a`.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,9 +174,15 @@ fn f_seg_crash_before_dirfsync() {
     //     We model that by re-materializing (the "next seal") onto the recovered
     //     store and confirming it now lands durably and reads back byte-identical.
     let store2 = store_on(&disk); // healthy FS this time (no fault wrapper).
-    store2.put(1, &data, &idx).expect("re-seal lands on a healthy FS");
+    store2
+        .put(1, &data, &idx)
+        .expect("re-seal lands on a healthy FS");
     sync_store_dir(&disk);
-    assert_eq!(store2.list().unwrap(), vec![1], "re-materialized segment is listable");
+    assert_eq!(
+        store2.list().unwrap(),
+        vec![1],
+        "re-materialized segment is listable"
+    );
     let recs = read_segment_records(&store2, 1, 1, 4).expect("re-sealed segment decodes");
     assert_eq!(recs.len(), 4, "all 4 records re-materialize");
     assert_eq!(recs[0].seq, 1);
@@ -182,7 +193,11 @@ fn f_seg_crash_before_dirfsync() {
     //     stays a single listed segment (no duplication, no growth).
     store2.put(1, &data, &idx).expect("re-put same id is fine");
     sync_store_dir(&disk);
-    assert_eq!(store2.list().unwrap(), vec![1], "still exactly one segment after re-put");
+    assert_eq!(
+        store2.list().unwrap(),
+        vec![1],
+        "still exactly one segment after re-put"
+    );
     assert_eq!(
         store2.read_all(1, SegmentPart::Data).unwrap(),
         data,
@@ -228,8 +243,14 @@ fn f_seg_eio_data_write() {
 
     // The failed put published NOTHING: no `.data`, no `.idx`, the segment is not
     // listed — the store is byte-for-byte as it was before the failed seal.
-    assert!(!store.exists(1, SegmentPart::Data), "no .data after a failed put");
-    assert!(!store.exists(1, SegmentPart::Idx), "no .idx after a failed put");
+    assert!(
+        !store.exists(1, SegmentPart::Data),
+        "no .data after a failed put"
+    );
+    assert!(
+        !store.exists(1, SegmentPart::Idx),
+        "no .idx after a failed put"
+    );
     assert_eq!(store.list().unwrap(), Vec::<u64>::new(), "nothing listed");
 
     // seal_active's CONTRACT on a put Err: report no sealed seqs (so the caller
@@ -246,12 +267,18 @@ fn f_seg_eio_data_write() {
     // WAL-IS-TRUTH + READ-PATH-CORRECT: a healthy retry seals the same range and
     // the records read back intact (the EIO was fail-once, so the next put works).
     let store_ok = store_on(&disk);
-    store_ok.put(1, &data, &idx).expect("retry seal succeeds on a healthy device");
+    store_ok
+        .put(1, &data, &idx)
+        .expect("retry seal succeeds on a healthy device");
     sync_store_dir(&disk);
     let recs = read_segment_records(&store_ok, 1, 1, 3).expect("retried segment decodes");
     assert_eq!(recs.len(), 3);
     for (i, r) in recs.iter().enumerate() {
-        assert_eq!(r.seq, 1 + i as u64, "records intact + contiguous after retry");
+        assert_eq!(
+            r.seq,
+            1 + i as u64,
+            "records intact + contiguous after retry"
+        );
     }
 }
 
@@ -285,7 +312,9 @@ fn f_seg_torn_data_frame() {
 
     // Write the `.idx` durably (it survives intact, still describing every frame).
     {
-        let mut f = fs.open(&idx_path, streams::storage::OpenOpts::create_truncate()).unwrap();
+        let mut f = fs
+            .open(&idx_path, streams::storage::OpenOpts::create_truncate())
+            .unwrap();
         let mut off = 0usize;
         while off < idx.len() {
             off += f.write_at(off as u64, &idx[off..]).unwrap();
@@ -295,7 +324,9 @@ fn f_seg_torn_data_frame() {
     // Write the `.data` as ONE pending write, then crash with a prefix-truncate
     // tear: only a strict prefix of `.data` lands durable — the last frame torn.
     {
-        let mut f = fs.open(&data_path, streams::storage::OpenOpts::create_truncate()).unwrap();
+        let mut f = fs
+            .open(&data_path, streams::storage::OpenOpts::create_truncate())
+            .unwrap();
         let mut off = 0usize;
         while off < data.len() {
             off += f.write_at(off as u64, &data[off..]).unwrap();
@@ -387,12 +418,16 @@ fn f_seg_crc_corrupt_data() {
     let data_path = PathBuf::from(ROOT).join(data_name(1));
     let fs = disk.arc();
     {
-        let f = fs.open(&data_path, streams::storage::OpenOpts::rw_existing()).unwrap();
+        let f = fs
+            .open(&data_path, streams::storage::OpenOpts::rw_existing())
+            .unwrap();
         let mut one = [0u8; 1];
         let n = f.read_at(flip_off, &mut one).unwrap();
         assert_eq!(n, 1, "byte to flip is within .data");
         drop(f);
-        let mut f = fs.open(&data_path, streams::storage::OpenOpts::rw_existing()).unwrap();
+        let mut f = fs
+            .open(&data_path, streams::storage::OpenOpts::rw_existing())
+            .unwrap();
         one[0] ^= 0xFF; // single-byte (multi-bit) flip — bit-rot.
         f.write_at(flip_off, &one).unwrap();
         f.sync_all().unwrap(); // the rot is now durable.
@@ -467,7 +502,11 @@ fn f_seg_put_overwrite_idempotent() {
             "the re-materialized .data is byte-identical by construction"
         );
         let store = tier.hot();
-        assert_eq!(store.list().unwrap(), vec![1], "exactly one segment, no duplication");
+        assert_eq!(
+            store.list().unwrap(),
+            vec![1],
+            "exactly one segment, no duplication"
+        );
         assert_eq!(
             store.read_all(1, SegmentPart::Data).unwrap(),
             data_before,
@@ -494,7 +533,11 @@ fn f_seg_put_overwrite_idempotent() {
 
         // Recovery re-materialize resolves the id: it is in COLD, so seal_active
         // records Tier::Cold and SKIPS the put — it must NOT pull cold back to hot.
-        assert_eq!(tier.resolve(1), Some(Tier::Cold), "id resolves to COLD, not HOT");
+        assert_eq!(
+            tier.resolve(1),
+            Some(Tier::Cold),
+            "id resolves to COLD, not HOT"
+        );
         assert!(
             !tier.hot().exists(1, SegmentPart::Data),
             "re-seal must NOT pull the cold segment back into the HOT tier"

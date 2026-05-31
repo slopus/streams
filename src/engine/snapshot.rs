@@ -201,7 +201,9 @@ fn capture_box(b: &BoxState) -> SnapshotBox {
             node: slot.node,
             tag: slot.tag,
             data_json: serde_json::to_vec(&data).unwrap_or_default(),
-            meta_json: meta.as_ref().map(|m| serde_json::to_vec(m).unwrap_or_default()),
+            meta_json: meta
+                .as_ref()
+                .map(|m| serde_json::to_vec(m).unwrap_or_default()),
             bytes: slot.bytes,
         });
     }
@@ -290,7 +292,11 @@ pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
         let mut graph = engine.routers.lock();
         for sr in snapshot.routers {
             let filter = sr.filter.map(|(op, value)| Filter {
-                op: if op == 0 { FilterOp::Eq } else { FilterOp::Glob },
+                op: if op == 0 {
+                    FilterOp::Eq
+                } else {
+                    FilterOp::Glob
+                },
                 value,
             });
             let router = Router {
@@ -361,24 +367,15 @@ fn restore_box(sb: SnapshotBox, config: BoxConfig) -> BoxState {
         floors.delete_floor = sb.delete_floor;
     }
     state.head_seq.store(sb.head_seq, Ordering::Release);
-    state.bytes_retained.store(sb.bytes_retained, Ordering::Relaxed);
+    // The snapshot's head is durable, so the reservation ceiling starts there
+    // (R3); a later replayed `HeadWatermark` may raise it further.
+    state.set_reserved_head(sb.head_seq);
+    state
+        .bytes_retained
+        .store(sb.bytes_retained, Ordering::Relaxed);
     state.live_count.store(sb.live_count, Ordering::Relaxed);
 
     state
 }
 
-/// A lightweight deleted-hole slot used to keep `seq - base_seq` indexing dense
-/// when a snapshot's live records have seq gaps (middle deletes not yet
-/// reclaimed at snapshot time).
-fn deleted_hole() -> StoredRecord {
-    StoredRecord {
-        ts: 0,
-        node: None,
-        tag: None,
-        data: serde_json::Value::Null,
-        meta: None,
-        bytes: 0,
-        deleted: true,
-        payload_resident: true,
-    }
-}
+use crate::engine::box_state::deleted_hole;

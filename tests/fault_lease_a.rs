@@ -27,7 +27,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -254,14 +259,24 @@ fn f_lease_nondurable_selfheal() {
     // Recover: no lease frames ⇒ the projection is empty ⇒ all 4 jobs claimable.
     let engine = open_engine(&disk);
     let (count, ready, in_flight) = queue_dump(&engine, "jobs");
-    assert_eq!(count, 4, "durable jobs log preserved all 4 jobs (none lost)");
-    assert_eq!(in_flight, 0, "no replayed lease ⇒ nothing in flight (self-heal)");
+    assert_eq!(
+        count, 4,
+        "durable jobs log preserved all 4 jobs (none lost)"
+    );
+    assert_eq!(
+        in_flight, 0,
+        "no replayed lease ⇒ nothing in flight (self-heal)"
+    );
     assert_eq!(ready, 4, "every in-flight job is claimable again");
 
     // Draining the queue yields exactly the 4 produced seqs, each once — no job
     // lost, no duplicate live record.
     let drained = drain_claimable(&engine, "jobs", "w-new");
-    assert_eq!(drained, vec![1, 2, 3, 4], "self-heal: all jobs reclaimable, no dup/loss");
+    assert_eq!(
+        drained,
+        vec![1, 2, 3, 4],
+        "self-heal: all jobs reclaimable, no dup/loss"
+    );
 }
 
 // ===========================================================================
@@ -321,8 +336,14 @@ fn f_lease_torn_event() {
         // and held + ready partitions the live set (no double-claim).
         let engine = open_engine(&disk);
         let (count, ready, in_flight) = queue_dump(&engine, "jobs");
-        assert_eq!(count, 2, "{damage:?}: durable jobs log intact (no job lost)");
-        assert!(in_flight <= count, "{damage:?}: in_flight {in_flight} <= count {count}");
+        assert_eq!(
+            count, 2,
+            "{damage:?}: durable jobs log intact (no job lost)"
+        );
+        assert!(
+            in_flight <= count,
+            "{damage:?}: in_flight {in_flight} <= count {count}"
+        );
         assert!(
             in_flight + ready <= count,
             "{damage:?}: in_flight {in_flight} + ready {ready} <= count {count} (no double-claim)"
@@ -337,7 +358,8 @@ fn f_lease_torn_event() {
         let engine = open_engine_at(&disk, BOOT_MS + 10_000_000);
         let drained = drain_claimable(&engine, "jobs", "w-heal");
         assert_eq!(
-            drained, vec![1, 2],
+            drained,
+            vec![1, 2],
             "{damage:?}: torn lease self-heals; all jobs reclaimable, no dup/loss"
         );
     }
@@ -383,7 +405,10 @@ fn f_lease_ack_crash() {
     // redelivered. The Lease(Acked) replay drops any lease state for it.
     let engine = open_engine(&disk);
     let (count, ready, in_flight) = queue_dump(&engine, "jobs");
-    assert_eq!(count, 2, "the acked job stays deleted after recovery (no resurrect)");
+    assert_eq!(
+        count, 2,
+        "the acked job stays deleted after recovery (no resurrect)"
+    );
     assert_eq!(in_flight, 0, "no live lease after recovery");
     assert_eq!(ready, 2, "exactly the two un-acked jobs are claimable");
 
@@ -393,7 +418,11 @@ fn f_lease_ack_crash() {
         !drained.contains(&acked_seq),
         "acked seq {acked_seq} must never be redelivered, got {drained:?}"
     );
-    assert_eq!(drained.len(), 2, "only the two surviving jobs are claimable");
+    assert_eq!(
+        drained.len(),
+        2,
+        "only the two surviving jobs are claimable"
+    );
 
     // No double-ack: re-acking the gone seq is a silent skip, not a second effect.
     let a2 = engine.ack("jobs", "w1", &[acked_seq]).unwrap();
@@ -459,7 +488,8 @@ fn f_lease_reorder_events() {
         let engine = open_engine_at(&disk, BOOT_MS + 10_000_000);
         let drained = drain_claimable(&engine, "jobs", "w-final");
         assert_eq!(
-            drained, vec![1, 2],
+            drained,
+            vec![1, 2],
             "{damage:?}: reordered/lost lease event ⇒ widened claimability only, \
              no dup/loss"
         );

@@ -17,7 +17,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -329,8 +334,7 @@ fn last_frame_span(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut pos = 0usize;
     let mut last: Option<(usize, usize)> = None;
     while pos + FRAME_LEN_PREFIX <= bytes.len() {
-        let frame_len =
-            u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let frame_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         if frame_len < 30 + 8 {
             break; // sub-minimum / preallocated zeros ⇒ end of real frames.
         }
@@ -372,7 +376,11 @@ fn f_wal_crash_after_write_pre_fsync() {
 
     let seqs = recover_seqs(&disk);
     // The two fsynced frames survive; the pre-fsync frame 3 is gone. Dense prefix.
-    assert_eq!(seqs, vec![1, 2], "acked frames survive; pre-fsync batch dropped");
+    assert_eq!(
+        seqs,
+        vec![1, 2],
+        "acked frames survive; pre-fsync batch dropped"
+    );
 }
 
 // ===========================================================================
@@ -398,7 +406,11 @@ fn f_wal_crash_after_fsync() {
     drop(wal);
 
     let seqs = recover_seqs(&disk);
-    assert_eq!(seqs, vec![1, 2, 3, 4, 5], "every acked-after-fsync frame survives");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3, 4, 5],
+        "every acked-after-fsync frame survives"
+    );
 }
 
 // ===========================================================================
@@ -471,10 +483,13 @@ fn f_compound_fsync_fail_then_crash() {
     // later fsync can land the buffered bytes. The failed batch poisons in-flight.
     let faulty = FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, true);
     {
-        let engine = Engine::with_data_dir_fs(cfg(), clock(), faulty.arc())
-            .expect("reopen through faultfs");
+        let engine =
+            Engine::with_data_dir_fs(cfg(), clock(), faulty.arc()).expect("reopen through faultfs");
         let res = engine.write("c", one_write("4"), true);
-        assert!(res.is_err(), "the fsync-failing durable append is not acked");
+        assert!(
+            res.is_err(),
+            "the fsync-failing durable append is not acked"
+        );
         // Crash: the buffered frame-4 bytes were never durably fsynced (the only
         // fsync that touched them errored). They vanish.
         disk.crash(TornDamage::None);
@@ -515,14 +530,21 @@ fn f_wal_crc_flip_tail() {
     // Flip one bit in the middle of the last frame's body (after the header,
     // before the CRC) so the stored CRC no longer matches.
     let flip_at = start + FRAME_LEN_PREFIX + 30 + 1; // inside the body region.
-    assert!(flip_at < start + total - 8, "flip lands inside the body, not the CRC");
+    assert!(
+        flip_at < start + total - 8,
+        "flip lands inside the body, not the CRC"
+    );
     let mut poison = bytes[flip_at];
     poison ^= 0x40;
     poke_durable(&disk, &path, flip_at as u64, &[poison]);
 
     let seqs = recover_seqs(&disk);
     // The 5th frame fails CRC and truncates; 1..=4 survive as a dense prefix.
-    assert_eq!(seqs, vec![1, 2, 3, 4], "CRC-flipped tail frame truncates; prior intact");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3, 4],
+        "CRC-flipped tail frame truncates; prior intact"
+    );
 }
 
 // ===========================================================================
@@ -658,16 +680,26 @@ fn f_rec_run_twice_identical() {
         drop(engine);
     }
 
-    assert_eq!(first_b, second_b, "recover(recover(x)) == recover(x) for box b");
+    assert_eq!(
+        first_b, second_b,
+        "recover(recover(x)) == recover(x) for box b"
+    );
     assert_eq!(
         first_cap, second_cap,
         "recover(recover(x)) == recover(x) for the capped box"
     );
     // Spot-check the concrete state: prefix delete removed 1,2; 3,4,5 remain.
-    assert_eq!(first_b.records.keys().copied().collect::<Vec<_>>(), vec![3, 4, 5]);
+    assert_eq!(
+        first_b.records.keys().copied().collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
     // cap=2 ⇒ only the newest two survive, with a cap tombstone.
     assert_eq!(first_cap.records.len(), 2, "cap window of 2 survives");
-    assert_eq!(first_cap.tombstone.as_deref(), Some("cap"), "cap tombstone persists");
+    assert_eq!(
+        first_cap.tombstone.as_deref(),
+        Some("cap"),
+        "cap tombstone persists"
+    );
 }
 
 // ===========================================================================
@@ -678,9 +710,7 @@ fn f_rec_run_twice_identical() {
 // ===========================================================================
 #[test]
 fn f_snap_crash_after_tmp_before_rename() {
-    use streams::storage::snapshot::{
-        load_latest_with, write_snapshot_with, Checkpoint, Snapshot,
-    };
+    use streams::storage::snapshot::{load_latest_with, write_snapshot_with, Checkpoint, Snapshot};
     use streams::storage::OpenOpts as OO;
 
     let disk = FakeDisk::new();
@@ -742,7 +772,10 @@ fn f_snap_crash_after_tmp_before_rename() {
     let loaded = load_latest_with(&fs, &data_dir)
         .unwrap()
         .expect("a valid snapshot still loads");
-    assert_eq!(loaded.id, 1, "stray .tmp ignored; previous snapshot #1 loads");
+    assert_eq!(
+        loaded.id, 1,
+        "stray .tmp ignored; previous snapshot #1 loads"
+    );
     assert_eq!(loaded.checkpoint.last_checkpoint_seq, 100);
 }
 
@@ -799,8 +832,8 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     }
     fs.sync_dir(&meta).unwrap(); // tmp name durable.
     fs.rename(&tmp, &fin).unwrap(); // rename issued...
-    // ...but NO sync_dir of meta here. Crash: the rename is un-fsynced ⇒ rolls back
-    // to the durable namespace (which has snapshot-1.bin, not snapshot-2.bin).
+                                    // ...but NO sync_dir of meta here. Crash: the rename is un-fsynced ⇒ rolls back
+                                    // to the durable namespace (which has snapshot-1.bin, not snapshot-2.bin).
     disk.crash(TornDamage::None);
 
     // Exactly one valid snapshot loads. The rolled-back rename means #1 loads; had
@@ -815,7 +848,10 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     );
     // FakeDisk's rename-durable-only-after-sync_dir model rolls the un-fsynced
     // rename back, so the previous snapshot #1 is what survives here.
-    assert_eq!(loaded.id, 1, "un-dir-fsynced rename rolls back ⇒ previous snapshot #1");
+    assert_eq!(
+        loaded.id, 1,
+        "un-dir-fsynced rename rolls back ⇒ previous snapshot #1"
+    );
     assert_eq!(loaded.checkpoint.last_checkpoint_seq, 100);
 }
 
@@ -958,6 +994,9 @@ fn f_cold_crash_after_copy_before_flip() {
         .expect("data frame readable");
     let rec = decode_data_frame(&frame).expect("frame decodes");
     assert_eq!(rec.seq, 1);
-    assert_eq!(rec.data, b"h1", "the relocated record is intact and readable from HOT");
+    assert_eq!(
+        rec.data, b"h1",
+        "the relocated record is intact and readable from HOT"
+    );
     let _ = (data_name(1), idx_name(1));
 }

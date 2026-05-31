@@ -567,9 +567,7 @@ impl<'de> Deserialize<'de> for Filter {
                     ));
                 }
                 if v[0] != "tag" {
-                    return Err(serde::de::Error::custom(
-                        "filter field must be \"tag\"",
-                    ));
+                    return Err(serde::de::Error::custom("filter field must be \"tag\""));
                 }
                 match v[1].as_str() {
                     "Eq" => Ok(Filter {
@@ -706,6 +704,13 @@ pub struct ClaimResponse {
 pub struct AckRequest {
     pub node: String,
     pub seqs: Vec<u64>,
+    /// Optional per-seq delivery tokens (R4 stale-worker fencing). When present,
+    /// `lease_ids[i]` must be the `lease_id` handed out for `seqs[i]` at claim
+    /// time, or that seq is rejected (skipped) — a worker reusing the same `node`
+    /// after its lease expired cannot ack a *newer* delivery. Omit for the legacy
+    /// node-only match (`/v0` back-compat). Length must equal `seqs` if present.
+    #[serde(default)]
+    pub lease_ids: Vec<String>,
 }
 
 /// Response for `POST /v0/boxes/:q/ack`.
@@ -727,6 +732,10 @@ pub struct NackRequest {
     pub seqs: Vec<u64>,
     #[serde(default)]
     pub delay_ms: u64,
+    /// Optional per-seq delivery tokens (R4 stale-worker fencing); see
+    /// [`AckRequest::lease_ids`]. Length must equal `seqs` if present.
+    #[serde(default)]
+    pub lease_ids: Vec<String>,
 }
 
 /// Response for `POST /v0/boxes/:q/nack`.
@@ -747,6 +756,10 @@ pub struct ExtendRequest {
     pub node: String,
     pub seqs: Vec<u64>,
     pub lease_ms: u64,
+    /// Optional per-seq delivery tokens (R4 stale-worker fencing); see
+    /// [`AckRequest::lease_ids`]. Length must equal `seqs` if present.
+    #[serde(default)]
+    pub lease_ids: Vec<String>,
 }
 
 /// Response for `POST /v0/boxes/:q/extend`.

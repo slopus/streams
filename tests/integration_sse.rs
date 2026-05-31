@@ -135,7 +135,11 @@ fn write(h: &Harness, box_name: &str, body: Value) -> Value {
 /// Create a watch session over `boxes`, returning `(stream_url, response-body)`.
 fn create_watch(h: &Harness, body: Value) -> (String, Value) {
     let (status, resp) = h.post("/v0/watch", body);
-    assert_eq!(status, StatusCode::OK, "POST /v0/watch should be 200: {resp}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POST /v0/watch should be 200: {resp}"
+    );
     let url = resp["stream_url"]
         .as_str()
         .expect("stream_url present")
@@ -229,7 +233,11 @@ fn watch_create_returns_wid_and_per_box_watermarks() {
     let h = Harness::start();
 
     // Seed two boxes with differing backlogs.
-    write(&h, "jobs", json!({ "records": [{ "data": 1 }, { "data": 2 }, { "data": 3 }] }));
+    write(
+        &h,
+        "jobs",
+        json!({ "records": [{ "data": 1 }, { "data": 2 }, { "data": 3 }] }),
+    );
     write(&h, "events", json!({ "records": [{ "data": "a" }] }));
 
     let (status, body) = h.post(
@@ -246,7 +254,8 @@ fn watch_create_returns_wid_and_per_box_watermarks() {
     let wid = body["wid"].as_str().expect("wid");
     assert!(wid.starts_with("wid_"), "wid should be prefixed: {wid}");
     assert_eq!(
-        body["stream_url"], json!(format!("/v0/watch/{wid}")),
+        body["stream_url"],
+        json!(format!("/v0/watch/{wid}")),
         "stream_url is /v0/watch/<wid>"
     );
     assert!(body["session_ttl_ms"].as_u64().unwrap() > 0);
@@ -272,7 +281,10 @@ fn watch_create_rejects_empty_boxes_and_unknown_box() {
     assert_eq!(body["error"]["code"], "invalid_request");
 
     // Unknown box → 404 box_not_found (no `?lenient=true`).
-    let (status, body) = h.post("/v0/watch", json!({ "boxes": { "ghost": { "from_seq": 0 } } }));
+    let (status, body) = h.post(
+        "/v0/watch",
+        json!({ "boxes": { "ghost": { "from_seq": 0 } } }),
+    );
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "box_not_found");
 }
@@ -303,8 +315,16 @@ fn stream_delivers_record_and_caught_up_with_composite_id() {
     assert_eq!(body["boxes"]["jobs"]["head_seq"], 2);
 
     let frames = h.sse_frames(&url, 2, SHORT);
-    assert!(events(&frames).contains(&"record"), "got {:?}", events(&frames));
-    assert!(events(&frames).contains(&"caught-up"), "got {:?}", events(&frames));
+    assert!(
+        events(&frames).contains(&"record"),
+        "got {:?}",
+        events(&frames)
+    );
+    assert!(
+        events(&frames).contains(&"caught-up"),
+        "got {:?}",
+        events(&frames)
+    );
 
     // The `record` frame carries the documented batch shape.
     let rec = find(&frames, "record");
@@ -314,7 +334,11 @@ fn stream_delivers_record_and_caught_up_with_composite_id() {
     assert_eq!(d["to_seq"], 2);
     assert_eq!(d["head_seq"], 2);
     let records = d["records"].as_array().unwrap();
-    assert_eq!(records.len(), 2, "both backlog records batched into one frame");
+    assert_eq!(
+        records.len(),
+        2,
+        "both backlog records batched into one frame"
+    );
     assert_eq!(records[0]["$seq"], 1);
     assert_eq!(records[0]["$tag"], "t-1", "include_tags=true surfaces $tag");
     assert_eq!(records[0]["$node"], "writer-1", "origin $node present");
@@ -323,7 +347,11 @@ fn stream_delivers_record_and_caught_up_with_composite_id() {
 
     // The data-bearing frame's composite id decodes to the post-batch cursor.
     assert!(!rec.id.is_empty());
-    assert_eq!(decode_id(&rec.id)["jobs"], 2, "id advances cursor to to_seq");
+    assert_eq!(
+        decode_id(&rec.id)["jobs"],
+        2,
+        "id advances cursor to to_seq"
+    );
 
     // caught-up reports the head and is one-per-backlog→tailing transition.
     let cu = find(&frames, "caught-up");
@@ -334,7 +362,11 @@ fn stream_delivers_record_and_caught_up_with_composite_id() {
 #[test]
 fn include_data_false_yields_metadata_only_frames() {
     let h = Harness::start();
-    write(&h, "feed", json!({ "records": [{ "data": { "big": "payload" }, "tag": "x" }] }));
+    write(
+        &h,
+        "feed",
+        json!({ "records": [{ "data": { "big": "payload" }, "tag": "x" }] }),
+    );
 
     let (url, _) = create_watch(
         &h,
@@ -345,7 +377,10 @@ fn include_data_false_yields_metadata_only_frames() {
     let r0 = &data_of(&rec)["records"][0];
     assert_eq!(r0["$seq"], 1);
     assert_eq!(r0["$tag"], "x");
-    assert!(r0.get("data").is_none(), "include_data=false omits data: {r0}");
+    assert!(
+        r0.get("data").is_none(),
+        "include_data=false omits data: {r0}"
+    );
 }
 
 // ===========================================================================
@@ -356,7 +391,11 @@ fn include_data_false_yields_metadata_only_frames() {
 fn tail_subscription_skips_backlog_and_delivers_new_records() {
     let h = Harness::start();
     // Backlog the writer should NOT see on a tail subscription.
-    write(&h, "live", json!({ "records": [{ "data": 1 }, { "data": 2 }] }));
+    write(
+        &h,
+        "live",
+        json!({ "records": [{ "data": 1 }, { "data": 2 }] }),
+    );
 
     let (url, body) = create_watch(&h, json!({ "boxes": { "live": { "tail": true } } }));
     assert_eq!(body["boxes"]["live"]["from_seq"], 2, "tail starts at head");
@@ -402,9 +441,18 @@ fn tail_subscription_skips_backlog_and_delivers_new_records() {
     write(&h, "live", json!({ "records": [{ "data": 3 }] }));
 
     let text = handle.join().unwrap();
-    assert!(text.contains("event: record") || text.contains("event:record"), "no record frame: {text}");
-    assert!(text.contains("\"$seq\":3"), "tail must deliver new seq 3: {text}");
-    assert!(!text.contains("\"$seq\":1"), "tail must NOT replay backlog seq 1: {text}");
+    assert!(
+        text.contains("event: record") || text.contains("event:record"),
+        "no record frame: {text}"
+    );
+    assert!(
+        text.contains("\"$seq\":3"),
+        "tail must deliver new seq 3: {text}"
+    );
+    assert!(
+        !text.contains("\"$seq\":1"),
+        "tail must NOT replay backlog seq 1: {text}"
+    );
 }
 
 // ===========================================================================
@@ -477,7 +525,11 @@ fn stream_rejects_non_event_stream_accept() {
     );
     // The error body carries the canonical code.
     let body: Value = serde_json::from_str(&raw.text).unwrap_or(Value::Null);
-    assert_eq!(body["error"]["code"], "not_acceptable", "body: {}", raw.text);
+    assert_eq!(
+        body["error"]["code"], "not_acceptable",
+        "body: {}",
+        raw.text
+    );
 }
 
 // ===========================================================================
@@ -487,7 +539,11 @@ fn stream_rejects_non_event_stream_accept() {
 #[test]
 fn last_event_id_resume_rewinds_and_redelivers() {
     let h = Harness::start();
-    write(&h, "jobs", json!({ "records": [{ "data": 1 }, { "data": 2 }, { "data": 3 }] }));
+    write(
+        &h,
+        "jobs",
+        json!({ "records": [{ "data": 1 }, { "data": 2 }, { "data": 3 }] }),
+    );
     let (url, _) = create_watch(&h, json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
 
     // First connection drains the whole backlog; its record frame's id is the
@@ -580,7 +636,10 @@ fn deleted_prefix_is_silent_in_stream_no_tombstone() {
     assert_eq!(del["earliest_seq"], 3);
 
     let (url, body) = create_watch(&h, json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
-    assert_eq!(body["boxes"]["jobs"]["earliest_seq"], 3, "earliest advanced past delete");
+    assert_eq!(
+        body["boxes"]["jobs"]["earliest_seq"], 3,
+        "earliest advanced past delete"
+    );
 
     let frames = h.sse_frames(&url, 3, SHORT);
     let evs = events(&frames);
@@ -703,8 +762,14 @@ fn node_loop_prevention_filters_own_records_in_stream() {
 
     let frames = h.sse_frames(&url, 2, SHORT);
     let evs = events(&frames);
-    assert!(!evs.contains(&"tombstone"), "node filtering is silent, got {evs:?}");
-    assert!(evs.contains(&"caught-up"), "stream reaches caught-up, got {evs:?}");
+    assert!(
+        !evs.contains(&"tombstone"),
+        "node filtering is silent, got {evs:?}"
+    );
+    assert!(
+        evs.contains(&"caught-up"),
+        "stream reaches caught-up, got {evs:?}"
+    );
 
     let rec = find(&frames, "record");
     let d = data_of(&rec);
@@ -713,7 +778,10 @@ fn node_loop_prevention_filters_own_records_in_stream() {
     assert_eq!(recs[0]["$seq"], 2);
     assert_eq!(recs[0]["$node"], "other");
     // The cursor (composite id) advanced past the filtered seq 3 to head.
-    assert_eq!(d["to_seq"], 3, "cursor advances past filtered own-node records");
+    assert_eq!(
+        d["to_seq"], 3,
+        "cursor advances past filtered own-node records"
+    );
     assert_eq!(decode_id(&rec.id)["topic"], 3);
 }
 
@@ -744,5 +812,9 @@ fn watcher_that_owns_all_records_sees_only_caught_up() {
         "an all-own-node watcher still reaches caught-up, got {evs:?}"
     );
     let cu = find(&frames, "caught-up");
-    assert_eq!(data_of(&cu)["head_seq"], 2, "caught-up reports the true head");
+    assert_eq!(
+        data_of(&cu)["head_seq"],
+        2,
+        "caught-up reports the true head"
+    );
 }

@@ -25,7 +25,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -398,7 +403,10 @@ fn f_wal_reorder_unsynced() {
     // Recovery yields a contiguous prefix [1..]; the acked durable frames survive,
     // the un-synced tail (3,4 — whatever order they were persisted in) is dropped
     // as a clean tail. No gap, no reorder of an acked frame past an unacked one.
-    assert!(seqs.len() >= 2, "the acked-durable prefix survives: {seqs:?}");
+    assert!(
+        seqs.len() >= 2,
+        "the acked-durable prefix survives: {seqs:?}"
+    );
     for (i, s) in seqs.iter().enumerate() {
         assert_eq!(
             *s,
@@ -470,7 +478,11 @@ fn f_wal_reorder_unsynced() {
 // ===========================================================================
 #[test]
 fn f_wal_nondurable_lost_tail() {
-    for &damage in &[TornDamage::None, TornDamage::PrefixTruncate, TornDamage::Garble] {
+    for &damage in &[
+        TornDamage::None,
+        TornDamage::PrefixTruncate,
+        TornDamage::Garble,
+    ] {
         let disk = FakeDisk::with_seed(0xDEAD_BEEF ^ damage as u64);
         let wal = Wal::open_at_with(disk.arc(), fast_cfg(), 1, 0).unwrap();
         let w = wal.writer();

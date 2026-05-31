@@ -58,7 +58,11 @@ fn max_boxes_cap_via_put() {
     // An idempotent re-PUT of an EXISTING box is an update, not a create — it must
     // still succeed even at the cap (a saturated server can be reconfigured).
     let (s, _) = h.put("/v0/boxes/a", json!({ "ttl_ms": 1000 }));
-    assert_eq!(s, StatusCode::OK, "re-PUT of existing box at cap must update");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "re-PUT of existing box at cap must update"
+    );
 }
 
 #[test]
@@ -72,7 +76,11 @@ fn max_boxes_cap_via_auto_create_write() {
     assert_eq!(s, StatusCode::CREATED);
     // A write that WOULD auto-create a second box hits the cap → 429.
     let (s, body) = h.post("/v0/boxes/b", json!({ "records": [{ "data": 1 }] }));
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "auto-create over cap: {body}");
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "auto-create over cap: {body}"
+    );
     assert_eq!(code(&body), "throttled");
     // But appending to the EXISTING box still works (not a create).
     let (s, _) = h.post("/v0/boxes/a", json!({ "records": [{ "data": 2 }] }));
@@ -99,24 +107,26 @@ fn max_routers_cap() {
         max_boxes: 1000,
         ..Default::default()
     });
-    let (s, _) = h.put(
-        "/v0/routers/r1",
-        json!({ "source": "src", "dest": "dst1" }),
-    );
+    let (s, _) = h.put("/v0/routers/r1", json!({ "source": "src", "dest": "dst1" }));
     assert_eq!(s, StatusCode::CREATED);
     // Second NEW router refused.
-    let (s, body) = h.put(
-        "/v0/routers/r2",
-        json!({ "source": "src", "dest": "dst2" }),
+    let (s, body) = h.put("/v0/routers/r2", json!({ "source": "src", "dest": "dst2" }));
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "2nd router over cap: {body}"
     );
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "2nd router over cap: {body}");
     assert_eq!(code(&body), "throttled");
     assert_eq!(body["error"]["detail"]["limit"], json!("max_routers"));
 
     // A refused router must not have auto-created its dest box (checked before any
     // box auto-create).
     let (s, _) = h.get("/v0/boxes/dst2");
-    assert_eq!(s, StatusCode::NOT_FOUND, "refused router left no phantom dest box");
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "refused router left no phantom dest box"
+    );
 
     // Re-PUT of the existing router still updates at the cap.
     let (s, _) = h.put(
@@ -141,9 +151,16 @@ fn max_watch_sessions_cap() {
     assert_eq!(s, StatusCode::OK);
     // Third session refused (no GET stream opened yet, so the registry holds 2).
     let (s, resp) = h.post("/v0/watch", body.clone());
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "3rd watch session over cap: {resp}");
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "3rd watch session over cap: {resp}"
+    );
     assert_eq!(code(&resp), "throttled");
-    assert_eq!(resp["error"]["detail"]["limit"], json!("max_watch_sessions"));
+    assert_eq!(
+        resp["error"]["detail"]["limit"],
+        json!("max_watch_sessions")
+    );
 }
 
 #[test]
@@ -225,7 +242,11 @@ fn max_inflight_per_key_does_not_break_normal_traffic() {
     );
     for i in 0..20 {
         let (s, _) = h.put_auth(&format!("/v0/boxes/b{i}"), json!({}), "k");
-        assert_eq!(s, StatusCode::CREATED, "serial request {i} should not be throttled");
+        assert_eq!(
+            s,
+            StatusCode::CREATED,
+            "serial request {i} should not be throttled"
+        );
     }
 }
 
@@ -238,17 +259,11 @@ fn max_total_bytes_quota_refuses_oversize_write() {
         ..Default::default()
     });
     // A modest write fits under the 200-byte quota.
-    let (s, _) = h.post(
-        "/v0/boxes/a",
-        json!({ "records": [{ "data": "x" }] }),
-    );
+    let (s, _) = h.post("/v0/boxes/a", json!({ "records": [{ "data": "x" }] }));
     assert_eq!(s, StatusCode::CREATED, "first small write fits");
     // A large write past the quota is refused.
     let big = "y".repeat(500);
-    let (s, body) = h.post(
-        "/v0/boxes/a",
-        json!({ "records": [{ "data": big }] }),
-    );
+    let (s, body) = h.post("/v0/boxes/a", json!({ "records": [{ "data": big }] }));
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "over-quota write: {body}");
     assert_eq!(code(&body), "throttled");
     assert_eq!(body["error"]["detail"]["limit"], json!("max_total_bytes"));
@@ -273,10 +288,7 @@ fn queue_ack_rejects_unbounded_seqs() {
     let h = Harness::start();
     h.put("/v0/boxes/q", json!({ "type": "queue" }));
     let seqs: Vec<u64> = (1..=1001).collect();
-    let (s, body) = h.post(
-        "/v0/boxes/q/ack",
-        json!({ "node": "w1", "seqs": seqs }),
-    );
+    let (s, body) = h.post("/v0/boxes/q/ack", json!({ "node": "w1", "seqs": seqs }));
     assert_eq!(s, StatusCode::BAD_REQUEST, "1001 seqs rejected: {body}");
     assert_eq!(code(&body), "batch_too_large");
     // A bounded ack (no matching leases) is a normal 200 with 0 acked.
@@ -310,7 +322,11 @@ fn query_token_rejected_for_non_sse_routes() {
     let h = limited_auth_harness(Limits::default(), &["k"]);
     // A normal GET with ?token= (no header) is unauthorized.
     let (s, _) = h.get("/v0/boxes?token=k");
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "?token= must not auth a data route");
+    assert_eq!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "?token= must not auth a data route"
+    );
     // The header still works.
     let (s, _) = h.get_auth("/v0/boxes", "k");
     assert_eq!(s, StatusCode::OK);

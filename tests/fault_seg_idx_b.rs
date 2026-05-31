@@ -29,7 +29,12 @@
 //!       lost); a re-`put` over the crashed image re-materializes idempotently.
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,7 +86,10 @@ fn write_pending(fs: &Arc<dyn Fs>, path: &Path, bytes: &[u8]) {
 /// dir-fsync), i.e. the exact byte/dir-fsync ordering `LocalSegmentStore::put`
 /// uses for one `write_atomic`. After this the final name survives a crash.
 fn install_part_durable(fs: &Arc<dyn Fs>, final_path: &Path, bytes: &[u8]) {
-    let ext = final_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = final_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     let tmp = final_path.with_extension(format!("{ext}.tmp"));
     write_pending(fs, &tmp, bytes);
     fs.open(&tmp, OpenOpts::rw_existing())
@@ -164,14 +172,19 @@ fn f_seg_idx_without_data() {
     // a panic and never neighbor bytes decoded as a frame. We resolve a record's
     // locator from the present `.idx` and then attempt the `.data` read it points
     // at — the read fails cleanly because the `.data` file is absent.
-    let idx_buf = store.read_all(id, SegmentPart::Idx).expect("the .idx reads");
+    let idx_buf = store
+        .read_all(id, SegmentPart::Idx)
+        .expect("the .idx reads");
     let e = lookup(&idx_buf, id, id).expect("the orphan .idx still locates seq");
     match store.read_range(id, SegmentPart::Data, e.offset as u64, e.len as u64) {
         Err(StoreError::NotFound(got)) => assert_eq!(got, id),
         other => panic!("a .data read with no .data file must be NotFound, got {other:?}"),
     }
     assert!(
-        matches!(store.len(id, SegmentPart::Data), Err(StoreError::NotFound(_))),
+        matches!(
+            store.len(id, SegmentPart::Data),
+            Err(StoreError::NotFound(_))
+        ),
         "len() on the absent .data is NotFound"
     );
 
@@ -183,7 +196,10 @@ fn f_seg_idx_without_data() {
         !store.exists(id, SegmentPart::Idx),
         "the stray .idx is removed by reclaim"
     );
-    assert!(store.list().unwrap().is_empty(), "store is clean after reclaim");
+    assert!(
+        store.list().unwrap().is_empty(),
+        "store is clean after reclaim"
+    );
     store.delete(id).expect("idempotent second reclaim sweep");
 }
 
@@ -387,7 +403,10 @@ fn assert_seg_complete_or_incomplete(disk: &FakeDisk, id: SegmentId, n: u64) {
             "an incomplete segment with no .data is not listed"
         );
         assert!(
-            matches!(store.read_all(id, SegmentPart::Data), Err(StoreError::NotFound(_))),
+            matches!(
+                store.read_all(id, SegmentPart::Data),
+                Err(StoreError::NotFound(_))
+            ),
             "a .data read with no .data file is a clean NotFound"
         );
         // `BoxTier::resolve` agrees: no `.data` ⇒ no tier ⇒ never served.
@@ -404,14 +423,21 @@ fn assert_seg_complete_or_incomplete(disk: &FakeDisk, id: SegmentId, n: u64) {
             "a present .data is listed even without its .idx"
         );
         assert!(
-            matches!(store.read_all(id, SegmentPart::Idx), Err(StoreError::NotFound(_))),
+            matches!(
+                store.read_all(id, SegmentPart::Idx),
+                Err(StoreError::NotFound(_))
+            ),
             "a missing .idx ⇒ NotFound, never a served half-index"
         );
         // resolve still keys on `.data`, so the segment resolves HOT — but it is
         // non-authoritative for reads until the `.idx` is re-materialized.
         let hot = Box::new(LocalSegmentStore::open_with(ROOT, disk.arc()).unwrap());
         let tier = BoxTier::new(hot, None);
-        assert_eq!(tier.resolve(id), Some(Tier::Hot), "a lone .data resolves HOT");
+        assert_eq!(
+            tier.resolve(id),
+            Some(Tier::Hot),
+            "a lone .data resolves HOT"
+        );
     }
 }
 

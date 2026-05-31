@@ -393,7 +393,9 @@ mod tests {
         drop(g1);
         assert_eq!(counts.sse_total(), 1);
         // A slot freed up ⇒ a new connection is admitted.
-        let g3 = counts.try_acquire_sse(&l, None).expect("admitted after free");
+        let g3 = counts
+            .try_acquire_sse(&l, None)
+            .expect("admitted after free");
         assert_eq!(counts.sse_total(), 2);
         drop(g2);
         drop(g3);
@@ -413,7 +415,11 @@ mod tests {
         let _g1 = counts.try_acquire_sse(&l, Some(a)).expect("key a 1st");
         // Key a is at its per-key cap; the global slot must NOT leak on rejection.
         assert!(counts.try_acquire_sse(&l, Some(a)).is_none());
-        assert_eq!(counts.sse_total(), 1, "rejected per-key attempt rolled back global");
+        assert_eq!(
+            counts.sse_total(),
+            1,
+            "rejected per-key attempt rolled back global"
+        );
         // A different key is unaffected.
         let _g2 = counts.try_acquire_sse(&l, Some(b)).expect("key b 1st");
         assert_eq!(counts.sse_total(), 2);
@@ -429,9 +435,14 @@ mod tests {
         let a = kid(1);
         let g1 = counts.try_acquire_inflight(&l, Some(a)).expect("1");
         let g2 = counts.try_acquire_inflight(&l, Some(a)).expect("2");
-        assert!(counts.try_acquire_inflight(&l, Some(a)).is_none(), "3rd over cap");
+        assert!(
+            counts.try_acquire_inflight(&l, Some(a)).is_none(),
+            "3rd over cap"
+        );
         drop(g1);
-        let _g3 = counts.try_acquire_inflight(&l, Some(a)).expect("after free");
+        let _g3 = counts
+            .try_acquire_inflight(&l, Some(a))
+            .expect("after free");
         drop(g2);
         // Dev mode (no key) is never capped.
         let l_dev = Limits {

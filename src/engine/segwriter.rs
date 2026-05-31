@@ -261,8 +261,20 @@ impl SegmentWriter {
         // size/event/age cap, seal it so this record starts a fresh segment. This
         // keeps each sealed segment within the caps (the active one can exceed by
         // at most the in-flight record, then seals on the next append/flush).
+        //
+        // ALSO seal on a SEQ GAP (R3): a `disk`-class box recovered at its durable
+        // head reservation has reserved-but-unwritten seqs as deleted holes; the
+        // next live append jumps past them, so `seq != active.next_seq`. Segments
+        // are dense + gapless by construction, so seal the active segment and start
+        // a fresh one at the new seq rather than feeding a non-contiguous seq into
+        // the builder (which would panic the debug contiguity assert).
         let mut sealed_seqs = Vec::new();
-        if self.should_seal_before(seq) {
+        let gap = self
+            .active
+            .as_ref()
+            .map(|a| a.record_count() > 0 && a.next_seq() != seq)
+            .unwrap_or(false);
+        if gap || self.should_seal_before(seq) {
             sealed_seqs.extend(self.seal_active());
         }
 
@@ -333,7 +345,12 @@ impl SegmentWriter {
     /// Force-seal the active segment regardless of triggers (e.g. on snapshot /
     /// shutdown so all committed records are materialized). Returns sealed seqs.
     pub fn flush(&mut self) -> Vec<u64> {
-        if self.active.as_ref().map(|a| a.record_count() > 0).unwrap_or(false) {
+        if self
+            .active
+            .as_ref()
+            .map(|a| a.record_count() > 0)
+            .unwrap_or(false)
+        {
             self.seal_active()
         } else {
             Vec::new()
@@ -670,8 +687,10 @@ impl SegmentWriter {
         if let Some(cold) = self.tier.cold() {
             let _ = cold.delete(id);
         }
-        self.cache.retain(|c| c.seq < seg.start_seq || c.seq > seg.end_seq);
-        self.cold_cache.retain(|c| c.seq < seg.start_seq || c.seq > seg.end_seq);
+        self.cache
+            .retain(|c| c.seq < seg.start_seq || c.seq > seg.end_seq);
+        self.cold_cache
+            .retain(|c| c.seq < seg.start_seq || c.seq > seg.end_seq);
     }
 
     /// Sealed segments fully below `live_floor` (every seq `< live_floor`), i.e.
@@ -732,7 +751,10 @@ impl SegmentWriter {
 /// delivery. Idempotent: re-copying overwrites the same id. Returns the segment's
 /// `.data` length on success. A `None`/`Err` leaves the HOT copy intact (the
 /// relocation simply did not advance — never a loss).
-pub fn copy_segment_to_cold(tier: &Arc<BoxTier>, id: u64) -> Result<(), crate::storage::StoreError> {
+pub fn copy_segment_to_cold(
+    tier: &Arc<BoxTier>,
+    id: u64,
+) -> Result<(), crate::storage::StoreError> {
     let Some(cold) = tier.cold() else {
         return Ok(()); // no cold tier ⇒ nothing to do.
     };
@@ -924,7 +946,14 @@ mod tests {
         };
         let (mut w, _d) = writer_with(cfg, clock);
         w.set_cache_cap(0); // force segment reads.
-        w.append_record(1, 5, Some("nodeA"), Some("t:1"), &json!({"k":"v"}), &Some(json!({"m":9})));
+        w.append_record(
+            1,
+            5,
+            Some("nodeA"),
+            Some("t:1"),
+            &json!({"k":"v"}),
+            &Some(json!({"m":9})),
+        );
         w.append_record(2, 6, None, None, &json!({"z":1}), &None); // seals 1
         let p = w.resolve_sealed(1).expect("read seq 1 from segment");
         assert_eq!(p.data, json!({"k":"v"}));
@@ -979,7 +1008,14 @@ mod tests {
         let (mut w, _h, _c) = writer_with_cold(cfg_events(1, 1), clock);
         w.set_cache_cap(0); // force a real segment read (no cache shortcut).
         for i in 1..=4u64 {
-            w.append_record(i, i as i64, Some("n"), Some("t"), &json!({"i": i}), &Some(json!({"m": i})));
+            w.append_record(
+                i,
+                i as i64,
+                Some("n"),
+                Some("t"),
+                &json!({"i": i}),
+                &Some(json!({"m": i})),
+            );
         }
         // 4 records / 1-per-segment → 3 sealed (1,2,3); seq 4 active.
         assert_eq!(w.sealed_count(), 3);
@@ -1004,14 +1040,22 @@ mod tests {
         for i in 1..=3u64 {
             let p = w.resolve_sealed(i).expect("sealed read");
             assert_eq!(p.data, json!({"i": i}), "data identical after relocation");
-            assert_eq!(p.meta, Some(json!({"m": i})), "meta identical after relocation");
+            assert_eq!(
+                p.meta,
+                Some(json!({"m": i})),
+                "meta identical after relocation"
+            );
         }
         // A cold read bumped the cold-read counter (seqs 1 and 2 came from cold).
         assert_eq!(w.cold_reads(), 2, "two records served from the cold tier");
         // And the second read of a cold seq is served from the cold LRU (no extra
         // cold read counted).
         let _ = w.resolve_sealed(1).unwrap();
-        assert_eq!(w.cold_reads(), 2, "re-read served from cold LRU, no new cold read");
+        assert_eq!(
+            w.cold_reads(),
+            2,
+            "re-read served from cold LRU, no new cold read"
+        );
     }
 
     #[test]
@@ -1030,15 +1074,27 @@ mod tests {
         copy_segment_to_cold(&tier, 1).unwrap();
         assert!(tier.hot().exists(1, SegmentPart::Data));
         assert!(tier.cold().unwrap().exists(1, SegmentPart::Data));
-        assert_eq!(tier.resolve(1), Some(Tier::Hot), "prefer hot mid-relocation");
-        assert_eq!(w.resolve_sealed(1).unwrap().data, json!({"i": 1}), "no loss");
+        assert_eq!(
+            tier.resolve(1),
+            Some(Tier::Hot),
+            "prefer hot mid-relocation"
+        );
+        assert_eq!(
+            w.resolve_sealed(1).unwrap().data,
+            json!({"i": 1}),
+            "no loss"
+        );
 
         // The relocator simply re-runs: the (idempotent) copy is a no-op since cold
         // exists, then the flip+drop completes. Nothing is lost.
         relocate(&mut w, 1);
         assert_eq!(tier.resolve(1), Some(Tier::Cold));
         assert!(!tier.hot().exists(1, SegmentPart::Data));
-        assert_eq!(w.resolve_sealed(1).unwrap().data, json!({"i": 1}), "still readable from cold");
+        assert_eq!(
+            w.resolve_sealed(1).unwrap().data,
+            json!({"i": 1}),
+            "still readable from cold"
+        );
 
         // --- Interruption B: crash AFTER the flip+drop but the relocator re-runs
         // confirm on an already-cold segment ⇒ a harmless no-op (idempotent).
@@ -1094,10 +1150,7 @@ mod tests {
         ) -> Result<Vec<u8>, StoreError> {
             // Block exactly once (the first read after the test arms the gate), so
             // the cold fetch is provably in flight while another thread does work.
-            if self
-                .armed
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 self.gate.wait();
             }
             self.inner.read_range(id, part, offset, len)
@@ -1190,12 +1243,19 @@ mod tests {
 
         // Let the writer thread finish first (it must NOT be blocked by the read).
         let sealed_after = writer_thread.join().expect("writer thread");
-        assert!(sealed_after >= 4, "a concurrent append/seal proceeded during the cold read");
+        assert!(
+            sealed_after >= 4,
+            "a concurrent append/seal proceeded during the cold read"
+        );
 
         // Now release the gate so the cold read completes and returns correct data.
         gate.wait();
         let data = reader.join().expect("reader thread");
-        assert_eq!(data, json!({"i": 1}), "cold read returns the correct payload");
+        assert_eq!(
+            data,
+            json!({"i": 1}),
+            "cold read returns the correct payload"
+        );
         // The concurrent appends are observable (live writes were never stalled).
         assert!(writer.lock().is_sealed(4));
     }

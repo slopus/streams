@@ -138,7 +138,10 @@ fn concurrent_durable_writers_no_loss_across_restart() {
     // Restart: every acked durable write is recovered as a contiguous prefix.
     let engine = engine_at(dir.path());
     let st = engine.box_state("hot", false).unwrap();
-    assert_eq!(st.head_seq, total, "no acked durable write lost across restart");
+    assert_eq!(
+        st.head_seq, total,
+        "no acked durable write lost across restart"
+    );
     assert_eq!(st.earliest_seq, 1);
     assert_eq!(st.count, total);
 
@@ -180,13 +183,29 @@ fn nondurable_writes_survive_clean_teardown() {
         let engine = engine_at(dir.path());
         engine.put_box("evts", BoxConfig::default()).unwrap(); // durable:false
         for i in 1..=3 {
-            engine.write("evts", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("evts", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
     }
     let engine = engine_at(dir.path());
     let st = engine.box_state("evts", false).unwrap();
-    assert_eq!(st.head_seq, 3);
+    // All 3 acked records survive a clean teardown (the writer drains + fsyncs on
+    // drop). `count` is exact; for a `disk` box `head_seq` may sit at the durable
+    // head RESERVATION (R3 fsyncs a head ceiling ahead of use to prevent seq reuse
+    // across a power loss), so it is `>= 3` and within the reservation block — the
+    // reserved-but-unwritten seqs are silent gaps that don't affect the live count.
     assert_eq!(st.count, 3);
+    assert!(
+        st.head_seq >= 3,
+        "head never below the acked head (no reuse), got {}",
+        st.head_seq
+    );
+    assert!(
+        st.head_seq <= 3 + streams::config::DISK_HEAD_RESERVE_AHEAD,
+        "head within the reservation block, got {}",
+        st.head_seq
+    );
 }
 
 /// Deletes replay deterministically: a previously-deleted record stays gone,
@@ -198,21 +217,42 @@ fn deletes_replay_and_stay_gone() {
         let engine = engine_at(dir.path());
         engine.put_box("d", durable_box()).unwrap();
         for i in 1..=5 {
-            engine.write("d", one(json!({ "i": i }), Some(&format!("tag{i}"))), true).unwrap();
+            engine
+                .write("d", one(json!({ "i": i }), Some(&format!("tag{i}"))), true)
+                .unwrap();
         }
         // Delete tag3 (a middle hole) and everything < seq 2 (a prefix).
         engine
-            .delete("d", DeleteRequest { before_seq: Some(2), match_: None })
+            .delete(
+                "d",
+                DeleteRequest {
+                    before_seq: Some(2),
+                    match_: None,
+                },
+            )
             .unwrap();
         engine
-            .delete("d", DeleteRequest { before_seq: None, match_: Some(Filter::from_shorthand("tag3")) })
+            .delete(
+                "d",
+                DeleteRequest {
+                    before_seq: None,
+                    match_: Some(Filter::from_shorthand("tag3")),
+                },
+            )
             .unwrap();
     }
     let engine = engine_at(dir.path());
     let d = engine.diff("d", diff_from(0)).unwrap();
     let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
-    assert_eq!(seqs, vec![2, 4, 5], "seq 1 (prefix) and seq 3 (tag) stay deleted");
-    assert!(d.tombstone.is_none(), "deletion stays silent across restart");
+    assert_eq!(
+        seqs,
+        vec![2, 4, 5],
+        "seq 1 (prefix) and seq 3 (tag) stay deleted"
+    );
+    assert!(
+        d.tombstone.is_none(),
+        "deletion stays silent across restart"
+    );
     assert_eq!(engine.box_state("d", false).unwrap().count, 3);
 }
 
@@ -243,7 +283,9 @@ fn routers_survive_restart() {
     assert_eq!(g.source, "src");
     assert_eq!(g.dest, "dst");
     // Forwarding still works post-restart.
-    engine.write("src", one(json!({ "x": 1 }), None), true).unwrap();
+    engine
+        .write("src", one(json!({ "x": 1 }), None), true)
+        .unwrap();
     let d = engine.diff("dst", diff_from(0)).unwrap();
     assert_eq!(d.records.len(), 1);
     assert_eq!(d.records[0].data, json!({ "x": 1 }));
@@ -256,10 +298,16 @@ fn evict_floor_tombstone_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        let cfg = BoxConfig { cap_records: 3, durable: true, ..BoxConfig::default() };
+        let cfg = BoxConfig {
+            cap_records: 3,
+            durable: true,
+            ..BoxConfig::default()
+        };
         engine.put_box("cap", cfg).unwrap();
         for i in 1..=6 {
-            engine.write("cap", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("cap", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
         // head=6, cap=3 ⇒ earliest=4, evict_floor=3.
         assert_eq!(engine.box_state("cap", false).unwrap().earliest_seq, 4);
@@ -285,7 +333,9 @@ fn torn_tail_is_truncated_not_read_as_data() {
         let engine = engine_at(dir.path());
         engine.put_box("t", durable_box()).unwrap();
         for i in 1..=3 {
-            engine.write("t", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("t", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
     }
 
@@ -303,8 +353,14 @@ fn torn_tail_is_truncated_not_read_as_data() {
     // write a half-written next frame right after it (an oversized frame_len with
     // only a few bytes following ⇒ length overrun / CRC failure ⇒ torn tail).
     use std::io::{Seek, SeekFrom, Write};
-    let data_end = streams::storage::WalReader::open(&active).unwrap().count_valid_len();
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&active).unwrap();
+    let data_end = streams::storage::WalReader::open(&active)
+        .unwrap()
+        .count_valid_len();
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&active)
+        .unwrap();
     f.seek(SeekFrom::Start(data_end as u64)).unwrap();
     let mut junk = Vec::new();
     junk.extend_from_slice(&9999u32.to_le_bytes());
@@ -319,12 +375,17 @@ fn torn_tail_is_truncated_not_read_as_data() {
     assert_eq!(st.head_seq, 3, "good frames recovered; torn tail discarded");
     assert_eq!(st.count, 3);
     let d = engine.diff("t", diff_from(0)).unwrap();
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 
     // And the truncated WAL is writable again: a new durable write appends cleanly
     // and survives a second restart (proves the tail was truncated, not appended
     // after garbage).
-    engine.write("t", one(json!({ "i": 4 }), None), true).unwrap();
+    engine
+        .write("t", one(json!({ "i": 4 }), None), true)
+        .unwrap();
     drop(engine);
     let engine = engine_at(dir.path());
     assert_eq!(engine.box_state("t", false).unwrap().head_seq, 4);
@@ -355,16 +416,27 @@ fn write_snapshot_more_writes_restart_matches() {
     {
         let engine = engine_at(dir.path());
         engine
-            .put_box("jobs", BoxConfig { durable: true, ttl_ms: 0, ..BoxConfig::default() })
+            .put_box(
+                "jobs",
+                BoxConfig {
+                    durable: true,
+                    ttl_ms: 0,
+                    ..BoxConfig::default()
+                },
+            )
             .unwrap();
         for i in 1..=4 {
-            engine.write("jobs", one(json!({ "i": i }), Some(&format!("t{i}"))), true).unwrap();
+            engine
+                .write("jobs", one(json!({ "i": i }), Some(&format!("t{i}"))), true)
+                .unwrap();
         }
         // Snapshot after 4...
         assert!(engine.write_snapshot().unwrap());
         // ...then more writes land only in the active WAL tail.
         for i in 5..=8 {
-            engine.write("jobs", one(json!({ "i": i }), Some(&format!("t{i}"))), true).unwrap();
+            engine
+                .write("jobs", one(json!({ "i": i }), Some(&format!("t{i}"))), true)
+                .unwrap();
         }
     }
 
@@ -395,18 +467,35 @@ fn tombstone_vs_silent_gap_survive_restart() {
         let engine = engine_at(dir.path());
         // Cap-eviction box: head 5, cap 3 ⇒ evict_floor advances (involuntary).
         engine
-            .put_box("capped", BoxConfig { cap_records: 3, durable: true, ..BoxConfig::default() })
+            .put_box(
+                "capped",
+                BoxConfig {
+                    cap_records: 3,
+                    durable: true,
+                    ..BoxConfig::default()
+                },
+            )
             .unwrap();
         for i in 1..=5 {
-            engine.write("capped", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("capped", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
         // Deletion box: delete a prefix (voluntary ⇒ silent, no evict_floor bump).
         engine.put_box("pruned", durable_box()).unwrap();
         for i in 1..=5 {
-            engine.write("pruned", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("pruned", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
         engine
-            .delete("pruned", DeleteRequest { before_seq: Some(3), match_: None })
+            .delete(
+                "pruned",
+                DeleteRequest {
+                    before_seq: Some(3),
+                    match_: None,
+                },
+            )
             .unwrap();
     }
 
@@ -414,14 +503,19 @@ fn tombstone_vs_silent_gap_survive_restart() {
 
     // Cap box: a cursor below the recovered involuntary floor ⇒ tombstone.
     let cap = engine.diff("capped", diff_from(0)).unwrap();
-    let tomb = cap.tombstone.expect("cap tombstone after restart (no silent loss)");
+    let tomb = cap
+        .tombstone
+        .expect("cap tombstone after restart (no silent loss)");
     assert_eq!(tomb.reason, TombstoneReason::Cap);
     assert!(cap.records.iter().all(|r| r.seq >= cap.earliest_seq));
 
     // Deletion box: a cursor in the purely-deleted gap ⇒ NO tombstone, silent
     // advance past the deleted prefix.
     let pruned = engine.diff("pruned", diff_from(0)).unwrap();
-    assert!(pruned.tombstone.is_none(), "voluntary delete stays silent across restart");
+    assert!(
+        pruned.tombstone.is_none(),
+        "voluntary delete stays silent across restart"
+    );
     assert_eq!(
         pruned.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
         vec![3, 4, 5],
@@ -455,7 +549,9 @@ fn ready_request(engine: Arc<Engine>) -> (u16, serde_json::Value) {
             .await
             .unwrap();
         let status = resp.status().as_u16();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, body)
@@ -524,12 +620,21 @@ fn snapshot_round_trips_materialized_state() {
         }
         // Delete a middle record and a prefix to exercise floors/holes.
         engine
-            .delete("jobs", DeleteRequest { before_seq: Some(3), match_: None })
+            .delete(
+                "jobs",
+                DeleteRequest {
+                    before_seq: Some(3),
+                    match_: None,
+                },
+            )
             .unwrap();
         engine
             .delete(
                 "jobs",
-                DeleteRequest { before_seq: None, match_: Some(Filter::from_shorthand("t6")) },
+                DeleteRequest {
+                    before_seq: None,
+                    match_: Some(Filter::from_shorthand("t6")),
+                },
             )
             .unwrap();
 
@@ -563,7 +668,10 @@ fn snapshot_round_trips_materialized_state() {
     let d = engine.diff("jobs", diff_from(0)).unwrap();
     let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
     assert_eq!(seqs, vec![3, 4, 5, 7, 8, 9, 10], "deleted seqs stay gone");
-    assert!(d.tombstone.is_none(), "deletes stay silent after snapshot recovery");
+    assert!(
+        d.tombstone.is_none(),
+        "deletes stay silent after snapshot recovery"
+    );
     assert_eq!(d.records[0].data, json!({ "i": 3 }));
     assert_eq!(d.records[0].tag.as_deref(), Some("t3"));
 }
@@ -578,18 +686,28 @@ fn snapshot_drops_absorbed_wal_and_replays_tail() {
         let engine = engine_at(dir.path());
         engine.put_box("b", durable_box()).unwrap();
         for i in 1..=4 {
-            engine.write("b", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("b", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
         assert!(engine.write_snapshot().unwrap());
         // A write AFTER the snapshot lives only in the active WAL tail.
-        engine.write("b", one(json!({ "i": 5 }), None), true).unwrap();
+        engine
+            .write("b", one(json!({ "i": 5 }), None), true)
+            .unwrap();
     }
     let engine = engine_at(dir.path());
     let st = engine.box_state("b", false).unwrap();
-    assert_eq!(st.head_seq, 5, "snapshotted 4 + post-snapshot tail write recovered");
+    assert_eq!(
+        st.head_seq, 5,
+        "snapshotted 4 + post-snapshot tail write recovered"
+    );
     assert_eq!(st.count, 5);
     let d = engine.diff("b", diff_from(0)).unwrap();
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
 }
 
 /// Routers + their auto-created boxes survive a snapshot-based restart and keep
@@ -613,7 +731,9 @@ fn routers_survive_snapshot_restart() {
                 },
             )
             .unwrap();
-        engine.write("src", one(json!({ "x": 1 }), None), true).unwrap();
+        engine
+            .write("src", one(json!({ "x": 1 }), None), true)
+            .unwrap();
         assert!(engine.write_snapshot().unwrap());
     }
     let engine = engine_at(dir.path());
@@ -621,11 +741,15 @@ fn routers_survive_snapshot_restart() {
     assert_eq!(g.source, "src");
     assert_eq!(g.forwarded_total, 1, "forward total restored from snapshot");
     // Forwarding still works post-restart, and doesn't re-forward the old record.
-    engine.write("src", one(json!({ "x": 2 }), None), true).unwrap();
+    engine
+        .write("src", one(json!({ "x": 2 }), None), true)
+        .unwrap();
     let d = engine.diff("dst", diff_from(0)).unwrap();
     assert_eq!(d.records.len(), 2);
-    assert_eq!(d.records.iter().map(|r| r.data.clone()).collect::<Vec<_>>(),
-        vec![json!({ "x": 1 }), json!({ "x": 2 })]);
+    assert_eq!(
+        d.records.iter().map(|r| r.data.clone()).collect::<Vec<_>>(),
+        vec![json!({ "x": 1 }), json!({ "x": 2 })]
+    );
 }
 
 /// A cap-eviction watermark captured in a snapshot still yields a tombstone
@@ -635,10 +759,16 @@ fn evict_floor_survives_snapshot_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        let cfg = BoxConfig { cap_records: 3, durable: true, ..BoxConfig::default() };
+        let cfg = BoxConfig {
+            cap_records: 3,
+            durable: true,
+            ..BoxConfig::default()
+        };
         engine.put_box("cap", cfg).unwrap();
         for i in 1..=6 {
-            engine.write("cap", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("cap", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
         assert!(engine.write_snapshot().unwrap());
     }
@@ -647,7 +777,11 @@ fn evict_floor_survives_snapshot_restart() {
     assert_eq!(st.head_seq, 6);
     assert_eq!(st.earliest_seq, 4, "cap floor recovered from snapshot");
     assert_eq!(st.count, 3);
-    let tomb = engine.diff("cap", diff_from(0)).unwrap().tombstone.expect("cap tombstone");
+    let tomb = engine
+        .diff("cap", diff_from(0))
+        .unwrap()
+        .tombstone
+        .expect("cap tombstone");
     assert_eq!(tomb.reason, TombstoneReason::Cap);
 }
 
@@ -661,7 +795,9 @@ fn repeated_snapshots_keep_one_and_stay_consistent() {
         engine.put_box("b", durable_box()).unwrap();
         for round in 0..3 {
             for i in 1..=3 {
-                engine.write("b", one(json!({ "r": round, "i": i }), None), true).unwrap();
+                engine
+                    .write("b", one(json!({ "r": round, "i": i }), None), true)
+                    .unwrap();
             }
             assert!(engine.write_snapshot().unwrap());
             assert_eq!(count_files(dir.path(), "meta", "snapshot-", ".bin"), 1);
@@ -748,7 +884,10 @@ fn kill_during_durable_write_survives_sigkill_restart() {
     let body: serde_json::Value = resp.json().unwrap();
     assert_eq!(body["head_seq"], 1);
     let fsync_ms = body["performance"]["fsync_ms"].as_f64().unwrap_or(0.0);
-    assert!(fsync_ms > 0.0, "durable write must be fsync-gated (fsync_ms>0)");
+    assert!(
+        fsync_ms > 0.0,
+        "durable write must be fsync-gated (fsync_ms>0)"
+    );
 
     // Hard kill — no graceful shutdown, no drop handlers, nothing flushed beyond
     // what the WAL fsync already durably committed.
@@ -768,7 +907,10 @@ fn kill_during_durable_write_survives_sigkill_restart() {
         .unwrap()
         .json()
         .unwrap();
-    assert_eq!(st["head_seq"], 1, "durable write survived SIGKILL + restart");
+    assert_eq!(
+        st["head_seq"], 1,
+        "durable write survived SIGKILL + restart"
+    );
     assert_eq!(st["count"], 1);
 
     let diff: serde_json::Value = client
@@ -875,7 +1017,10 @@ fn graceful_shutdown_writes_snapshot() {
         .unwrap()
         .json()
         .unwrap();
-    assert_eq!(st["head_seq"], 3, "data recovered after graceful-shutdown snapshot");
+    assert_eq!(
+        st["head_seq"], 3,
+        "data recovered after graceful-shutdown snapshot"
+    );
     assert_eq!(st["count"], 3);
 
     let _ = child2.kill();
@@ -1073,20 +1218,33 @@ fn segment_rolls_at_age_threshold_via_test_clock() {
     let engine = engine_with_segment(dir.path(), seg_cfg(1_000_000, 0, 5_000), shared);
 
     engine.put_box("aged", durable_box()).unwrap();
-    engine.write("aged", one(json!({ "i": 1 }), None), true).unwrap();
+    engine
+        .write("aged", one(json!({ "i": 1 }), None), true)
+        .unwrap();
     // Still young → no seal.
     clock.advance(2_000);
-    engine.write("aged", one(json!({ "i": 2 }), None), true).unwrap();
+    engine
+        .write("aged", one(json!({ "i": 2 }), None), true)
+        .unwrap();
     assert_eq!(count_segment_files(dir.path()), 0, "not yet aged out");
 
     // Cross the age cap: the next append seals the (now-old) active segment.
     clock.advance(6_000); // age since start (1000) = 8000 >= 5000.
-    engine.write("aged", one(json!({ "i": 3 }), None), true).unwrap();
-    assert_eq!(count_segment_files(dir.path()), 1, "age trigger sealed seqs 1,2");
+    engine
+        .write("aged", one(json!({ "i": 3 }), None), true)
+        .unwrap();
+    assert_eq!(
+        count_segment_files(dir.path()),
+        1,
+        "age trigger sealed seqs 1,2"
+    );
 
     // Data still reads correctly across the sealed/active boundary.
     let d = engine.diff("aged", diff_from(0)).unwrap();
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
     assert_eq!(d.records[0].data["i"], json!(1));
     assert_eq!(d.records[2].data["i"], json!(3));
 }
@@ -1101,7 +1259,9 @@ fn sealed_records_survive_restart() {
         let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
         engine.put_box("s", durable_box()).unwrap();
         for i in 1..=7u64 {
-            engine.write("s", one(json!({ "i": i }), Some("k")), true).unwrap();
+            engine
+                .write("s", one(json!({ "i": i }), Some("k")), true)
+                .unwrap();
         }
         // 7 records / 2-per-segment → 3 sealed (1-2,3-4,5-6); seq 7 active.
         assert_eq!(count_segment_files(dir.path()), 3);
@@ -1116,7 +1276,10 @@ fn sealed_records_survive_restart() {
     assert_eq!(st.head_seq, 7);
     assert_eq!(st.count, 7);
     let d = engine.diff("s", diff_from(0)).unwrap();
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (1..=7).collect::<Vec<_>>()
+    );
     assert_eq!(d.records[0].data, json!({ "i": 1 }));
     assert_eq!(d.records[6].data, json!({ "i": 7 }));
 }
@@ -1162,22 +1325,48 @@ fn relocated_segment_reads_identically_through_diff() {
             .unwrap();
     }
     // 7 records / 2-per-segment → 3 sealed (1-2,3-4,5-6); seq 7 active. All hot.
-    assert_eq!(count_tier_segments(dir.path()), 3, "all sealed segments start hot");
+    assert_eq!(
+        count_tier_segments(dir.path()),
+        3,
+        "all sealed segments start hot"
+    );
     assert_eq!(count_tier_segments(cold.path()), 0);
 
     // Relocate: keep the newest 1 sealed (5-6) hot; spill 1-2 and 3-4 to cold.
     let n = engine.relocate_box_cold("logs");
     assert_eq!(n, 2, "two oldest sealed segments relocated");
-    assert_eq!(count_tier_segments(dir.path()), 1, "only the newest sealed kept hot");
-    assert_eq!(count_tier_segments(cold.path()), 2, "two segments now in cold");
+    assert_eq!(
+        count_tier_segments(dir.path()),
+        1,
+        "only the newest sealed kept hot"
+    );
+    assert_eq!(
+        count_tier_segments(cold.path()),
+        2,
+        "two segments now in cold"
+    );
 
     // Every record still reads back in order with the right payload — cold
     // portion (1-4) stitched transparently before the hot portion (5-7).
-    let d = engine.diff("logs", DiffRequest { from_seq: 0, limit: 1000, include_tags: true, ..DiffRequest::default() }).unwrap();
+    let d = engine
+        .diff(
+            "logs",
+            DiffRequest {
+                from_seq: 0,
+                limit: 1000,
+                include_tags: true,
+                ..DiffRequest::default()
+            },
+        )
+        .unwrap();
     let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
     assert_eq!(seqs, (1..=7).collect::<Vec<_>>());
     for (k, r) in d.records.iter().enumerate() {
-        assert_eq!(r.data, json!({ "i": (k as u64 + 1) }), "data identical after relocation");
+        assert_eq!(
+            r.data,
+            json!({ "i": (k as u64 + 1) }),
+            "data identical after relocation"
+        );
         assert_eq!(r.tag.as_deref(), Some("t"));
     }
     // The records served from cold (seqs 1-4) are reported via the hint.
@@ -1206,7 +1395,9 @@ fn interrupted_relocation_recovers_through_engine() {
 
     engine.put_box("logs", durable_box()).unwrap();
     for i in 1..=5u64 {
-        engine.write("logs", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("logs", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
     // 5 records / 2-per-segment → 2 sealed (1-2,3-4); seq 5 active.
     assert_eq!(count_tier_segments(dir.path()), 2);
@@ -1233,15 +1424,25 @@ fn interrupted_relocation_recovers_through_engine() {
 
     // The record is fully readable (no loss) despite the duplicate.
     let d = engine.diff("logs", diff_from(0)).unwrap();
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=5).collect::<Vec<_>>());
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (1..=5).collect::<Vec<_>>()
+    );
     assert_eq!(d.records[0].data, json!({ "i": 1 }));
 
     // Re-running the relocator completes idempotently: the copy is a no-op (cold
     // exists), the flip+drop finishes, and reads still match.
     engine.relocate_box_cold("logs");
     let d2 = engine.diff("logs", diff_from(0)).unwrap();
-    assert_eq!(d2.records.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=5).collect::<Vec<_>>());
-    assert_eq!(d2.records[0].data, json!({ "i": 1 }), "no loss after recovery");
+    assert_eq!(
+        d2.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (1..=5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        d2.records[0].data,
+        json!({ "i": 1 }),
+        "no loss after recovery"
+    );
 }
 
 /// Relocated COLD segments survive a restart: after reopening the same hot+cold
@@ -1256,11 +1457,17 @@ fn relocated_segments_survive_restart() {
         let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
         engine.put_box("logs", durable_box()).unwrap();
         for i in 1..=7u64 {
-            engine.write("logs", one(json!({ "i": i }), Some("t")), true).unwrap();
+            engine
+                .write("logs", one(json!({ "i": i }), Some("t")), true)
+                .unwrap();
         }
         let n = engine.relocate_box_cold("logs");
         assert_eq!(n, 2);
-        assert_eq!(count_tier_segments(cold.path()), 2, "two segments relocated to cold");
+        assert_eq!(
+            count_tier_segments(cold.path()),
+            2,
+            "two segments relocated to cold"
+        );
     }
     // Reopen the SAME hot+cold dirs: recovery rebuilds the index (payloads
     // resident via WAL replay) and the segments are still present across tiers.
@@ -1270,11 +1477,17 @@ fn relocated_segments_survive_restart() {
     assert_eq!(st.head_seq, 7);
     assert_eq!(st.count, 7, "no record lost across restart");
     let d = engine.diff("logs", diff_from(0)).unwrap();
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (1..=7).collect::<Vec<_>>()
+    );
     assert_eq!(d.records[0].data, json!({ "i": 1 }));
     assert_eq!(d.records[6].data, json!({ "i": 7 }));
     // The cold segments are still in the cold tier (not pulled back hot needlessly).
-    assert!(count_tier_segments(cold.path()) >= 2, "relocated segments still present in cold");
+    assert!(
+        count_tier_segments(cold.path()) >= 2,
+        "relocated segments still present in cold"
+    );
 }
 
 /// With NO cold dir configured (the default in every existing test), the
@@ -1286,14 +1499,23 @@ fn no_cold_dir_means_no_relocation() {
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
     engine.put_box("logs", durable_box()).unwrap();
     for i in 1..=7u64 {
-        engine.write("logs", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("logs", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
-    assert_eq!(engine.relocate_all_due(), 0, "no cold tier ⇒ nothing relocates");
+    assert_eq!(
+        engine.relocate_all_due(),
+        0,
+        "no cold tier ⇒ nothing relocates"
+    );
     assert_eq!(engine.relocate_box_cold("logs"), 0);
     // All sealed segments stay hot; reads unchanged.
     let d = engine.diff("logs", diff_from(0)).unwrap();
     assert_eq!(d.records.len(), 7);
-    assert_eq!(d.performance.cold_segments_read, None, "no cold reads when all hot");
+    assert_eq!(
+        d.performance.cold_segments_read, None,
+        "no cold reads when all hot"
+    );
 }
 
 // ===========================================================================
@@ -1321,7 +1543,11 @@ fn cap_eviction_drops_whole_segments_and_still_tombstones() {
     engine
         .put_box(
             "cap",
-            BoxConfig { cap_records: 4, durable: true, ..BoxConfig::default() },
+            BoxConfig {
+                cap_records: 4,
+                durable: true,
+                ..BoxConfig::default()
+            },
         )
         .unwrap();
 
@@ -1329,7 +1555,9 @@ fn cap_eviction_drops_whole_segments_and_still_tombstones() {
     // seal every 2 (1-2,3-4,5-6,7-8,9-10), seq 11/12 active-ish. The segments
     // fully below earliest (9) — i.e. 1-2,3-4,5-6,7-8 — are dropped whole.
     for i in 1..=12u64 {
-        engine.write("cap", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("cap", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
 
     let st = engine.box_state("cap", false).unwrap();
@@ -1348,7 +1576,9 @@ fn cap_eviction_drops_whole_segments_and_still_tombstones() {
     // A consumer at from_seq=0 fell below the involuntary floor ⇒ cap tombstone,
     // then live records resume at earliest_seq.
     let d = engine.diff("cap", diff_from(0)).unwrap();
-    let tomb = d.tombstone.expect("cap eviction still tombstones after segment drop");
+    let tomb = d
+        .tombstone
+        .expect("cap eviction still tombstones after segment drop");
     assert_eq!(tomb.reason, TombstoneReason::Cap);
     assert_eq!(tomb.gap_from, 1);
     assert_eq!(tomb.gap_to, 8);
@@ -1371,18 +1601,26 @@ fn ttl_expiry_drops_whole_segments_and_tombstones() {
     engine
         .put_box(
             "ttl",
-            BoxConfig { ttl_ms: 1_000, durable: true, ..BoxConfig::default() },
+            BoxConfig {
+                ttl_ms: 1_000,
+                durable: true,
+                ..BoxConfig::default()
+            },
         )
         .unwrap();
 
     // Write 6 at t≈1000 (seals 1-2,3-4; 5-6 maybe active), then advance past the
     // TTL and write more so the floor advances past the expired prefix.
     for i in 1..=6u64 {
-        engine.write("ttl", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("ttl", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
     clock.advance(5_000); // now 6000: the first six (ts≈1000) are all expired.
     for i in 7..=8u64 {
-        engine.write("ttl", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("ttl", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
 
     let st = engine.box_state("ttl", false).unwrap();
@@ -1401,7 +1639,10 @@ fn ttl_expiry_drops_whole_segments_and_tombstones() {
     let d = engine.diff("ttl", diff_from(0)).unwrap();
     let tomb = d.tombstone.expect("ttl tombstone after segment drop");
     assert_eq!(tomb.reason, TombstoneReason::Ttl);
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![7, 8]);
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![7, 8]
+    );
 }
 
 /// A `before_seq` (prefix) delete that clears whole sealed segments reclaims them
@@ -1415,15 +1656,26 @@ fn prefix_delete_reclaims_segments_silently() {
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
     engine.put_box("d", durable_box()).unwrap();
     for i in 1..=8u64 {
-        engine.write("d", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("d", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
     // 8 records / 2-per-segment → 3 sealed (1-2,3-4,5-6); seq 7,8 active-ish.
     let before = count_segment_files(dir.path());
-    assert!(before >= 3, "several sealed segments before delete (got {before})");
+    assert!(
+        before >= 3,
+        "several sealed segments before delete (got {before})"
+    );
 
     // Delete everything below seq 7 (a prefix), clearing segments 1-2,3-4,5-6.
     let r = engine
-        .delete("d", DeleteRequest { before_seq: Some(7), match_: None })
+        .delete(
+            "d",
+            DeleteRequest {
+                before_seq: Some(7),
+                match_: None,
+            },
+        )
         .unwrap();
     assert_eq!(r.deleted, 6);
     assert_eq!(r.earliest_seq, 7);
@@ -1435,8 +1687,14 @@ fn prefix_delete_reclaims_segments_silently() {
     );
 
     let d = engine.diff("d", diff_from(0)).unwrap();
-    assert!(d.tombstone.is_none(), "voluntary delete stays silent despite segment drop");
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![7, 8]);
+    assert!(
+        d.tombstone.is_none(),
+        "voluntary delete stays silent despite segment drop"
+    );
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![7, 8]
+    );
     assert_eq!(engine.box_state("d", false).unwrap().count, 2);
 }
 
@@ -1452,16 +1710,24 @@ fn interior_match_delete_reclaims_its_segment_silently() {
     // Tag seqs 3 and 4 (one whole sealed segment) "mid"; the rest "keep".
     for i in 1..=8u64 {
         let tag = if i == 3 || i == 4 { "mid" } else { "keep" };
-        engine.write("m", one(json!({ "i": i }), Some(tag)), true).unwrap();
+        engine
+            .write("m", one(json!({ "i": i }), Some(tag)), true)
+            .unwrap();
     }
     let before = count_segment_files(dir.path());
-    assert!(before >= 3, "segments sealed before the match delete (got {before})");
+    assert!(
+        before >= 3,
+        "segments sealed before the match delete (got {before})"
+    );
 
     // Delete every "mid" record (seqs 3,4) — the whole interior segment 3-4.
     let r = engine
         .delete(
             "m",
-            DeleteRequest { before_seq: None, match_: Some(Filter::from_shorthand("mid")) },
+            DeleteRequest {
+                before_seq: None,
+                match_: Some(Filter::from_shorthand("mid")),
+            },
         )
         .unwrap();
     assert_eq!(r.deleted, 2);
@@ -1500,11 +1766,17 @@ fn reclaimed_segments_stay_gone_across_restart() {
         engine
             .put_box(
                 "cap",
-                BoxConfig { cap_records: 4, durable: true, ..BoxConfig::default() },
+                BoxConfig {
+                    cap_records: 4,
+                    durable: true,
+                    ..BoxConfig::default()
+                },
             )
             .unwrap();
         for i in 1..=12u64 {
-            engine.write("cap", one(json!({ "i": i }), None), true).unwrap();
+            engine
+                .write("cap", one(json!({ "i": i }), None), true)
+                .unwrap();
         }
         // Snapshot so the reclaimed prefix is also dropped from the WAL (the
         // checkpoint absorbs it), proving recovery does not resurrect it.
@@ -1515,13 +1787,21 @@ fn reclaimed_segments_stay_gone_across_restart() {
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
     let st = engine.box_state("cap", false).unwrap();
     assert_eq!(st.head_seq, 12, "head recovered");
-    assert_eq!(st.earliest_seq, 9, "cap floor recovered; reclaimed prefix not resurrected");
+    assert_eq!(
+        st.earliest_seq, 9,
+        "cap floor recovered; reclaimed prefix not resurrected"
+    );
     assert_eq!(st.count, 4);
 
     let d = engine.diff("cap", diff_from(0)).unwrap();
-    let tomb = d.tombstone.expect("cap tombstone after restart (no silent loss)");
+    let tomb = d
+        .tombstone
+        .expect("cap tombstone after restart (no silent loss)");
     assert_eq!(tomb.reason, TombstoneReason::Cap);
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![9, 10, 11, 12]);
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![9, 10, 11, 12]
+    );
     assert_eq!(d.records[0].data, json!({ "i": 9 }));
 }
 
@@ -1538,7 +1818,9 @@ fn restart_rebuilds_across_hot_cold_and_reclaim() {
         let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
         engine.put_box("logs", durable_box()).unwrap();
         for i in 1..=10u64 {
-            engine.write("logs", one(json!({ "i": i }), Some(&format!("t{i}"))), true).unwrap();
+            engine
+                .write("logs", one(json!({ "i": i }), Some(&format!("t{i}"))), true)
+                .unwrap();
         }
         // Relocate older sealed segments to cold (keep newest 1 sealed hot).
         let n = engine.relocate_box_cold("logs");
@@ -1546,7 +1828,13 @@ fn restart_rebuilds_across_hot_cold_and_reclaim() {
         assert!(count_tier_segments(cold.path()) >= 1);
         // Voluntary prefix delete of seqs < 3 — drops a whole (cold) segment file.
         engine
-            .delete("logs", DeleteRequest { before_seq: Some(3), match_: None })
+            .delete(
+                "logs",
+                DeleteRequest {
+                    before_seq: Some(3),
+                    match_: None,
+                },
+            )
             .unwrap();
         assert!(engine.write_snapshot().unwrap());
     }
@@ -1560,10 +1848,24 @@ fn restart_rebuilds_across_hot_cold_and_reclaim() {
     assert!(st.config.durable);
 
     let d = engine
-        .diff("logs", DiffRequest { from_seq: 0, limit: 1000, include_tags: true, ..DiffRequest::default() })
+        .diff(
+            "logs",
+            DiffRequest {
+                from_seq: 0,
+                limit: 1000,
+                include_tags: true,
+                ..DiffRequest::default()
+            },
+        )
         .unwrap();
-    assert!(d.tombstone.is_none(), "deleted prefix stays silent after restart");
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), (3..=10).collect::<Vec<_>>());
+    assert!(
+        d.tombstone.is_none(),
+        "deleted prefix stays silent after restart"
+    );
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (3..=10).collect::<Vec<_>>()
+    );
     assert_eq!(d.records[0].data, json!({ "i": 3 }));
     assert_eq!(d.records[0].tag.as_deref(), Some("t3"));
     assert_eq!(d.records.last().unwrap().data, json!({ "i": 10 }));
@@ -1584,22 +1886,33 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
     engine
         .put_box(
             "cap",
-            BoxConfig { cap_records: 6, durable: true, ..BoxConfig::default() },
+            BoxConfig {
+                cap_records: 6,
+                durable: true,
+                ..BoxConfig::default()
+            },
         )
         .unwrap();
 
     // Write 6 (all within cap=6) → seals 1-2,3-4 (5-6 active). Relocate the oldest.
     for i in 1..=6u64 {
-        engine.write("cap", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("cap", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
     let relocated = engine.relocate_box_cold("cap");
     assert!(relocated >= 1, "at least one segment relocated to cold");
     let cold_before = count_tier_segments(cold.path());
-    assert!(cold_before >= 1, "a segment is now in cold (got {cold_before})");
+    assert!(
+        cold_before >= 1,
+        "a segment is now in cold (got {cold_before})"
+    );
 
     // Overflow the cap so the cold segments fall fully below the live floor.
     for i in 7..=14u64 {
-        engine.write("cap", one(json!({ "i": i }), None), true).unwrap();
+        engine
+            .write("cap", one(json!({ "i": i }), None), true)
+            .unwrap();
     }
     let st = engine.box_state("cap", false).unwrap();
     assert_eq!(st.head_seq, 14);
@@ -1612,10 +1925,24 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
     );
 
     // Still no silent involuntary loss: a cursor below evict_floor tombstones.
-    let d = engine.diff("cap", DiffRequest { from_seq: 0, limit: 1000, ..DiffRequest::default() }).unwrap();
-    let tomb = d.tombstone.expect("cap tombstone after cold-segment reclaim");
+    let d = engine
+        .diff(
+            "cap",
+            DiffRequest {
+                from_seq: 0,
+                limit: 1000,
+                ..DiffRequest::default()
+            },
+        )
+        .unwrap();
+    let tomb = d
+        .tombstone
+        .expect("cap tombstone after cold-segment reclaim");
     assert_eq!(tomb.reason, TombstoneReason::Cap);
-    assert_eq!(d.records.iter().map(|r| r.seq).collect::<Vec<_>>(), (9..=14).collect::<Vec<_>>());
+    assert_eq!(
+        d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (9..=14).collect::<Vec<_>>()
+    );
 }
 
 // ===========================================================================
@@ -1684,10 +2011,18 @@ fn forwarded_copy_into_durable_dest_survives_restart() {
     assert_eq!(st.head_seq, 1, "forwarded durable copy recovered");
     assert_eq!(st.count, 1);
     let d = engine.diff("dst", diff_from(0)).unwrap();
-    assert_eq!(d.records.len(), 1, "forwarded copy present exactly once after restart");
+    assert_eq!(
+        d.records.len(),
+        1,
+        "forwarded copy present exactly once after restart"
+    );
     assert_eq!(d.records[0].data, json!({ "fwd": 1 }));
     assert_eq!(d.records[0].tag.as_deref(), Some("ftag"), "$tag preserved");
-    assert_eq!(d.records[0].node.as_deref(), Some("writerA"), "$node preserved");
+    assert_eq!(
+        d.records[0].node.as_deref(),
+        Some("writerA"),
+        "$node preserved"
+    );
 
     // And forwarding still works for a NEW write after restart.
     engine
@@ -1695,7 +2030,10 @@ fn forwarded_copy_into_durable_dest_survives_restart() {
         .unwrap();
     let d2 = engine.diff("dst", diff_from(0)).unwrap();
     assert_eq!(
-        d2.records.iter().map(|r| r.data.clone()).collect::<Vec<_>>(),
+        d2.records
+            .iter()
+            .map(|r| r.data.clone())
+            .collect::<Vec<_>>(),
         vec![json!({ "fwd": 1 }), json!({ "fwd": 2 })],
         "post-restart forward appends after the recovered copy (no duplicate)"
     );
@@ -1713,7 +2051,9 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
     {
         let engine = engine_at(dir.path());
         engine.put_box("d", durable_box()).unwrap();
-        let resp = engine.write("d", one(json!({ "n": 1 }), None), true).unwrap();
+        let resp = engine
+            .write("d", one(json!({ "n": 1 }), None), true)
+            .unwrap();
         // The ack came back only after the fsync (WAL-first publish).
         assert!(resp.performance.fsync_ms.unwrap_or(0.0) > 0.0);
         // And it is immediately visible to a reader (published post-fsync).
@@ -1721,7 +2061,10 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
     }
     let engine = engine_at(dir.path());
     assert_eq!(engine.box_state("d", false).unwrap().head_seq, 1);
-    assert_eq!(engine.diff("d", diff_from(0)).unwrap().records[0].data, json!({ "n": 1 }));
+    assert_eq!(
+        engine.diff("d", diff_from(0)).unwrap().records[0].data,
+        json!({ "n": 1 })
+    );
 }
 
 // ===========================================================================
@@ -1755,14 +2098,28 @@ fn memory_box_loses_records_but_config_survives_restart() {
         engine
             .put_box(
                 "cache",
-                BoxConfig { durability: Some(Durability::Memory), cap_records: 99, ..BoxConfig::default() },
+                BoxConfig {
+                    durability: Some(Durability::Memory),
+                    cap_records: 99,
+                    ..BoxConfig::default()
+                },
             )
             .unwrap();
         for i in 1..=5 {
-            let resp = engine.write("cache", one(json!({ "i": i }), None), true).unwrap();
+            let resp = engine
+                .write("cache", one(json!({ "i": i }), None), true)
+                .unwrap();
             // The memory class never touches the WAL: zero append/fsync time.
-            assert_eq!(resp.performance.wal_append_ms, Some(0.0), "memory write skips WAL append");
-            assert_eq!(resp.performance.fsync_ms, Some(0.0), "memory write never fsyncs");
+            assert_eq!(
+                resp.performance.wal_append_ms,
+                Some(0.0),
+                "memory write skips WAL append"
+            );
+            assert_eq!(
+                resp.performance.fsync_ms,
+                Some(0.0),
+                "memory write never fsyncs"
+            );
         }
         // In-memory the records ARE present (pure RAM, this process's lifetime).
         let st = engine.box_state("cache", false).unwrap();
@@ -1777,15 +2134,30 @@ fn memory_box_loses_records_but_config_survives_restart() {
     let st = engine.box_state("cache", false).unwrap();
     assert_eq!(st.head_seq, 0, "memory box head_seq resets to 0 on restart");
     assert_eq!(st.count, 0, "memory box reappears EMPTY (records lost)");
-    assert_eq!(st.config.durability, Some(Durability::Memory), "config (durability) survives");
+    assert_eq!(
+        st.config.durability,
+        Some(Durability::Memory),
+        "config (durability) survives"
+    );
     assert_eq!(st.config.cap_records, 99, "config (cap_records) survives");
-    assert!(!st.config.durable, "memory ⇒ durable:false (back-compat: class != fsync)");
+    assert!(
+        !st.config.durable,
+        "memory ⇒ durable:false (back-compat: class != fsync)"
+    );
     let d = engine.diff("cache", diff_from(0)).unwrap();
-    assert!(d.records.is_empty(), "no records resurrected from WAL/snapshot");
-    assert!(d.tombstone.is_none(), "an empty fresh box has nothing to tombstone");
+    assert!(
+        d.records.is_empty(),
+        "no records resurrected from WAL/snapshot"
+    );
+    assert!(
+        d.tombstone.is_none(),
+        "an empty fresh box has nothing to tombstone"
+    );
 
     // The box is fully functional post-restart: a fresh write starts at seq 1.
-    engine.write("cache", one(json!({ "i": 100 }), None), true).unwrap();
+    engine
+        .write("cache", one(json!({ "i": 100 }), None), true)
+        .unwrap();
     assert_eq!(engine.box_state("cache", false).unwrap().head_seq, 1);
 }
 
@@ -1799,9 +2171,15 @@ fn disk_box_survives_clean_restart_and_is_not_fsync_gated() {
         let engine = engine_at(dir.path());
         engine.put_box("evts", class_box(Durability::Disk)).unwrap();
         for i in 1..=4 {
-            let resp = engine.write("evts", one(json!({ "i": i }), None), true).unwrap();
+            let resp = engine
+                .write("evts", one(json!({ "i": i }), None), true)
+                .unwrap();
             // Disk is group-committed: the ack is not fsync-gated.
-            assert_eq!(resp.performance.fsync_ms, Some(0.0), "disk write is not fsync-gated");
+            assert_eq!(
+                resp.performance.fsync_ms,
+                Some(0.0),
+                "disk write is not fsync-gated"
+            );
         }
         let st = engine.box_state("evts", false).unwrap();
         assert_eq!(st.config.durability, Some(Durability::Disk));
@@ -1810,9 +2188,26 @@ fn disk_box_survives_clean_restart_and_is_not_fsync_gated() {
     // Clean teardown drained + fsynced the WAL ⇒ the disk records are recovered.
     let engine = engine_at(dir.path());
     let st = engine.box_state("evts", false).unwrap();
-    assert_eq!(st.head_seq, 4, "disk writes survive a clean restart");
-    assert_eq!(st.count, 4);
-    assert_eq!(st.config.durability, Some(Durability::Disk), "class persisted");
+    // All 4 acked records survive (exact `count`). For a `disk` box `head_seq` may
+    // sit at the durable head RESERVATION (R3: a head ceiling fsynced ahead of use
+    // to prevent seq reuse across a power loss) — `>= 4` and within the reservation
+    // block; the reserved-but-unwritten seqs are silent gaps.
+    assert_eq!(st.count, 4, "disk writes survive a clean restart");
+    assert!(
+        st.head_seq >= 4,
+        "head never below the acked head, got {}",
+        st.head_seq
+    );
+    assert!(
+        st.head_seq <= 4 + streams::config::DISK_HEAD_RESERVE_AHEAD,
+        "head within the reservation block, got {}",
+        st.head_seq
+    );
+    assert_eq!(
+        st.config.durability,
+        Some(Durability::Disk),
+        "class persisted"
+    );
 }
 
 /// `durability_class` resolution (API §0.10): explicit `durability` wins; absent
@@ -1824,7 +2219,15 @@ fn durability_resolution_and_back_compat_reporting() {
     let engine = engine_at(dir.path());
 
     // Legacy durable:true (no `durability`) ⇒ resolves to fsync.
-    engine.put_box("a", BoxConfig { durable: true, ..BoxConfig::default() }).unwrap();
+    engine
+        .put_box(
+            "a",
+            BoxConfig {
+                durable: true,
+                ..BoxConfig::default()
+            },
+        )
+        .unwrap();
     let a = engine.box_state("a", false).unwrap().config;
     assert_eq!(a.durability, Some(Durability::Fsync));
     assert!(a.durable);
@@ -1837,10 +2240,21 @@ fn durability_resolution_and_back_compat_reporting() {
 
     // Explicit `durability` WINS over a conflicting `durable` bool.
     engine
-        .put_box("c", BoxConfig { durable: true, durability: Some(Durability::Disk), ..BoxConfig::default() })
+        .put_box(
+            "c",
+            BoxConfig {
+                durable: true,
+                durability: Some(Durability::Disk),
+                ..BoxConfig::default()
+            },
+        )
         .unwrap();
     let c = engine.box_state("c", false).unwrap().config;
-    assert_eq!(c.durability, Some(Durability::Disk), "explicit durability wins");
+    assert_eq!(
+        c.durability,
+        Some(Durability::Disk),
+        "explicit durability wins"
+    );
     assert!(!c.durable, "durable normalized to match the resolved class");
 
     // Explicit memory ⇒ durable:false; is_durable()==false.
@@ -1860,7 +2274,9 @@ fn router_into_memory_dest_does_not_persist_the_copy() {
         let engine = engine_at(dir.path());
         // A durable source; a memory destination box.
         engine.put_box("src", durable_box()).unwrap();
-        engine.put_box("mem_dst", class_box(Durability::Memory)).unwrap();
+        engine
+            .put_box("mem_dst", class_box(Durability::Memory))
+            .unwrap();
         engine
             .put_router(
                 "src->mem_dst",
@@ -1875,16 +2291,32 @@ fn router_into_memory_dest_does_not_persist_the_copy() {
                 },
             )
             .unwrap();
-        engine.write("src", one(json!({ "x": 1 }), None), true).unwrap();
+        engine
+            .write("src", one(json!({ "x": 1 }), None), true)
+            .unwrap();
         // The forward landed in RAM: the memory dest has the copy right now.
-        assert_eq!(engine.diff("mem_dst", diff_from(0)).unwrap().records.len(), 1);
+        assert_eq!(
+            engine.diff("mem_dst", diff_from(0)).unwrap().records.len(),
+            1
+        );
         assert!(engine.write_snapshot().unwrap());
     }
     // Restart: the durable source keeps its record; the memory dest is EMPTY.
     let engine = engine_at(dir.path());
-    assert_eq!(engine.box_state("src", false).unwrap().head_seq, 1, "durable source survives");
+    assert_eq!(
+        engine.box_state("src", false).unwrap().head_seq,
+        1,
+        "durable source survives"
+    );
     let dst = engine.box_state("mem_dst", false).unwrap();
     assert_eq!(dst.head_seq, 0, "memory dest head resets");
-    assert_eq!(dst.count, 0, "forwarded copy into a memory dest does not persist");
-    assert!(engine.diff("mem_dst", diff_from(0)).unwrap().records.is_empty());
+    assert_eq!(
+        dst.count, 0,
+        "forwarded copy into a memory dest does not persist"
+    );
+    assert!(engine
+        .diff("mem_dst", diff_from(0))
+        .unwrap()
+        .records
+        .is_empty());
 }

@@ -24,7 +24,12 @@
 //! ```
 
 #![cfg(feature = "test-fs")]
-#![allow(clippy::ptr_arg, clippy::manual_clamp, clippy::unusual_byte_groupings, clippy::doc_lazy_continuation)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::manual_clamp,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -218,14 +223,29 @@ fn f_idemp_retry_after_crash() {
     let seqs_after = assert_no_gap(&after);
     // (c) NO GAP and NO RESURRECTION: a dense run 1..=4; the original keyed
     //     record (seq 2) still present unchanged; the retry is the new seq 4.
-    assert_eq!(seqs_after, vec![1, 2, 3, 4], "dense gap-free run after retry");
-    assert_eq!(after[1], (2, "b".to_string()), "original keyed record intact");
-    assert_eq!(after[3], (4, "b".to_string()), "retry materialized at head+1");
+    assert_eq!(
+        seqs_after,
+        vec![1, 2, 3, 4],
+        "dense gap-free run after retry"
+    );
+    assert_eq!(
+        after[1],
+        (2, "b".to_string()),
+        "original keyed record intact"
+    );
+    assert_eq!(
+        after[3],
+        (4, "b".to_string()),
+        "retry materialized at head+1"
+    );
 
     // (d) Head monotone & advanced by exactly the one retried record.
     let st = engine.box_state("jobs", false).expect("state");
     assert_eq!(st.head_seq, 4, "head advanced to head_before+1");
-    assert!(st.head_seq > head_before, "head never regresses across restart");
+    assert!(
+        st.head_seq > head_before,
+        "head never regresses across restart"
+    );
 
     drop(engine);
 
@@ -233,7 +253,11 @@ fn f_idemp_retry_after_crash() {
     //     the dedupe map is STILL empty (a second retry would re-execute again).
     let engine2 = open_engine(&disk);
     let again = read_records(&engine2, "jobs");
-    assert_eq!(assert_no_gap(&again), vec![1, 2, 3, 4], "recovery is idempotent");
+    assert_eq!(
+        assert_no_gap(&again),
+        vec![1, 2, 3, 4],
+        "recovery is idempotent"
+    );
     let b = engine2.get_box("jobs").expect("box present");
     assert!(
         b.dedupe.read().is_empty(),
@@ -274,7 +298,10 @@ fn f_idemp_window_not_persisted() {
 
         // A real snapshot lands on the same FakeDisk image (and is durable: the
         // write_snapshot_with path does write→fsync→rename→dir-fsync).
-        assert!(engine.write_snapshot().expect("snapshot ok"), "snapshot written");
+        assert!(
+            engine.write_snapshot().expect("snapshot ok"),
+            "snapshot written"
+        );
 
         sync_dirs(&disk);
         disk.crash(TornDamage::None);
@@ -289,7 +316,11 @@ fn f_idemp_window_not_persisted() {
     //     recovered (the snapshot materialized them), dense and gap-free.
     let recs = read_records(&engine, "q");
     let seqs = assert_no_gap(&recs);
-    assert_eq!(seqs, vec![1, 2], "both keyed records recovered from snapshot+WAL");
+    assert_eq!(
+        seqs,
+        vec![1, 2],
+        "both keyed records recovered from snapshot+WAL"
+    );
     assert_eq!(recs[0].1, "j1");
     assert_eq!(recs[1].1, "j2");
 
@@ -306,7 +337,15 @@ fn f_idemp_window_not_persisted() {
     //     stays dense — exactly the best-effort, never-unsafe behavior.
     let retry = write_one(&engine, "q", "j1-again", Some("key-a"));
     assert!(!retry.deduped, "lost dedupe window ⇒ retry re-executes");
-    assert_eq!(retry.seqs.as_deref(), Some(&[3u64][..]), "fresh append at head+1");
+    assert_eq!(
+        retry.seqs.as_deref(),
+        Some(&[3u64][..]),
+        "fresh append at head+1"
+    );
     let after = read_records(&engine, "q");
-    assert_eq!(assert_no_gap(&after), vec![1, 2, 3], "still dense, no gap/duplicate");
+    assert_eq!(
+        assert_no_gap(&after),
+        vec![1, 2, 3],
+        "still dense, no gap/duplicate"
+    );
 }

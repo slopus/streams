@@ -39,10 +39,7 @@ fn diff_all(h: &Harness, box_name: &str) -> Vec<Value> {
         json!({ "from_seq": 0, "limit": 1000, "node": "consumer", "include_tags": true }),
     );
     assert_eq!(status, StatusCode::OK, "diff {box_name}: {body}");
-    body["records"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    body["records"].as_array().cloned().unwrap_or_default()
 }
 
 /// Write one record to `box` (origin node + optional tag); assert 2xx.
@@ -116,7 +113,11 @@ fn put_router_source_equals_dest_is_400() {
         "/v0/routers/loop",
         json!({ "source": "same", "dest": "same" }),
     );
-    assert_eq!(status, StatusCode::BAD_REQUEST, "source==dest -> 400: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "source==dest -> 400: {body}"
+    );
     assert_eq!(body["error"]["code"], "invalid_request");
 }
 
@@ -169,7 +170,11 @@ fn list_routers_filters_by_source_and_dest() {
         .iter()
         .map(|r| r["router"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["a->b", "a->c"], "source filter + sorted by name");
+    assert_eq!(
+        names,
+        vec!["a->b", "a->c"],
+        "source filter + sorted by name"
+    );
 
     // Filter by dest=c -> two (a->c and x->c).
     let (_s, body) = h.get("/v0/routers?dest=c");
@@ -193,7 +198,10 @@ fn list_routers_filters_by_source_and_dest() {
 #[test]
 fn delete_router_is_idempotent_and_stops_forwarding() {
     let h = Harness::start();
-    h.put("/v0/routers/src->dst", json!({ "source": "src", "dest": "dst" }));
+    h.put(
+        "/v0/routers/src->dst",
+        json!({ "source": "src", "dest": "dst" }),
+    );
 
     // Forward two records, confirm they land in dst.
     write_one(&h, "src", json!({ "i": 1 }), Some("o"), None);
@@ -214,8 +222,15 @@ fn delete_router_is_idempotent_and_stops_forwarding() {
     // A further write to src is NOT forwarded; the two prior copies remain in dst.
     write_one(&h, "src", json!({ "i": 3 }), Some("o"), None);
     let recs = diff_all(&h, "dst");
-    assert_eq!(recs.len(), 2, "forwarding stopped; already-forwarded records remain");
-    let vals: Vec<i64> = recs.iter().map(|r| r["data"]["i"].as_i64().unwrap()).collect();
+    assert_eq!(
+        recs.len(),
+        2,
+        "forwarding stopped; already-forwarded records remain"
+    );
+    let vals: Vec<i64> = recs
+        .iter()
+        .map(|r| r["data"]["i"].as_i64().unwrap())
+        .collect();
     assert_eq!(vals, vec![1, 2], "the third record never reached dst");
 
     // The router is gone from GET as well.
@@ -230,7 +245,10 @@ fn delete_router_is_idempotent_and_stops_forwarding() {
 #[test]
 fn fanout_preserves_node_and_tag_in_fifo_order() {
     let h = Harness::start();
-    h.put("/v0/routers/feed->mirror", json!({ "source": "feed", "dest": "mirror" }));
+    h.put(
+        "/v0/routers/feed->mirror",
+        json!({ "source": "feed", "dest": "mirror" }),
+    );
 
     // Three tagged records from one origin node, written in order.
     write_one(&h, "feed", json!({ "n": 1 }), Some("origin-1"), Some("t1"));
@@ -241,8 +259,15 @@ fn fanout_preserves_node_and_tag_in_fifo_order() {
     assert_eq!(recs.len(), 3, "all three fanned out");
 
     // Per-source FIFO: dest order matches source commit order.
-    let order: Vec<i64> = recs.iter().map(|r| r["data"]["n"].as_i64().unwrap()).collect();
-    assert_eq!(order, vec![1, 2, 3], "per-source FIFO preserved through fan-out");
+    let order: Vec<i64> = recs
+        .iter()
+        .map(|r| r["data"]["n"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        order,
+        vec![1, 2, 3],
+        "per-source FIFO preserved through fan-out"
+    );
 
     // $node preserved (loop-prevention key carries through).
     for r in &recs {
@@ -284,8 +309,14 @@ fn fanout_preserve_node_and_tag_false_clears_them() {
 #[test]
 fn fanout_to_multiple_dests_each_gets_a_copy() {
     let h = Harness::start();
-    h.put("/v0/routers/feed->a", json!({ "source": "feed", "dest": "a" }));
-    h.put("/v0/routers/feed->b", json!({ "source": "feed", "dest": "b" }));
+    h.put(
+        "/v0/routers/feed->a",
+        json!({ "source": "feed", "dest": "a" }),
+    );
+    h.put(
+        "/v0/routers/feed->b",
+        json!({ "source": "feed", "dest": "b" }),
+    );
 
     write_one(&h, "feed", json!({ "x": 1 }), Some("o"), None);
 
@@ -312,7 +343,10 @@ fn cycle_creation_rejected_409_with_detail() {
     let cycle = body["error"]["detail"]["cycle"]
         .as_array()
         .expect("detail.cycle path present");
-    assert!(cycle.len() >= 2, "cycle path lists the box names: {cycle:?}");
+    assert!(
+        cycle.len() >= 2,
+        "cycle path lists the box names: {cycle:?}"
+    );
     let path: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
     // Path starts at the new source and ends back at it (a -> ... -> a).
     assert_eq!(path.first(), Some(&"c"), "cycle reported from new source");
@@ -320,7 +354,11 @@ fn cycle_creation_rejected_409_with_detail() {
 
     // The rejected router was NOT created.
     let (status, _b) = h.get("/v0/routers/c->a");
-    assert_eq!(status, StatusCode::NOT_FOUND, "rejected cycle router not persisted");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "rejected cycle router not persisted"
+    );
 }
 
 #[test]
@@ -348,8 +386,14 @@ fn allow_cycle_mirror_terminates_via_hop_cap() {
     let a_head = a_state["head_seq"].as_u64().unwrap();
     let b_head = b_state["head_seq"].as_u64().unwrap();
     // MAX_ROUTER_HOPS = 8: a handful of copies at most, never unbounded.
-    assert!((1..=16).contains(&a_head), "a head bounded by hop cap, got {a_head}");
-    assert!((1..=16).contains(&b_head), "b head bounded by hop cap, got {b_head}");
+    assert!(
+        (1..=16).contains(&a_head),
+        "a head bounded by hop cap, got {a_head}"
+    );
+    assert!(
+        (1..=16).contains(&b_head),
+        "b head bounded by hop cap, got {b_head}"
+    );
 
     // $node is preserved through the cycle (the loop-prevention key stays intact).
     let recs = diff_all(&h, "b");
@@ -389,7 +433,11 @@ fn create_dest_true_auto_creates_destination() {
 
     // dest now exists (state read, which never auto-creates, returns 200).
     let (status, body) = h.get("/v0/boxes/freshdst");
-    assert_eq!(status, StatusCode::OK, "create_dest auto-created the dest: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create_dest auto-created the dest: {body}"
+    );
     // source auto-created too.
     let (status, _b) = h.get("/v0/boxes/srcx");
     assert_eq!(status, StatusCode::OK, "source auto-created as well");
@@ -402,7 +450,11 @@ fn create_dest_false_on_missing_dest_is_404() {
         "/v0/routers/srcy->missingdst",
         json!({ "source": "srcy", "dest": "missingdst", "create_dest": false }),
     );
-    assert_eq!(status, StatusCode::NOT_FOUND, "create_dest:false + missing -> 404: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "create_dest:false + missing -> 404: {body}"
+    );
     assert_eq!(body["error"]["code"], "box_not_found");
 
     // The router was not created.
@@ -421,7 +473,11 @@ fn create_dest_false_with_existing_dest_succeeds() {
         "/v0/routers/srcz->predst",
         json!({ "source": "srcz", "dest": "predst", "create_dest": false }),
     );
-    assert_eq!(status, StatusCode::CREATED, "existing dest -> create ok: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "existing dest -> create ok: {body}"
+    );
 
     // Forwarding works into the pre-existing dest.
     write_one(&h, "srcz", json!({ "ok": true }), Some("o"), None);

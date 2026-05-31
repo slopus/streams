@@ -412,14 +412,23 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
     let head = st["head_seq"].as_u64().unwrap();
     let count = st["count"].as_u64().unwrap();
     assert_eq!(st["earliest_seq"], 1, "no eviction; earliest stays 1");
-    // The recovered set is a contiguous prefix [1..=head] with count == head
-    // (no deletes/eviction), and every seq is present exactly once.
-    assert_eq!(count, head, "count == head ⇒ dense, contiguous prefix");
-    assert!(head >= 1, "at least some prefix survived");
+    // The recovered LIVE set is a dense contiguous prefix [1..=count] (no deletes/
+    // eviction, no middle gap). For a `disk` box, `head` may sit ABOVE `count` by
+    // the durable head reservation (R3): the SIGKILL dropped the un-fsynced disk
+    // tail, so recovery resumes at the reservation ceiling and the unwritten
+    // reserved seqs are silent deleted gaps — but head NEVER regresses below an
+    // acked seq (no reuse) and never exceeds the reservation block.
+    assert!(head >= count, "head never below the live count (no reuse)");
+    assert!(
+        head <= count + streams::config::DISK_HEAD_RESERVE_AHEAD,
+        "head {head} within the reservation block of count {count}"
+    );
+    assert!(count >= 1, "at least some prefix survived");
 
-    // Read the whole log back and assert it is exactly the contiguous prefix
-    // [1..=head] — i.e. a torn tail was truncated, not misinterpreted as a
-    // bogus/garbled record, and there are no gaps.
+    // Read the whole live log back and assert it is exactly the contiguous prefix
+    // [1..=count] — i.e. a torn tail was truncated, not misinterpreted as a
+    // bogus/garbled record, and there are no gaps in the LIVE set (the reserved
+    // tail gap, if any, reads as silent deleted holes the diff skips).
     let mut all_seqs: Vec<u64> = Vec::new();
     let mut from = 0u64;
     loop {
@@ -442,10 +451,10 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
             break;
         }
     }
-    let expected: Vec<u64> = (1..=head).collect();
+    let expected: Vec<u64> = (1..=count).collect();
     assert_eq!(
         all_seqs, expected,
-        "recovered records are exactly the contiguous prefix [1..=head] (clean tail)"
+        "recovered live records are exactly the contiguous prefix [1..=count] (clean tail)"
     );
 
     // The WAL is writable again post-recovery: a fresh durable write appends
@@ -455,7 +464,9 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
         .json(&json!({ "records": [{ "data": { "after": "crash" } }] }))
         .send()
         .unwrap();
-    assert!(r.status().is_success());
+    let status = r.status();
+    let body = r.text().unwrap_or_default();
+    assert!(status.is_success(), "fresh write failed: {status} {body}");
     let new_head: u64 = c
         .get(format!("{base}/v0/boxes/burst"))
         .send()
@@ -464,7 +475,11 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
         .unwrap()["head_seq"]
         .as_u64()
         .unwrap();
-    assert_eq!(new_head, head + 1, "append continues after the clean prefix");
+    assert_eq!(
+        new_head,
+        head + 1,
+        "append continues after the clean prefix"
+    );
 
     let _ = child2.kill();
     let _ = child2.wait();
@@ -550,7 +565,10 @@ fn torn_tail_on_subprocess_wal_recovers_clean() {
     wait_ready(&c, &base, Duration::from_secs(10));
 
     let st = get_json(&c, format!("{base}/v0/boxes/t"));
-    assert_eq!(st["head_seq"], 3, "good frames recovered, torn tail discarded");
+    assert_eq!(
+        st["head_seq"], 3,
+        "good frames recovered, torn tail discarded"
+    );
     assert_eq!(st["count"], 3);
     let d: Value = c
         .post(format!("{base}/v0/boxes/t/diff"))
