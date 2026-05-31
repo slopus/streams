@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>streams — Internals: Data, Disk &amp; Durability</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --bg-soft: #161922;
+    --panel: #1b1f2a;
+    --panel-2: #232838;
+    --ink: #e7eaf0;
+    --ink-soft: #aeb6c6;
+    --ink-dim: #7b8497;
+    --line: #2b3142;
+    --accent: #6ea8fe;
+    --accent-2: #8b7bf0;
+    --green: #54d18c;
+    --amber: #f2c14e;
+    --red: #ef6b73;
+    --teal: #43c9c0;
+    --code: #c8d3f5;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+  }
+  .layout { display: flex; align-items: flex-start; }
+
+  /* ---- Sidebar nav ---- */
+  nav.toc {
+    position: sticky;
+    top: 0;
+    width: 290px;
+    min-width: 290px;
+    height: 100vh;
+    overflow-y: auto;
+    background: var(--bg-soft);
+    border-right: 1px solid var(--line);
+    padding: 22px 18px 60px;
+  }
+  nav.toc .brand {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 18px;
+    letter-spacing: .5px;
+    color: var(--ink);
+    margin-bottom: 2px;
+  }
+  nav.toc .brand .dot { color: var(--accent); }
+  nav.toc .sub { color: var(--ink-dim); font-size: 12px; margin-bottom: 18px; }
+  nav.toc a {
+    display: block;
+    color: var(--ink-soft);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 13.5px;
+    border-left: 2px solid transparent;
+  }
+  nav.toc a:hover { background: var(--panel); color: var(--ink); }
+  nav.toc a.section { margin-top: 14px; font-weight: 600; color: var(--ink); font-size: 12px; text-transform: uppercase; letter-spacing: .8px; }
+  nav.toc a.sub-link { padding-left: 22px; color: var(--ink-dim); }
+
+  /* ---- Content ---- */
+  main {
+    flex: 1;
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 46px 48px 120px;
+  }
+  header.hero {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 28px;
+    margin-bottom: 36px;
+  }
+  header.hero h1 {
+    font-size: 34px;
+    margin: 0 0 8px;
+    letter-spacing: -.5px;
+  }
+  header.hero .tag { color: var(--accent); font-family: var(--mono); font-size: 14px; }
+  header.hero p.lede { color: var(--ink-soft); font-size: 17px; margin: 14px 0 0; }
+
+  h2 {
+    font-size: 25px;
+    margin: 52px 0 6px;
+    padding-top: 12px;
+    letter-spacing: -.3px;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    color: var(--accent);
+    font-size: 16px;
+    margin-right: 10px;
+    opacity: .8;
+  }
+  h3 { font-size: 19px; margin: 34px 0 4px; color: var(--ink); }
+  h4 { font-size: 15px; margin: 22px 0 4px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .6px; font-weight: 600; }
+  p { margin: 12px 0; color: var(--ink); }
+  p.muted { color: var(--ink-soft); }
+  a { color: var(--accent); }
+  strong { color: #fff; }
+  em.term { color: var(--teal); font-style: normal; font-weight: 600; }
+  code {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    background: var(--panel-2);
+    color: var(--code);
+    padding: 1.5px 6px;
+    border-radius: 5px;
+  }
+  ul, ol { color: var(--ink); }
+  li { margin: 6px 0; }
+
+  pre {
+    background: #0b0d13;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--code);
+  }
+  pre .c { color: #6b7488; }      /* comment */
+  pre .k { color: var(--accent-2); }  /* keyword */
+  pre .s { color: var(--green); } /* string */
+  pre .n { color: var(--amber); } /* number/field */
+  pre .hl { color: var(--accent); font-weight: 600; }
+
+  /* ---- Callouts ---- */
+  .call {
+    border-radius: var(--radius);
+    padding: 14px 18px;
+    margin: 20px 0;
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .call .lbl {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    font-weight: 700;
+    display: inline-block;
+    margin-bottom: 6px;
+  }
+  .call p:first-of-type { margin-top: 0; }
+  .call p:last-child { margin-bottom: 0; }
+  .call.guarantee { border-left: 4px solid var(--green); }
+  .call.guarantee .lbl { color: var(--green); }
+  .call.warn { border-left: 4px solid var(--amber); }
+  .call.warn .lbl { color: var(--amber); }
+  .call.danger { border-left: 4px solid var(--red); }
+  .call.danger .lbl { color: var(--red); }
+  .call.note { border-left: 4px solid var(--accent); }
+  .call.note .lbl { color: var(--accent); }
+  .call.invariant { border-left: 4px solid var(--accent-2); background: var(--panel-2); }
+  .call.invariant .lbl { color: var(--accent-2); }
+
+  /* ---- Tables ---- */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 20px 0;
+    font-size: 14px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th { color: var(--ink-soft); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; background: var(--bg-soft); }
+  td code { background: transparent; padding: 0; }
+  tr:hover td { background: var(--bg-soft); }
+  .pill {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    padding: 2px 8px;
+    border-radius: 20px;
+    white-space: nowrap;
+  }
+  .pill.mem { background: rgba(242,193,78,.14); color: var(--amber); border: 1px solid rgba(242,193,78,.3); }
+  .pill.disk { background: rgba(110,168,254,.14); color: var(--accent); border: 1px solid rgba(110,168,254,.3); }
+  .pill.fsync { background: rgba(84,209,140,.14); color: var(--green); border: 1px solid rgba(84,209,140,.3); }
+
+  /* ---- Diagram blocks ---- */
+  .diagram {
+    background: #0b0d13;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 22px;
+    margin: 22px 0;
+    overflow-x: auto;
+  }
+  .diagram pre { background: transparent; border: none; padding: 0; color: var(--ink-soft); font-size: 12.5px; }
+
+  .layers { display: flex; flex-direction: column; gap: 0; margin: 22px 0; }
+  .layer {
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--accent);
+    background: var(--panel);
+    padding: 12px 16px;
+    position: relative;
+  }
+  .layer:not(:last-child) { border-bottom: none; }
+  .layer .ltitle { font-family: var(--mono); font-weight: 700; color: var(--ink); font-size: 14px; }
+  .layer .ldesc { color: var(--ink-soft); font-size: 13px; margin-top: 2px; }
+  .layer.l1 { border-left-color: var(--teal); }
+  .layer.l2 { border-left-color: var(--accent); }
+  .layer.l3 { border-left-color: var(--accent-2); }
+  .layer.l4 { border-left-color: var(--amber); }
+  .layer.l5 { border-left-color: var(--green); }
+
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 2px 16px; margin: 16px 0; font-size: 14px; }
+  .kv .k { font-family: var(--mono); color: var(--teal); }
+  .kv .v { color: var(--ink-soft); }
+
+  hr.soft { border: none; border-top: 1px solid var(--line); margin: 40px 0; }
+
+  .footnote { color: var(--ink-dim); font-size: 13px; }
+  .anchor-pad { scroll-margin-top: 20px; }
+
+  @media (max-width: 900px) {
+    nav.toc { display: none; }
+    main { padding: 28px 20px 80px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc">
+  <div class="brand">streams<span class="dot">.</span></div>
+  <div class="sub">Internals — data, disk &amp; durability</div>
+
+  <a class="section" href="#overview">Overview</a>
+  <a class="sub-link" href="#mental-model">The one-line model</a>
+  <a class="sub-link" href="#layers">Layered architecture</a>
+
+  <a class="section" href="#writepath">The write path</a>
+  <a class="sub-link" href="#write-steps">11 steps, top to bottom</a>
+  <a class="sub-link" href="#durability-classes">Durability classes</a>
+
+  <a class="section" href="#wal">The WAL</a>
+  <a class="sub-link" href="#wal-frame">Frame format</a>
+  <a class="sub-link" href="#group-commit">Group commit</a>
+  <a class="sub-link" href="#off-lock">Off-lock fsync</a>
+  <a class="sub-link" href="#tail-rewind">Tail-rewind on error</a>
+
+  <a class="section" href="#segments">Segments &amp; tiering</a>
+  <a class="sub-link" href="#segment-format">.data / .idx format</a>
+  <a class="sub-link" href="#tiering">Hot / cold tiers</a>
+
+  <a class="section" href="#snapshots">Metadata snapshots</a>
+  <a class="sub-link" href="#snapshot-format">Format &amp; checkpoint</a>
+  <a class="sub-link" href="#atomic-swap">Atomic swap</a>
+
+  <a class="section" href="#recovery">Recovery</a>
+  <a class="sub-link" href="#recovery-steps">Restart sequence</a>
+  <a class="sub-link" href="#idempotent-replay">Idempotent replay</a>
+
+  <a class="section" href="#fsseam">The Fs seam</a>
+  <a class="section" href="#guarantees">Guarantees</a>
+  <a class="sub-link" href="#watermarks">Watermarks &amp; tombstones</a>
+  <a class="section" href="#faulttest">Proving it</a>
+  <a class="section" href="#reference">Reference card</a>
+</nav>
+
+<main>
+<header class="hero anchor-pad" id="overview">
+  <div class="tag">single binary · pure Rust · axum + tokio</div>
+  <h1>How <strong>streams</strong> persists data &amp; survives disk failure</h1>
+  <p class="lede">A top-to-bottom tour of the storage engine: the path a write takes from an HTTP
+  request down to fsynced bytes, the on-disk formats that hold it, and the exact mechanics by
+  which a crash, a torn write, or a bad disk sector loses nothing it promised to keep.</p>
+</header>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="mental-model"><span class="num">00</span>The one-line mental model</h2>
+
+<p><strong>streams</strong> is a persistent event engine. You <code>POST</code> records into a named
+<em class="term">box</em> (a log or a queue) and read them back in order, durably, across restarts.
+Everything about its disk story collapses to a single sentence:</p>
+
+<div class="call guarantee">
+  <span class="lbl">The durability boundary</span>
+  <p><strong>The Write-Ahead Log (WAL) is the one and only line between "remembered" and "forgotten."</strong>
+  A write is durable exactly when its frame is in the WAL on disk. Everything else on disk —
+  segments, snapshots, indexes — is a <em>performance-and-serving optimization</em> that can be
+  rebuilt by replaying the WAL. Only data not yet in the WAL can be lost.</p>
+</div>
+
+<p>Hold that thought through every layer below. The segments make reads fast; the snapshots make
+restart fast; the indexes make lookups fast. None of them are the source of truth. The WAL is.</p>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="layers"><span class="num">01</span>Layered architecture</h2>
+
+<p>From the socket down to the platter, a write passes through five layers. Each one has a single
+job and a clean seam to the next.</p>
+
+<div class="layers">
+  <div class="layer l1">
+    <div class="ltitle">① HTTP / wire layer &nbsp;<span style="color:var(--ink-dim);font-weight:400">src/http/, src/serve.rs</span></div>
+    <div class="ldesc">axum 0.8 over hyper 1.10. Parses the request, authenticates the API key (SHA-256 hashed,
+    constant-time compare, scope bits), enforces global limits (box/router/watch/inflight caps → 429), hands a typed <code>RecordIn</code> to the engine.</div>
+  </div>
+  <div class="layer l2">
+    <div class="ltitle">② Engine / write orchestration &nbsp;<span style="color:var(--ink-dim);font-weight:400">src/engine/mod.rs</span></div>
+    <div class="ldesc">The 11-step write: validate → resolve/auto-create the box → idempotency dedupe → admission control
+    (retention, caps, byte quota) → assign seqs under the append lock → enqueue to the WAL → wait for durability →
+    forward to routers → publish &amp; wake watchers.</div>
+  </div>
+  <div class="layer l3">
+    <div class="ltitle">③ In-memory state &nbsp;<span style="color:var(--ink-dim);font-weight:400">box_state.rs, eviction.rs, queue.rs, router.rs</span></div>
+    <div class="ldesc">A <code>DashMap</code> of boxes; each box holds an index (<code>VecDeque&lt;RecordLoc&gt;</code> + tag <code>BTreeMap</code>),
+    an atomic <code>head_seq</code> as the visibility watermark, retention floors, and an optional queue projection.</div>
+  </div>
+  <div class="layer l4">
+    <div class="ltitle">④ Durable storage &nbsp;<span style="color:var(--ink-dim);font-weight:400">storage/wal.rs, segment.rs, snapshot.rs</span></div>
+    <div class="ldesc">The WAL (truth), segments (materialized per-box data + index), and metadata snapshots (checkpointed
+    state). All framed and XXH3-checksummed; all written through a narrow filesystem trait.</div>
+  </div>
+  <div class="layer l5">
+    <div class="ltitle">⑤ Filesystem seam &nbsp;<span style="color:var(--ink-dim);font-weight:400">storage/fs.rs</span></div>
+    <div class="ldesc">A single injectable <code>Fs</code> / <code>File</code> trait that <em>all</em> durability I/O routes through.
+    Production uses <code>RealFs</code> (a thin <code>std::fs</code> wrapper); tests swap in hostile in-memory disks
+    to drive crashes and I/O errors precisely.</div>
+  </div>
+</div>
+
+<div class="call note">
+  <span class="lbl">Why a library crate?</span>
+  <p>The binary (<code>main.rs</code>) is a thin wrapper. Exposing the engine as a library lets the integration
+  suite drive the <em>exact same</em> in-process app via <code>tower::ServiceExt::oneshot</code> — no sockets, no
+  sleeps, no flakiness. The crash tests run the real engine against a fake disk.</p>
+</div>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="writepath"><span class="num">02</span>The write path, top to bottom</h2>
+
+<p id="write-steps">Here is what actually happens when a record is written. The ordering is load-bearing — it is the
+reason a crash at any instant leaves a consistent state.</p>
+
+<div class="diagram">
+<pre>
+ HTTP POST /boxes/{name}/records
+        │
+        ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │ 1. validate        size limits (data+meta ≤1 MiB, tag ≤256B, …)      │
+ │ 2. resolve box     existing, or auto-create from config              │
+ │ 3. idempotency     dedupe by client key inside the idempotency window│
+ │ 4. admission       enforce_retention · cap check · byte-quota CAS    │
+ │ 5. snapshot inputs  deep-clone payload only if WAL or router needs it │
+ ├─────────────────────────────────────────────────────────────────────┤
+ │   ╔══════════════ append_lock (critical section) ═══════════════╗    │
+ │ 6 ║ stage_append   assign contiguous seqs (head+1, head+2, …)    ║    │
+ │ 7 ║ wal_enqueue    push frame(s) onto the WAL writer's channel   ║    │
+ │ 8 ║ ticket         take next_publish_ticket  ──►  DROP THE LOCK  ║    │
+ │   ╚═════════════════════════════════════════════════════════════╝    │
+ ├─────────────────────────────────────────────────────────────────────┤
+ │ 9. durability gate  wait on the CommitToken  (OFF the lock!)          │
+ │10. forward          fan out to routers (at-least-once)               │
+ │11. publish          advance head_seq · wake watchers · record dedupe │
+ └─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+ 200 OK { seq, ts }   ← returned only after the durability class is satisfied
+</pre>
+</div>
+
+<p>The subtlety is in steps 6–9. Sequence assignment and WAL enqueue happen <strong>under a per-box
+lock</strong> so seqs are dense and the WAL order matches the seq order. But the expensive part —
+<strong>waiting for fsync</strong> — happens <strong>after the lock is dropped</strong>, so many concurrent
+writers' fsync waits coalesce into one disk flush. A <em class="term">ticket</em> taken under the lock
+guarantees writers still <em>publish</em> in strict seq order even though they wait in parallel. (More
+in <a href="#off-lock">§3.3</a>.)</p>
+
+<!-- ---- Durability classes ---- -->
+<h3 id="durability-classes" class="anchor-pad">2.1 — Three durability classes</h3>
+
+<p>Not every box wants the same trade between speed and safety. Each box picks a
+<code>Durability</code> class that decides <em>how far down the stack</em> a write must reach before the
+engine answers <code>200 OK</code>.</p>
+
+<table>
+  <thead><tr><th>Class</th><th>What "ack" means</th><th>Survives a crash?</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="pill mem">memory</span></td>
+      <td>Record is in RAM. <strong>No WAL frame is ever written.</strong></td>
+      <td><strong>No.</strong> Gone on restart, by design. The box reappears empty.</td>
+      <td>Zero disk. Fastest.</td>
+    </tr>
+    <tr>
+      <td><span class="pill disk">disk</span></td>
+      <td>Frame is in the WAL's OS write buffer (group-committed), <em>not</em> necessarily fsynced.</td>
+      <td><strong>Process crash: yes. Power loss / kernel panic: the un-fsynced tail may be lost</strong> — but never silently (see tombstones).</td>
+      <td>One batched <code>write()</code>. No per-write fsync.</td>
+    </tr>
+    <tr>
+      <td><span class="pill fsync">fsync</span></td>
+      <td>Frame is fsynced to stable storage — the platter, not just the page cache.</td>
+      <td><strong>Yes — any crash, including power loss.</strong></td>
+      <td>One <code>fdatasync</code> per batch, amortized across the group.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="call note">
+  <span class="lbl">The clever part</span>
+  <p>Even <span class="pill disk">disk</span> writes go through the same group-commit machinery as
+  <span class="pill fsync">fsync</span> writes — they just don't <em>gate the ack</em> on the fdatasync.
+  A single batch can mix both: the writer issues exactly one <code>fdatasync</code> if <em>any</em> record
+  in the batch is fsync-class, and only the fsync-class waiters are released after it completes. The
+  disk-class waiters are released as soon as the buffered <code>write()</code> returns.</p>
+</div>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="wal"><span class="num">03</span>The Write-Ahead Log</h2>
+
+<p>The WAL is an append-only sequence of length-prefixed, checksummed frames in files named
+<code>wal-&lt;idx&gt;.log</code>. It is the engine's heartbeat and its source of truth. Three properties make
+it trustworthy: every frame is <strong>self-describing and checksummed</strong>, writes are
+<strong>group-committed by a single thread</strong>, and a failed write <strong>never leaves bytes behind</strong>.</p>
+
+<!-- ---- Frame format ---- -->
+<h3 id="wal-frame" class="anchor-pad">3.1 — Frame format</h3>
+
+<p>Each record becomes one frame. The header is fixed at <strong>30 bytes</strong>; the trailing checksum
+is <strong>8 bytes</strong> of XXH3-64. Multi-byte integers are little-endian.</p>
+
+<div class="diagram">
+<pre>
+ off  size  field          note
+ ───  ────  ─────────────  ─────────────────────────────────────────────
+   0    4   <span class="hl">frame_len  u32</span>   bytes of this frame EXCLUDING this prefix
+   4    1   type       u8   1=Append 2=Delete 3=BoxConfig … 10=Lease
+   5    1   flags      u8   bit0=has_tag bit1=has_node bit2=durable
+   6    4   box_id     u32
+  10    8   <span class="hl">seq        u64</span>   the record's monotonic sequence number
+  18    8   ts         u64   server commit time (ms)
+  26    2   node_len   u16
+  28    2   tag_len    u16
+  30    4   data_len   u32
+  34    N   node       bytes
+   .    M   tag        bytes
+   .    P   data+meta  bytes   ← opaque payload envelope
+   .    8   <span class="hl">xxh3       u64</span>   XXH3-64 over bytes [4 .. crc_start)
+</pre>
+</div>
+
+<p>Two design choices here do all the crash-safety work:</p>
+<ul>
+  <li><strong><code>frame_len</code> comes first.</strong> A reader can validate a frame boundary —
+  "do I even have this many bytes?" — <em>before</em> trying to parse the body. A half-written frame at
+  the end of the file fails this check immediately.</li>
+  <li><strong>XXH3-64 trailer over the whole body.</strong> If the length looks right but a byte is torn
+  or rotted, the checksum mismatches. The reader treats that as the end of valid data.</li>
+</ul>
+
+<div class="call note">
+  <span class="lbl">Why XXH3, not CRC32</span>
+  <p>The on-disk integrity hash is <strong>xxHash XXH3-64</strong> everywhere — WAL frames, segment frames,
+  snapshot bodies. It is dramatically faster than CRC32 on modern CPUs (multi-GB/s) while giving a wider
+  64-bit check field, and the same function is reused across all three formats so there is one crash anchor
+  to reason about.</p>
+</div>
+
+<h4>The torn-tail-safe reader</h4>
+<p>On startup, a <code>WalReader</code> iterates frames and <strong>stops at the first frame that fails the
+length or checksum test.</strong> It reports a <code>valid_len()</code> — the byte offset of the last good
+frame's end. Everything past that is a torn write from a crash mid-append, and recovery truncates the file
+to exactly that length. The reader cannot be fooled into reading a partial frame as a real one.</p>
+
+<!-- ---- Group commit ---- -->
+<h3 id="group-commit" class="anchor-pad">3.2 — Single-writer group commit</h3>
+
+<p>All WAL writes funnel through <strong>one dedicated OS thread</strong>. Producers (the async request
+handlers) submit a record over an mpsc channel and get back a <code>CommitToken</code> they can wait on.
+The writer thread runs a tight loop:</p>
+
+<div class="diagram">
+<pre>
+ WriterTask::run()  — the group-commit loop
+ ─────────────────────────────────────────────────────────────
+ loop {
+   batch = [ recv_timeout(50ms) ]          <span class="c">// block for the first record</span>
+   drain_ready(batch)                       <span class="c">// try_recv everything queued NOW</span>
+
+   if batch has any fsync-class record:
+       adaptive_window(batch)               <span class="c">// linger 500µs..10ms to coalesce</span>
+       drain_ready(batch)                   <span class="c">// pick up what arrived during the wait</span>
+
+   len_before = active.len
+   for rec in batch: active.write_frame(rec)   <span class="c">// one buffered write per frame</span>
+
+   if any record was fsync-class:
+       active.fdatasync()                   <span class="c">// ONE flush for the whole batch</span>
+
+   publish_outcomes(batch)                  <span class="c">// release every waiter as Ok</span>
+ }
+</pre>
+</div>
+
+<div class="kv">
+  <div class="k">gc_min</div><div class="v">500 µs — the minimum linger to let a batch form</div>
+  <div class="k">gc_max</div><div class="v">10 ms — the cap on how long a write will wait to coalesce</div>
+  <div class="k">file_size</div><div class="v">64 MiB — rotate to <code>wal-&lt;idx+1&gt;.log</code> past this</div>
+  <div class="k">channel_cap</div><div class="v">4096 — backpressure bound on in-flight submissions</div>
+</div>
+
+<p>The <em class="term">adaptive window</em> only triggers for durable batches: there is no point lingering
+to coalesce fsyncs if nothing in the batch needs an fsync. Under load, hundreds of writes collapse into a
+single <code>fdatasync</code> — that is where the throughput comes from.</p>
+
+<!-- ---- Off-lock fsync ---- -->
+<h3 id="off-lock" class="anchor-pad">3.3 — Off-lock fsync (the ~8× win)</h3>
+
+<p>The naïve design holds the per-box append lock across the fsync wait, so writers serialize on the
+slowest part of the path. The current design splits the critical section:</p>
+
+<div class="diagram">
+<pre>
+ Writer A          Writer B          Writer C
+ ────────          ────────          ────────
+ │ lock                                          ┐
+ │ seq=5                                          │  Under the lock: ONLY
+ │ enqueue                                        │  seq assignment +
+ │ ticket=5                                       │  WAL enqueue + ticket.
+ │ unlock ──────►  lock                           │  Microseconds.
+                   │ seq=6                         ┘
+                   │ enqueue
+                   │ ticket=6
+                   │ unlock ──────►  lock
+                                     │ seq=7 …
+ │ wait fsync ◄──── coalesced ────► │ wait fsync   ┐  OFF the lock: all three
+ │                                  │              │  fsync waits land on the
+ │ ◄──── one fdatasync releases all ─────────►     │  SAME batch flush.
+ │ publish 5  (ticket gate)         │             ┘
+                   │ publish 6  (only after 5)
+                                     │ publish 7
+</pre>
+</div>
+
+<p>Because seq assignment is still serialized, the WAL order equals the seq order. Because the fsync wait
+is <em>not</em> serialized, the flushes coalesce. And because each writer took a monotonic
+<em class="term">ticket</em> under the lock, the <strong>publish step is gated in strict ticket order</strong>
+— writer 6 cannot make its record visible until writer 5 has. So readers still see a perfectly ordered,
+gap-free stream even though the durability waits happened concurrently.</p>
+
+<div class="call invariant">
+  <span class="lbl">Invariant — publish atomicity</span>
+  <p>A record becomes visible (<code>head_seq</code> advances to cover it) <strong>only after</strong> its
+  durability class is satisfied <strong>and</strong> all lower-seq records have published. There is no
+  window in which a reader can observe seq <em>N</em> but not seq <em>N−1</em>, nor observe an
+  un-durable record from a durable box.</p>
+</div>
+
+<!-- ---- Tail rewind ---- -->
+<h3 id="tail-rewind" class="anchor-pad">3.4 — Tail-rewind on error</h3>
+
+<p>What if the <code>write()</code> or the <code>fdatasync()</code> <em>fails</em> partway through a batch —
+a full disk (<code>ENOSPC</code>), an I/O error (<code>EIO</code>)? The writer captured
+<code>len_before</code> at the top of the batch. On any write or fsync error it <strong>rewinds the active
+file's logical length back to <code>len_before</code></strong> and fails every waiter in the batch.</p>
+
+<div class="call guarantee">
+  <span class="lbl">No half-written batch ever persists</span>
+  <p>Failed, un-acked bytes are truncated away before any acknowledgement is sent. A writer either gets a
+  clean <code>Ok</code> (its frame is fully on disk to its durability class) or a <code>Failed</code> (its
+  frame is <em>not</em> on disk and the file is back to its pre-batch length). There is no third outcome
+  where a frame is acked but only partly written.</p>
+</div>
+
+<p>Two more details close the loop on WAL durability:</p>
+<ul>
+  <li><strong>Parent-dir fsync before first ack.</strong> Creating <code>wal-0.log</code> isn't durable until
+  the <em>directory entry</em> is fsynced. The WAL fsyncs the parent directory before acknowledging any write
+  into a newly created file — otherwise a crash could lose the file itself, not just its contents.</li>
+  <li><strong>Rotation names from the file index, not a counter.</strong> The next WAL file is
+  <code>wal-&lt;idx+1&gt;.log</code> derived from the current file's real index, so a crash during rotation can
+  never produce two files claiming the same index or a gap.</li>
+  <li><strong>Drain-and-fsync on shutdown.</strong> The writer's <code>Drop</code> path drains the channel and
+  fsyncs, so a clean shutdown loses nothing even for disk-class boxes.</li>
+</ul>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="segments"><span class="num">04</span>Segments &amp; tiering</h2>
+
+<p>The WAL is great for writing but bad for reading old data: it interleaves every box's records and grows
+without bound. So committed <code>Append</code> records are <strong>materialized per box</strong> into
+<em class="term">segment</em> files — the long-term, queryable form. This is purely a serving optimization;
+segments are always reconstructible from the WAL.</p>
+
+<!-- ---- Segment format ---- -->
+<h3 id="segment-format" class="anchor-pad">4.1 — The .data / .idx pair</h3>
+
+<p>A segment covers a contiguous seq range <code>[start_seq, end_seq]</code> and is two files that sort by
+seq because the start-seq is zero-padded in the name:</p>
+
+<div class="kv">
+  <div class="k">seg-&lt;start&gt;.data</div><div class="v">append-ordered framed records — one XXH3-checksummed frame each</div>
+  <div class="k">seg-&lt;start&gt;.idx</div><div class="v">fixed 20-byte stride locator — entry <em>i</em> ⇔ seq <code>start+i</code></div>
+</div>
+
+<p>The <code>.data</code> frame is a <strong>close cousin of the WAL frame, minus the <code>type</code>
+byte</strong> — a segment only ever holds Append records, so the type is implied. Header is
+<strong>25 bytes</strong>:</p>
+
+<div class="diagram">
+<pre>
+ .data frame                          .idx entry  (20-byte stride)
+ ───────────────────────────          ──────────────────────────────
+  0  4  frame_len  u32                 0  4  offset  u32  → frame in .data
+  4  1  flags      u8                  4  4  len     u32  → framed length
+  5  8  seq        u64                 8  8  ts      u64  → inline, for TTL math
+ 13  8  ts         u64                16  1  flags   u8   → has_tag / has_node
+ 21  2  node_len   u16                17  3  pad     ·    → round stride to 20
+ 23  2  tag_len    u16
+ 25  4  data_len   u32                <span class="c">seq → entry is a DIRECT seek:</span>
+ 29  N  node                          <span class="c">  (seq − start_seq) × 20</span>
+  .  M  tag                           <span class="c">No scan. No hashing.</span>
+  .  P  data+meta
+  .  8  xxh3       u64
+</pre>
+</div>
+
+<p>The inline <code>ts</code> in the index is a small but important trick: it lets the engine do a TTL
+binary-search ("which records have expired?") <strong>without ever touching the <code>.data</code> file</strong>,
+and the presence-flag bits answer "does this record have a tag?" equally cheaply. Rebuilding the in-memory
+index on restart is just a bulk read of the tiny <code>.idx</code>.</p>
+
+<div class="call warn">
+  <span class="lbl">Sealed segments are immutable — so corruption is loud</span>
+  <p>The WAL's torn tail is an <em>expected</em> crash artifact, so the reader silently truncates it. A sealed
+  segment is different: it is finished and never rewritten, so a checksum mismatch there is genuine
+  <strong>bit-rot or corruption, not a torn write</strong>. The segment decoder <em>surfaces the error</em>
+  rather than silently dropping data. Silent truncation of a sealed file would be a silent data loss — exactly
+  what the design forbids.</p>
+</div>
+
+<h4>Sealing</h4>
+<p>The <em>active</em> segment is buffered and appended to; it <em>seals</em> when it hits a size, event-count,
+or age cap, after which it is immutable and can be <code>mmap</code>'d for zero-copy reads. Sealed segments are
+the unit of tiering.</p>
+
+<!-- ---- Tiering ---- -->
+<h3 id="tiering" class="anchor-pad">4.2 — Hot / cold tiers</h3>
+
+<p>Sealed segments live in a <strong>HOT</strong> tier (local, fast) and can be relocated to a
+<strong>COLD</strong> tier (a cheaper/larger store — a local folder today, object storage later) when configured
+via <code>STREAMS_COLD_DIR</code>. The rule that makes this safe:</p>
+
+<div class="call guarantee">
+  <span class="lbl">Cold relocation is all-or-nothing, and never blocks the write path</span>
+  <p>A segment is fully present in COLD <em>and</em> fsynced before its HOT copy is removed — a crash mid-move
+  leaves a usable copy in at least one tier (recovery reclaims the orphan). And a cold read — pulling an old
+  segment back — <strong>never stalls or slows an active write or a live delivery.</strong> Cold is for history;
+  the hot path stays hot.</p>
+</div>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="snapshots"><span class="num">05</span>Metadata snapshots</h2>
+
+<p>Replaying the entire WAL from frame zero on every restart would be slow once the log is large. A
+<em class="term">snapshot</em> is a periodic, self-contained capture of the engine's durable state plus a
+<strong>checkpoint position</strong> <code>(wal_idx, wal_offset)</code> that says "the WAL is fully reflected in
+this snapshot up to here — replay only what comes after."</p>
+
+<!-- ---- Snapshot format ---- -->
+<h3 id="snapshot-format" class="anchor-pad">5.1 — Format &amp; what it carries</h3>
+
+<p>The file is a <strong>20-byte header</strong> (<code>magic "SNP1"</code> + version + body_len + XXH3) wrapping
+a <code>postcard</code>-encoded body:</p>
+
+<div class="diagram">
+<pre>
+ Snapshot {
+   id, ts, next_box_id,
+   checkpoint: { <span class="hl">wal_idx, wal_offset</span>, last_checkpoint_seq },
+   boxes:   [ SnapshotBox  { name, box_id, epoch, config,
+                             base_seq, head_seq,
+                             evict_floor, expiry_floor, delete_floor,
+                             bytes_retained, live_count,
+                             records: [ live, compacted, hole-free ] } ],
+   routers: [ SnapshotRouter { …, forward_cursor, forwarded_total } ],
+ }
+</pre>
+</div>
+
+<p>The captured record set is the <strong>compacted</strong> form: deleted middle-holes and front-reclaimed
+prefixes are simply absent. Two capture rules are critical:</p>
+<ul>
+  <li><strong>Memory-class boxes are captured <em>empty</em>.</strong> Their records are RAM-only and must never
+  hit disk; the snapshot carries only the config so the box reappears empty on restart. Its <code>head_seq</code>
+  resets to a fresh box.</li>
+  <li><strong>Never persist a staged-but-unpublished tail.</strong> A record can sit in the in-memory deque
+  before <code>head_seq</code> advances (the WAL-first reservation). Capture clamps to <code>seq ≤ head_seq</code>
+  so an invisible, not-yet-acked record is excluded — its WAL frame lands at/after the checkpoint and will be
+  replayed instead.</li>
+</ul>
+
+<h4>The consistency ordering — why a snapshot loses nothing</h4>
+<p>Capture does things in an order chosen so no acked write can fall into the gap between "checkpoint position"
+and "materialized state":</p>
+<ol>
+  <li><strong>Flush barrier first.</strong> Write a durable <code>CheckpointMark</code> and wait for its fsync,
+  so the writer's published position covers every prior committed frame. <em>If that barrier fsync fails, the
+  snapshot is abandoned</em> — better no snapshot than one whose checkpoint races ahead of durability.</li>
+  <li><strong>Record the checkpoint position next.</strong> Any write committed after this read has a WAL offset
+  ≥ the checkpoint, so recovery will replay it.</li>
+  <li><strong>Materialize each box under its append lock, after draining in-flight publishes.</strong> This makes
+  <code>(head_seq, index)</code> a consistent pair. A write that raced into both the snapshot and the post-checkpoint
+  WAL is harmless: replay skips it by seq.</li>
+</ol>
+
+<!-- ---- Atomic swap ---- -->
+<h3 id="atomic-swap" class="anchor-pad">5.2 — The atomic swap</h3>
+
+<p>A snapshot must appear <strong>all-or-nothing</strong> to a restart that races with it. The write sequence:</p>
+
+<div class="diagram">
+<pre>
+ write body → <span class="hl">snap.tmp</span>
+ fsync       snap.tmp            <span class="c">// contents durable BEFORE it has its real name</span>
+ rename      snap.tmp → snap-&lt;id&gt; <span class="c">// atomic: either old or new name resolves, never half</span>
+ fsync       directory           <span class="c">// the rename itself is now durable</span>
+ prune       older snapshots     <span class="c">// keep the newest valid one(s)</span>
+</pre>
+</div>
+
+<p>Recovery reads snapshots <strong>newest-first</strong> and skips any whose header magic, version, or XXH3
+fails — a snapshot that was torn mid-write is simply ignored in favor of the previous good one (or, if none,
+a full WAL replay from zero). The atomic <code>rename</code> means a partially written
+<code>snap.tmp</code> never has a real snapshot name, so it is never even considered.</p>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="recovery"><span class="num">06</span>Recovery — putting it back together</h2>
+
+<p id="recovery-steps">On startup the engine reconstructs its entire in-memory state from disk. The sequence is designed so that
+a crash <em>during recovery itself</em> is also safe (recovery is idempotent and re-runnable).</p>
+
+<div class="diagram">
+<pre>
+ recover_and_open(fs, engine, data_dir)
+ ──────────────────────────────────────────────────────────────────────
+ 1. load_latest snapshot ──► restore()        rebuild boxes+routers in RAM,
+    │   (newest valid; skip torn/CRC-bad)       get checkpoint (ckpt_idx, ckpt_offset)
+    │   none?  ──► start empty, replay from frame 0
+    ▼
+ 2. replay WAL files ≥ ckpt_idx, from ckpt_offset
+    │   for each good frame: replay_frame()
+    │     Append  → skip if seq ≤ head (already have it)         <span class="c">idempotent</span>
+    │              skip if seq ≠ head+1 (misdirected/torn)        <span class="c">contiguity guard</span>
+    │              else apply at head+1
+    │     Delete  → re-apply seqs / selector
+    │     EvictWatermark → advance ONLY if greater                <span class="c">monotone</span>
+    │     Lease   → skip for memory boxes                         <span class="c">ghost-lease guard</span>
+    ▼
+ 3. truncate the active WAL's torn tail to valid_len, then fsync
+    ▼
+ 4. reclaim orphan segments  (a HOT/COLD move that crashed mid-flight)
+    ▼
+ engine is open — identical state to just before the crash, minus only
+ the un-fsynced tail of disk-class writes (which were never acked as durable)
+</pre>
+</div>
+
+<!-- ---- Idempotent replay ---- -->
+<h3 id="idempotent-replay" class="anchor-pad">6.1 — Why replay is idempotent</h3>
+
+<p>The snapshot already contains state up to its checkpoint, but the checkpoint <em>offset</em> is conservative
+— some frames before it may already be reflected in the snapshot. So replay re-encounters records the snapshot
+already has. Two guards make that a no-op:</p>
+
+<ul>
+  <li><strong>Seq-skip:</strong> an <code>Append</code> whose <code>seq ≤ head_seq</code> is already present;
+  replay drops it. Replaying the same WAL twice yields the same state.</li>
+  <li><strong>Contiguity guard:</strong> an <code>Append</code> whose <code>seq ≠ head_seq + 1</code> is treated
+  as a misdirected or torn frame and is <em>not</em> applied. A frame that somehow landed in the wrong place
+  can never tear a gap into a box.</li>
+</ul>
+
+<div class="call guarantee">
+  <span class="lbl">Recovery is deterministic and re-runnable</span>
+  <p>Running recovery, crashing halfway, and running it again produces the same final state as running it once
+  cleanly. There is no "half-recovered" disk state, because recovery only ever <em>reads</em> the WAL/segments
+  and the single mutating step (torn-tail truncation) is itself idempotent — truncating to <code>valid_len</code>
+  twice is the same as once.</p>
+</div>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="fsseam"><span class="num">07</span>The filesystem seam</h2>
+
+<p>Every byte of durable I/O — WAL, segments, snapshots, directory fsyncs — goes through one narrow trait pair.
+This is what makes the durability guarantees <em>testable</em> rather than merely asserted.</p>
+
+<div class="diagram">
+<pre>
+ trait Fs : Send + Sync {                  trait File : Send {
+   open(path, opts) -> File                  read_at(off, buf)
+   rename(from, to)                          <span class="hl">write_at(off, buf) -> usize</span>   <span class="c">// short writes are first-class</span>
+   remove_file(path)                         set_len(n)
+   read_dir(path)                            <span class="hl">sync_data()</span>               <span class="c">// fdatasync</span>
+   <span class="hl">sync_dir(path)</span>            <span class="hl">sync_all()</span>                <span class="c">// fsync</span>
+   create_dir_all(path)                      metadata_len()
+   exists / metadata_len                     read_to_end_from(off)
+ }                                         }
+</pre>
+</div>
+
+<p>The signature detail that matters: <code>write_at</code> returns the number of bytes <em>actually</em>
+written. <strong>Short writes are a first-class outcome</strong>, not an error to paper over — the WAL's
+<code>write_all_at_tail</code> loops until the whole frame is on disk, exactly as a hostile disk that writes
+"3 of your 8 bytes" would force a real kernel to behave.</p>
+
+<table>
+  <thead><tr><th>Implementation</th><th>Role</th><th>Behavior</th></tr></thead>
+  <tbody>
+    <tr><td><code>RealFs</code></td><td>Production &amp; ground truth</td><td>A thin, faithful <code>std::fs</code> wrapper. What ships.</td></tr>
+    <tr><td><code>FakeDisk</code></td><td>Crash simulator</td><td>In-memory, tracks <em>durable</em> vs <em>pending</em> (un-fsynced) bytes; <code>crash()</code> discards everything not yet fsynced — exactly what power-loss does.</td></tr>
+    <tr><td><code>FaultFs</code></td><td>Error injector</td><td>Injects <code>EIO</code> / <code>ENOSPC</code> / short writes at chosen call sites to test the error paths (tail-rewind, barrier-abort).</td></tr>
+    <tr><td><code>MonitorFs</code></td><td>Always-on assertor</td><td>Wraps any Fs and continuously asserts ordering rules (e.g. data fsynced before the rename that publishes it). Catches a missing barrier the moment it happens.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="guarantees"><span class="num">08</span>The guarantees — theoretical &amp; implied</h2>
+
+<p>Everything above exists to support a short list of promises. Here they are, stated plainly, with the
+mechanism that backs each.</p>
+
+<div class="call guarantee">
+  <span class="lbl">G1 — Durability</span>
+  <p>An <span class="pill fsync">fsync</span>-acked write survives <strong>any</strong> crash, including power
+  loss. A <span class="pill disk">disk</span>-acked write survives a process crash and survives power loss
+  <em>except</em> for an un-fsynced tail. A <span class="pill mem">memory</span> write makes no durability
+  promise. <em>Backed by:</em> WAL group commit + the durability gate + tail-rewind-on-error.</p>
+</div>
+
+<div class="call guarantee">
+  <span class="lbl">G2 — No silent loss</span>
+  <p>If involuntary loss <em>does</em> happen (the un-fsynced tail of a disk-class box, or an eviction under a
+  cap/TTL), a reader is <strong>told</strong>, via an in-band tombstone gap signal. The system never quietly
+  skips a seq a client was led to expect. <em>Backed by:</em> the <code>evict_floor</code> watermark and
+  tombstones (§8.1).</p>
+</div>
+
+<div class="call guarantee">
+  <span class="lbl">G3 — Ordering &amp; no gaps</span>
+  <p>Within a box, seqs are dense and monotonic, and a reader observing seq <em>N</em> has necessarily been able
+  to observe every seq below it (that wasn't explicitly deleted/evicted). <em>Backed by:</em> serialized seq
+  assignment under the append lock + the ticket-gated publish order.</p>
+</div>
+
+<div class="call guarantee">
+  <span class="lbl">G4 — Crash atomicity of metadata</span>
+  <p>A snapshot is observed whole or not at all; a WAL batch persists whole or not at all; a cold relocation
+  completes in both tiers or leaves a reclaimable orphan. No structure is ever observed half-applied.
+  <em>Backed by:</em> tmp→fsync→rename→dir-fsync swaps and len-before tail rewind.</p>
+</div>
+
+<div class="call guarantee">
+  <span class="lbl">G5 — Corruption is explicit, never silent</span>
+  <p>A torn WAL tail is truncated (expected crash artifact). A checksum failure in a <em>sealed</em> segment or a
+  snapshot is surfaced as an error, never silently dropped. <em>Backed by:</em> XXH3 on every frame + the
+  immutable-means-loud rule.</p>
+</div>
+
+<div class="call guarantee">
+  <span class="lbl">G6 — Idempotent recovery &amp; best-effort dedupe</span>
+  <p>Recovery is deterministic and re-runnable. Client idempotency keys suppress duplicate writes inside their
+  window on the live path (the dedupe state is intentionally <em>not</em> persisted across restart — it is a
+  best-effort live guard, not a durability promise). <em>Backed by:</em> seq-skip replay + the idempotency window.</p>
+</div>
+
+<!-- ---- Watermarks ---- -->
+<h3 id="watermarks" class="anchor-pad">8.1 — Watermarks &amp; tombstones (the no-silent-loss machinery)</h3>
+
+<p>This is the most subtle and most important guarantee, so it gets its own anatomy. The engine tracks
+<strong>two</strong> kinds of "the floor moved up" — and they mean very different things to a reader.</p>
+
+<table>
+  <thead><tr><th>Watermark</th><th>Cause</th><th>Visible to reader?</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>evict_floor</code></td>
+      <td><strong>Involuntary</strong> loss — a cap or TTL forced records out before they were consumed.</td>
+      <td><strong>Yes — emits a tombstone.</strong> This is the <em>only</em> trigger for a tombstone.</td>
+    </tr>
+    <tr>
+      <td><code>delete_floor</code> / <code>earliest_seq</code></td>
+      <td><strong>Voluntary</strong> — a client explicitly deleted a prefix, or a node-filter skipped records.</td>
+      <td><strong>No — silent.</strong> The client asked for it; no surprise to signal.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="call invariant">
+  <span class="lbl">Invariant — evict_floor ≤ earliest_seq</span>
+  <p>Involuntary loss can never get <em>ahead</em> of voluntary deletion. If a client already deleted up to seq
+  100, evicting up to seq 80 emits no tombstone (those records were already voluntarily gone). The tombstone
+  only ever fires for the genuinely-surprising gap: data that vanished without the client asking.</p>
+</div>
+
+<p>A tombstone is an in-band, 200-level gap signal carrying a reason — <code>Cap</code>, <code>Ttl</code>,
+<code>Mixed</code>, <code>Recreated</code>, or <code>FromSeqTooOld</code>. A consumer reading the stream sees it
+inline and knows precisely <em>what</em> it missed and <em>why</em>. Contrast: deleting records yourself, or a
+multi-master node-filter dropping a loop, is silent — there is nothing to warn about.</p>
+
+<h4>Record fields &amp; size limits (the box that holds it all)</h4>
+<p>For completeness, the record envelope and the validation limits that step 1 enforces:</p>
+<div class="kv">
+  <div class="k">seq · ts · node · tag</div><div class="v">sequence, server-commit ms, optional origin node, optional routing/filter tag</div>
+  <div class="k">data + meta</div><div class="v">opaque payload + optional metadata map — together ≤ <strong>1 MiB</strong></div>
+  <div class="k">tag</div><div class="v">≤ 256 bytes &nbsp;·&nbsp; <span class="k" style="display:inline">node</span> ≤ 128 bytes</div>
+  <div class="k">meta</div><div class="v">≤ 16 KiB and ≤ 64 keys</div>
+  <div class="k">per write</div><div class="v">≤ 10 000 records &nbsp;·&nbsp; body ≤ 64 MiB</div>
+</div>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="faulttest"><span class="num">09</span>Proving it — the fault-injection harness</h2>
+
+<p>A durability claim is only as good as its test. The guarantees above are not asserted by hand — they are
+<strong>mechanically verified</strong> by driving the real engine through a crash at every persistence call site
+and checking the recovered state against a model.</p>
+
+<h4>The method, in four moves</h4>
+<ol>
+  <li><strong>Inject a precise crash.</strong> The <code>fail</code> crate arms named failpoints at the exact
+  call sites — <code>wal::after_write</code>, <code>wal::after_fdatasync</code>, <code>snapshot::after_rename</code>,
+  <code>recovery::before_truncate</code>, and more. A test fires a crash at <em>that</em> instruction and not a
+  microsecond elsewhere. (The feature is OFF by default — release builds compile these macros to nothing.)</li>
+  <li><strong>Crash a fake disk.</strong> <code>FakeDisk.crash()</code> discards every byte that wasn't fsynced,
+  modelling power loss exactly.</li>
+  <li><strong>Recover and compare to a model.</strong> A pure-Rust model oracle (the analog of Postgres's
+  <code>wal_consistency_checking</code>) tracks what <em>should</em> be recoverable. The check is a relaxed
+  set relation:</li>
+</ol>
+
+<div class="diagram">
+<pre>
+   acked  ⊆  recovered  ⊆  model ∪ {acked}
+   └────┬───┘            └──────┬─────────┘
+   every write the         nothing appears that was never
+   engine ACKED as         written — no resurrection, no
+   durable IS there        invention of data
+   after recovery
+</pre>
+</div>
+
+<p>The relaxation is the whole point: a disk-class write that was <em>not</em> acked may or may not survive (it's
+allowed in the upper bound but not required in the lower), while an fsync-acked write <em>must</em> be in
+<code>recovered</code>. This captures the durability contract precisely.</p>
+
+<div class="call note">
+  <span class="lbl">The scale of it</span>
+  <p><strong>15 model-oracle invariants</strong> (durability, no-silent-loss/no-gap, seq monotonicity, idempotent
+  replay, torn-tail truncation, explicit corruption, atomic snapshot swap, segment idx⇒data consistency,
+  all-or-nothing cold relocation, delete-never-resurrects, floors-preserved, lease projection, best-effort
+  idempotency, visibility/publish atomicity, commit-token correctness) are checked against a
+  <strong>125-strategy crash-point catalog</strong> (the <code>F-WAL-*</code>, <code>F-SNAP-*</code>,
+  <code>F-SEG-*</code>, <code>F-COLD-*</code>, <code>F-RECLAIM-*</code>, <code>F-LEASE-*</code>,
+  <code>F-REC-*</code>, <code>F-PUB-*</code> … families), plus an always-on <code>MonitorFs</code> that asserts
+  ordering on <em>every</em> test in the suite, plus property-based fuzzing.</p>
+</div>
+
+<p>This is why the guarantees can be stated as facts rather than hopes: the same engine that serves production
+is run, in-process, against a disk that lies, tears, fills up, and loses power at the worst possible instant —
+and the recovered state is held to the model every time.</p>
+
+<!-- ============================================================= -->
+<h2 class="anchor-pad" id="reference"><span class="num">10</span>Reference card</h2>
+
+<h4>On-disk files</h4>
+<div class="kv">
+  <div class="k">wal-&lt;idx&gt;.log</div><div class="v">the source of truth — framed, XXH3, group-committed, 64 MiB rotation</div>
+  <div class="k">seg-&lt;start&gt;.data</div><div class="v">materialized per-box records (Append frames, no type byte)</div>
+  <div class="k">seg-&lt;start&gt;.idx</div><div class="v">20-byte-stride locator; seq→entry is a direct seek</div>
+  <div class="k">snap-&lt;id&gt;</div><div class="v">postcard metadata snapshot + checkpoint; atomic tmp→rename swap</div>
+</div>
+
+<h4>The numbers</h4>
+<div class="kv">
+  <div class="k">WAL header / crc</div><div class="v">30 B header · 8 B XXH3-64</div>
+  <div class="k">Segment header / crc</div><div class="v">25 B header · 8 B XXH3-64 · 20 B idx stride</div>
+  <div class="k">Snapshot header</div><div class="v">20 B (magic "SNP1" + version 2 + body_len + XXH3)</div>
+  <div class="k">Group commit window</div><div class="v">500 µs min … 10 ms max (durable batches only)</div>
+  <div class="k">Limits</div><div class="v">data+meta 1 MiB · tag 256 B · node 128 B · meta 16 KiB/64 keys · 10 000 rec/write · 64 MiB body</div>
+</div>
+
+<h4>The mantra</h4>
+<div class="call guarantee" style="margin-top:10px">
+  <span class="lbl">Remember this and you understand the whole engine</span>
+  <p><strong>The WAL is the only truth.</strong> Acks are gated on it to the box's durability class. Failed
+  writes are rewound, never half-persisted. Segments and snapshots are rebuildable optimizations. Recovery is
+  idempotent. Involuntary loss is always announced; voluntary loss is always silent. And every one of those
+  sentences is enforced by a crash test against a hostile disk.</p>
+</div>
+
+<hr class="soft">
+<p class="footnote">Generated from the source: <code>src/storage/{wal,segment,snapshot,fs}.rs</code>,
+<code>src/engine/{mod,recovery,snapshot,box_state,queue,router,eviction}.rs</code>, and
+<code>docs/{ARCHITECTURE,DESIGN,FAULT_TESTING}.md</code>. Frame layouts, constants, and ordering rules reflect
+the code as committed.</p>
+
+</main>
+</div>
+</body>
+</html>

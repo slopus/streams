@@ -411,7 +411,11 @@ impl Engine {
         let box_lease_ms = cfg.lease_ms;
         let max_deliveries = cfg.max_deliveries;
         let dead_letter = cfg.dead_letter.clone();
-        let leases_durable = cfg.leases_durable;
+        // A `memory`-class queue must NEVER WAL-log lease events (codex P1 #4): its
+        // records are RAM-only and reset to empty on restart, so a replayed lease
+        // frame would be a ghost lease over a non-existent job (stranding fresh
+        // post-restart jobs). Treat `leases_durable` as false for a memory box.
+        let leases_durable = cfg.leases_durable && !cfg.is_memory();
         let box_id = b.box_id;
         drop(cfg);
 
@@ -602,7 +606,13 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        let leases_durable = b.config.read().leases_durable;
+        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
+        // are RAM-only, so a replayed lease frame would ghost over a non-existent
+        // job. Treat `leases_durable` as false for memory.
+        let leases_durable = {
+            let cfg = b.config.read();
+            cfg.leases_durable && !cfg.is_memory()
+        };
 
         let mut acked_seqs: Vec<(u64, u64)> = Vec::new(); // (seq, lease_id)
         let mut skipped: Vec<u64> = Vec::new();
@@ -626,19 +636,25 @@ impl Engine {
         // durability == jobs-log durability: a durable box fsyncs the delete
         // BEFORE the ack returns (codex P0).
         //
-        // The lease was already removed from the projection above. If the durable
-        // delete then FAILS, the job is no longer leased AND not deleted — and
+        // The leases were ALL removed from the projection above. If a durable delete
+        // then FAILS, the affected jobs are no longer leased AND not deleted — and
         // `next_claimable` consults only the reclaim freelist + claim cursor (the
-        // cursor has already advanced past this seq), so the job would be stranded
-        // forever (codex HIGH #4). Re-push the seq onto the reclaim freelist before
-        // propagating the error so it resurfaces as claimable (at-least-once)
-        // instead of being lost.
+        // cursor has already advanced past these seqs), so they would be stranded
+        // forever (codex HIGH #4 / P1 #5). On the FIRST failure we re-push the
+        // failing seq AND every not-yet-deleted seq remaining in this ack batch onto
+        // the reclaim freelist before propagating the error, so the whole un-deleted
+        // suffix resurfaces as claimable (at-least-once) instead of being lost — not
+        // just the single failing seq (the prior bug stranded the later batch seqs
+        // whose leases were already dropped).
         let mut fsync_ms = 0.0;
-        for &(seq, lease_id) in &acked_seqs {
+        for (i, &(seq, lease_id)) in acked_seqs.iter().enumerate() {
             match self.delete_one_seq(&b, seq, now) {
                 Ok(ms) => fsync_ms += ms,
                 Err(e) => {
-                    self.reclaim_seq(&b, seq);
+                    // Re-queue this seq and every still-undeleted seq after it.
+                    for &(later_seq, _) in &acked_seqs[i..] {
+                        self.reclaim_seq(&b, later_seq);
+                    }
                     return Err(e);
                 }
             }
@@ -688,7 +704,13 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        let leases_durable = b.config.read().leases_durable;
+        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
+        // are RAM-only, so a replayed lease frame would ghost over a non-existent
+        // job. Treat `leases_durable` as false for memory.
+        let leases_durable = {
+            let cfg = b.config.read();
+            cfg.leases_durable && !cfg.is_memory()
+        };
         let delay = delay_ms.min(config::MAX_NACK_DELAY_MS) as i64;
 
         let mut nacked: Vec<(u64, u64)> = Vec::new();
@@ -756,7 +778,13 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        let leases_durable = b.config.read().leases_durable;
+        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
+        // are RAM-only, so a replayed lease frame would ghost over a non-existent
+        // job. Treat `leases_durable` as false for memory.
+        let leases_durable = {
+            let cfg = b.config.read();
+            cfg.leases_durable && !cfg.is_memory()
+        };
         let effective = lease_ms.clamp(config::MIN_LEASE_MS, config::MAX_LEASE_MS) as i64;
         let deadline = now.saturating_add(effective);
 
@@ -858,11 +886,33 @@ impl Engine {
         max_deliveries: u64,
         now: i64,
     ) {
-        // Ensure the dead-letter box exists (auto-create with defaults).
+        // Re-queue every diverted source seq onto the reclaim freelist and roll back
+        // the `dead_lettered` counter (codex P1 #6): used on any dead-letter failure
+        // so a diverted job — already popped off the claim cursor / reclaim freelist
+        // in the claim pass — is never stranded (it resurfaces as claimable and is
+        // re-dead-lettered later, at-least-once).
+        let requeue_diverted = |src: &BoxState| {
+            if let Some(q) = &src.queue {
+                let mut q = q.lock();
+                for &seq in seqs {
+                    q.push_reclaim(seq);
+                }
+                q.dead_lettered = q.dead_lettered.saturating_sub(seqs.len() as u64);
+            }
+        };
+
+        // Ensure the dead-letter box exists (auto-create with defaults). If it does
+        // not exist and cannot be created, do NOT strand the diverted jobs: re-queue
+        // them for reclaim and bail (codex P1 #6).
         if self.get_box(dl_box).is_none() {
             let _ = self.put_box(dl_box, BoxConfig::default());
         }
         let Some(dl) = self.get_box(dl_box) else {
+            tracing::warn!(
+                src = %src.name, dead_letter = %dl_box,
+                "dead-letter: DL box missing/uncreatable; re-queuing source jobs for reclaim"
+            );
+            requeue_diverted(src);
             return;
         };
         let src_name = src.name.clone();
@@ -941,11 +991,17 @@ impl Engine {
             if let Err(e) = self.durable_append(&dl, records, now) {
                 tracing::warn!(
                     src = %src.name, dead_letter = %dl_box, error = %e,
-                    "dead-letter: durable DL append failed; leaving jobs in source"
+                    "dead-letter: durable DL append failed; re-queuing source jobs for reclaim"
                 );
-                // The DL append failed and published nothing: do NOT delete the
-                // jobs from the source (they remain claimable / reclaimable), so a
-                // failed dead-letter never silently drops a job.
+                // The DL append failed and published nothing. The diverted seqs were
+                // already popped off the claim cursor / reclaim freelist and their
+                // delivery counters cleared in the claim pass (and `dead_lettered`
+                // bumped), so they are now neither leased nor reclaimable — stranded
+                // (codex P1 #6). Re-queue every diverted seq for reclaim (it
+                // resurfaces as claimable and is re-dead-lettered later,
+                // at-least-once) and roll back the `dead_lettered` counter for the
+                // copies that never landed. Do NOT delete from the source.
+                requeue_diverted(src);
                 return;
             }
             dl.enforce_retention(now);
@@ -1002,7 +1058,13 @@ impl Engine {
         }
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        let leases_durable = b.config.read().leases_durable;
+        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
+        // are RAM-only, so a replayed lease frame would ghost over a non-existent
+        // job. Treat `leases_durable` as false for memory.
+        let leases_durable = {
+            let cfg = b.config.read();
+            cfg.leases_durable && !cfg.is_memory()
+        };
 
         let mut released: Vec<(u64, String, u64)> = Vec::new(); // (seq, node, lease_id)
         {

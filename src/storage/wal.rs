@@ -1394,10 +1394,20 @@ impl WriterTask {
             }
         }
 
-        // One buffered write for the whole batch.
+        // One buffered write for the whole batch. Remember the pre-batch append
+        // position so a failed batch can be REWOUND (codex P0 #1): on a write or
+        // fsync error the batch's bytes must NOT remain in `file.len` — otherwise a
+        // LATER successful fsync would persist the failed (unacked) frame, and
+        // recovery would replay it (a phantom record / a live seq gap). Rewinding
+        // `len` to `len_before` discards the failed bytes logically: the next batch
+        // overwrites them in the preallocated region, and since they were never
+        // fsynced (and the tail is rewound) recovery never surfaces them.
+        let len_before = self.file.len;
         let frames = states.len() as u64;
         if let Err(e) = self.file.write_all_at_tail(batch_bytes) {
-            tracing::error!(error = %e, "wal batch write failed");
+            tracing::error!(error = %e, "wal batch write failed; rewinding tail");
+            self.file.len = len_before;
+            self.metrics.active_len.store(len_before, Ordering::Relaxed);
             Self::signal(&states, CommitOutcome::Failed); // callers observe WriterGone.
             return;
         }
@@ -1421,7 +1431,15 @@ impl WriterTask {
         // batches skip the fsync; their durability follows on a later group fsync.
         if any_durable {
             if let Err(e) = self.file.fdatasync() {
-                tracing::error!(error = %e, "wal fdatasync failed");
+                // The batch's bytes are written but the fsync FAILED — they are not
+                // durable, the tokens fail, and the callers roll back (not acked ⇒
+                // not committed). Rewind the tail to the pre-batch position (codex P0
+                // #1) so a LATER successful fsync can never persist these failed
+                // frames and recovery can never replay them. The next batch
+                // overwrites the discarded bytes from `len_before`.
+                tracing::error!(error = %e, "wal fdatasync failed; rewinding tail");
+                self.file.len = len_before;
+                self.metrics.active_len.store(len_before, Ordering::Relaxed);
                 Self::signal(&states, CommitOutcome::Failed);
                 return;
             }

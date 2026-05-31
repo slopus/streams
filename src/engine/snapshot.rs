@@ -274,7 +274,16 @@ pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
             }
         }
         let bx = Arc::new(state);
-        engine.boxes.insert(bx.name.clone(), bx);
+        // Keep the live gauges in lockstep with the restored registry so the
+        // `max_boxes` / `max_total_bytes` reservation counters reflect recovered
+        // state (a fresh insert bumps the box count by 1 and the byte total by the
+        // box's retained bytes).
+        if engine.boxes.insert(bx.name.clone(), bx.clone()).is_none() {
+            engine.box_count.fetch_add(1, Ordering::AcqRel);
+        }
+        engine
+            .total_bytes_live
+            .fetch_add(bx.bytes(), Ordering::AcqRel);
     }
 
     {

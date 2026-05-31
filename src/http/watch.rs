@@ -147,6 +147,13 @@ impl Session {
 /// a `DashMap`; phase 4 may persist. GC of idle sessions is best-effort.
 pub struct SessionStore {
     sessions: DashMap<String, Arc<Session>>,
+    /// Live session count, maintained as an atomic gauge so the `max_watch_sessions`
+    /// cap can be enforced with an **atomic reserve-then-insert** (codex P2 #10): the
+    /// reserve CAS happens-before the registry insert, so a concurrent
+    /// `POST /v0/watch` race can never push the live session count over the cap (the
+    /// prior `len()`-read-then-insert was a TOCTOU). Kept in lockstep with
+    /// `sessions`: bumped on insert, decremented on GC removal.
+    count: std::sync::atomic::AtomicU64,
 }
 
 impl Default for SessionStore {
@@ -159,6 +166,7 @@ impl SessionStore {
     pub fn new() -> Self {
         SessionStore {
             sessions: DashMap::new(),
+            count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -174,10 +182,34 @@ impl SessionStore {
         format!("wid_{suffix}")
     }
 
-    fn insert(&self, session: Session) -> String {
+    /// Atomically reserve a session slot against `cap` (`0` ⇒ unlimited) and, if
+    /// admitted, insert `session` under a fresh `wid` (codex P2 #10). Returns the new
+    /// `wid`, or `None` when the live count is already at the cap (the caller returns
+    /// `429 throttled`). The reserve CAS happens-before the insert and is the
+    /// serialization point for the cap, so a concurrent create race can never push
+    /// the live session count over `cap`.
+    fn try_insert_capped(&self, session: Session, cap: u64) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        if cap != 0 {
+            let mut cur = self.count.load(Ordering::Relaxed);
+            loop {
+                if cur >= cap {
+                    return None;
+                }
+                match self
+                    .count
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                {
+                    Ok(_) => break,
+                    Err(c) => cur = c,
+                }
+            }
+        } else {
+            self.count.fetch_add(1, Ordering::AcqRel);
+        }
         let wid = Self::alloc_wid();
         self.sessions.insert(wid.clone(), Arc::new(session));
-        wid
+        Some(wid)
     }
 
     fn get(&self, wid: &str) -> Option<Arc<Session>> {
@@ -188,30 +220,43 @@ impl SessionStore {
     /// stream whose last access is older than [`config::SESSION_TTL_MS`] at `now_ms`
     /// is removed. Called opportunistically on session create and on stream open,
     /// so a client that abandons sessions cannot pin `max_watch_sessions` slots
-    /// until restart. `DashMap::retain` holds shard locks only briefly.
+    /// until restart. `DashMap::retain` holds shard locks only briefly. Each
+    /// reaped session releases its slot from the `count` gauge so the cap frees up.
     fn gc_expired(&self, now_ms: i64) {
-        self.sessions.retain(|_wid, s| !s.is_expired(now_ms));
+        use std::sync::atomic::Ordering;
+        self.sessions.retain(|_wid, s| {
+            let keep = !s.is_expired(now_ms);
+            if !keep {
+                self.count.fetch_sub(1, Ordering::AcqRel);
+            }
+            keep
+        });
     }
 
-    /// Mark a stream as open on `wid` (if it still exists), returning an RAII
-    /// [`StreamHandle`] that decrements the active-stream count and re-stamps the
-    /// last-access time on drop (clean close / broken pipe). While the handle is
-    /// held the session is never GC'd.
-    fn open_stream(self: &Arc<Self>, wid: &str, now_ms: i64) -> Option<StreamHandle> {
-        let s = self.get(wid)?;
-        s.touch(now_ms);
+    /// Mark a stream as open on an ALREADY-FETCHED session `s` (its `wid`), bumping
+    /// `active_streams` so a concurrent idle-GC cannot reap it (codex MEDIUM #11),
+    /// and returning an RAII [`StreamHandle`] that decrements the count and re-stamps
+    /// the last-access time on drop (clean close / broken pipe). The bump is applied
+    /// to the caller's held `Arc`, so it takes effect even though the registry entry
+    /// is looked up by `wid` on drop — closing the race where GC ran between the
+    /// fetch and the bump. Always returns a handle (the session is the caller's, so
+    /// the stream is always tracked).
+    fn open_on(self: &Arc<Self>, wid: &str, s: &Arc<Session>, now_ms: i64) -> StreamHandle {
         s.active_streams
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(StreamHandle {
+        s.touch(now_ms);
+        StreamHandle {
             store: self.clone(),
             wid: wid.to_string(),
-        })
+            session: s.clone(),
+        }
     }
 
     /// Number of live sessions in the registry (resource-limit check;
-    /// [`crate::limits`]).
+    /// [`crate::limits`]). Reads the atomic gauge kept in lockstep with the registry
+    /// (the reservation point for `max_watch_sessions`).
     pub fn len(&self) -> usize {
-        self.sessions.len()
+        self.count.load(std::sync::atomic::Ordering::Relaxed) as usize
     }
 
     /// Whether the registry holds no sessions.
@@ -223,27 +268,34 @@ impl SessionStore {
 /// RAII handle for an open SSE stream on a session: decrements the session's
 /// active-stream count on drop and re-stamps its last-access time so the idle-GC
 /// TTL is measured from when the stream *ended* (codex MEDIUM #11). Held inside the
-/// stream future; a broken pipe / cancel frees it just like a clean close.
+/// stream future; a broken pipe / cancel frees it just like a clean close. The
+/// handle holds its own `Arc<Session>` so the count decrement always lands on the
+/// exact session it was opened on (even if the registry entry was meanwhile GC'd /
+/// re-minted under the same `wid`), closing the GC-vs-open race.
 pub struct StreamHandle {
     store: Arc<SessionStore>,
     wid: String,
+    session: Arc<Session>,
 }
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        if let Some(s) = self.store.get(&self.wid) {
-            s.active_streams.fetch_sub(1, Ordering::Relaxed);
-            // Re-stamp so the TTL clock starts now (stream just ended), not from
-            // the original open.
-            s.last_access_ms.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0),
-                Ordering::Relaxed,
-            );
-        }
+        // Decrement on the held Arc — authoritative regardless of the registry's
+        // current state — and re-stamp so the idle-TTL clock restarts when the
+        // stream ENDED, not when it opened. The session can then be reaped by a
+        // later `gc_expired` once it is genuinely idle (active_streams back to 0).
+        self.session.active_streams.fetch_sub(1, Ordering::Relaxed);
+        self.session.last_access_ms.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        // Keep `store`/`wid` referenced (the handle's identity); no registry mutation
+        // is needed on drop.
+        let _ = (&self.store, &self.wid);
     }
 }
 
@@ -293,27 +345,12 @@ pub async fn create_watch(
         }
     }
 
-    // Reclaim idle, expired sessions before the cap check (codex MEDIUM #11) so a
-    // freed slot is reusable and a client that abandons sessions cannot pin the
+    // Reclaim idle, expired sessions before the cap reservation (codex MEDIUM #11)
+    // so a freed slot is reusable and a client that abandons sessions cannot pin the
     // `max_watch_sessions` slots until restart.
     let now_ms = state.engine.clock.now_ms();
     state.sessions.gc_expired(now_ms);
 
-    // Resource limit: cap the number of live watch sessions (DoS hardening;
-    // [`crate::limits`]). `0` ⇒ unlimited. Capacity exhaustion is a transient
-    // `429 throttled` (the client can retry after sessions free up).
-    let limits = &state.engine.config.limits;
-    if !limits.watch_session_ok(state.sessions.len() as u64) {
-        return Err(Error::new(
-            ErrorCode::Throttled,
-            "watch session limit reached",
-        )
-        .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
-        .with_detail(serde_json::json!({
-            "limit": "max_watch_sessions",
-            "max": limits.max_watch_sessions,
-        })));
-    }
     // Clamp heartbeat into the documented bounds (API §7.2).
     req.heartbeat_ms = req
         .heartbeat_ms
@@ -337,14 +374,32 @@ pub async fn create_watch(
         .map(|p| p.scopes)
         .unwrap_or(crate::auth::Scope::ALL);
 
-    let wid = state.sessions.insert(Session {
-        req: req.clone(),
-        cursors: Mutex::new(cursors),
-        key_id,
-        scopes,
-        last_access_ms: std::sync::atomic::AtomicI64::new(now_ms),
-        active_streams: std::sync::atomic::AtomicU64::new(0),
-    });
+    // Resource limit: cap the number of live watch sessions (DoS hardening;
+    // [`crate::limits`]). `0` ⇒ unlimited. The reservation is ATOMIC with the insert
+    // (codex P2 #10) — a concurrent `POST /v0/watch` race can never push the live
+    // session count over the cap. Capacity exhaustion is a transient `429 throttled`.
+    let limits = &state.engine.config.limits;
+    let wid = state
+        .sessions
+        .try_insert_capped(
+            Session {
+                req: req.clone(),
+                cursors: Mutex::new(cursors),
+                key_id,
+                scopes,
+                last_access_ms: std::sync::atomic::AtomicI64::new(now_ms),
+                active_streams: std::sync::atomic::AtomicU64::new(0),
+            },
+            limits.max_watch_sessions,
+        )
+        .ok_or_else(|| {
+            Error::new(ErrorCode::Throttled, "watch session limit reached")
+                .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+                .with_detail(serde_json::json!({
+                    "limit": "max_watch_sessions",
+                    "max": limits.max_watch_sessions,
+                }))
+        })?;
 
     Ok(Json(WatchCreateResponse {
         stream_url: format!("/v0/watch/{wid}"),
@@ -409,10 +464,18 @@ pub async fn stream_watch(
     // (codex MEDIUM #11). The returned handle is moved into the stream future and
     // decrements the count / restarts the idle-TTL clock on drop, so a session is
     // never GC'd while a stream is live and its TTL resumes when the stream ends.
-    // GC any idle sessions opportunistically on each open, too.
+    //
+    // GC-vs-open race (codex MEDIUM #11): we bump `active_streams` on the
+    // ALREADY-FETCHED `Arc<Session>` BEFORE running the opportunistic GC, so the
+    // session this open is about to stream can never be reaped out from under it
+    // (`is_expired` requires `active_streams == 0`). `open_on` then attaches the RAII
+    // handle to the registry entry (still present, since GC could not remove it),
+    // restamps, and decrements on drop. The prior order (GC then open) could free the
+    // session between the fetch and the count bump, leaving a stream live with the
+    // registry/count gauge already decremented (a use-after-GC of the slot).
     let now_ms = state.engine.clock.now_ms();
+    let stream_handle = state.sessions.open_on(&wid, &session, now_ms);
     state.sessions.gc_expired(now_ms);
-    let stream_handle = state.sessions.open_stream(&wid, now_ms);
 
     // `Last-Event-ID` (or the `cursor` query) may rewind the session cursors to
     // an exact prior map — never advance past the authoritative server state.
@@ -433,7 +496,7 @@ pub async fn stream_watch(
     }
 
     let engine = state.engine.clone();
-    let stream = build_stream(engine, session, sse_guard, stream_handle);
+    let stream = build_stream(engine, session, sse_guard, Some(stream_handle));
 
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()

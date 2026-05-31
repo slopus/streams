@@ -362,8 +362,17 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // (DESIGN §10.1). Only durable lease frames survive a crash; with the
             // default non-durable leases log nothing replays here and every
             // in-flight job is claimable again (self-healing, DESIGN §10.6).
+            //
+            // Skip Lease replay for a `memory`-class box (codex P1 #4): a memory
+            // queue's records reset to empty on restart, so a replayed lease would be
+            // a ghost lease over a non-existent job — advancing the claim cursor and
+            // stranding fresh post-restart jobs. A memory box should never have
+            // logged a lease (the writer side now also gates on the class), but
+            // recovery is defensive against an older log.
             if let Some(b) = engine.get_box_by_id(box_id) {
-                if let Some(q) = &b.queue {
+                if b.config.read().is_memory() {
+                    // ghost lease — ignore.
+                } else if let Some(q) = &b.queue {
                     let mut q = q.lock();
                     q.apply_lease_event(event, seq, node, lease_id, deadline as i64, deliveries);
                 }

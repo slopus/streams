@@ -121,6 +121,7 @@ pub async fn write(
     State(state): State<AppState>,
     Path(box_name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
+    extensions: axum::http::Extensions,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
@@ -130,6 +131,29 @@ pub async fn write(
     if req.idempotency_key.is_none() {
         if let Some(v) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
             req.idempotency_key = Some(v.to_string());
+        }
+    }
+
+    // Auto-create is a control-plane door (codex HIGH #8): `Engine::write`
+    // auto-creates a missing box from the request's `config`, but this route is
+    // classified as `WRITE`-scope only. A write-only key that smuggles `config`
+    // (e.g. a queue + dead-letter target) into a write to a NOT-YET-EXISTING box
+    // would configure a box without `admin`. Require `admin` to CONFIGURE a new box
+    // via write: when the box is absent and the request carries body `config`, the
+    // principal must hold `admin` (a dev-mode/full-access principal always does). A
+    // plain auto-create with no body config (default box) stays a write-scope op, so
+    // the documented `create`-on-write convenience is preserved.
+    if req.config.is_some() && state.engine.get_box(&box_name).is_none() {
+        let admin = extensions
+            .get::<crate::auth::Principal>()
+            .map(|p| p.allows_scope(crate::auth::Scope::ADMIN))
+            .unwrap_or(true); // no principal stashed ⇒ dev mode (full access).
+        if !admin {
+            return Err(crate::error::Error::new(
+                crate::types::ErrorCode::Forbidden,
+                "configuring a new box on write requires the admin scope",
+            )
+            .with_detail(serde_json::json!({ "box": box_name })));
         }
     }
 

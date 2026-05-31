@@ -46,6 +46,23 @@ pub struct Engine {
     routers: Mutex<RouterGraph>,
     /// Monotonic interned box-id allocator (used by WAL framing, ARCHITECTURE §2.1).
     next_box_id: AtomicU64,
+    /// Live box count, maintained as an atomic gauge so the `max_boxes` cap can be
+    /// enforced with an **atomic reserve-then-insert** (codex P2 #10): the reserve
+    /// CAS happens-before the registry insert and only on the vacant-create path, so
+    /// the surviving count can never exceed the cap under a concurrent create race
+    /// (the old `box_count()` read-then-insert was a TOCTOU that overshot the cap by
+    /// the racer count). Kept in lockstep with `boxes`: bumped only on an actual new
+    /// insert, decremented on every removal (live delete + recovery).
+    box_count: AtomicU64,
+    /// Live total retained record bytes across all boxes, maintained as an atomic
+    /// gauge so the global `max_total_bytes` quota can be enforced with an **atomic
+    /// reserve** against the running total (codex P2 #10): a write reserves its bytes
+    /// against this counter before staging and rolls the reservation back on any
+    /// failure, so the committed total can never exceed the cap by the racer count
+    /// (the old `total_bytes()` read-then-write was a TOCTOU). Each box also tracks
+    /// its own `bytes()` for per-box accounting/recovery; this gauge is the sum,
+    /// reconciled on recovery + box delete.
+    total_bytes_live: AtomicU64,
     /// The WAL writer, present once a data dir is configured (durability layer,
     /// phase 4). `None` ⇒ pure in-memory mode (engine unit tests / phase-2 shape):
     /// mutating ops skip WAL append and `fsync_ms`/`wal_append_ms` report `0.0`.
@@ -101,6 +118,8 @@ impl Engine {
             boxes: DashMap::new(),
             routers: Mutex::new(RouterGraph::new()),
             next_box_id: AtomicU64::new(1),
+            box_count: AtomicU64::new(0),
+            total_bytes_live: AtomicU64::new(0),
             wal: None,
             _wal_owner: None,
             data_dir: None,
@@ -167,6 +186,8 @@ impl Engine {
             boxes: DashMap::new(),
             routers: Mutex::new(RouterGraph::new()),
             next_box_id: AtomicU64::new(1),
+            box_count: AtomicU64::new(0),
+            total_bytes_live: AtomicU64::new(0),
             wal: None,
             _wal_owner: None,
             data_dir: Some(std::path::PathBuf::from(&data_dir)),
@@ -216,6 +237,19 @@ impl Engine {
                 .store(m.clock.now_ms().max(0) as u64, Ordering::Relaxed);
             e
         };
+        // Reconcile the live byte gauge from the fully-recovered registry (snapshot
+        // restore seeds it per box, but WAL replay then mutates per-box bytes via
+        // appends/deletes/evictions). Recompute the authoritative sum once here so
+        // the `max_total_bytes` reservation counter starts exactly at the recovered
+        // live total (codex P2 #10). Single-threaded at this point.
+        engine.total_bytes_live.store(
+            engine
+                .boxes
+                .iter()
+                .map(|b| b.value().bytes())
+                .fold(0u64, |a, x| a.saturating_add(x)),
+            Ordering::Relaxed,
+        );
         // Recovery is complete and the writer is open: open the readiness gate so
         // `/v0/ready` answers 200. Release ordering pairs with the Acquire load in
         // `is_ready` so a reader that observes `ready` also observes all replayed
@@ -341,9 +375,11 @@ impl Engine {
         since_ms >= config::SNAPSHOT_INTERVAL_MS
     }
 
-    /// Number of boxes currently registered.
+    /// Number of boxes currently registered. Reads the atomic gauge kept in
+    /// lockstep with the registry (bumped on an actual create, decremented on every
+    /// removal), which is also the reservation point for the `max_boxes` cap.
     pub fn box_count(&self) -> u64 {
-        self.boxes.len() as u64
+        self.box_count.load(Ordering::Relaxed)
     }
 
     /// Number of routers currently defined (resource-limit / observability).
@@ -351,15 +387,79 @@ impl Engine {
         self.routers.lock().len() as u64
     }
 
-    /// Sum of retained record bytes across all boxes — the live total enforced by
-    /// the global byte quota (codex HIGH #5). O(boxes); only called on the write
-    /// path when the quota is enabled (non-zero), so the default/unlimited case
-    /// pays nothing. Each box's `bytes()` is a single relaxed atomic load.
+    /// Sum of retained record bytes across all boxes — the authoritative live total
+    /// (codex HIGH #5). O(boxes). Used to seed/reconcile the `total_bytes_live`
+    /// reservation gauge (recovery, and the self-correcting reconcile on a refused
+    /// reservation); the hot write path reserves against the gauge, not this scan.
     pub fn total_bytes(&self) -> u64 {
         self.boxes
             .iter()
             .map(|b| b.value().bytes())
             .fold(0u64, |a, x| a.saturating_add(x))
+    }
+
+    /// Atomically **reserve** `incoming` bytes against the global `max_total_bytes`
+    /// quota (codex P2 #10). Returns `true` (and bumps the running `total_bytes_live`
+    /// gauge) iff the reserved total stays at/under the cap; `false` (gauge
+    /// unchanged) when it would exceed it — the caller returns `429 throttled`.
+    ///
+    /// The CAS loop is the serialization point for the quota: only a reservation
+    /// that observed a total within the cap commits, so concurrent writers can never
+    /// push the committed total over the cap (the prior `total_bytes()` read-then-
+    /// write was a TOCTOU that admitted everything). The gauge is a reservation
+    /// counter (incremented at admission, released on write failure, decremented on
+    /// box delete). It also COUNTS in-flight reservations (a write that reserved but
+    /// has not yet published), so a hard reservation cap is correct under
+    /// concurrency. `discard:"old"` eviction reduces *actual* box bytes without
+    /// touching the gauge, which can only make the gauge an OVER-estimate — the
+    /// quota then errs strict (refuses slightly early), never loose (it can never
+    /// overshoot the cap). The authoritative `total_bytes()` sum reconciles the
+    /// gauge on recovery; a long-lived process with heavy eviction trades a little
+    /// headroom for a hard guarantee. `max_total_bytes == 0` ⇒ unlimited.
+    fn try_reserve_total_bytes(&self, incoming: u64) -> bool {
+        let cap = self.config.limits.max_total_bytes;
+        if cap == 0 {
+            return true;
+        }
+        self.cas_reserve_bytes(incoming, cap)
+    }
+
+    /// CAS-add `incoming` onto `total_bytes_live` iff the result stays `<= cap`.
+    fn cas_reserve_bytes(&self, incoming: u64, cap: u64) -> bool {
+        let mut cur = self.total_bytes_live.load(Ordering::Relaxed);
+        loop {
+            if cur.saturating_add(incoming) > cap {
+                return false;
+            }
+            match self.total_bytes_live.compare_exchange_weak(
+                cur,
+                cur + incoming,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// Release a previously-reserved `bytes` back to the quota gauge (a write that
+    /// reserved capacity then failed/aborted before committing). Saturating so it
+    /// can never underflow.
+    fn release_total_bytes(&self, bytes: u64) {
+        let mut cur = self.total_bytes_live.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(bytes);
+            match self.total_bytes_live.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(c) => cur = c,
+            }
+        }
     }
 
     /// Look up a box by name.
@@ -696,11 +796,16 @@ impl Engine {
             (staged, seqs, ticket, token)
         };
 
+        // Block on the commit token for ANY persisted class — `disk` AND `fsync`
+        // (codex P0 #2): a `disk` token resolves after the buffered WAL write (so we
+        // never publish a forwarded/dead-lettered copy the WAL writer hasn't accepted
+        // yet, just skip the fsync), a `fsync` token after the group fdatasync. Only
+        // `memory` has no token and never waits.
         let mut fsync_failed: Option<String> = None;
-        if durable {
+        if class != Durability::Memory {
             if let Some(token) = token {
                 if let Err(e) = token.wait() {
-                    fsync_failed = Some(format!("WAL fsync failed: {e}"));
+                    fsync_failed = Some(format!("WAL commit failed: {e}"));
                 }
             }
         }
@@ -760,33 +865,21 @@ impl Engine {
             }
         }
 
-        // Resource limit: cap the number of boxes (DoS hardening; see
-        // [`crate::limits`]). Only a *new* box counts against the cap — an
-        // idempotent re-PUT of an existing box is an update and always proceeds, so
-        // a saturated server can still be reconfigured. `0` ⇒ unlimited (the
-        // back-compat default cap is large enough that existing suites never trip
-        // it). The check is a non-atomic read-then-create; a tiny concurrent
-        // overshoot past the cap is acceptable for a coarse DoS guard.
-        let exists = self.get_box(name).is_some();
-        if !exists && !self.config.limits.box_ok(self.box_count()) {
-            return Err(Error::new(
-                ErrorCode::Throttled,
-                format!(
-                    "box limit reached ({} boxes); cannot create {name:?}",
-                    self.config.limits.max_boxes
-                ),
-            )
-            .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
-            .with_detail(serde_json::json!({
-                "limit": "max_boxes",
-                "max": self.config.limits.max_boxes,
-            })));
-        }
-
         // `type` is immutable once a box exists (API §0.10): a `PUT` that would
-        // change it is rejected with `409 box_exists_incompatible`.
+        // change it is rejected with `409 box_exists_incompatible`. The MEMORY
+        // durability boundary is likewise immutable (codex P0 #3): flipping a box
+        // into or out of `memory` in place would leave a stale segment writer
+        // attached (or detach one), so a later memory write would materialize into
+        // segments, or a flip back to disk/fsync would let a snapshot persist
+        // memory-era records — resurrecting RAM-only records or silently dropping
+        // disk records. `disk`↔`fsync` is SAFE (both are non-memory, both have a
+        // segment writer, the snapshot path treats them identically) and stays a
+        // permitted in-place update (the common "auto-create then set durability"
+        // flow). A real change across the memory boundary must be delete + recreate
+        // (a fresh box_id with a clean index/segment store).
         if let Some(existing) = self.get_box(name) {
-            let cur_type = existing.config.read().r#type;
+            let cur_cfg = existing.config.read();
+            let cur_type = cur_cfg.r#type;
             if cur_type != config.r#type {
                 return Err(Error::new(
                     ErrorCode::BoxExistsIncompatible,
@@ -800,9 +893,53 @@ impl Engine {
                     "requested_type": config.r#type,
                 })));
             }
+            let cur_memory = cur_cfg.is_memory();
+            let new_memory = config.is_memory();
+            if cur_memory != new_memory {
+                let cur_class = cur_cfg.durability_class();
+                let new_class = config.durability_class();
+                drop(cur_cfg);
+                return Err(Error::new(
+                    ErrorCode::BoxExistsIncompatible,
+                    format!(
+                        "box {name:?} already exists with durability {cur_class:?}; \
+                         the memory durability boundary is immutable (delete + recreate \
+                         to change to/from memory)"
+                    ),
+                )
+                .with_detail(serde_json::json!({
+                    "box": name,
+                    "existing_durability": cur_class,
+                    "requested_durability": new_class,
+                })));
+            }
         }
 
-        let (created, box_id) = self.apply_put_box(name, config.clone(), None, None);
+        // Resource limit: cap the number of boxes (DoS hardening; [`crate::limits`]).
+        // Only a *new* box counts against the cap — an idempotent re-PUT of an
+        // existing box is an update and always proceeds. `0` ⇒ unlimited. The cap is
+        // enforced INSIDE `apply_put_box` as an atomic reserve-then-insert (codex P2
+        // #10): the reserve CAS happens-before the registry insert and only on the
+        // vacant-create path, so the surviving count can never exceed the cap under a
+        // concurrent create race. A refused reservation returns `429 throttled`.
+        let cap = self.config.limits.max_boxes;
+        let (created, box_id) = match self.apply_put_box(name, config.clone(), None, None, cap) {
+            Some(v) => v,
+            None => {
+                return Err(Error::new(
+                    ErrorCode::Throttled,
+                    format!(
+                        "box limit reached ({} boxes); cannot create {name:?}",
+                        self.config.limits.max_boxes
+                    ),
+                )
+                .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+                .with_detail(serde_json::json!({
+                    "limit": "max_boxes",
+                    "max": self.config.limits.max_boxes,
+                })));
+            }
+        };
 
         // Log the config mutation (create or update). Box config is durable as a
         // matter of policy (control frames share the WAL's durability boundary).
@@ -827,8 +964,10 @@ impl Engine {
             // retry — the divergence is bounded to this box and self-corrects on
             // the next durable PUT (documented tradeoff: rolling back an in-place
             // config replace would need the prior config saved).
-            if created {
-                self.boxes.remove(name);
+            if created && self.boxes.remove(name).is_some() {
+                // Release the box-count reservation taken by the (now rolled-back)
+                // create so the cap accounting stays exact.
+                self.box_count.fetch_sub(1, Ordering::AcqRel);
             }
             return Err(e);
         }
@@ -839,14 +978,23 @@ impl Engine {
     /// Apply a box create/update to the in-memory registry (no WAL logging).
     /// Shared by the live `put_box` and WAL replay. `forced_id`/`forced_epoch`
     /// let recovery restore the interned id + epoch from the log; live calls pass
-    /// `None` and allocate fresh. Returns `(created, box_id)`.
+    /// `None` and allocate fresh.
+    ///
+    /// `cap` is the `max_boxes` limit (`0` ⇒ unlimited): on the vacant-create path
+    /// the live `box_count` gauge is **atomically reserved** against `cap` BEFORE the
+    /// registry insert (codex P2 #10), so a concurrent create race can never push the
+    /// surviving box count over the cap. Returns `Some((created, box_id))`, or `None`
+    /// when a fresh create was refused because the cap is full (the caller maps that
+    /// to `429 throttled`). An update of an existing box never counts against the cap
+    /// and always returns `Some`.
     fn apply_put_box(
         &self,
         name: &str,
         config: BoxConfig,
         forced_id: Option<u32>,
         forced_epoch: Option<u64>,
-    ) -> (bool, u32) {
+        cap: u64,
+    ) -> Option<(bool, u32)> {
         use dashmap::mapref::entry::Entry;
         match self.boxes.entry(name.to_string()) {
             Entry::Occupied(e) => {
@@ -855,9 +1003,32 @@ impl Engine {
                 let b = e.get();
                 *b.config.write() = config;
                 b.enforce_retention(self.clock.now_ms());
-                (false, b.box_id)
+                Some((false, b.box_id))
             }
             Entry::Vacant(e) => {
+                // Atomic reserve-then-insert against the box cap. The CAS loop is the
+                // serialization point for the cap: only a reservation that observed a
+                // count strictly below `cap` proceeds to insert, so the surviving
+                // count never exceeds `cap`. `cap == 0` ⇒ unlimited (just bump).
+                if cap != 0 {
+                    let mut cur = self.box_count.load(Ordering::Relaxed);
+                    loop {
+                        if cur >= cap {
+                            return None; // cap full → caller returns 429 throttled.
+                        }
+                        match self.box_count.compare_exchange_weak(
+                            cur,
+                            cur + 1,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(c) => cur = c,
+                        }
+                    }
+                } else {
+                    self.box_count.fetch_add(1, Ordering::AcqRel);
+                }
                 let box_id = forced_id.unwrap_or_else(|| self.alloc_box_id());
                 if let Some(fid) = forced_id {
                     // Keep the allocator ahead of any replayed id.
@@ -889,7 +1060,7 @@ impl Engine {
                     }
                 }
                 e.insert(Arc::new(state));
-                (true, box_id)
+                Some((true, box_id))
             }
         }
     }
@@ -908,19 +1079,24 @@ impl Engine {
     }
 
     /// Create/update a box during replay (no WAL logging). Returns `(created,
-    /// box_id)`.
+    /// box_id)`. Recovery is single-threaded and must restore every logged box, so
+    /// the cap is bypassed (`0` ⇒ unlimited); the live `box_count` gauge is still
+    /// bumped so it matches the rebuilt registry.
     pub(crate) fn apply_put_box_for_recovery(
         &self,
         name: &str,
         config: BoxConfig,
         forced_id: Option<u32>,
     ) -> (bool, u32) {
-        self.apply_put_box(name, config, forced_id, None)
+        self.apply_put_box(name, config, forced_id, None, 0)
+            .expect("recovery box create is never cap-refused (cap bypassed)")
     }
 
     /// Remove a box during replay (box-delete tombstone). No cascade logging.
     pub(crate) fn remove_box_for_recovery(&self, name: &str) {
-        self.boxes.remove(name);
+        if self.boxes.remove(name).is_some() {
+            self.box_count.fetch_sub(1, Ordering::AcqRel);
+        }
         self.routers.lock().remove_touching_box(name);
     }
 
@@ -1155,8 +1331,15 @@ impl Engine {
             )?;
         }
 
-        // Durably logged: NOW apply the in-memory removal + cascade.
-        self.boxes.remove(name);
+        // Durably logged: NOW apply the in-memory removal + cascade. Release this
+        // box's reservations from the live gauges (box-count + byte-total) so the
+        // `max_boxes` / `max_total_bytes` caps free the capacity it held.
+        let freed_bytes = b.bytes();
+        if self.boxes.remove(name).is_some() {
+            self.box_count.fetch_sub(1, Ordering::AcqRel);
+            self.total_bytes_live
+                .fetch_sub(freed_bytes.min(self.total_bytes_live.load(Ordering::Relaxed)), Ordering::AcqRel);
+        }
         self.routers.lock().remove_touching_box(name);
 
         Ok(BoxDeleteResponse {
@@ -1334,20 +1517,19 @@ impl Engine {
             })));
         }
 
-        // Global byte quota (DoS hardening; codex HIGH #5): bound total disk/RAM
-        // growth across all boxes. Checked ONLY when the quota is enabled
+        // Global byte quota (DoS hardening; codex HIGH #5 / P2 #10): bound total
+        // disk/RAM growth across all boxes. Checked ONLY when the quota is enabled
         // (`max_total_bytes != 0`), so the default/unlimited path is unchanged and
-        // pays nothing. A write that would push the live total over the cap is a
-        // transient `429 throttled` — the operator/clients can delete/evict and
-        // retry. This is a coarse admission guard (a tiny concurrent overshoot is
-        // acceptable); the per-box `discard:"old"` eviction above already trims a
-        // capped box back down.
-        if self.config.limits.max_total_bytes != 0
-            && !self
-                .config
-                .limits
-                .total_bytes_ok(self.total_bytes(), incoming_bytes)
-        {
+        // pays nothing. The reservation is ATOMIC — `try_reserve_total_bytes` CASes
+        // `incoming_bytes` onto the running `total_bytes_live` gauge and only admits
+        // a write whose reserved total stays at/under the cap — so a concurrent
+        // writer race can never push the committed total over the cap by the racer
+        // count (the old `total_bytes()` read-then-write was a TOCTOU). A refused
+        // reservation is a transient `429 throttled`. The reservation is released
+        // (`release_total_bytes`) on any write failure below so a rejected/aborted
+        // write never permanently consumes quota.
+        let bytes_reserved = self.config.limits.max_total_bytes != 0;
+        if bytes_reserved && !self.try_reserve_total_bytes(incoming_bytes) {
             return Err(Error::new(
                 ErrorCode::Throttled,
                 "server total-bytes quota reached",
@@ -1406,6 +1588,9 @@ impl Engine {
                         // ticket was taken yet, so a tail truncation is still safe
                         // (no later writer staged past us under the held lock).
                         b.rollback_staged(staged);
+                        if bytes_reserved {
+                            self.release_total_bytes(incoming_bytes);
+                        }
                         return Err(e);
                     }
                 }
@@ -1418,27 +1603,39 @@ impl Engine {
         };
 
         let (head, fsync_ms) = {
-            // Durability gate (OFF the append lock): for a `durable` box block on
-            // the last frame's commit token (the single ordered writer guarantees
-            // every prior frame in the batch is fsynced by then) — so the response
-            // is fsync-gated and nothing visible is non-durable. A non-durable
-            // write's frames are buffered and group-committed shortly after; we
-            // don't wait. Multiple writers' waits overlap and group-commit
-            // together (the throughput win).
+            // Durability gate (OFF the append lock). The single ordered writer
+            // signals each batch's commit token AFTER its buffered `write` (and,
+            // for a durable/fsync batch, AFTER the group `fdatasync`). We block on
+            // that token for ANY persisted class — `disk` AND `fsync` (codex P0 #2):
+            //   * `fsync`: the token resolves after the fdatasync, so the response
+            //     is fsync-gated (acked ⇒ hardened).
+            //   * `disk`: the token resolves after the buffered write, so we never
+            //     publish/ack a record the WAL writer hasn't even accepted yet (the
+            //     prior bug published disk records that were still only in the
+            //     channel or had hit a WAL write error). The `fdatasync` is skipped
+            //     for disk (whole-tail durability follows on a later group fsync),
+            //     so the latency win stands — we only wait for the WRITE, not the
+            //     sync. A `memory` write has no token and never waits.
+            // Many writers' waits overlap and group-commit together (throughput).
             let mut fsync_failed: Option<String> = None;
-            let fsync_ms = if durable {
+            let await_token = class != Durability::Memory;
+            let fsync_ms = if await_token {
                 if let Some(token) = commit_token {
                     let t1 = Instant::now();
                     if let Err(e) = token.wait() {
-                        fsync_failed = Some(format!("WAL fsync failed: {e}"));
+                        fsync_failed = Some(format!("WAL commit failed: {e}"));
                     }
-                    elapsed_ms(t1)
+                    // Only the fsync class pays (and reports) the sync latency; a
+                    // disk write's token resolves at the buffered write, not a sync.
+                    if durable {
+                        elapsed_ms(t1)
+                    } else {
+                        0.0
+                    }
                 } else {
                     0.0
                 }
             } else {
-                // A non-durable write still drops its token (fire-and-forget); the
-                // group commit hardens it shortly after.
                 0.0
             };
 
@@ -1447,13 +1644,17 @@ impl Engine {
             // so head advances monotonically and prefix-durability holds.
             b.publish_wait_turn(ticket);
             if let Some(msg) = fsync_failed {
-                // fsync FAILED: mark THIS batch's seqs deleted in place (a later
-                // writer may already have staged past them, so we cannot truncate),
-                // advance the gate, and return an error. The records were never
-                // published by us; if a later writer advances head past them they
-                // read as a silent deleted gap. Not acked ⇒ not committed.
+                // The WAL commit FAILED (write or fsync): mark THIS batch's seqs
+                // deleted in place (a later writer may already have staged past
+                // them, so we cannot truncate), advance the gate, release the byte
+                // reservation, and return an error. The records were never published
+                // by us; if a later writer advances head past them they read as a
+                // silent deleted gap. Not acked ⇒ not committed.
                 b.rollback_staged_by_seqs(&staged);
                 b.publish_done(ticket);
+                if bytes_reserved {
+                    self.release_total_bytes(incoming_bytes);
+                }
                 return Err(Error::internal(msg));
             }
             // Durably committed (or non-durable buffered write): NOW publish the
@@ -1904,12 +2105,27 @@ impl Engine {
     // Routers (API §6)
     // -----------------------------------------------------------------------
 
+    /// Lazily auto-create a router's `source` and `dest` boxes with defaults (the
+    /// dest only when it is missing — `create_dest:false` + missing dest is rejected
+    /// by the caller before the router slot is reserved). Called AFTER the router
+    /// slot is secured so a refused router leaves no phantom box.
+    fn ensure_router_boxes(&self, req: &RouterCreateRequest, _created: bool) -> Result<()> {
+        if self.get_box(&req.source).is_none() {
+            self.put_box(&req.source, BoxConfig::default())?;
+        }
+        if self.get_box(&req.dest).is_none() {
+            self.put_box(&req.dest, BoxConfig::default())?;
+        }
+        Ok(())
+    }
+
     /// `PUT /v0/routers/:router` — create/configure a router (idempotent upsert).
     ///
-    /// Validates the request, auto-creates `source`/`dest` (unless
-    /// `create_dest:false`), runs the DAG cycle check, then upserts. The router's
-    /// forward cursor starts at the source's current head so it only forwards
-    /// records committed *after* creation (no historical backfill).
+    /// Validates the request, reserves the router slot under the cap (atomically
+    /// with the cycle check + insert), auto-creates `source`/`dest` (unless
+    /// `create_dest:false`), then durably logs it. The router's forward cursor
+    /// starts at the source's current head so it only forwards records committed
+    /// *after* creation (no historical backfill).
     pub fn put_router(
         &self,
         name: &str,
@@ -1923,42 +2139,12 @@ impl Engine {
         }
         router::validate_router(&req.source, &req.dest)?;
 
-        // Resource limit: cap the number of routers (DoS hardening; [`crate::limits`]).
-        // Only a *new* router counts — an idempotent re-PUT of an existing router is
-        // an update and always proceeds. `0` ⇒ unlimited. Checked BEFORE any
-        // source/dest box auto-create so a router that would be refused does not
-        // leave phantom boxes behind.
-        {
-            let graph = self.routers.lock();
-            let exists = graph.get(name).is_some();
-            let count = graph.len() as u64;
-            drop(graph);
-            if !exists && !self.config.limits.router_ok(count) {
-                return Err(Error::new(
-                    ErrorCode::Throttled,
-                    format!(
-                        "router limit reached ({} routers); cannot create {name:?}",
-                        self.config.limits.max_routers
-                    ),
-                )
-                .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
-                .with_detail(serde_json::json!({
-                    "limit": "max_routers",
-                    "max": self.config.limits.max_routers,
-                })));
-            }
-        }
-
-        // Ensure `source` exists (lazy auto-create with defaults).
-        if self.get_box(&req.source).is_none() {
-            self.put_box(&req.source, BoxConfig::default())?;
-        }
-        // Ensure `dest` exists, honoring `create_dest`.
-        if self.get_box(&req.dest).is_none() {
-            if !req.create_dest {
-                return Err(Error::box_not_found(&req.dest));
-            }
-            self.put_box(&req.dest, BoxConfig::default())?;
+        // `create_dest:false` + a missing dest is a `box_not_found` reject — check it
+        // (read-only) BEFORE reserving a router slot or auto-creating anything, so a
+        // request that cannot succeed leaves no phantom box and consumes no slot.
+        let dest_missing = self.get_box(&req.dest).is_none();
+        if dest_missing && !req.create_dest {
+            return Err(Error::box_not_found(&req.dest));
         }
 
         let router = Router {
@@ -1973,18 +2159,38 @@ impl Engine {
         };
 
         // Forward cursor starts at the source's current head: only records
-        // committed after this PUT are forwarded (per-source FIFO from "now").
+        // committed after this PUT are forwarded (per-source FIFO from "now"). A
+        // not-yet-created source reads as head 0 (its auto-create below assigns the
+        // same fresh base), which is correct — no historical backfill.
         let src_head = self
             .get_box(&req.source)
             .map(|b| b.head_seq())
             .unwrap_or(0);
 
+        // Resource limit + cycle check + insert, ALL under the single graph lock
+        // (codex P2 #10): `upsert_capped` refuses a NEW router with `429 throttled`
+        // when the live count is already at `max_routers`, atomically with the
+        // insert — so a concurrent create race can never push the router count over
+        // the cap (the prior read-len-then-drop-lock-then-insert was a TOCTOU). The
+        // box auto-creates happen AFTER, only once the slot is secured, so a refused
+        // router never leaves a phantom dest/source box. `0` ⇒ unlimited.
         let created = {
             let mut graph = self.routers.lock();
-            let created = graph.upsert(router)?;
+            let created = graph.upsert_capped(router, self.config.limits.max_routers)?;
             graph.note_forwarded(name, src_head, 0);
             created
         };
+
+        // The router slot is now reserved. Auto-create `source`/`dest` boxes (the
+        // dest honoring `create_dest`, already validated above). If a box create
+        // fails (e.g. the box cap is full), roll the router back so a half-wired
+        // router never lingers.
+        if let Err(e) = self.ensure_router_boxes(&req, created) {
+            if created {
+                self.routers.lock().remove(name);
+            }
+            return Err(e);
+        }
 
         // Log the router upsert (durable control frame) so it replays on restart.
         // PROPAGATE a WAL failure so a router a crash would lose is never reported
@@ -2104,6 +2310,16 @@ impl Engine {
     }
 
     /// `DELETE /v0/routers/:router` — stops forwarding immediately. Idempotent.
+    /// The `(source, dest)` box names of router `name`, or `None` if it does not
+    /// exist. Used by the HTTP layer to authorize a prefix-limited key against a
+    /// router's endpoints (not just its path name) on GET/DELETE (codex P1 #9).
+    pub fn router_endpoints(&self, name: &str) -> Option<(String, String)> {
+        self.routers
+            .lock()
+            .get(name)
+            .map(|r| (r.source.clone(), r.dest.clone()))
+    }
+
     pub fn delete_router(&self, name: &str) -> Result<RouterDeleteResponse> {
         let start = Instant::now();
         // Probe existence WITHOUT removing, log the tombstone, THEN remove (codex

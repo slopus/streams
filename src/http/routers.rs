@@ -51,11 +51,45 @@ pub async fn put_router(
     Ok((status, Json(resp)).into_response())
 }
 
+/// Authorize a prefix-restricted principal against a router's NAME, SOURCE, and
+/// DEST (codex HIGH/P1 #9): the route-level check only saw the router path name, so
+/// a prefix-limited key could read/delete a router whose name is allowed but whose
+/// source/dest boxes are not. A full-access / unrestricted key (or dev mode) passes
+/// transparently. A no-op when the router does not exist (the handler then returns
+/// the usual not-found / idempotent response).
+fn authorize_router_endpoints(
+    state: &AppState,
+    extensions: &axum::http::Extensions,
+    router: &str,
+) -> Result<()> {
+    let Some(p) = extensions.get::<crate::auth::Principal>() else {
+        return Ok(()); // dev mode / full access.
+    };
+    if p.prefixes.is_empty() {
+        return Ok(()); // unrestricted key.
+    }
+    let Some((source, dest)) = state.engine.router_endpoints(router) else {
+        return Ok(()); // absent: defer to the handler's not-found path.
+    };
+    for name in [router, source.as_str(), dest.as_str()] {
+        if !p.allows_name(name) {
+            return Err(crate::error::Error::new(
+                crate::types::ErrorCode::Forbidden,
+                "api key is not allowed to access this router's box(es)",
+            )
+            .with_detail(serde_json::json!({ "box": name })));
+        }
+    }
+    Ok(())
+}
+
 /// `GET /v0/routers/:router`.
 pub async fn get_router(
     State(state): State<AppState>,
     Path(router): Path<String>,
+    extensions: axum::http::Extensions,
 ) -> Result<Json<RouterGetResponse>> {
+    authorize_router_endpoints(&state, &extensions, &router)?;
     Ok(Json(state.engine.get_router(&router)?))
 }
 
@@ -85,7 +119,9 @@ pub async fn list_routers(
 pub async fn delete_router(
     State(state): State<AppState>,
     Path(router): Path<String>,
+    extensions: axum::http::Extensions,
 ) -> Result<Json<RouterDeleteResponse>> {
+    authorize_router_endpoints(&state, &extensions, &router)?;
     let engine = state.engine.clone();
     let resp = run_blocking(move || engine.delete_router(&router)).await?;
     Ok(Json(resp))

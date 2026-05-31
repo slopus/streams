@@ -424,6 +424,13 @@ partial or planned):
   The cap-vs-TTL tombstone **reason** is best-effort across a restart (the gap *range* is
   always authoritative). The throughput/latency targets above are design goals validated by
   the in-memory baseline benchmarks, not yet a tuned production SLO on durable boxes.
+  With `leases_durable:true`, a queue **claim** durably logs its lease BUT the lease-log
+  append is best-effort: if it fails (a transient WAL error), the claim still succeeds and the
+  job degrades to the queue's baseline **at-least-once** guarantee (it becomes reclaimable
+  early, on the visibility timeout, instead of replaying its in-flight lease across a restart).
+  This never loses or duplicates a job beyond at-least-once; the in-flight-lease *durability*
+  is the only relaxation. A fully fail-closed durable lease (stage → durably append → publish,
+  propagating the error) is planned.
 - **Planned:** TLS termination (run behind a reverse proxy today), hard multi-tenant
   *namespace* isolation (beyond the prefix-allowlist filter that ships today), and a durable
   router-backlog worker that retries failed forwards from a persisted cursor. See

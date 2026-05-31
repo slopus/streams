@@ -84,6 +84,33 @@ impl RouterGraph {
         Ok(created)
     }
 
+    /// Cap-aware [`Self::upsert`]: enforce `max_routers` (`0` ⇒ unlimited)
+    /// **atomically with the insert** under the caller's single held graph lock
+    /// (codex P2 #10). A *new* router is refused (`Throttled`) only when the live
+    /// count is already at the cap; an idempotent re-PUT of an existing router is an
+    /// update and always proceeds. Because the count read and the insert happen
+    /// under one lock, a concurrent create race can never push the router count over
+    /// the cap (the prior read-len-then-drop-lock-then-insert was a TOCTOU that
+    /// fully bypassed the cap). Returns whether the router was newly created.
+    pub fn upsert_capped(&mut self, router: Router, max_routers: u64) -> Result<bool> {
+        let is_new = !self.routers.contains_key(&router.name);
+        if is_new && max_routers != 0 && self.routers.len() as u64 >= max_routers {
+            return Err(Error::new(
+                crate::types::ErrorCode::Throttled,
+                format!(
+                    "router limit reached ({max_routers} routers); cannot create {:?}",
+                    router.name
+                ),
+            )
+            .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+            .with_detail(serde_json::json!({
+                "limit": "max_routers",
+                "max": max_routers,
+            })));
+        }
+        self.upsert(router)
+    }
+
     /// Remove a router by name. Returns whether it existed.
     pub fn remove(&mut self, name: &str) -> bool {
         let existed = self.routers.remove(name).is_some();
