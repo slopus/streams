@@ -40,7 +40,11 @@ Five concepts. That's the whole product.
   range and/or by `tag` match. A delete is **silent** (never a tombstone) and takes
   effect immediately on all reads; the physical memory/disk is reclaimed lazily in the
   background. It only removes records that exist at call time — it is not a standing
-  filter, so future records are never affected.
+  filter, so future records are never affected. For a record already sealed into a
+  segment, the delete is made durable **in place**: it flips a single delete-flag byte
+  in the segment file (and fsyncs) while the WAL stays append-only, so the deletion
+  survives a checkpoint that trims the WAL `Delete` frame and is re-derived from the
+  on-disk flag on restart. Clearing a whole segment drops it in one op (crash-safe).
 
 The load-bearing invariant: **involuntary capacity-driven loss you didn't ask for
 (cap eviction, TTL expiry) always produces a tombstone; voluntary removal you did ask
@@ -71,8 +75,11 @@ What streams **aims** for — the design targets the implementation is built and
 The central tradeoff is the **three durability commit classes**, chosen per box, so each box
 buys exactly the guarantee it needs without taxing the others:
 
-- **`memory`** — RAM-only, never touches the WAL. Fastest; **data is lost on restart** (the
-  box reappears empty, config preserved). For caches / scratch / ephemeral fan-out.
+- **`memory`** — _"disk-like but best-effort"_. Takes the **same** group-committed WAL write +
+  recovery path as `disk` and is fully queryable, but with **no durability guarantee**: after a
+  restart data **may survive or be lost** (recovery is gradual/best-effort — it never blocks
+  readiness). Never fsync-gated. For caches / scratch / ephemeral fan-out where occasional loss
+  is fine.
 - **`disk`** — WAL + **group commit**, no per-write fsync. Survives a crash minus the
   un-fsynced tail. The pub/sub default.
 - **`fsync`** — **fsync-gated** ack. Survives any crash; an acked write is always recovered.
@@ -290,16 +297,17 @@ durability/performance tradeoff:
 
 | Class | Where it lands | Ack timing | Survives a crash? |
 |---|---|---|---|
-| `memory` | never written to the WAL (pure RAM) | immediate (skips the WAL; `fsync_ms` 0) | **no** — records lost on restart; the box reappears EMPTY (config persists, `head_seq` resets to 0). Lowest latency. |
+| `memory` | WAL, **group-committed** (same path as `disk`) | on WAL-frame enqueue, not fsync-gated (`fsync_ms` 0) | **best-effort — no guarantee.** Disk-like but lossy: records **MAY survive OR be lost** on restart (recovery is gradual/best-effort, never blocks readiness); the box is fully queryable and its CONFIG always survives. Lowest-latency, for caches/scratch. |
 | `disk` | WAL, **group-committed** (no per-write fsync) | on WAL-frame enqueue, not fsync-gated (`fsync_ms` 0) | yes, **minus the un-fsynced tail** (the not-yet-group-committed frames). |
 | `fsync` | WAL, **fsync-gated** | after the group `fsync` (real `fsync_ms`) | **yes, any crash** — an acked write is recovered by WAL replay. |
 
 The legacy `durable` bool is a back-compat alias: `durable:true` ⇒ `fsync`,
-`durable:false` ⇒ `disk` (set `durability:"memory"` explicitly for the RAM-only
-class). The resolved `durability` is reported on every box-state response, and
-`durable` is normalized to `durable == (class == "fsync")`. Router-forwarded and
-dead-lettered copies honor the **destination** box's class (a `memory` dest
-persists no copy). Regardless of class, **an acknowledged write is published; a
+`durable:false` ⇒ `disk` (set `durability:"memory"` explicitly for the
+best-effort/lossy class). The resolved `durability` is reported on every box-state
+response, and `durable` is normalized to `durable == (class == "fsync")`.
+Router-forwarded and dead-lettered copies honor the **destination** box's class (a
+`memory` dest persists a best-effort copy — it may survive or be lost). Regardless
+of class, **an acknowledged write is published; a
 write that fails to commit publishes nothing visible** (no readable-but-not-durable
 state). The server shuts down gracefully on `SIGINT`/`SIGTERM`, writing a final
 snapshot so a clean restart starts from a current checkpoint. The quickstart
@@ -397,15 +405,16 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
 - **Routers** — server-side `source → dest` forwarding, at-least-once, per-source FIFO,
   cycle-rejecting by default. A forwarded copy goes through the same write path as a user write,
   so it **honors the destination box's durability class** (`fsync`/`disk` recover on restart; a
-  `memory` dest persists no copy).
+  `memory` dest's copy is best-effort — it may survive or be lost).
 - **Lease-based queues** — set `type: "queue"` to layer claim/ack/nack/extend (and a
   `/work` auto-claim SSE stream) on the same log: visibility-timeout leases,
   coalesced fair fan-out, redelivery, and optional dead-lettering (see API §10).
 - **Multiplexed SSE** — watch many boxes over one resumable connection with composite
   cursors, named events, heartbeats, and tombstones.
-- **Per-box durability, three commit classes** — `memory` (RAM-only, lost on restart),
-  `disk` (group-committed WAL, survives a crash minus the un-fsynced tail), and `fsync`
-  (fsync-gated ack, survives any crash). WAL-first: an acknowledged write is committed and
+- **Per-box durability, three commit classes** — `memory` (disk-like but best-effort: same WAL
+  write+recovery path, fully queryable, but data may survive or be lost on restart), `disk`
+  (group-committed WAL, survives a crash minus the un-fsynced tail), and `fsync` (fsync-gated
+  ack, survives any crash). WAL-first: a `disk`/`fsync`-acknowledged write is committed and
   nothing visible is ever un-durable. Crash-recovery via snapshot + WAL replay on start.
 - **Priority + elastic throttling** — manual or recency-based auto priority; under CPU
   pressure delivery degrades in latency, never in correctness.

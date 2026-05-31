@@ -446,11 +446,11 @@ impl Engine {
         let box_lease_ms = cfg.lease_ms;
         let max_deliveries = cfg.max_deliveries;
         let dead_letter = cfg.dead_letter.clone();
-        // A `memory`-class queue must NEVER WAL-log lease events (codex P1 #4): its
-        // records are RAM-only and reset to empty on restart, so a replayed lease
-        // frame would be a ghost lease over a non-existent job (stranding fresh
-        // post-restart jobs). Treat `leases_durable` as false for a memory box.
-        let leases_durable = cfg.leases_durable && !cfg.is_memory();
+        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
+        // so it logs lease events exactly like a `disk` queue when `leases_durable`
+        // is set (best-effort: a lost lease frame self-heals — the job becomes
+        // claimable again on restart, DESIGN §10.6).
+        let leases_durable = cfg.leases_durable;
         let box_id = b.box_id;
         drop(cfg);
 
@@ -658,12 +658,13 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
-        // are RAM-only, so a replayed lease frame would ghost over a non-existent
-        // job. Treat `leases_durable` as false for memory.
+        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
+        // so it logs lease events exactly like a `disk` queue when `leases_durable`
+        // is set (best-effort: a lost lease frame self-heals — the in-flight job
+        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable && !cfg.is_memory()
+            cfg.leases_durable
         };
 
         let mut acked_seqs: Vec<(u64, u64)> = Vec::new(); // (seq, lease_id)
@@ -770,12 +771,13 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
-        // are RAM-only, so a replayed lease frame would ghost over a non-existent
-        // job. Treat `leases_durable` as false for memory.
+        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
+        // so it logs lease events exactly like a `disk` queue when `leases_durable`
+        // is set (best-effort: a lost lease frame self-heals — the in-flight job
+        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable && !cfg.is_memory()
+            cfg.leases_durable
         };
         let delay = delay_ms.min(config::MAX_NACK_DELAY_MS) as i64;
 
@@ -858,12 +860,13 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
-        // are RAM-only, so a replayed lease frame would ghost over a non-existent
-        // job. Treat `leases_durable` as false for memory.
+        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
+        // so it logs lease events exactly like a `disk` queue when `leases_durable`
+        // is set (best-effort: a lost lease frame self-heals — the in-flight job
+        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable && !cfg.is_memory()
+            cfg.leases_durable
         };
         let effective = lease_ms.clamp(config::MIN_LEASE_MS, config::MAX_LEASE_MS) as i64;
         let deadline = now.saturating_add(effective);
@@ -951,11 +954,11 @@ impl Engine {
         }
         // Disk / memory class: the in-memory removal first, then a best-effort
         // frame (its loss self-heals — the job resurfaces as claimable, DESIGN
-        // §10.6, at-least-once). A `memory`-class queue never logs (RAM-only).
+        // §10.6, at-least-once). A `memory`-class queue logs the same best-effort
+        // frame: it shares the disk-like path (§0.10), just with no durability
+        // GUARANTEE (the frame may persist or be lost).
         b.delete_seqs(&[seq], now);
-        if class != crate::types::Durability::Memory {
-            self.wal_log_delete_seqs(box_id, vec![seq], now, false);
-        }
+        self.wal_log_delete_seqs(box_id, vec![seq], now, false);
         Ok(0.0)
     }
 
@@ -1142,12 +1145,13 @@ impl Engine {
         }
         let now = self.clock.now_ms();
         let box_id = b.box_id;
-        // A `memory`-class queue never WAL-logs lease events (codex P1 #4): its jobs
-        // are RAM-only, so a replayed lease frame would ghost over a non-existent
-        // job. Treat `leases_durable` as false for memory.
+        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
+        // so it logs lease events exactly like a `disk` queue when `leases_durable`
+        // is set (best-effort: a lost lease frame self-heals — the in-flight job
+        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable && !cfg.is_memory()
+            cfg.leases_durable
         };
 
         let mut released: Vec<(u64, String, u64)> = Vec::new(); // (seq, node, lease_id)

@@ -27,17 +27,21 @@ box-state and box-create response, and never reinterpreted at runtime.
 
 ### `memory`
 
-Records are **never written to the WAL** — pure RAM, the fastest path. The write skips WAL
-enqueue entirely, so `wal_append_ms` and `fsync_ms` are `0`.
+_"disk-like but best-effort."_ A `memory` box takes the **same** group-committed WAL write
+**and** recovery path as `disk` and is **fully queryable** (getState / getDifference / SSE) —
+but it carries **NO durability guarantee**. The ack is never `fsync`-gated, so `fsync_ms` is
+`0` (the fastest path).
 
-Records are **lost on restart**: the box reappears EMPTY and `head_seq` resets to `0`. The box
-**config persists** (it is a control frame in the WAL), so the empty box is rebuilt on
-recovery — but its records are not resurrected. The snapshot captures a memory box EMPTY (no
-records, head/base/floors reset) precisely so old data can never reappear.
+After a restart its records **MAY survive OR be lost** — recovery is **gradual / best-effort**:
+it does **not** block readiness and does **not** guarantee completeness or emptiness. The box
+**config always persists** (it is a control frame in the WAL). The one hard bound is
+no-fabrication / no-future-seq: a recovered record is always one that was actually written, and
+the head never hands out a seq past what was acked (a best-effort restart may legitimately
+regress the head if the un-fsynced tail was lost — there is no durable seq reservation).
 
-Reach for `memory` for caches, scratch state, and ephemeral fan-out where losing everything on
-restart is an acceptable trade for the lowest possible latency. It is reachable **only** by
-setting `durability:"memory"` explicitly — no legacy bool produces it.
+Effectively `disk` minus the durability promise. Reach for `memory` for caches, scratch state,
+and ephemeral fan-out where occasional loss is an acceptable trade for the lowest latency. It is
+reachable **only** by setting `durability:"memory"` explicitly — no legacy bool produces it.
 
 ### `disk`
 
@@ -75,7 +79,7 @@ than one fsync per record. See [WAL & group commit](/how-it-works/wal-and-group-
 
 | Class | WAL? | Ack fires | Survives a crash? | `fsync_ms` |
 |---|---|---|---|---|
-| `memory` | never (pure RAM) | immediately (skips the WAL) | **no** — records lost; box reappears EMPTY, `head_seq` resets to `0`, config persists | `0` |
+| `memory` | yes, group-committed (same path as `disk`) | immediately, **not** fsync-gated | **best-effort** — records MAY survive OR be lost (no guarantee); config always persists | `0` |
 | `disk` | yes, group-committed (no per-write fsync) | on WAL-frame enqueue, **not** fsync-gated | yes, **minus the un-fsynced tail** | `0` |
 | `fsync` | yes, fsync-gated | after the group `fsync` | **yes, any crash** — an acked write is always recovered | real value |
 
@@ -130,12 +134,14 @@ box, so they take on the **destination box's** commit class — not the source's
 - A `fsync` destination advances the router's forward cursor only **after** the destination
   fsyncs the forwarded record.
 - A `disk` destination writes the forwarded copy to the WAL, group-committed.
-- A `memory` destination **skips the WAL entirely** — the forwarded copy is RAM-only and
-  persists nothing, exactly like a direct write to that box.
+- A `memory` destination takes the **same best-effort path** as any `memory` write — the
+  forwarded copy is group-committed to the WAL like `disk` but carries **no durability
+  guarantee**, exactly like a direct write to that box.
 
-So if you route an `fsync` source into a `memory` destination, the destination is RAM-only and
-recovers nothing on restart — the durability of the copy follows where it lands, not where it
-came from. Size and class your destinations deliberately. See
+So if you route an `fsync` source into a `memory` destination, the forwarded copies are
+best-effort — they **MAY survive OR be lost** on a restart (the dest config always persists),
+while the durable source recovers in full. The durability of the copy follows where it lands,
+not where it came from. Size and class your destinations deliberately. See
 [Routers](/api/routers) and the [Multi-master guide](/guides/multi-master).
 
 <Callout type="info">

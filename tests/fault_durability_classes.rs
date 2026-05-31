@@ -6,10 +6,13 @@
 //! exactly to contract across snapshot + WAL replay + a crash mid-write:
 //!
 //! ```text
-//!   memory  — RAM only; NEVER persists records; head_seq resets to 0 on restart
-//!             (config persists, records do not). No WAL/fsync. Even a crash
-//!             mid-write leaves nothing on disk. A router forwarding INTO a memory
-//!             dest does not persist the forwarded copy either.
+//!   memory  — "disk-like but best-effort" (§0.10): takes the SAME group-committed
+//!             WAL write + recovery path as disk and is fully queryable, but with
+//!             NO durability GUARANTEE — recovered records MAY survive OR be lost.
+//!             The WEAK contract: no fabrication (survivors ⊆ ever_acked, byte-for-
+//!             byte), seq monotone (head never exceeds the acked head). NO exact
+//!             empty-on-restart and NO exact full-survival assertion. (The config
+//!             always survives — it is a control-frame mutation.)
 //!   disk    — group-committed WAL; survives a CLEAN restart fully, but a power
 //!             loss may lose only the un-fsynced TAIL (a dense prefix survives,
 //!             never a hole, never a fabricated/torn frame).
@@ -56,9 +59,11 @@ use streams::types::{
 
 // ===========================================================================
 // Reference model (the oracle) — the durability-class-aware subset of the
-// `tests/crash_oracle.rs` RefModel. A `memory` box is modeled as never-durable
-// AND never-persisting (its `acked` survivor set is always empty after a crash);
-// a `disk`/`fsync` box keeps acked records, with `fsync` being must-survive.
+// `tests/crash_oracle.rs` RefModel. A `memory` box is modeled like a `disk` box
+// for the no-fabrication universe (`ever_acked`), but it carries NO durability
+// guarantee: its survivors after a restart are an UNCONSTRAINED subset of
+// `ever_acked` (MAY survive OR be lost). A `disk`/`fsync` box keeps acked records,
+// with `fsync` being must-survive.
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,23 +355,28 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (3) NO GAP — survivors are a dense prefix of the model's live set.
-    if let Some(&hi) = survivors.last() {
-        if whole_tail_durable && model.class != Class::Memory {
-            let expected_prefix: Vec<u64> = live.iter().copied().filter(|s| *s <= hi).collect();
-            assert_eq!(
-                survivors, expected_prefix,
-                "{name}: survivors must be a dense prefix of the model's live set \
-                 (survivors={survivors:?}, model live={live:?})"
-            );
-        } else {
-            for &s in &live {
-                if s <= hi {
-                    assert!(
-                        dump.records.contains_key(&s),
-                        "{name}: model-live seq {s} missing below surviving high-water {hi} \
-                         (hole in the live set): survivors={survivors:?}"
-                    );
+    // (3) NO GAP — survivors are a dense prefix of the model's live set. A `memory`
+    //     box is EXEMPT: it is best-effort/lossy (§0.10), so it may lose ANY records
+    //     (not just a tail) — a hole below the surviving high-water is permitted.
+    //     Only the no-fabrication (1) + head-monotone (4) checks bind it.
+    if model.class != Class::Memory {
+        if let Some(&hi) = survivors.last() {
+            if whole_tail_durable {
+                let expected_prefix: Vec<u64> = live.iter().copied().filter(|s| *s <= hi).collect();
+                assert_eq!(
+                    survivors, expected_prefix,
+                    "{name}: survivors must be a dense prefix of the model's live set \
+                     (survivors={survivors:?}, model live={live:?})"
+                );
+            } else {
+                for &s in &live {
+                    if s <= hi {
+                        assert!(
+                            dump.records.contains_key(&s),
+                            "{name}: model-live seq {s} missing below surviving high-water {hi} \
+                             (hole in the live set): survivors={survivors:?}"
+                        );
+                    }
                 }
             }
         }
@@ -379,7 +389,9 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
     //     head may sit ABOVE the acked head by up to `DISK_HEAD_RESERVE_AHEAD` (the
     //     dropped un-fsynced tail becomes silent deleted gaps); an `fsync` box has
     //     no reservation, so its head matches the acked head exactly. A `memory` box
-    //     resets to head 0 on restart (RAM-only), so no floor binds.
+    //     is best-effort (§0.10): its head never EXCEEDS the acked head (no future
+    //     seq / no fabrication), but it may be anywhere from 0 up to the acked head
+    //     (records may survive or be lost) — only the no-future-seq bound binds.
     match model.class {
         Class::Fsync => {
             assert!(
@@ -410,10 +422,12 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
             );
         }
         Class::Memory => {
-            // RAM-only: the box reappears empty; head resets to 0.
+            // Best-effort/lossy: records MAY survive or be lost, so the head may sit
+            // anywhere in `0..=acked_head`. The ONE hard bound: it never exceeds the
+            // acked head (no future / fabricated seq).
             assert!(
                 dump.head <= model.head,
-                "{name}: memory recovered head {} exceeds model head {}",
+                "{name}: memory recovered head {} exceeds model head {} (future seq?)",
                 dump.head,
                 model.head
             );
@@ -523,15 +537,20 @@ impl Fs for CrashAfter {
 }
 
 // ===========================================================================
-// 1) MEMORY class: never persists records; head_seq resets to 0 on restart.
-//    Covers (a) clean stop, (b) WAL replay path, (c) crash mid-write.
+// 1) MEMORY class: "disk-like but best-effort" (§0.10). Takes the same WAL write +
+//    recovery path as disk and is fully queryable, but with NO durability
+//    GUARANTEE: records MAY survive OR be lost. The WEAK contract: config always
+//    survives; recovered records are a no-fabrication subset of the writes; head
+//    never exceeds the acked head. NO exact empty-on-restart / full-survival.
 // ===========================================================================
 
-/// A `memory` box's records NEVER reach the WAL: after a CLEAN stop + reopen the
-/// box's config persists (it is a control-frame mutation) but every record is
-/// gone and `head_seq` resets to 0. The acked write reports no fsync (RAM-only).
+/// A `memory` box is best-effort across a CLEAN restart: the config always
+/// survives (a control-frame mutation), the box is fully queryable pre-restart,
+/// and the acked write is never fsync-gated. Post-restart the records MAY survive
+/// OR be lost — assert only the weak contract (no fabrication, head monotone), NOT
+/// an exact empty-on-restart.
 #[test]
-fn memory_box_records_vanish_on_clean_restart() {
+fn memory_box_best_effort_across_clean_restart() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
     let ops = vec![
@@ -562,11 +581,11 @@ fn memory_box_records_vanish_on_clean_restart() {
     {
         let engine = open_engine(&disk);
         run_ops(&engine, &mut model, &ops);
-        // The box reports the live records BEFORE restart (RAM-resident).
+        // The box reports the live records BEFORE restart (fully queryable).
         let pre = dump_box(&engine, "mem").expect("mem box live pre-restart");
-        assert_eq!(pre.head, 3, "memory box head advances in RAM");
+        assert_eq!(pre.head, 3, "memory box head advances + is queryable");
         assert_eq!(pre.count, 3);
-        // A memory write is RAM-only: never fsync-gated.
+        // A memory write is never fsync-gated (best-effort, no durability promise).
         let req = WriteRequest {
             records: vec![RecordIn {
                 data: json!({ "v": "d" }),
@@ -586,41 +605,63 @@ fn memory_box_records_vanish_on_clean_restart() {
             0.0,
             "memory write is never fsync-gated"
         );
-        assert_eq!(
-            resp.performance.wal_append_ms.unwrap_or(0.0),
-            0.0,
-            "memory write never touches the WAL"
+        model.ack_append(
+            "mem",
+            std::slice::from_ref(&resp.last_seq),
+            std::slice::from_ref(&ModelRecord {
+                data: "d".into(),
+                tag: None,
+                node: None,
+            }),
         );
         sync_wal_dir(&disk);
         drop(engine);
     }
 
-    // Reopen cleanly: config persists, records do not, head resets to 0.
+    // Reopen cleanly: the config ALWAYS persists. Records are best-effort — assert
+    // only the weak contract (no fabrication, head monotone, may survive or be lost).
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "mem").expect("memory box config persists across restart");
-    assert_eq!(dump.head, 0, "memory box head_seq RESETS to 0 on restart");
-    assert_eq!(dump.count, 0, "no memory records persisted");
-    assert!(
-        dump.records.is_empty(),
-        "memory records are RAM-only and gone"
-    );
-    // The config is back as `memory`.
     let st = engine.box_state("mem", false).unwrap();
     assert_eq!(
         st.config.durability_class(),
         Durability::Memory,
         "memory class config persisted"
     );
+    let dump = dump_box(&engine, "mem").expect("memory box config persists across restart");
+    // whole_tail_durable=false: the WEAK contract (no fabrication + head monotone;
+    // a memory box may lose any records, even a non-tail hole).
+    assert_box_contract("mem", &model.boxes["mem"], &dump, false);
+
+    // The box is fully functional post-restart: a fresh write advances head by 1.
+    let before = engine.box_state("mem", false).unwrap().head_seq;
+    let req = WriteRequest {
+        records: vec![RecordIn {
+            data: json!({ "v": "z" }),
+            tag: None,
+            node: None,
+            meta: None,
+        }],
+        node: None,
+        idempotency_key: None,
+        create: Some(true),
+        config: None,
+        disable_backpressure: true,
+    };
+    engine.write("mem", req, true).unwrap();
+    assert_eq!(
+        engine.box_state("mem", false).unwrap().head_seq,
+        before + 1,
+        "a post-restart memory write advances head by 1"
+    );
 }
 
-/// A `memory` box survives a CRASH MID-WRITE leaving nothing on disk: even when
-/// the disk is frozen partway through the workload, the memory box never wrote a
-/// WAL frame, so recovery surfaces an empty box (head 0). A `disk`-class sibling
-/// in the SAME workload still recovers its acked prefix — proving the memory box
-/// is not persisting while the disk box is.
+/// A `memory` box across a CRASH MID-WRITE: best-effort recovery never fabricates
+/// and never exceeds the acked head. A `disk`-class sibling in the SAME workload
+/// recovers its acked prefix. Both honor the no-fabrication subset contract; the
+/// memory box additionally may lose ANY records (not just a tail).
 #[test]
-fn memory_box_crash_mid_write_persists_nothing() {
-    // Sweep a few crash points; the memory box must ALWAYS recover empty.
+fn memory_box_crash_mid_write_best_effort() {
+    // Sweep a few crash points; the memory box must ALWAYS satisfy the weak contract.
     for crash_at in [0u64, 2, 5, 9] {
         let disk = FakeDisk::with_seed(0x0E11_u64.wrapping_add(crash_at));
         let trip = CrashAfter::new(disk.clone(), crash_at);
@@ -659,13 +700,11 @@ fn memory_box_crash_mid_write_persists_nothing() {
         disk.reset_power();
 
         let engine = open_engine(&disk);
-        // The memory box NEVER persists, regardless of the crash point.
+        // The memory box is best-effort: whatever recovers must satisfy the weak
+        // contract (no fabrication, head monotone) — it may have kept records or
+        // come back empty, both are valid.
         if let Some(dump) = dump_box(&engine, "mem") {
-            assert_eq!(dump.head, 0, "memory box head 0 after crash@{crash_at}");
-            assert!(
-                dump.records.is_empty(),
-                "memory box empty after crash@{crash_at}"
-            );
+            assert_box_contract("mem", &model.boxes["mem"], &dump, false);
         }
         // The disk box recovers a dense prefix (subset contract) — no fabrication.
         if let Some(dump) = dump_box(&engine, "dsk") {
@@ -914,16 +953,16 @@ fn fsync_box_sweep_acked_always_durable() {
 }
 
 // ===========================================================================
-// 4) ROUTER forwarding into a MEMORY dest does not persist.
+// 4) ROUTER forwarding into a MEMORY dest is best-effort (disk-like, §0.10).
 // ===========================================================================
 
 /// A router forwarding from a DURABLE (fsync) source into a `memory` destination:
-/// the forwarded copies land in the dest's RAM and are visible pre-restart, but
-/// the dest writes NO WAL frame, so on restart the dest is empty (head 0) while
-/// the durable SOURCE fully recovers. Proves the `durable_append` memory-class
-/// skip (no WAL enqueue for a memory dest) holds across a crash.
+/// the forwarded copies land in the dest and are visible + queryable pre-restart
+/// (the dest takes the same disk-like best-effort WAL path). On restart the dest
+/// config always survives and the durable SOURCE fully recovers; the forwarded
+/// copies are best-effort — they MAY survive OR be lost (no fabrication).
 #[test]
-fn router_into_memory_dest_does_not_persist() {
+fn router_into_memory_dest_best_effort() {
     let disk = FakeDisk::new();
     {
         let engine = open_engine(&disk);
@@ -977,31 +1016,44 @@ fn router_into_memory_dest_does_not_persist() {
             };
             engine.write("src", req, true).unwrap();
         }
-        // Pre-restart: the forwarded copies are visible in the memory dest (RAM).
+        // Pre-restart: the forwarded copies are visible + queryable in the dest.
         let dst = dump_box(&engine, "mem_dst").expect("mem dest live pre-restart");
         assert_eq!(
             dst.count, 4,
-            "router forwarded 4 copies into the memory dest (RAM)"
+            "router forwarded 4 copies into the memory dest (queryable)"
         );
         sync_wal_dir(&disk);
         drop(engine);
     }
 
-    // Reopen: the durable source recovers; the memory dest is EMPTY (no WAL frame
-    // was ever written for the forwarded copies).
+    // Reopen: the durable source recovers fully; the memory dest config always
+    // survives. The forwarded copies are best-effort — assert only the weak
+    // contract (head monotone, no fabrication; they may survive or be lost).
     let engine = open_engine(&disk);
     let src = dump_box(&engine, "src").expect("durable source recovers");
     assert_eq!(src.records.len(), 4, "durable router source fully recovers");
     let dst = dump_box(&engine, "mem_dst").expect("memory dest config persists");
     assert_eq!(
-        dst.head, 0,
-        "memory dest head resets to 0 (forwarded copies not persisted)"
+        engine
+            .box_state("mem_dst", false)
+            .unwrap()
+            .config
+            .durability,
+        Some(Durability::Memory),
+        "memory dest config survives"
     );
-    assert_eq!(
-        dst.count, 0,
-        "router forwarding into a memory dest does not persist"
+    assert!(
+        dst.head <= 4,
+        "memory dest head monotone (no future seq), got {}",
+        dst.head
     );
-    assert!(dst.records.is_empty());
+    for (seq, rec) in &dst.records {
+        let v: u64 = rec.data.parse().unwrap_or(0);
+        assert!(
+            (1..=4).contains(&v),
+            "recovered forwarded record at seq {seq} is not fabricated: {rec:?}"
+        );
+    }
 }
 
 // ===========================================================================

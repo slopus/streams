@@ -550,8 +550,20 @@ fn f_monitor_page_checksum() {
     // --- Silent bit-rot in the at-rest COLD copy is caught -------------------
     // Flip one data byte of the cold .data WITHOUT updating its page checksum
     // trailer — the classic silent corruption a naive copy would propagate.
+    //
+    // Target a byte squarely inside a frame's XXH3-covered BODY (so ORACLE 2 below
+    // also catches it). A segment frame's trailing delete-flag byte is deliberately
+    // OUTSIDE the checksum (it is flipped in place on a sealed-record delete), so a
+    // flip that landed there would NOT trip the per-frame XXH3 — pick the midpoint
+    // of a middle frame's body instead of a blind `data.len()/2`.
     let cold_data_path = data_path(COLD_ROOT, id);
-    let flip_at = data.len() / 2;
+    let flip_at = {
+        let e = lookup(&idx, id, id + 3).expect("middle frame present");
+        // Body = [offset+4 .. offset+len-8-1) (after frame_len, before CRC+del_flag).
+        let body_lo = e.offset as usize + 4;
+        let body_hi = e.offset as usize + e.len as usize - 8 - 1;
+        (body_lo + body_hi) / 2
+    };
     pfs.silent_flip(&cold_data_path, flip_at);
 
     // ORACLE 1 (FS layer): the page-checksum shim catches the silent flip on the

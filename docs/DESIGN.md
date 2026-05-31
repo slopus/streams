@@ -89,12 +89,17 @@ auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Defaults: `tt
 **Durability commit class (`durability`).** A box has one of three commit classes — the
 durability/performance tradeoff — resolved once at create as `durability_class()`:
 
-- **`memory`** — records are **never written to the WAL**; pure RAM; the fastest path (it
-  skips WAL enqueue entirely, so `wal_append_ms`/`fsync_ms` are `0`). Records are **lost on
-  restart**: the box reappears EMPTY and `head_seq` resets to `0`, but the box CONFIG persists
-  (a control frame), so the empty box is rebuilt on recovery. The snapshot captures a memory
-  box EMPTY (no records, head/base/floors reset) so its data is never resurrected. A router /
-  dead-letter copy whose **destination** is a memory box likewise persists nothing.
+- **`memory`** — _"disk-like but best-effort"_. Takes the **same** group-committed WAL write
+  **and** recovery path as `disk` (the SAME write/recovery code — no special-casing) and is
+  fully queryable (getState / getDifference / SSE; its records may persist), but carries **NO
+  durability GUARANTEE**: after a restart its records **MAY survive OR be lost**, and recovery
+  is **gradual / best-effort** — it does **not** block readiness and does **not** guarantee
+  completeness or emptiness. Never `fsync`-gated, so `fsync_ms` is `0`. The box CONFIG always
+  survives (a control frame). It forgoes the disk-class seq-ceiling fsync (`HeadWatermark`), so
+  on a lost tail its `head_seq` may legitimately regress; it never fabricates a record or hands
+  out a future seq. A router / dead-letter copy whose **destination** is a memory box takes the
+  same best-effort path (the copy may survive or be lost). Effectively `disk` minus the
+  durability promise — for caches / scratch where occasional loss is acceptable.
 - **`disk`** — written to the WAL and **group-committed** (no per-write `fsync`); `fsync_ms` is
   `0` (the fast path). The write is acked as soon as its frame is enqueued to the single WAL
   writer (the ack is **not** fsync-gated — the engine drops the commit token); the writer
@@ -119,8 +124,9 @@ so a legacy client reading `durable` still sees the right boolean. `is_durable()
   durable-queue users flip to `"reject"`. With both caps off, `discard` is inert.
 - `durable=false` (class `disk`): the 1–5 ms target on NVMe means fsync-by-default would make
   the common pub/sub case pay for a guarantee it doesn't want. One bool (or `durability`) away
-  from `fsync`. The third class, `memory`, drops the WAL entirely for RAM-only caches/scratch
-  boxes that explicitly want to lose their data on restart in exchange for the lowest latency.
+  from `fsync`. The third class, `memory`, is `disk` with **no durability guarantee** —
+  best-effort/lossy caches/scratch boxes that take the same write+recovery path but where data
+  MAY survive OR be lost on restart (recovery is gradual, never blocks readiness).
 - `priority=null` + `auto_priority=true`: most users never think about priority; recency-based
   auto does the right thing. Power users pin an integer.
 
@@ -471,6 +477,40 @@ record no longer counts toward `cap`/`age` (its payload is already freed). Delet
 propagates through routers: a delete on `src` removes records from `src`, but a copy may already
 have been forwarded to `dst`; to remove it in `dst` too, issue a delete on `dst` (§8.3).
 
+### 7.4 Durable deletion of already-sealed records (the segment side)
+
+A delete must be durable for records that have already been sealed into an immutable segment, even
+after a checkpoint trims the WAL. Three witnesses are kept in agreement:
+
+- **The in-memory mark** — the slot's `deleted` flag (the read pipeline, §7.3 step 3, skips it).
+- **The WAL `Delete` frame** — append-only, carrying the `before_seq`/`match`/`seqs` selector and
+  the point-in-time `bound_head`. The WAL is **never mutated** for a delete (it stays append-only);
+  the frame covers not-yet-sealed (tail) records, replay ordering, and the point-in-time bound.
+- **The on-disk segment delete-flag byte** — for an **already-sealed** record, the delete also
+  flips a single trailing **delete-flag byte** in the segment `.data` frame **in place** (then
+  fsyncs). The byte sits **after** the frame's XXH3 checksum (outside the checksummed body) and is
+  **inside** `frame_len`, so the flip rewrites neither the frame nor the checksum and never changes
+  the framing stride. Liveness is an exact sentinel: a frame is deleted **only** when the byte is
+  `0xD5`; every other value — the `0x00` an encode writes, or any partial value a torn one-byte
+  write could leave — reads **live**. A single-byte write is sector-atomic, so a **mid-flip crash**
+  either lands the full sentinel (deleted) or leaves the old byte (live): it can never corrupt the
+  framing, skip a live record, or resurrect a deleted one. An un-landed flip simply means the
+  delete did not take durably on the segment — the WAL frame + in-memory mark still cover it until
+  the next checkpoint re-flips.
+
+This makes a sealed-record deletion survive a **WAL trim / checkpoint** that drops the `Delete`
+frame: on recovery the engine **reads the on-disk flags back** (it lists each box's segment files
+and scans their `.data` frames) and re-marks the corresponding seqs deleted in the rebuilt index —
+the deletion no longer depends on a retained WAL frame. Reads (`diff`/SSE) skip the flagged
+records, and the recovery scan is idempotent and crash-safe to re-run.
+
+**Whole-segment optimization.** When a delete (e.g. a `before_seq` trim, or a `match` that clears
+an interior segment) makes **every** record of a segment dead, the segment is dropped in **one op**
+— the existing segment-granular reclaim unlinks the whole `.data`+`.idx` pair (composing with the
+cap/TTL segment eviction) — instead of N per-record flips. A **partially**-cleared segment stays on
+disk and flips its deleted records **per-record**. Both paths are crash-safe (an unlink is
+idempotent; a per-record flip is sector-atomic).
+
 ---
 
 ## 8. Router semantics
@@ -502,8 +542,9 @@ to `dst`. `{ name, source, dest, preserve_node, preserve_tag, filter, allow_cycl
   lesson).
 - Forwarding honors the **destination** box's durability commit class (§2.2): a `fsync` `dst`
   advances the router cursor only after `dst` fsyncs the forwarded record; a `disk` `dst` writes
-  the forwarded copy to the WAL group-committed; a `memory` `dst` **skips the WAL entirely** (the
-  forwarded copy is RAM-only and persists nothing, exactly like a direct write to that box).
+  the forwarded copy to the WAL group-committed; a `memory` `dst` takes that **same** disk-like
+  best-effort path — the forwarded copy is group-committed to the WAL too, but with no durability
+  guarantee (it may survive or be lost on restart), exactly like a direct write to that box.
 
 ### 8.3 What carries through a forward
 

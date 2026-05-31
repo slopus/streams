@@ -180,13 +180,6 @@ impl BoxConfig {
         self.durability_class() == Durability::Fsync
     }
 
-    /// Whether this box's records are RAM-only (never written to the WAL, lost on
-    /// restart — the `memory` class). The box CONFIG still persists, but its
-    /// records do not and `head_seq` resets to 0 on restart.
-    pub fn is_memory(&self) -> bool {
-        self.durability_class() == Durability::Memory
-    }
-
     /// Normalize the config so the resolved `durability` is reported and the
     /// legacy `durable` bool stays consistent with it (`durable == (class ==
     /// fsync)`). Called on create/update so responses always carry the resolved
@@ -201,9 +194,12 @@ impl BoxConfig {
 /// The durability commit class of a box (API §0.10). Selects where a write lands
 /// and when it is acknowledged — the durability/performance tradeoff:
 ///
-/// - `memory` — never written to the WAL; pure RAM. Fastest; data is lost on
-///   restart (the box reappears EMPTY, its config persists). Skips the WAL append
-///   entirely (`wal_append_ms`/`fsync_ms == 0`).
+/// - `memory` — "disk-like but best-effort". Takes the SAME group-committed WAL
+///   write + recovery path as `disk` (fully queryable via getState/getDifference/
+///   SSE; records MAY persist) but carries NO durability GUARANTEE: after a restart
+///   data MAY survive OR be lost, and recovery is gradual/best-effort (it does not
+///   block readiness or guarantee completeness/emptiness). Never fsync-gated, so
+///   `fsync_ms == 0`. Effectively `disk` minus the durability promise.
 /// - `disk` — written to the WAL and group-committed (no per-write fsync).
 ///   Survives a crash minus the un-fsynced tail. (The legacy `durable:false`.)
 /// - `fsync` — fsync-gated ack: the response is held until the WAL frame is
@@ -211,7 +207,9 @@ impl BoxConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Durability {
-    /// RAM-only; lost on restart; no WAL frames.
+    /// Disk-like but best-effort: same group-committed WAL write+recovery path as
+    /// `Disk`, fully queryable, but NO durability guarantee — data may survive or be
+    /// lost on restart (recovery is best-effort).
     Memory,
     /// Group-committed WAL; survives a crash minus the un-fsynced tail.
     Disk,

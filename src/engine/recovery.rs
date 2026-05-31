@@ -776,16 +776,13 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // default non-durable leases log nothing replays here and every
             // in-flight job is claimable again (self-healing, DESIGN §10.6).
             //
-            // Skip Lease replay for a `memory`-class box (codex P1 #4): a memory
-            // queue's records reset to empty on restart, so a replayed lease would be
-            // a ghost lease over a non-existent job — advancing the claim cursor and
-            // stranding fresh post-restart jobs. A memory box should never have
-            // logged a lease (the writer side now also gates on the class), but
-            // recovery is defensive against an older log.
+            // A `memory`-class queue now takes the same disk-like best-effort path
+            // (§0.10): its records may survive a restart, so a replayed lease is no
+            // longer necessarily a ghost — replay it generically with no class
+            // special-casing (the self-healing visibility timeout, DESIGN §10.6,
+            // still makes any genuinely-orphaned lease claimable again).
             if let Some(b) = engine.get_box_by_id(box_id) {
-                if b.config.read().is_memory() {
-                    // ghost lease — ignore.
-                } else if let Some(q) = &b.queue {
+                if let Some(q) = &b.queue {
                     let mut q = q.lock();
                     q.apply_lease_event(event, seq, node, lease_id, deadline as i64, deliveries);
                 }
@@ -801,11 +798,11 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // only raise the (monotone) reservation ceiling; the final
             // `apply_head_watermarks` pass (after every Append replayed) pads any
             // reserved-but-unwritten tail as deleted gaps and advances head, so an
-            // already-acked `disk` seq is never re-handed.
+            // already-acked `disk` seq is never re-handed. (A `memory` box never
+            // logs a HeadWatermark — it forgoes the seq-ceiling fsync, §0.10 — but
+            // recovery applies any frame generically, no class special-casing.)
             if let Some(b) = engine.get_box_by_id(box_id) {
-                if !b.config.read().is_memory() {
-                    b.set_reserved_head(head_seq);
-                }
+                b.set_reserved_head(head_seq);
             }
         }
         // CheckpointMark is the snapshot flush barrier / boundary; replay no-op.

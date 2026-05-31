@@ -86,6 +86,17 @@ pub trait SegmentStore: Send + Sync {
         len: u64,
     ) -> Result<Vec<u8>, StoreError>;
 
+    /// Flip a single **delete-flag byte** in place in the segment's `.data` file
+    /// to [`crate::storage::SEG_DEL_SENTINEL`] at `data_offset` (the frame's
+    /// `del_flag` byte, after its CRC — see [`crate::storage::segment`]), then
+    /// fsync so the deletion is durable on disk (DESIGN §7, the segment side). A
+    /// single sector-atomic byte write + fsync: a mid-flip crash either lands the
+    /// full sentinel (deleted) or leaves the old byte (live), never corrupting the
+    /// framing. Idempotent (re-flipping an already-deleted byte is a no-op write).
+    /// A missing segment is [`StoreError::NotFound`]; an out-of-bounds offset is
+    /// [`StoreError::RangeOutOfBounds`].
+    fn mark_record_deleted(&self, id: SegmentId, data_offset: u64) -> Result<(), StoreError>;
+
     /// Read an entire segment part (convenience over [`Self::read_range`] for the
     /// `.idx` bulk read on recovery / for a small `.data`).
     fn read_all(&self, id: SegmentId, part: SegmentPart) -> Result<Vec<u8>, StoreError> {
@@ -240,6 +251,33 @@ impl SegmentStore for LocalSegmentStore {
         let mut buf = vec![0u8; len as usize];
         read_exact_at(f.as_ref(), offset, &mut buf)?;
         Ok(buf)
+    }
+
+    fn mark_record_deleted(&self, id: SegmentId, data_offset: u64) -> Result<(), StoreError> {
+        use crate::storage::SEG_DEL_SENTINEL;
+        let path = self.part_path(id, SegmentPart::Data);
+        let mut f = match self.fs.open(&path, OpenOpts::rw_existing()) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(StoreError::NotFound(id)),
+            Err(e) => return Err(e.into()),
+        };
+        let file_len = f.metadata_len()?;
+        if data_offset >= file_len {
+            return Err(StoreError::RangeOutOfBounds);
+        }
+        // One sector-atomic byte write + fsync. The byte is OUTSIDE the frame's
+        // XXH3 (it is the trailing del_flag), so flipping it never invalidates the
+        // checksum; a torn/partial flip either lands the full sentinel or the old
+        // byte, never a value that corrupts framing.
+        write_all_at(f.as_mut(), data_offset, &[SEG_DEL_SENTINEL])?;
+        // Named crash point: the byte is written but the fsync has NOT returned yet
+        // (F-SEG-DELFLIP-CRASH-MID-FSYNC). On restart the byte may or may not have
+        // reached durable media; either way recovery is correct — the WAL Delete
+        // frame + in-memory mark still cover the record until the next checkpoint
+        // re-flips. No-op without `--features failpoints`.
+        fail::fail_point!("segdel::after_write_before_fsync");
+        f.sync_data()?;
+        Ok(())
     }
 
     fn delete(&self, id: SegmentId) -> Result<(), StoreError> {
@@ -509,6 +547,53 @@ mod tests {
         assert_eq!(tier.resolve(999), None);
         // store_for routes to the resolved tier.
         assert!(tier.store_for(1).unwrap().exists(1, SegmentPart::Data));
+    }
+
+    #[test]
+    fn mark_record_deleted_flips_ondisk_flag_in_place() {
+        use crate::storage::segment::{
+            decode_data_frame, del_flag_offset_in_frame, frame_is_deleted, lookup,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(dir.path()).unwrap();
+        let (data, idx) = build_segment(1, 3);
+        store.put(1, &data, &idx).unwrap();
+
+        // Locate seq 2's frame, compute its del_flag byte offset, flip it on disk.
+        let e = lookup(&idx, 1, 2).expect("seq 2 present");
+        let flag_off = e.offset as u64 + del_flag_offset_in_frame(e.len);
+        store.mark_record_deleted(1, flag_off).unwrap();
+
+        // Re-read the whole .data: only seq 2's frame is now flagged deleted, and
+        // every frame still decodes (the flip never broke framing).
+        let back = store.read_all(1, SegmentPart::Data).unwrap();
+        for seq in 1..=3u64 {
+            let e = lookup(&idx, 1, seq).unwrap();
+            let lo = e.offset as usize;
+            let hi = lo + e.len as usize;
+            let frame = &back[lo..hi];
+            assert!(decode_data_frame(frame).is_ok(), "seq {seq} still decodes");
+            assert_eq!(
+                frame_is_deleted(frame),
+                seq == 2,
+                "only seq 2 is flagged deleted on disk"
+            );
+        }
+
+        // Idempotent: re-flipping the same byte is a no-op write.
+        store.mark_record_deleted(1, flag_off).unwrap();
+        let back2 = store.read_all(1, SegmentPart::Data).unwrap();
+        assert_eq!(back, back2, "re-flip is idempotent");
+
+        // A missing segment / out-of-bounds offset are reported, not silent.
+        assert!(matches!(
+            store.mark_record_deleted(999, 0),
+            Err(StoreError::NotFound(999))
+        ));
+        assert!(matches!(
+            store.mark_record_deleted(1, data.len() as u64 + 10),
+            Err(StoreError::RangeOutOfBounds)
+        ));
     }
 
     #[test]

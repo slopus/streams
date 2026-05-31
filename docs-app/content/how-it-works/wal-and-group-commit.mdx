@@ -177,7 +177,9 @@ is exact:
 - **`disk` box:** an acked write is in the page cache but may not be fsynced; a power loss
   can drop the un-fsynced tail — the documented fast-path tradeoff, surfacing on read as an
   ordinary eviction-style gap.
-- **`memory` box:** never written to the WAL at all; it reappears empty after a restart.
+- **`memory` box:** written to the WAL on the **same** group-committed path as `disk`, but with
+  no durability guarantee — after a restart its records **may survive or be lost** (best-effort,
+  gradual recovery); the box config always persists.
 
 The full replay-and-truncate procedure is in [Crash Recovery](/how-it-works/recovery).
 

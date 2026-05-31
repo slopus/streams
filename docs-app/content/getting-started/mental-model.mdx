@@ -77,7 +77,7 @@ The load-bearing config knob is the **durability commit class**, resolved once a
 
 | Class | Where it lands | Ack timing | Survives a crash? |
 |---|---|---|---|
-| `memory` | never written to the WAL (pure RAM) | immediate; `fsync_ms` is `0` | **No** — records lost on restart; the box reappears EMPTY (config persists, `head_seq` resets to `0`). |
+| `memory` | WAL, group-committed (same path as `disk`) | immediate; **not** fsync-gated; `fsync_ms` is `0` | **Best-effort** — records MAY survive OR be lost on restart (no guarantee; config always persists). |
 | `disk` | WAL, group-committed (no per-write fsync) | on WAL-frame enqueue, **not** fsync-gated; `fsync_ms` is `0` | Yes, **minus the un-fsynced tail**. |
 | `fsync` | WAL, **fsync-gated** | after the group `fsync` (real `fsync_ms`) | **Yes, any crash** — an acked write is recovered by WAL replay. |
 

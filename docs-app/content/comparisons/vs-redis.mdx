@@ -43,8 +43,9 @@ whole instance.
 
 streams makes durability a **per-box** decision via [durability classes](/guarantees/durability):
 
-- **`memory`** — pure RAM, never written to the WAL, lost on restart (the box reappears
-  empty). Fastest.
+- **`memory`** — _disk-like but best-effort_: the same group-committed WAL path as `disk`, fully
+  queryable, but with no durability guarantee — records MAY survive OR be lost on restart (the
+  config always persists). Fastest (never fsync-gated).
 - **`disk`** — WAL with adaptive group commit; the ack happens on frame enqueue, not gated
   on `fsync`. Survives a crash minus the un-fsynced tail.
 - **`fsync`** — the ack is **fsync-gated**: it is held until the group `fsync` completes, so

@@ -27,6 +27,7 @@
 //!    .    M   tag         bytes (tag_len)
 //!    .    P   data+meta   bytes (data_len)   -- opaque payload blob
 //!    .    8   xxh3        u64   XXH3-64 over bytes [4 .. crc_start)
+//!    .    1   del_flag    u8    DELETED sentinel (0xD5) ⇒ deleted; anything else ⇒ live
 //! ```
 //!
 //! `frame_len` first lets a reader validate a frame boundary without parsing the
@@ -34,6 +35,23 @@
 //! detects bit-rot / a torn write (the same crash anchor as the WAL, §2.1). A
 //! mismatch on a *sealed* (immutable) segment is corruption, not a torn tail — the
 //! caller surfaces it rather than silently truncating.
+//!
+//! # In-place delete (DESIGN §7, the segment side)
+//!
+//! `del_flag` is a **single trailing byte AFTER the XXH3 checksum** — outside the
+//! checksum-covered region on purpose, so a deletion flips ONE byte in place and
+//! re-fsyncs WITHOUT rewriting the frame or recomputing the checksum (`frame_len`
+//! INCLUDES this byte, so the framing stride is unchanged). Liveness is decided by
+//! an exact sentinel: a frame is deleted ONLY when `del_flag == 0xD5`
+//! ([`SEG_DEL_SENTINEL`]); every other value — a fresh `0x00`, or any intermediate
+//! value a torn single-byte write could leave — reads as **LIVE**. That makes the
+//! flip crash-safe: a single-byte write is sector-atomic, so a mid-flip crash
+//! either lands the full sentinel (deleted) or leaves the old byte (live) — it can
+//! never corrupt the framing, skip a live record, or resurrect a deleted one. A
+//! torn flip that somehow left a partial value is read as live (the delete simply
+//! did not take durably; the WAL Delete frame + in-memory mark still cover it until
+//! the next checkpoint re-flips). The XXH3 covers the record BODY only, so it is
+//! untouched by a delete and still detects bit-rot of the payload.
 //!
 //! # `.idx` format
 //!
@@ -63,6 +81,15 @@ use std::io;
 pub const SEG_FRAME_HEADER_LEN: usize = 25;
 /// Trailing XXH3-64 checksum size on each `.data` frame.
 pub const SEG_FRAME_CRC_LEN: usize = 8;
+/// The trailing in-place **delete-flag** byte after the checksum. One byte so a
+/// deletion is a single sector-atomic flip + fsync (crash-safe; see module docs).
+pub const SEG_FRAME_DEL_LEN: usize = 1;
+/// The exact `del_flag` value that marks a frame DELETED. Any other byte value —
+/// `0x00` (the encode default), or an intermediate value a torn flip could leave —
+/// reads as LIVE, so a mid-flip crash never resurrects/skips a record.
+pub const SEG_DEL_SENTINEL: u8 = 0xD5;
+/// The `del_flag` value of a LIVE frame as written by [`encode_data_frame`].
+pub const SEG_DEL_LIVE: u8 = 0x00;
 /// The leading `frame_len` u32 size.
 const SEG_FRAME_LEN_PREFIX: usize = 4;
 
@@ -171,45 +198,122 @@ pub fn encode_data_frame(out: &mut Vec<u8>, rec: &SegmentRecord) -> u32 {
     out.extend_from_slice(tag);
     out.extend_from_slice(&rec.data);
 
-    // CRC over [4 .. crc_start) (the body, excluding the frame_len prefix).
+    // CRC over [4 .. crc_start) (the body, excluding the frame_len prefix AND the
+    // trailing del_flag byte — the flag is flipped in place after sealing, so it
+    // must NOT be covered by the checksum).
     let crc_val = crc(&out[frame_start + SEG_FRAME_LEN_PREFIX..]);
     out.extend_from_slice(&crc_val.to_le_bytes());
 
-    // frame_len = everything after the prefix = (total - 4).
+    // The in-place delete flag (after the CRC, INSIDE frame_len). A fresh frame is
+    // LIVE; a delete flips this one byte to `SEG_DEL_SENTINEL` and re-fsyncs.
+    out.push(SEG_DEL_LIVE);
+
+    // frame_len = everything after the prefix = (total - 4), now incl. del_flag.
     let frame_len = (out.len() - frame_start - SEG_FRAME_LEN_PREFIX) as u32;
     out[frame_start..frame_start + SEG_FRAME_LEN_PREFIX].copy_from_slice(&frame_len.to_le_bytes());
 
     (out.len() - frame_start) as u32
 }
 
-/// Decode exactly one `.data` frame from the start of `buf` (a slice carved out
-/// of the `.data` file by the `.idx` offset/len). Validates `frame_len`, the
-/// XXH3, and the internal section lengths; a mismatch is corruption (a sealed
-/// segment is immutable, so there is no torn-tail truncation — the caller
-/// surfaces the error).
+/// The byte offset of a frame's `del_flag` within the framed slice (relative to
+/// the frame start): `frame_len` prefix + the frame body + the CRC. Used to flip
+/// the flag in place in the `.data` file (an absolute file offset is this plus the
+/// frame's `.idx` offset). Only meaningful for a NEW-format frame (one written by
+/// this build's [`encode_data_frame`], whose `frame_len` includes the byte); a
+/// legacy frame with no `del_flag` is never flipped (its records are deleted via
+/// the WAL/in-memory path until re-sealed in the new format).
+#[inline]
+pub fn del_flag_offset_in_frame(framed_len: u32) -> u64 {
+    framed_len as u64 - SEG_FRAME_DEL_LEN as u64
+}
+
+/// Whether a framed slice is a DELETED record — **CRC-validated**, not a raw
+/// trailing-byte peek. A frame is deleted ONLY when it decodes cleanly under the
+/// NEW layout (trailing `del_flag` byte inside `frame_len`, CRC over the body
+/// before it) AND that `del_flag` is exactly [`SEG_DEL_SENTINEL`]. Anything else
+/// reads LIVE:
+/// - a LEGACY frame (no `del_flag`; the CRC is the last 8 bytes) — its final CRC
+///   byte may by chance equal the sentinel, but it does NOT validate under the new
+///   layout, so a live legacy record is never fabricated-deleted (codex P1 #3);
+/// - a CORRUPT / truncated range — never validates, so it cannot fabricate a
+///   deletion that skips a live record;
+/// - a torn/partial flip that left an intermediate value — not the sentinel ⇒ live.
+///
+/// This makes the recovery delete scan and the read-path liveness probe robust to
+/// the legacy on-disk format and to a corrupt `.idx`/`.data` range.
+#[inline]
+pub fn frame_is_deleted(buf: &[u8]) -> bool {
+    matches!(decode_data_frame_full(buf), Ok((_, true)))
+}
+
+/// Decode exactly one `.data` frame from the start of `buf`, returning just the
+/// record. See [`decode_data_frame_full`] for the deleted flag. Validates
+/// `frame_len`, the XXH3, and the internal section lengths; tolerates BOTH the new
+/// (trailing `del_flag`) and the legacy (no `del_flag`) on-disk layouts. A
+/// mismatch under both layouts is corruption (a sealed segment is immutable, so
+/// there is no torn-tail truncation — the caller surfaces the error).
 pub fn decode_data_frame(buf: &[u8]) -> Result<SegmentRecord, SegmentError> {
+    decode_data_frame_full(buf).map(|(r, _)| r)
+}
+
+/// Decode one `.data` frame, returning `(record, is_deleted)`. **Format-tolerant**:
+/// first tries the NEW layout (a trailing `del_flag` byte inside `frame_len`, the
+/// CRC over the body before it); if that CRC does not validate, falls back to the
+/// LEGACY layout (no `del_flag`; the CRC is the trailing 8 bytes). The XXH3-64 is a
+/// strong hash, so a cross-layout false match is astronomically unlikely, which is
+/// what lets a single byte-flip delete be added to the segment format WITHOUT a
+/// version bump or rewriting already-sealed segments. A legacy frame is always
+/// reported LIVE (it has no `del_flag`).
+pub fn decode_data_frame_full(buf: &[u8]) -> Result<(SegmentRecord, bool), SegmentError> {
     if buf.len() < SEG_FRAME_LEN_PREFIX {
         return Err(SegmentError::Corrupt(
             "shorter than frame_len prefix".into(),
         ));
     }
     let frame_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-    if frame_len < SEG_FRAME_HEADER_LEN + SEG_FRAME_CRC_LEN {
-        return Err(SegmentError::Corrupt("frame_len below the minimum".into()));
-    }
     let total = SEG_FRAME_LEN_PREFIX + frame_len;
     if buf.len() < total {
         return Err(SegmentError::Corrupt("frame_len overruns the slice".into()));
     }
 
-    // CRC over [4 .. crc_start); the checksum is the last 8 bytes.
-    let crc_start = total - SEG_FRAME_CRC_LEN;
-    let stored_crc = u64::from_le_bytes(buf[crc_start..total].try_into().unwrap());
-    if stored_crc != crc(&buf[SEG_FRAME_LEN_PREFIX..crc_start]) {
-        return Err(SegmentError::Corrupt("checksum mismatch".into()));
+    // Try the NEW layout first: the CRC is the 8 bytes before the trailing
+    // del_flag byte; the flag is the very last byte (outside the CRC region).
+    if frame_len >= SEG_FRAME_HEADER_LEN + SEG_FRAME_CRC_LEN + SEG_FRAME_DEL_LEN {
+        let crc_end = total - SEG_FRAME_DEL_LEN;
+        let crc_start = crc_end - SEG_FRAME_CRC_LEN;
+        let stored_crc = u64::from_le_bytes(buf[crc_start..crc_end].try_into().unwrap());
+        if stored_crc == crc(&buf[SEG_FRAME_LEN_PREFIX..crc_start]) {
+            let rec = parse_body(&buf[SEG_FRAME_LEN_PREFIX..crc_start])?;
+            let deleted = buf[crc_end] == SEG_DEL_SENTINEL;
+            return Ok((rec, deleted));
+        }
     }
 
-    let h = &buf[SEG_FRAME_LEN_PREFIX..];
+    // Fall back to the LEGACY layout: no del_flag; the CRC is the trailing 8 bytes
+    // (a segment sealed by a build before the in-place delete byte was added).
+    if frame_len >= SEG_FRAME_HEADER_LEN + SEG_FRAME_CRC_LEN {
+        let crc_end = total;
+        let crc_start = crc_end - SEG_FRAME_CRC_LEN;
+        let stored_crc = u64::from_le_bytes(buf[crc_start..crc_end].try_into().unwrap());
+        if stored_crc == crc(&buf[SEG_FRAME_LEN_PREFIX..crc_start]) {
+            let rec = parse_body(&buf[SEG_FRAME_LEN_PREFIX..crc_start])?;
+            return Ok((rec, false)); // legacy frame ⇒ no del_flag ⇒ live.
+        }
+    }
+
+    if frame_len < SEG_FRAME_HEADER_LEN + SEG_FRAME_CRC_LEN {
+        return Err(SegmentError::Corrupt("frame_len below the minimum".into()));
+    }
+    Err(SegmentError::Corrupt("checksum mismatch".into()))
+}
+
+/// Parse the record fields out of the body slice `[flags .. data]` (the bytes
+/// between `frame_len` and the CRC, in either layout). Validates the internal
+/// section lengths and UTF-8 of node/tag.
+fn parse_body(h: &[u8]) -> Result<SegmentRecord, SegmentError> {
+    if h.len() < SEG_FRAME_HEADER_LEN {
+        return Err(SegmentError::Corrupt("frame body too short".into()));
+    }
     let flags = h[0];
     let seq = u64::from_le_bytes(h[1..9].try_into().unwrap());
     let ts = u64::from_le_bytes(h[9..17].try_into().unwrap());
@@ -217,7 +321,7 @@ pub fn decode_data_frame(buf: &[u8]) -> Result<SegmentRecord, SegmentError> {
     let tag_len = u16::from_le_bytes(h[19..21].try_into().unwrap()) as usize;
     let data_len = u32::from_le_bytes(h[21..25].try_into().unwrap()) as usize;
 
-    let body = &h[SEG_FRAME_HEADER_LEN..crc_start - SEG_FRAME_LEN_PREFIX];
+    let body = &h[SEG_FRAME_HEADER_LEN..];
     if node_len + tag_len + data_len != body.len() {
         return Err(SegmentError::Corrupt(
             "internal length inconsistency".into(),
@@ -517,5 +621,189 @@ mod tests {
         assert_eq!(data_name(1), "seg-0000000000000001.data");
         assert_eq!(idx_name(10001), "seg-0000000000010001.idx");
         assert!(data_name(1) < data_name(10001), "names sort by seq");
+    }
+
+    #[test]
+    fn fresh_frame_is_live_and_decodes() {
+        let mut buf = Vec::new();
+        let len = encode_data_frame(&mut buf, &rec(7, Some("n"), Some("t"), b"x"));
+        assert_eq!(len as usize, buf.len());
+        // A fresh frame's trailing del_flag is LIVE (the sentinel is absent).
+        assert!(!frame_is_deleted(&buf), "fresh frame is live");
+        assert_eq!(*buf.last().unwrap(), SEG_DEL_LIVE);
+        // It still decodes (the del_flag is outside the body the CRC covers).
+        let got = decode_data_frame(&buf).expect("decodes");
+        assert_eq!(got.seq, 7);
+    }
+
+    #[test]
+    fn flipping_del_flag_marks_deleted_without_breaking_decode() {
+        let mut buf = Vec::new();
+        let len = encode_data_frame(&mut buf, &rec(9, None, None, b"hello"));
+        // The del_flag is the last byte of the framed slice.
+        let off = del_flag_offset_in_frame(len) as usize;
+        assert_eq!(off, buf.len() - 1, "del_flag is the trailing byte");
+        // Flip it to the sentinel in place — exactly what mark_record_deleted does.
+        buf[off] = SEG_DEL_SENTINEL;
+        assert!(frame_is_deleted(&buf), "flipped frame reads deleted");
+        // The CRC is unchanged (it never covered the del_flag), so the record body
+        // still decodes — the flip never corrupts framing.
+        let got = decode_data_frame(&buf).expect("still decodes after the flip");
+        assert_eq!(got.seq, 9);
+        assert_eq!(got.data, b"hello");
+    }
+
+    #[test]
+    fn torn_flip_intermediate_value_reads_live() {
+        // A torn single-byte flip that left an arbitrary intermediate value (NOT the
+        // exact sentinel) reads as LIVE — never resurrects/skips, never corrupts.
+        let mut buf = Vec::new();
+        let len = encode_data_frame(&mut buf, &rec(3, None, None, b"z"));
+        let off = del_flag_offset_in_frame(len) as usize;
+        for partial in [0x01u8, 0x55, 0xD4, 0xFF, 0x7F] {
+            buf[off] = partial;
+            assert!(
+                !frame_is_deleted(&buf),
+                "intermediate del_flag {partial:#x} reads live (torn-flip safe)"
+            );
+            assert!(
+                decode_data_frame(&buf).is_ok(),
+                "frame still decodes with a partial del_flag {partial:#x}"
+            );
+        }
+        // Only the exact sentinel means deleted.
+        buf[off] = SEG_DEL_SENTINEL;
+        assert!(frame_is_deleted(&buf));
+    }
+
+    #[test]
+    fn builder_frames_carry_a_live_del_flag() {
+        let start = 100;
+        let mut b = SegmentBuilder::new(start);
+        for i in 0..3 {
+            b.push(&rec(start + i, None, Some("t"), b"v"));
+        }
+        let (data, idx) = b.finish();
+        for seq in start..start + 3 {
+            let e = lookup(&idx, start, seq).expect("seq present");
+            let lo = e.offset as usize;
+            let hi = lo + e.len as usize;
+            assert!(!frame_is_deleted(&data[lo..hi]), "builder frame is live");
+            assert_eq!(
+                del_flag_offset_in_frame(e.len) as usize,
+                e.len as usize - 1,
+                "del_flag offset is the trailing byte of the framed len"
+            );
+        }
+    }
+
+    /// Encode a frame in the LEGACY layout (NO trailing `del_flag` byte — the
+    /// format a build before the in-place delete shipped wrote). `frame_len` covers
+    /// only the body + CRC; the CRC is the trailing 8 bytes.
+    fn encode_legacy_frame(out: &mut Vec<u8>, r: &SegmentRecord) -> u32 {
+        let frame_start = out.len();
+        out.extend_from_slice(&[0u8; SEG_FRAME_LEN_PREFIX]);
+        let mut flags = 0u8;
+        let node: &[u8] = match &r.node {
+            Some(n) => {
+                flags |= SEG_FLAG_HAS_NODE;
+                n.as_bytes()
+            }
+            None => &[],
+        };
+        let tag: &[u8] = match &r.tag {
+            Some(t) => {
+                flags |= SEG_FLAG_HAS_TAG;
+                t.as_bytes()
+            }
+            None => &[],
+        };
+        out.push(flags);
+        out.extend_from_slice(&r.seq.to_le_bytes());
+        out.extend_from_slice(&r.ts.to_le_bytes());
+        out.extend_from_slice(&(node.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(tag.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(r.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(node);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&r.data);
+        let crc_val = crc(&out[frame_start + SEG_FRAME_LEN_PREFIX..]);
+        out.extend_from_slice(&crc_val.to_le_bytes());
+        let frame_len = (out.len() - frame_start - SEG_FRAME_LEN_PREFIX) as u32;
+        out[frame_start..frame_start + SEG_FRAME_LEN_PREFIX]
+            .copy_from_slice(&frame_len.to_le_bytes());
+        (out.len() - frame_start) as u32
+    }
+
+    #[test]
+    fn legacy_frame_without_del_flag_decodes_and_reads_live() {
+        // A segment sealed by an OLDER build has NO del_flag byte. The new decoder
+        // must read it byte-for-byte and treat it as LIVE (backward compatibility —
+        // existing persisted data must never become unreadable). codex P0 #1.
+        for r in [
+            rec(1, None, None, b"{\"d\":1}"),
+            rec(2, Some("nodeA"), Some("tenant:job"), b"payload"),
+            rec(3, Some("n"), None, b""),
+        ] {
+            let mut buf = Vec::new();
+            let len = encode_legacy_frame(&mut buf, &r);
+            assert_eq!(len as usize, buf.len());
+            // Decodes to the original record under the legacy fallback.
+            let got = decode_data_frame(&buf).expect("legacy frame decodes");
+            assert_eq!(got, r, "legacy record round-trips");
+            // A legacy frame is always LIVE (it has no del_flag).
+            assert!(!frame_is_deleted(&buf), "legacy frame reads live");
+            let (got2, deleted) = decode_data_frame_full(&buf).expect("decodes");
+            assert_eq!(got2, r);
+            assert!(!deleted);
+        }
+    }
+
+    #[test]
+    fn legacy_frame_whose_last_crc_byte_is_sentinel_still_reads_live() {
+        // A legacy frame's trailing CRC byte may, by chance, equal SEG_DEL_SENTINEL.
+        // A naive last-byte peek would fabricate a deletion of a LIVE record; the
+        // CRC-validated `frame_is_deleted` must NOT (it only trusts a frame that
+        // validates under the NEW layout). codex P1 #3. Search seqs for one whose
+        // legacy CRC ends in the sentinel byte.
+        let mut found = false;
+        for seq in 0..5000u64 {
+            let mut buf = Vec::new();
+            encode_legacy_frame(&mut buf, &rec(seq, None, None, b"x"));
+            if *buf.last().unwrap() == SEG_DEL_SENTINEL {
+                found = true;
+                assert!(
+                    !frame_is_deleted(&buf),
+                    "legacy frame ending in the sentinel byte must NOT read deleted (seq {seq})"
+                );
+                // It still decodes as a live record.
+                let (got, deleted) = decode_data_frame_full(&buf).expect("decodes");
+                assert_eq!(got.seq, seq);
+                assert!(!deleted);
+                break;
+            }
+        }
+        assert!(
+            found,
+            "expected at least one legacy CRC ending in the sentinel byte in 5000 seqs"
+        );
+    }
+
+    #[test]
+    fn corrupt_range_never_reads_deleted() {
+        // A garbled framed slice must never be reported deleted (it cannot fabricate
+        // a deletion that skips a live record on the recovery scan). codex P1 #3.
+        let mut buf = Vec::new();
+        encode_data_frame(&mut buf, &rec(42, Some("n"), Some("t"), b"important"));
+        // Corrupt the body: the NEW-layout CRC no longer validates, and the legacy
+        // fallback (different CRC window) does not validate either ⇒ not deleted.
+        let mid = buf.len() / 2;
+        buf[mid] ^= 0xFF;
+        assert!(!frame_is_deleted(&buf), "corrupt frame is never deleted");
+        // And it surfaces as Corrupt on a decode (the caller handles it).
+        assert!(matches!(
+            decode_data_frame(&buf),
+            Err(SegmentError::Corrupt(_))
+        ));
     }
 }

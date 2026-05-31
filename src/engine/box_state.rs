@@ -1481,14 +1481,87 @@ impl BoxState {
         }
     }
 
+    /// Flip the on-disk **delete-flag byte** for each just-deleted seq that lives in
+    /// a sealed segment, so the deletion is durable in the segment file itself and
+    /// survives a WAL trim/checkpoint that drops the Delete frame (DESIGN §7, the
+    /// segment side). A WHOLE-SEGMENT clear is handled by [`Self::reclaim_segments`]
+    /// (which unlinks the entire `.data`+`.idx` pair in ONE op); this per-record
+    /// flip handles a PARTIALLY-cleared segment — only the seqs still on disk (their
+    /// whole segment was not dropped) are flipped. Crash-safe per byte; best-effort
+    /// (a flip failure leaves the WAL frame + in-memory mark as the witnesses). A
+    /// box without a writer, or a seq still in the active (unsealed) tail, is a
+    /// no-op. Runs off the index lock (only the writer lock is taken per flip).
+    pub fn flag_sealed_deletes(&self, seqs: &[u64]) {
+        let Some(sw) = &self.segwriter else { return };
+        if seqs.is_empty() {
+            return;
+        }
+        let mut w = sw.lock();
+        for &seq in seqs {
+            // `flag_sealed_deleted` is a no-op for an active-tail / dropped-segment
+            // seq (returns false) and otherwise flips + fsyncs the on-disk byte.
+            w.flag_sealed_deleted(seq);
+        }
+    }
+
+    /// **Recovery**: re-derive sealed-record deletions from the on-disk segment
+    /// **delete-flag bytes** (DESIGN §7, the segment side). A sealed-record delete
+    /// flips an on-disk byte that survives a WAL trim/checkpoint, so on restart the
+    /// engine reads those flags back and marks the corresponding seqs deleted in the
+    /// index — the deletion no longer depends on a retained WAL Delete frame. Marks
+    /// each flagged seq deleted in place (freeing its payload/tag, adjusting
+    /// `bytes`/`count`), exactly like the live-path delete, then reclaims the now-
+    /// dead front. Idempotent (an already-deleted slot is skipped) and crash-safe to
+    /// re-run. A no-op for a box without a writer or with no on-disk-flagged records.
+    pub fn apply_ondisk_segment_deletes_on_recovery(&self) {
+        let Some(sw) = &self.segwriter else { return };
+        let flagged = sw.lock().scan_ondisk_deleted();
+        if flagged.is_empty() {
+            return;
+        }
+        let head = self.head_seq();
+        let mut freed_bytes: u64 = 0;
+        let mut deleted: u64 = 0;
+        {
+            let mut index = self.index.write();
+            for seq in &flagged {
+                if let Some(f) = index.mark_deleted_pub(*seq) {
+                    freed_bytes = freed_bytes.saturating_add(f);
+                    deleted += 1;
+                }
+            }
+        }
+        if freed_bytes > 0 {
+            let prev = self.bytes_retained.load(Ordering::Relaxed);
+            self.bytes_retained
+                .store(prev.saturating_sub(freed_bytes), Ordering::Relaxed);
+        }
+        if deleted > 0 {
+            let prev = self.live_count.load(Ordering::Relaxed);
+            self.live_count
+                .store(prev.saturating_sub(deleted), Ordering::Relaxed);
+        }
+        self.reclaim_front(head);
+    }
+
     /// On-restart segment reclaim (ARCHITECTURE §4 step 5): after recovery rebuilt
     /// this box's index + floors + segment registry, drop (1) any registered sealed
     /// segment now fully below the live set, and (2) any **orphan** segment object
     /// left on disk (a pre-crash reclaim whose unlink never completed). Idempotent,
     /// off the hot path; a no-op for a box without a writer. Returns the orphan
     /// count dropped (registry drops go through the normal `reclaim_segments`).
+    ///
+    /// FIRST re-derives sealed-record deletions from the on-disk segment delete-flag
+    /// bytes ([`Self::apply_ondisk_segment_deletes_on_recovery`]) so a deletion whose
+    /// WAL frame was trimmed is recovered from the segment file, THEN the fully-dead
+    /// segment drop runs (a segment all of whose records are on-disk-flagged dead is
+    /// then dropped whole).
     pub fn reclaim_segments_on_recovery(&self) -> usize {
-        // First the normal registry reclaim (fully-dead registered segments).
+        // Re-derive sealed deletions from the on-disk flags before reclaiming, so a
+        // segment cleared on disk (but whose WAL Delete frame was trimmed) is seen as
+        // dead by the reclaim pass below.
+        self.apply_ondisk_segment_deletes_on_recovery();
+        // Then the normal registry reclaim (fully-dead registered segments).
         self.reclaim_segments();
         let Some(sw) = &self.segwriter else { return 0 };
         // Then sweep on-disk orphans strictly below the recovered live floor.
@@ -1576,10 +1649,12 @@ impl BoxState {
             }
         }
 
+        let mut deleted_seqs: Vec<u64> = Vec::new();
         for seq in victims {
             if let Some(f) = index.mark_deleted(seq) {
                 freed_bytes = freed_bytes.saturating_add(f);
                 deleted += 1;
+                deleted_seqs.push(seq);
             }
         }
 
@@ -1623,7 +1698,14 @@ impl BoxState {
         // Segment-granular reclaim: drop whole sealed segments cleared by this
         // delete — a prefix delete below the floor, or an interior segment all of
         // whose records were point-deleted (a `match` delete). Silent (voluntary).
+        // This is the WHOLE-SEGMENT optimization: a segment all of whose records
+        // are now dead is unlinked in ONE op instead of N per-record flips.
         self.reclaim_segments();
+        // For a PARTIALLY-cleared segment (some records survive), flip each deleted
+        // sealed record's on-disk delete-flag byte so the deletion is durable in the
+        // segment file and survives a WAL trim/checkpoint. A seq whose whole segment
+        // was just dropped above, or that is still in the active tail, is a no-op.
+        self.flag_sealed_deletes(&deleted_seqs);
         deleted
     }
 
@@ -1636,12 +1718,14 @@ impl BoxState {
         let head = self.head_seq();
         let mut freed_bytes: u64 = 0;
         let mut deleted: u64 = 0;
+        let mut deleted_seqs: Vec<u64> = Vec::new();
         {
             let mut index = self.index.write();
             for &seq in seqs {
                 if let Some(f) = index.mark_deleted_pub(seq) {
                     freed_bytes = freed_bytes.saturating_add(f);
                     deleted += 1;
+                    deleted_seqs.push(seq);
                 }
             }
         }
@@ -1657,8 +1741,12 @@ impl BoxState {
         }
         self.reclaim_front(head);
         // Segment-granular reclaim for the queue ack / dead-letter delete path:
-        // an acked job whose whole sealed segment is now dead drops that file.
+        // an acked job whose whole sealed segment is now dead drops that file
+        // (the WHOLE-SEGMENT optimization, one unlink instead of N flips).
         self.reclaim_segments();
+        // Durably flip the on-disk delete-flag for each acked seq still in a
+        // partially-cleared sealed segment, so the ack survives a WAL trim.
+        self.flag_sealed_deletes(&deleted_seqs);
         let _ = now_ms;
         deleted
     }

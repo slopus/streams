@@ -59,7 +59,8 @@ the whole stream.
 streams resolves a [durability class](/guarantees/durability) **per box**, with three
 levels rather than two:
 
-- `memory` — pure RAM, lost on restart (box reappears empty, config persists).
+- `memory` — disk-like but best-effort: same group-committed WAL path as `disk`, no durability
+  guarantee (records may survive or be lost on restart; config always persists).
 - `disk` — WAL + group commit, acked on frame enqueue, survives a crash minus the
   un-fsynced tail.
 - `fsync` — ack is held until the group `fdatasync` completes, so an acknowledged write

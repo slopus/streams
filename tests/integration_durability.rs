@@ -2076,8 +2076,9 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
 // Durability commit classes (memory / disk / fsync) — Stage 2.
 //
 // A box's `durability` selects where its records land and when an ack returns:
-//   - memory: never written to the WAL; pure RAM; records lost on restart while
-//     the box CONFIG survives (the box reappears EMPTY, head_seq resets to 0).
+//   - memory: "disk-like but best-effort" — takes the SAME group-committed WAL
+//     write + recovery path as disk (fully queryable), but with NO durability
+//     GUARANTEE: records MAY survive a restart OR be lost; recovery is best-effort.
 //   - disk:   group-committed WAL (today's durable:false); survives a clean
 //     restart minus the un-fsynced tail.
 //   - fsync:  fsync-gated ack (today's durable:true); survives any crash.
@@ -2091,12 +2092,17 @@ fn class_box(class: Durability) -> BoxConfig {
     }
 }
 
-/// A `memory`-class box LOSES its records across a restart while its CONFIG
-/// survives: the box reappears EMPTY, `head_seq` resets to 0, and no WAL/segment
-/// trace of the records remains. Writes report `wal_append_ms`/`fsync_ms == 0`.
+/// A `memory`-class box is "disk-like but best-effort" (§0.10): it takes the same
+/// group-committed WAL write + recovery path as `disk`, is fully queryable, and is
+/// never fsync-gated (`fsync_ms == 0`). The WEAK contract: its records MAY survive
+/// a restart OR be lost (no fabrication, seq monotone) — so this test asserts only
+/// what is guaranteed (config survives; recovered records are a no-fabrication
+/// subset of what was written; head never exceeds the acked head), NOT an exact
+/// empty-on-restart nor an exact full-survival.
 #[test]
-fn memory_box_loses_records_but_config_survives_restart() {
+fn memory_box_best_effort_recovery_no_fabrication() {
     let dir = tempfile::tempdir().unwrap();
+    let written: Vec<i64> = (1..=5).collect();
     {
         let engine = engine_at(dir.path());
         // A memory box with a non-default field so we can prove the CONFIG persists.
@@ -2110,35 +2116,34 @@ fn memory_box_loses_records_but_config_survives_restart() {
                 },
             )
             .unwrap();
-        for i in 1..=5 {
+        for &i in &written {
             let resp = engine
                 .write("cache", one(json!({ "i": i }), None), true)
                 .unwrap();
-            // The memory class never touches the WAL: zero append/fsync time.
-            assert_eq!(
-                resp.performance.wal_append_ms,
-                Some(0.0),
-                "memory write skips WAL append"
-            );
+            // Memory is never fsync-gated (it shares the disk-like path but with no
+            // durability guarantee): zero fsync time.
             assert_eq!(
                 resp.performance.fsync_ms,
                 Some(0.0),
-                "memory write never fsyncs"
+                "memory write is never fsync-gated"
             );
         }
-        // In-memory the records ARE present (pure RAM, this process's lifetime).
+        // Pre-restart the records are present and fully queryable.
         let st = engine.box_state("cache", false).unwrap();
         assert_eq!(st.head_seq, 5);
         assert_eq!(st.count, 5);
-        // Snapshot now: a memory box must be captured EMPTY (no record persists).
+        assert_eq!(
+            engine.diff("cache", diff_from(0)).unwrap().records.len(),
+            5,
+            "memory box is fully queryable pre-restart"
+        );
         assert!(engine.write_snapshot().unwrap());
     }
 
-    // Restart: the box config survives, but the records do NOT, and head resets.
+    // Restart: the box CONFIG always survives (a control-frame mutation). The
+    // records MAY survive OR be lost (best-effort) — assert only the weak contract.
     let engine = engine_at(dir.path());
     let st = engine.box_state("cache", false).unwrap();
-    assert_eq!(st.head_seq, 0, "memory box head_seq resets to 0 on restart");
-    assert_eq!(st.count, 0, "memory box reappears EMPTY (records lost)");
     assert_eq!(
         st.config.durability,
         Some(Durability::Memory),
@@ -2149,21 +2154,35 @@ fn memory_box_loses_records_but_config_survives_restart() {
         !st.config.durable,
         "memory ⇒ durable:false (back-compat: class != fsync)"
     );
+    // head never exceeds the acked head (seq monotone, no future seq).
+    assert!(
+        st.head_seq <= 5,
+        "recovered head {} must not exceed the acked head 5",
+        st.head_seq
+    );
+    // NO FABRICATION: every recovered record is one that was actually written
+    // (a `{"i": <1..=5>}` payload) — memory may lose records but never invents them.
     let d = engine.diff("cache", diff_from(0)).unwrap();
-    assert!(
-        d.records.is_empty(),
-        "no records resurrected from WAL/snapshot"
-    );
-    assert!(
-        d.tombstone.is_none(),
-        "an empty fresh box has nothing to tombstone"
-    );
+    for r in &d.records {
+        let i = r.data.get("i").and_then(|v| v.as_i64());
+        assert!(
+            i.map(|v| written.contains(&v)).unwrap_or(false),
+            "recovered record {:?} was never written (fabricated)",
+            r.data
+        );
+    }
 
-    // The box is fully functional post-restart: a fresh write starts at seq 1.
+    // The box is fully functional post-restart: a fresh write is accepted and
+    // queryable (regardless of whether the prior records survived).
+    let before = engine.box_state("cache", false).unwrap().head_seq;
     engine
         .write("cache", one(json!({ "i": 100 }), None), true)
         .unwrap();
-    assert_eq!(engine.box_state("cache", false).unwrap().head_seq, 1);
+    assert_eq!(
+        engine.box_state("cache", false).unwrap().head_seq,
+        before + 1,
+        "a post-restart write advances head by 1"
+    );
 }
 
 /// A `disk`-class box (today's durable:false) survives a CLEAN restart (the WAL
@@ -2269,11 +2288,12 @@ fn durability_resolution_and_back_compat_reporting() {
     assert!(!d.durable);
 }
 
-/// A router forwarding into a `memory` destination does NOT persist the copy: the
-/// forwarded record is live in RAM this process's lifetime, but after a restart
-/// the memory dest reappears EMPTY while the (durable) source still has its record.
+/// A router forwarding into a `memory` destination takes the same disk-like
+/// best-effort path (§0.10): the forwarded copy is live + queryable in the dest,
+/// and the dest's config always survives a restart. Its records MAY survive OR be
+/// lost (best-effort, no fabrication); the (durable) SOURCE always recovers fully.
 #[test]
-fn router_into_memory_dest_does_not_persist_the_copy() {
+fn router_into_memory_dest_best_effort() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
@@ -2299,14 +2319,16 @@ fn router_into_memory_dest_does_not_persist_the_copy() {
         engine
             .write("src", one(json!({ "x": 1 }), None), true)
             .unwrap();
-        // The forward landed in RAM: the memory dest has the copy right now.
+        // The forward landed and is queryable: the memory dest has the copy now.
         assert_eq!(
             engine.diff("mem_dst", diff_from(0)).unwrap().records.len(),
-            1
+            1,
+            "forwarded copy is live + queryable in the memory dest"
         );
         assert!(engine.write_snapshot().unwrap());
     }
-    // Restart: the durable source keeps its record; the memory dest is EMPTY.
+    // Restart: the durable source always recovers fully; the memory dest config
+    // always survives. Its records are best-effort — assert only the weak contract.
     let engine = engine_at(dir.path());
     assert_eq!(
         engine.box_state("src", false).unwrap().head_seq,
@@ -2314,14 +2336,19 @@ fn router_into_memory_dest_does_not_persist_the_copy() {
         "durable source survives"
     );
     let dst = engine.box_state("mem_dst", false).unwrap();
-    assert_eq!(dst.head_seq, 0, "memory dest head resets");
     assert_eq!(
-        dst.count, 0,
-        "forwarded copy into a memory dest does not persist"
+        dst.config.durability,
+        Some(Durability::Memory),
+        "memory dest config survives"
     );
-    assert!(engine
-        .diff("mem_dst", diff_from(0))
-        .unwrap()
-        .records
-        .is_empty());
+    // head never exceeds the acked head; recovered records (if any) are not
+    // fabricated — they are exactly the forwarded `{"x": 1}` copy.
+    assert!(dst.head_seq <= 1, "memory dest head monotone");
+    for r in &engine.diff("mem_dst", diff_from(0)).unwrap().records {
+        assert_eq!(
+            r.data.get("x").and_then(|v| v.as_i64()),
+            Some(1),
+            "recovered forwarded record is not fabricated"
+        );
+    }
 }

@@ -148,29 +148,10 @@ fn capture_box(b: &BoxState) -> SnapshotBox {
     let config = b.config.read().clone();
     let config_json = serde_json::to_vec(&config).unwrap_or_default();
 
-    // A `memory`-class box is captured EMPTY: its records are RAM-only and must
-    // NEVER persist, so the snapshot carries only the config (the box reappears on
-    // restart, empty) with head_seq/base/floors reset to a fresh box. Recovery
-    // then rebuilds it empty from this config and `head_seq` resets to 0.
-    if config.is_memory() {
-        return SnapshotBox {
-            name: b.name.clone(),
-            box_id: b.box_id,
-            epoch: b.epoch(),
-            config_json,
-            base_seq: b.seq_base,
-            head_seq: b.seq_base.saturating_sub(1),
-            evict_floor: 0,
-            expiry_floor: 0,
-            delete_floor: 0,
-            delete_below: 0,
-            bytes_retained: 0,
-            live_count: 0,
-            records: Vec::new(),
-            source_trim_floor: 0,
-        };
-    }
-
+    // A `memory`-class box is captured exactly like a `disk` box: it shares the
+    // disk-like best-effort path (§0.10), so its live records are snapshotted and
+    // MAY survive a restart — the contract is only that there is no durability
+    // GUARANTEE (records may persist OR be lost). No empty-capture special-casing.
     let floors = *b.floors.read();
     // The published head: never persist a staged-but-unpublished (invisible) tail.
     let head_seq = b.head_seq();
@@ -300,18 +281,17 @@ pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
     for sb in snapshot.boxes {
         let config: BoxConfig = serde_json::from_slice(&sb.config_json).unwrap_or_default();
         let box_id = sb.box_id;
-        let is_memory = config.is_memory();
         let mut state = restore_box(sb, config);
         // Attach a HOT segment writer for a durable engine so post-restore
         // appends materialize into segments (Phase 6 Stage 2). `attach_segwriter`
         // pre-seeds the writer's active segment with the restored live records so
         // its sealed/active state is consistent with the index. Idempotent `put`s
-        // make re-materializing a previously-sealed range safe. A `memory`-class
-        // box gets NO writer — it was captured empty and stays RAM-only.
-        if !is_memory {
-            if let Some(writer) = engine.build_segment_writer(box_id) {
-                state.attach_segwriter(writer);
-            }
+        // make re-materializing a previously-sealed range safe. A `memory`-class box
+        // gets a writer too — it shares the disk-like best-effort path (§0.10), so
+        // whatever the snapshot captured for it is restored just like a disk box
+        // (best-effort: it MAY have persisted records or MAY come back empty).
+        if let Some(writer) = engine.build_segment_writer(box_id) {
+            state.attach_segwriter(writer);
         }
         let bx = Arc::new(state);
         // Keep the live gauges in lockstep with the restored registry so the

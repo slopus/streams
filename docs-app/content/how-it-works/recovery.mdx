@@ -135,9 +135,11 @@ boundary on a crash is *what reached the WAL on disk*, and it differs by
 - **`disk`** — the write is acked on frame enqueue, not fsync-gated; a background
   `fdatasync` follows on the group-commit timer. Loss window on power loss: the un-fsynced
   tail (the documented fast-path tradeoff), surfacing to consumers as eviction-style gaps.
-- **`memory`** — never written to the WAL at all. On restart the box reappears **empty**
-  (`head_seq` resets to `0`), though its config persists as a control frame. A memory box's
-  data is never resurrected.
+- **`memory`** — _disk-like but best-effort_: written to the WAL on the **same**
+  group-committed path as `disk` and recovered through the **same** replay, but with **no
+  durability guarantee**. On restart its records **may survive or be lost** — recovery is
+  gradual / best-effort and guarantees neither completeness nor emptiness; only no-fabrication /
+  no-future-seq holds. The box config always persists as a control frame.
 
 <Callout type="info">
   Recovery time is bounded by the un-checkpointed tail, not the total record count. After a

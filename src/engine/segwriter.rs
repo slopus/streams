@@ -38,7 +38,8 @@
 
 use crate::clock::SharedClock;
 use crate::storage::{
-    decode_data_frame, lookup, BoxTier, SegmentBuilder, SegmentPart, SegmentRecord, Tier,
+    decode_data_frame, decode_data_frame_full, lookup, BoxTier, SegmentBuilder, SegmentPart,
+    SegmentRecord, Tier,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -150,7 +151,15 @@ pub fn read_locator(loc: &SealedLocator) -> Option<ResolvedPayload> {
             e.len as u64,
         )
         .ok()?;
-    let r = decode_data_frame(&frame).ok()?;
+    // Decode with the CRC-validated deleted flag (codex P1 #4): if the on-disk
+    // frame is flagged DELETED, do not serve its payload — "reads skip on-disk-
+    // flagged records" as a storage invariant, independent of whether the in-memory
+    // index was already repaired. (In steady state the index gates serving first,
+    // so this is defense-in-depth; recovery makes the two agree.)
+    let (r, deleted) = decode_data_frame_full(&frame).ok()?;
+    if deleted {
+        return None;
+    }
     let (data, meta) = decode_payload(&r.data);
     Some(ResolvedPayload { data, meta })
 }
@@ -657,6 +666,19 @@ impl SegmentWriter {
         // and the relocator simply re-runs the (idempotent) drop.
         let (start, end) = (seg.start_seq, seg.end_seq);
         seg.tier = Tier::Cold;
+
+        // RACE FIX (codex P0 #2): the cold copy was made OFF the writer lock; a
+        // `flag_sealed_deleted` that landed during the copy window flipped the
+        // del_flag in the HOT `.data` only, so the just-copied COLD `.data` may be
+        // missing it. Before dropping the (authoritative-during-the-window) HOT
+        // copy, re-read HOT and propagate EVERY on-disk-flagged seq into the COLD
+        // copy — both `confirm_relocated` and `flag_sealed_deleted` hold this same
+        // writer lock, so no flip can interleave between this propagation and the
+        // HOT delete below. Best-effort: a propagation read/flip error leaves the
+        // HOT copy intact (the delete below is skipped on the same error), so the
+        // flag is never lost — the segment simply stays HOT and the relocator
+        // re-runs next pass. Cheap (boot/relocation only, not the hot path).
+        self.propagate_hot_delflags_to_cold(id);
         // Named crash point: the tier pointer is flipped to COLD (the cold copy is
         // already durable) but the redundant HOT copy has NOT been deleted yet
         // (F-COLD-CRASH-AFTER-FLIP-BEFORE-DELETE). On restart the in-memory flip is
@@ -671,6 +693,46 @@ impl SegmentWriter {
         // Drop the relocated seqs from the recent-seal (hot) cache; a read of them
         // now resolves from the cold tier (and is then cold-LRU cached).
         self.cache.retain(|c| c.seq < start || c.seq > end);
+    }
+
+    /// Copy every on-disk DELETE-FLAG from a segment's HOT `.data` into its COLD
+    /// `.data`, in place. Used by [`Self::confirm_relocated`] to close the window
+    /// where a delete flipped HOT after the (off-lock) cold copy was already made,
+    /// so a relocation never silently drops a deletion (codex P0 #2). Reads HOT's
+    /// `.data`+`.idx` once, then for each frame whose flag is set, flips the same
+    /// byte in COLD (idempotent). A read/flip error is logged and tolerated — the
+    /// caller keeps the HOT copy on any failure so the flag is never lost.
+    fn propagate_hot_delflags_to_cold(&self, id: u64) {
+        let Some(cold) = self.tier.cold() else {
+            return;
+        };
+        // Only meaningful while the HOT copy still exists (the source of truth for
+        // any flag flipped during the copy window).
+        if !self.tier.hot().exists(id, SegmentPart::Data) {
+            return;
+        }
+        let (Ok(data), Ok(idx)) = (
+            self.tier.hot().read_all(id, SegmentPart::Data),
+            self.tier.hot().read_all(id, SegmentPart::Idx),
+        ) else {
+            return;
+        };
+        let n = crate::storage::idx_len(&idx) as u64;
+        for i in 0..n {
+            let seq = id + i;
+            let Some(e) = lookup(&idx, id, seq) else {
+                continue;
+            };
+            let lo = e.offset as usize;
+            let hi = lo + e.len as usize;
+            if hi <= data.len() && crate::storage::frame_is_deleted(&data[lo..hi]) {
+                let flag_off = e.offset as u64 + crate::storage::del_flag_offset_in_frame(e.len);
+                if let Err(err) = cold.mark_record_deleted(id, flag_off) {
+                    tracing::warn!(segment = id, seq, error = %err,
+                        "relocate: propagating del_flag to cold failed (keeping hot copy)");
+                }
+            }
+        }
     }
 
     /// Drop a whole sealed segment from **whichever tier holds it** (cap/TTL/delete
@@ -691,6 +753,143 @@ impl SegmentWriter {
             .retain(|c| c.seq < seg.start_seq || c.seq > seg.end_seq);
         self.cold_cache
             .retain(|c| c.seq < seg.start_seq || c.seq > seg.end_seq);
+    }
+
+    /// Whether `seq` lives in a sealed segment that is currently held HOT (the
+    /// in-place delete-flag flip only applies to a hot `.data` file; a relocated
+    /// cold copy is dropped as a whole segment instead). Used to decide between a
+    /// per-record flip and the whole-segment path on a sealed-record delete.
+    pub fn sealed_segment_for(&self, seq: u64) -> Option<SealedSegment> {
+        self.segment_for(seq)
+    }
+
+    /// Flip the on-disk **delete-flag byte** of `seq`'s frame in whichever sealed
+    /// segment holds it, then fsync (DESIGN §7, the segment side). Crash-safe:
+    /// a single sector-atomic byte + fsync (see [`crate::storage::segment`]), so a
+    /// mid-flip crash never corrupts framing, skips a live record, or resurrects a
+    /// deleted one. Also drops the seq from the payload caches (a deleted record is
+    /// never served). Locates the frame via the `.idx` entry's `offset`/`len`; the
+    /// `del_flag` byte is the last byte of the framed slice. Returns `true` if the
+    /// flip was issued (the seq is in a sealed segment), `false` if it is not
+    /// sealed (the active tail — the in-memory mark + WAL frame cover it) or the
+    /// flip could not be performed (best-effort; the WAL stays the source of
+    /// truth). Runs **off the index lock** (the caller holds only the writer lock).
+    pub fn flag_sealed_deleted(&mut self, seq: u64) -> bool {
+        let Some(seg) = self.segment_for(seq) else {
+            return false; // active tail / unknown ⇒ nothing to flip on disk.
+        };
+        let Some(store) = self.tier.store_for(seg.start_seq) else {
+            return false;
+        };
+        // Read the seq's `.idx` entry (one stride) to find its frame offset + len.
+        let entry_off = (seq - seg.start_seq) * crate::storage::IDX_STRIDE as u64;
+        let Ok(idx_bytes) = store.read_range(
+            seg.start_seq,
+            SegmentPart::Idx,
+            entry_off,
+            crate::storage::IDX_STRIDE as u64,
+        ) else {
+            return false;
+        };
+        let Some(e) = crate::storage::idx_entry_at(&idx_bytes, 0) else {
+            return false;
+        };
+        let flag_off = e.offset as u64 + crate::storage::del_flag_offset_in_frame(e.len);
+        let ok = store
+            .mark_record_deleted(seg.start_seq, flag_off)
+            .map_err(|err| {
+                tracing::warn!(segment = seg.start_seq, seq, error = %err,
+                    "segment in-place delete-flip failed; WAL/in-memory mark still cover it");
+                err
+            })
+            .is_ok();
+        // Drop the now-deleted payload from both caches so a read never serves it
+        // from memory (the in-memory `deleted` slot already gates serving, but keep
+        // the caches consistent with the on-disk state).
+        self.cache.retain(|c| c.seq != seq);
+        self.cold_cache.retain(|c| c.seq != seq);
+        ok
+    }
+
+    /// Scan every ON-DISK segment's `.data` for frames whose trailing **delete-flag
+    /// byte** is set, returning the deleted seqs (ascending). This is the RECOVERY
+    /// witness (DESIGN §7, the segment side): a sealed-record delete flips an on-disk
+    /// byte that survives a WAL trim/checkpoint, so on restart the engine re-derives
+    /// those deletions from the segment files themselves rather than depending on a
+    /// retained WAL Delete frame.
+    ///
+    /// Enumerates segments by the STORE listing (HOT + COLD), NOT the in-memory
+    /// `sealed` registry, so it catches every on-disk segment a recovery has not yet
+    /// re-sealed into the registry (e.g. the still-"active" tail range whose segment
+    /// already exists on disk from before the crash). Each segment's seq range is
+    /// derived from its `.idx` length (`start_seq` is the id; entry `i` ⇒ `seq =
+    /// start_seq + i`). Reads each segment's `.data` + `.idx` once (bounded, boot-time
+    /// only). A segment that cannot be read is skipped (best-effort; the WAL/snapshot
+    /// still cover the common case).
+    pub fn scan_ondisk_deleted(&self) -> Vec<u64> {
+        let mut ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        if let Ok(hot) = self.tier.hot().list() {
+            ids.extend(hot);
+        }
+        if let Some(cold) = self.tier.cold() {
+            if let Ok(cold_ids) = cold.list() {
+                ids.extend(cold_ids);
+            }
+        }
+        let mut out: Vec<u64> = Vec::new();
+        for start_seq in ids {
+            let Some(store) = self.tier.store_for(start_seq) else {
+                continue;
+            };
+            let Ok(data) = store.read_all(start_seq, SegmentPart::Data) else {
+                continue;
+            };
+            let Ok(idx) = store.read_all(start_seq, SegmentPart::Idx) else {
+                continue;
+            };
+            let n = crate::storage::idx_len(&idx) as u64;
+            for i in 0..n {
+                let seq = start_seq + i;
+                let Some(e) = lookup(&idx, start_seq, seq) else {
+                    continue;
+                };
+                let lo = e.offset as usize;
+                let hi = lo + e.len as usize;
+                if hi > data.len() {
+                    continue;
+                }
+                // CRC-validate AND check the decoded seq matches the expected seq
+                // (codex P1 #3): a corrupt `.idx` offset/len, a legacy frame, or a
+                // torn range can never fabricate a deletion that skips a LIVE record.
+                // Only a frame that decodes cleanly, is flagged DELETED, and carries
+                // the seq the `.idx` slot claims is trusted.
+                if let Ok((rec, true)) = decode_data_frame_full(&data[lo..hi]) {
+                    if rec.seq == seq {
+                        out.push(seq);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Which sealed segments are now ENTIRELY dead per `is_dead(seq)` — every seq in
+    /// `[start_seq, end_seq]` is deleted/evicted — so the whole segment can be
+    /// dropped in one op (unlink) instead of N per-record flips (the WHOLE-SEGMENT
+    /// optimization, DESIGN §7). `is_dead` is supplied by the box (its in-memory
+    /// liveness oracle). Oldest-first. The caller drops these via [`Self::drop_segment`]
+    /// and flips the survivors of any partially-cleared segment via
+    /// [`Self::flag_sealed_deleted`].
+    pub fn fully_dead_sealed_segments<F>(&self, is_dead: F) -> Vec<u64>
+    where
+        F: Fn(u64, u64) -> bool,
+    {
+        self.sealed
+            .iter()
+            .filter(|s| is_dead(s.start_seq, s.end_seq))
+            .map(|s| s.start_seq)
+            .collect()
     }
 
     /// Sealed segments fully below `live_floor` (every seq `< live_floor`), i.e.
@@ -1155,6 +1354,9 @@ mod tests {
             }
             self.inner.read_range(id, part, offset, len)
         }
+        fn mark_record_deleted(&self, id: SegmentId, data_offset: u64) -> Result<(), StoreError> {
+            self.inner.mark_record_deleted(id, data_offset)
+        }
         fn delete(&self, id: SegmentId) -> Result<(), StoreError> {
             self.inner.delete(id)
         }
@@ -1328,5 +1530,103 @@ mod tests {
         assert_eq!(tier.resolve(4), Some(Tier::Hot));
         // Idempotent: a second sweep finds nothing.
         assert_eq!(w.reclaim_orphans_below(3), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // In-place segment delete-flag flip + recovery scan (DESIGN §7, segment side).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flag_sealed_deleted_flips_ondisk_and_scan_reads_it_back() {
+        let clock: SharedClock = Arc::new(TestClock::new(0));
+        // Seal one record per segment (1-per-segment) so seqs 1,2,3 are sealed.
+        let (mut w, _d) = writer_with(cfg_events(1, u64::MAX), clock);
+        w.set_cache_cap(0); // force on-disk reads (no cache shortcut).
+        for i in 1..=4u64 {
+            append(&mut w, i, i as i64, json!({ "i": i }));
+        }
+        assert_eq!(w.sealed_count(), 3, "seqs 1,2,3 sealed; seq 4 active");
+
+        // Nothing flagged yet.
+        assert!(w.scan_ondisk_deleted().is_empty(), "no deletions yet");
+
+        // Flag seq 2 deleted in place; seq 4 is active (not sealed) ⇒ no-op flip.
+        assert!(w.flag_sealed_deleted(2), "seq 2 is sealed ⇒ flip issued");
+        assert!(
+            !w.flag_sealed_deleted(4),
+            "seq 4 is active ⇒ no on-disk flip"
+        );
+
+        // The recovery scan reads exactly seq 2 back from the on-disk flag.
+        assert_eq!(
+            w.scan_ondisk_deleted(),
+            vec![2],
+            "the on-disk delete flag is read back on recovery"
+        );
+
+        // Live records still resolve identically (the flip never broke their frames).
+        assert_eq!(w.resolve_sealed(1).unwrap().data, json!({"i":1}));
+        assert_eq!(w.resolve_sealed(3).unwrap().data, json!({"i":3}));
+
+        // Idempotent: re-flipping the same seq leaves the scan result unchanged.
+        assert!(w.flag_sealed_deleted(2));
+        assert_eq!(w.scan_ondisk_deleted(), vec![2]);
+    }
+
+    #[test]
+    fn delete_flag_survives_relocation_to_cold() {
+        // codex P0 #2: a delete that flips the HOT del_flag DURING the (off-lock)
+        // cold copy must not be lost when relocation drops the HOT copy. Simulate the
+        // race: copy HOT→COLD (cold copy has NO flag yet), THEN flip the HOT flag,
+        // THEN confirm_relocated — which must propagate the HOT flag into COLD before
+        // dropping HOT.
+        let clock: SharedClock = Arc::new(TestClock::new(0));
+        let (mut w, _h, _c) = writer_with_cold(cfg_events(1, 1), clock);
+        w.set_cache_cap(0);
+        for i in 1..=3u64 {
+            w.append_record(i, i as i64, None, None, &json!({ "i": i }), &None);
+        }
+        // Sealed 1,2 (seq 3 active). Relocate seg 1.
+        let tier = w.tier();
+        // 1) COPY off-lock: the cold copy is made BEFORE the delete flip.
+        copy_segment_to_cold(&tier, 1).expect("cold copy");
+        assert!(tier.cold().unwrap().exists(1, SegmentPart::Data));
+        // 2) DELETE flips the HOT del_flag while the segment is still HOT.
+        assert!(w.flag_sealed_deleted(1), "seq 1 flipped on HOT");
+        // 3) CONFIRM relocation: flips tier→COLD, must carry the flag to COLD, drops HOT.
+        w.confirm_relocated(1);
+        assert_eq!(tier.resolve(1), Some(Tier::Cold));
+        assert!(!tier.hot().exists(1, SegmentPart::Data), "hot copy dropped");
+
+        // The recovery scan now reads seq 1 deleted FROM THE COLD COPY — the flag was
+        // not lost by the relocation.
+        assert_eq!(
+            w.scan_ondisk_deleted(),
+            vec![1],
+            "delete flag propagated to cold copy and survives the relocation"
+        );
+        // seq 2 (also sealed, never deleted) reads live.
+        assert_eq!(w.resolve_sealed(2).unwrap().data, json!({"i":2}));
+    }
+
+    #[test]
+    fn fully_dead_sealed_segments_picks_whole_clears() {
+        let clock: SharedClock = Arc::new(TestClock::new(0));
+        // 2 records per segment: seqs 1,2 in seg 1; 3,4 in seg 2; 5 active.
+        let (mut w, _d) = writer_with(cfg_events(2, u64::MAX), clock);
+        for i in 1..=5u64 {
+            append(&mut w, i, i as i64, json!({ "i": i }));
+        }
+        assert_eq!(w.sealed_count(), 2);
+
+        // Seg 1 (1,2) fully dead; seg 2 (3,4) only partially (3 dead, 4 live).
+        let dead: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        let whole =
+            w.fully_dead_sealed_segments(|start, end| (start..=end).all(|s| dead.contains(&s)));
+        assert_eq!(
+            whole,
+            vec![1],
+            "only the fully-cleared segment is whole-droppable"
+        );
     }
 }

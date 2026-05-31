@@ -936,18 +936,13 @@ impl Engine {
     /// `earliest_seq` move past a floor that a restart would regress (resurrecting
     /// the evicted records). On a hardening failure NOTHING is evicted and the
     /// error is RETURNED — the caller propagates it instead of silently serving a
-    /// tombstone for an un-hardened floor. A re-derivable advance (records-cap) or a
-    /// `memory` box needs no watermark and never fails here.
+    /// tombstone for an un-hardened floor. A re-derivable advance (records-cap)
+    /// needs no watermark and never fails here. A `memory` box takes the same path
+    /// (it shares the disk-like best-effort write path, §0.10): it logs the same
+    /// best-effort watermark — its loss merely re-derives on the next pass.
     fn enforce_retention_durable(&self, b: &BoxState, now: i64) -> Result<()> {
-        let is_memory = b.config.read().is_memory();
         let box_id = b.box_id;
-        b.enforce_retention_hardened(now, |plan| {
-            // Only reached for a non-re-derivable advance on a non-memory box.
-            if is_memory {
-                return Ok(());
-            }
-            self.log_evict_watermark(box_id, plan, now)
-        })?;
+        b.enforce_retention_hardened(now, |plan| self.log_evict_watermark(box_id, plan, now))?;
         Ok(())
     }
 
@@ -1055,20 +1050,17 @@ impl Engine {
             let _guard = dest.append_lock.lock();
             let staged = dest.stage_append(records);
             let seqs = staged.seqs();
-            // A `memory`-class destination NEVER writes to the WAL: forwarded /
-            // dead-lettered copies into it are RAM-only and lost on restart,
-            // exactly like a direct write. Skip the enqueue + fsync entirely.
-            let token = if class != Durability::Memory {
-                match self.wal_enqueue_batch(box_id, &seqs, &snapshot, now, durable) {
-                    Ok((_wal_ms, token)) => token,
-                    Err(e) => {
-                        // No ticket taken yet: tail truncation is still safe.
-                        dest.rollback_staged(staged);
-                        return Err(e);
-                    }
+            // A `memory`-class destination takes the SAME disk-like best-effort
+            // path: forwarded / dead-lettered copies into it are group-committed to
+            // the WAL (NOT fsync-gated) exactly like a direct memory write — they
+            // MAY survive a restart or MAY be lost (no durability GUARANTEE, §0.10).
+            let token = match self.wal_enqueue_batch(box_id, &seqs, &snapshot, now, durable) {
+                Ok((_wal_ms, token)) => token,
+                Err(e) => {
+                    // No ticket taken yet: tail truncation is still safe.
+                    dest.rollback_staged(staged);
+                    return Err(e);
                 }
-            } else {
-                None
             };
             // Arm the guard to roll this staged batch back on an unexpected unwind
             // (R14 / codex P0 #2) — identical to the user write path.
@@ -1077,17 +1069,16 @@ impl Engine {
             (staged, seqs, ticket, token)
         };
 
-        // Block on the commit token for ANY persisted class — `disk` AND `fsync`
-        // (codex P0 #2): a `disk` token resolves after the buffered WAL write (so we
-        // never publish a forwarded/dead-lettered copy the WAL writer hasn't accepted
-        // yet, just skip the fsync), a `fsync` token after the group fdatasync. Only
-        // `memory` has no token and never waits.
+        // Block on the commit token for EVERY class — `memory`, `disk` AND `fsync`
+        // (codex P0 #2): a `disk`/`memory` token resolves after the buffered WAL
+        // write (so we never publish a forwarded/dead-lettered copy the WAL writer
+        // hasn't accepted yet, just skip the fsync), a `fsync` token after the group
+        // fdatasync. `memory` is `disk` with no durability GUARANTEE — same path,
+        // best-effort (§0.10).
         let mut fsync_failed: Option<String> = None;
-        if class != Durability::Memory {
-            if let Some(token) = token {
-                if let Err(e) = token.wait() {
-                    fsync_failed = Some(format!("WAL commit failed: {e}"));
-                }
+        if let Some(token) = token {
+            if let Err(e) = token.wait() {
+                fsync_failed = Some(format!("WAL commit failed: {e}"));
             }
         }
         let mut ticket = ticket;
@@ -1102,7 +1093,8 @@ impl Engine {
         // the durable head ceiling BEFORE publishing the copy — identical to the
         // direct user write path. Reserve against the head this batch will publish
         // so visibility never precedes the durable reservation; on failure roll the
-        // batch back in place and return (nothing visible is unreserved).
+        // batch back in place and return (nothing visible is unreserved). A `memory`
+        // dest is best-effort/lossy (§0.10) and forgoes the seq-ceiling fsync.
         if class == Durability::Disk {
             let publish_head = staged.publish_head();
             if let Err(e) = self.ensure_disk_head_reserved(box_id, dest, publish_head, now) {
@@ -1193,17 +1185,13 @@ impl Engine {
         }
 
         // `type` is immutable once a box exists (API §0.10): a `PUT` that would
-        // change it is rejected with `409 box_exists_incompatible`. The MEMORY
-        // durability boundary is likewise immutable (codex P0 #3): flipping a box
-        // into or out of `memory` in place would leave a stale segment writer
-        // attached (or detach one), so a later memory write would materialize into
-        // segments, or a flip back to disk/fsync would let a snapshot persist
-        // memory-era records — resurrecting RAM-only records or silently dropping
-        // disk records. `disk`↔`fsync` is SAFE (both are non-memory, both have a
-        // segment writer, the snapshot path treats them identically) and stays a
-        // permitted in-place update (the common "auto-create then set durability"
-        // flow). A real change across the memory boundary must be delete + recreate
-        // (a fresh box_id with a clean index/segment store).
+        // change it is rejected with `409 box_exists_incompatible`. The durability
+        // class is freely mutable in place across ALL three classes: `memory` now
+        // shares the disk-like write/snapshot/segment path (§0.10), so every class
+        // has a segment writer and is treated identically by the snapshot/recovery
+        // path — a `memory`↔`disk`↔`fsync` flip is just a config swap (no stale or
+        // missing segment writer, no resurrected/dropped records). The common
+        // "auto-create then set durability" flow works for any class.
         if let Some(existing) = self.get_box(name) {
             let cur_cfg = existing.config.read();
             let cur_type = cur_cfg.r#type;
@@ -1216,26 +1204,6 @@ impl Engine {
                     "box": name,
                     "existing_type": cur_type,
                     "requested_type": config.r#type,
-                })));
-            }
-            let cur_memory = cur_cfg.is_memory();
-            let new_memory = config.is_memory();
-            if cur_memory != new_memory {
-                let cur_class = cur_cfg.durability_class();
-                let new_class = config.durability_class();
-                drop(cur_cfg);
-                return Err(Error::new(
-                    ErrorCode::BoxExistsIncompatible,
-                    format!(
-                        "box {name:?} already exists with durability {cur_class:?}; \
-                         the memory durability boundary is immutable (delete + recreate \
-                         to change to/from memory)"
-                    ),
-                )
-                .with_detail(serde_json::json!({
-                    "box": name,
-                    "existing_durability": cur_class,
-                    "requested_durability": new_class,
                 })));
             }
         }
@@ -1397,14 +1365,14 @@ impl Engine {
                 false
             }
             Entry::Vacant(e) => {
-                let is_memory = config.is_memory();
                 let mut state = BoxState::new(name.to_string(), box_id, config, SEQ_BASE, 1);
-                // Attach a HOT segment writer for a non-memory box (Phase 6 Stage
-                // 2); a memory box / pure in-memory engine attaches none.
-                if !is_memory {
-                    if let Some(writer) = self.build_segment_writer(box_id) {
-                        state.attach_segwriter(writer);
-                    }
+                // Attach a HOT segment writer on a durable engine (Phase 6 Stage 2)
+                // — for EVERY class including `memory`: a memory box now takes the
+                // same disk-like write/recovery path (best-effort, §0.10), so its
+                // records materialize into segments and are fully queryable. A pure
+                // in-memory engine still attaches none (no segment store).
+                if let Some(writer) = self.build_segment_writer(box_id) {
+                    state.attach_segwriter(writer);
                 }
                 e.insert(Arc::new(state));
                 true
@@ -1482,7 +1450,6 @@ impl Engine {
                         }
                     }
                 }
-                let is_memory = config.is_memory();
                 let mut state = BoxState::new(
                     name.to_string(),
                     box_id,
@@ -1491,15 +1458,14 @@ impl Engine {
                     forced_epoch.unwrap_or(1),
                 );
                 // Attach a HOT segment writer for a durable engine so committed
-                // records are materialized into segments (Phase 6 Stage 2). A
-                // pure in-memory engine attaches none → payloads stay resident and
-                // the read path is unchanged by construction. A `memory`-class box
-                // attaches none either — its records are RAM-only and must never
-                // touch the segment store (no on-disk trace to resurrect).
-                if !is_memory {
-                    if let Some(writer) = self.build_segment_writer(box_id) {
-                        state.attach_segwriter(writer);
-                    }
+                // records are materialized into segments (Phase 6 Stage 2). A pure
+                // in-memory engine attaches none → payloads stay resident and the
+                // read path is unchanged by construction. A `memory`-class box gets
+                // a writer too: it shares the disk-like best-effort path (§0.10), so
+                // its records materialize + are fully queryable + may persist (its
+                // on-disk trace is allowed — recovery is best-effort, never forced).
+                if let Some(writer) = self.build_segment_writer(box_id) {
+                    state.attach_segwriter(writer);
                 }
                 e.insert(Arc::new(state));
                 Some((true, box_id))
@@ -2105,11 +2071,10 @@ impl Engine {
 
         // --- WAL-FIRST append (ARCHITECTURE §2.2). -------------------------
         // The resolved records are needed in two places AFTER `stage_append`
-        // consumes the input vec: (a) WAL frame encoding, which only happens for
-        // a non-`memory` box when a WAL actually exists, and (b) router
-        // forwarding when this box is a router source. A write that needs
-        // NEITHER (no WAL, no routers — e.g. a `memory` box, or any box on an
-        // in-memory engine) skips the deep clone of every `serde_json::Value`
+        // consumes the input vec: (a) WAL frame encoding, which happens whenever a
+        // WAL actually exists, and (b) router forwarding when this box is a router
+        // source. A write that needs NEITHER (no WAL, no routers — e.g. any box on
+        // an in-memory engine) skips the deep clone of every `serde_json::Value`
         // entirely on that hot path (codex P0 #2). The router check reads the box's
         // lock-free `is_router_source` atomic (maintained by the rare graph-mutation
         // control path) instead of taking the GLOBAL router-graph mutex on every
@@ -2117,8 +2082,13 @@ impl Engine {
         // synchronous `forward_from` below still re-reads the graph under its lock to
         // get the actual routes, so a momentarily-stale flag never drops/duplicates a
         // record; it only decides whether to snapshot the payloads for forwarding.
+        //
+        // A `memory`-class box now takes the SAME disk-like write path (group-
+        // committed WAL, NO fsync gate) — it is `disk` with NO durability GUARANTEE:
+        // its records MAY survive a restart or MAY be lost, recovery is best-effort
+        // (§0.10). So `memory` writes to the WAL exactly like `disk`.
         let need_forward = b.is_router_source.load(Ordering::Relaxed);
-        let need_wal = self.wal.is_some() && class != Durability::Memory;
+        let need_wal = self.wal.is_some();
         let stored_snapshot = if need_wal || need_forward {
             stored.clone()
         } else {
@@ -2141,13 +2111,11 @@ impl Engine {
             let staged = b.stage_append(stored);
             let seqs = staged.seqs();
             // Enqueue the WAL frame(s) for the staged seqs (still under the lock,
-            // so a box's frames are enqueued in exactly their seq order). The
-            // `memory` class NEVER writes to the WAL (pure RAM, lost on restart):
-            // skip the enqueue entirely (`wal_append_ms`/`fsync_ms == 0`) so its
-            // records leave no durable trace.
-            let (wal_append_ms, commit_token) = if class == Durability::Memory {
-                (0.0, None)
-            } else {
+            // so a box's frames are enqueued in exactly their seq order). A
+            // `memory`-class box takes this disk-like path too (group-committed,
+            // best-effort, NOT fsync-gated): its frames may persist or be lost, but
+            // it shares the exact write path so it is fully queryable + recoverable.
+            let (wal_append_ms, commit_token) =
                 match self.wal_enqueue_batch(box_id, &seqs, &stored_snapshot, now, durable) {
                     Ok(v) => v,
                     Err(e) => {
@@ -2160,8 +2128,7 @@ impl Engine {
                         }
                         return Err(e);
                     }
-                }
-            };
+                };
             // Take the publish ticket UNDER the lock, in enqueue order. From here
             // on a later writer may stage past us once we drop the lock, so any
             // rollback below must target THIS batch's seqs (not a tail truncation).
@@ -2182,17 +2149,17 @@ impl Engine {
             // that token for ANY persisted class — `disk` AND `fsync` (codex P0 #2):
             //   * `fsync`: the token resolves after the fdatasync, so the response
             //     is fsync-gated (acked ⇒ hardened).
-            //   * `disk`: the token resolves after the buffered write, so we never
-            //     publish/ack a record the WAL writer hasn't even accepted yet (the
-            //     prior bug published disk records that were still only in the
-            //     channel or had hit a WAL write error). The `fdatasync` is skipped
-            //     for disk (whole-tail durability follows on a later group fsync),
-            //     so the latency win stands — we only wait for the WRITE, not the
-            //     sync. A `memory` write has no token and never waits.
+            //   * `disk` / `memory`: the token resolves after the buffered write, so
+            //     we never publish/ack a record the WAL writer hasn't even accepted
+            //     yet (the prior bug published disk records that were still only in
+            //     the channel or had hit a WAL write error). The `fdatasync` is
+            //     skipped (whole-tail durability follows on a later group fsync), so
+            //     the latency win stands — we only wait for the WRITE, not the sync.
+            //     `memory` is exactly `disk` here, just with NO durability GUARANTEE
+            //     (its frames may persist or be lost — best-effort, §0.10).
             // Many writers' waits overlap and group-commit together (throughput).
             let mut fsync_failed: Option<String> = None;
-            let await_token = class != Durability::Memory;
-            let fsync_ms = if await_token {
+            let fsync_ms = {
                 if let Some(token) = commit_token {
                     let t1 = Instant::now();
                     if let Err(e) = token.wait() {
@@ -2208,8 +2175,6 @@ impl Engine {
                 } else {
                     0.0
                 }
-            } else {
-                0.0
             };
 
             // Wait for our turn to publish, in strict seq order (codex P0 #1).
@@ -2247,7 +2212,9 @@ impl Engine {
             // a watermark fsync failure we roll the batch back in place and return
             // an error — the records are never published, so nothing visible is
             // outside a durable reservation. The `fsync` class needs none (its own
-            // frame is fsynced before ack); `memory` persists nothing.
+            // frame is fsynced before ack); `memory` is best-effort/lossy (§0.10) —
+            // its records MAY be lost, so it forgoes the seq-ceiling fsync (its head
+            // may legitimately regress on a lost tail; no durability GUARANTEE).
             if class == Durability::Disk {
                 // The head this batch is about to publish (its last staged seq).
                 let publish_head = staged.publish_head();
@@ -4777,7 +4744,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_class_write_skips_wal_timings_and_serves_in_ram() {
+    fn memory_class_write_serves_in_ram_and_is_queryable() {
         let (engine, _clock) = engine_with_clock();
         engine
             .put_box(
@@ -4795,9 +4762,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        // A pure in-memory engine reports 0 timings anyway, but the memory class
-        // explicitly skips the WAL path; the record is served from RAM.
-        assert_eq!(resp.performance.wal_append_ms, Some(0.0));
+        // A `memory` box takes the disk-like best-effort path (§0.10), but it is
+        // never fsync-gated, so `fsync_ms` is 0. On a pure in-memory engine there is
+        // no WAL, so timings are 0 here regardless; the record is served from RAM
+        // and is fully queryable via diff exactly like a disk box.
         assert_eq!(resp.performance.fsync_ms, Some(0.0));
         let d = engine.diff("mem", diff_from(0)).unwrap();
         assert_eq!(d.records.len(), 1);

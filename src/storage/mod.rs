@@ -42,9 +42,10 @@ pub mod testfs;
 pub use fs::{File, Fs, OpenOpts, RealFs};
 
 pub use segment::{
-    data_name, decode_data_frame, encode_data_frame, encode_idx_entry, idx_entry_at, idx_len,
-    idx_name, lookup, IdxEntry, SegmentBuilder, SegmentError, SegmentRecord, IDX_STRIDE,
-    SEG_FRAME_CRC_LEN, SEG_FRAME_HEADER_LEN,
+    data_name, decode_data_frame, decode_data_frame_full, del_flag_offset_in_frame,
+    encode_data_frame, encode_idx_entry, frame_is_deleted, idx_entry_at, idx_len, idx_name, lookup,
+    IdxEntry, SegmentBuilder, SegmentError, SegmentRecord, IDX_STRIDE, SEG_DEL_LIVE,
+    SEG_DEL_SENTINEL, SEG_FRAME_CRC_LEN, SEG_FRAME_DEL_LEN, SEG_FRAME_HEADER_LEN,
 };
 pub use segstore::{
     BoxTier, LocalSegmentStore, SegmentId, SegmentPart, SegmentStore, StoreError, Tier,
