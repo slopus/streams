@@ -1,0 +1,196 @@
+---
+title: Install & Run
+description: Build the streams binary or pull the Docker image, run it, wait for the readiness gate during WAL replay, and shut it down cleanly.
+---
+
+import { Callout, Steps, Tabs } from 'nextra/components'
+
+# Install & Run
+
+streams ships as a single static binary or a multi-arch Docker image — no external
+services, no runtime dependencies. This page covers building and running it, the default
+loopback bind and dev-mode auth, the `/v0/ready` readiness gate during WAL replay, and
+graceful shutdown. For the complete environment variable set see
+[Configuration](/deployment/configuration); for hardening a real deployment see
+[Security](/deployment/security).
+
+<Callout type="info">
+  The defaults are tuned for a safe local run: the server binds **loopback**
+  (`127.0.0.1:4000`) and disables auth when no keys are configured. That same default makes
+  it **refuse to start** on a non-loopback bind with no keys — so you can't accidentally
+  stand up an open, unauthenticated event store.
+</Callout>
+
+## Run it
+
+<Tabs items={['Binary', 'Docker']}>
+  <Tabs.Tab>
+
+Building from source needs a Rust toolchain. The release build is a single self-contained
+binary named `streams`.
+
+```bash
+# Build the single binary.
+cargo build --release
+
+# Run it. Defaults: bind 127.0.0.1:4000, auth disabled (dev mode),
+# WAL + segments + snapshots under ./streams-data.
+./target/release/streams
+# Listening on 127.0.0.1:4000 — auth disabled (dev mode).
+```
+
+On start the server opens the data directory, loads the latest snapshot, and **replays the
+WAL forward** before serving (see [the readiness gate](#the-readiness-gate) below). The
+data directory defaults to `./streams-data`; a missing or empty directory is a fresh start.
+
+```bash
+# Confirm it is up.
+curl -fsS http://127.0.0.1:4000/v0/health   # → 200 {"status":"ok", ...}
+```
+
+  </Tabs.Tab>
+  <Tabs.Tab>
+
+A multi-arch image (`linux/amd64` + `linux/arm64`) is published to GHCR at
+`ghcr.io/slopus/streams`. The image binds `0.0.0.0:4000`, stores durable state in the
+`/data` volume, runs as a non-root user, and ships a `HEALTHCHECK` that hits `/v0/health`.
+
+Because the image binds a **non-loopback** address, the server refuses to start with no
+keys — so pass `STREAMS_API_KEYS` for any real run, or `STREAMS_ALLOW_INSECURE_NO_AUTH=1`
+for a local-only one.
+
+```bash
+# Production-ish: real auth, durable state on a named volume.
+docker run --rm -p 4000:4000 -v streams-data:/data \
+  -e STREAMS_API_KEYS=replace-with-a-real-secret \
+  ghcr.io/slopus/streams:latest
+```
+
+```bash
+# Local / dev only: auth disabled. Never use this on a network-exposed deployment.
+docker run --rm -p 4000:4000 -v streams-data:/data \
+  -e STREAMS_ALLOW_INSECURE_NO_AUTH=1 \
+  ghcr.io/slopus/streams:latest
+```
+
+- `-p 4000:4000` maps the container's listen port to the host.
+- `-v streams-data:/data` is a named volume holding the WAL, segments, and snapshots
+  (`STREAMS_DATA_DIR` defaults to `/data` in the image). Reuse it across restarts to
+  preserve durable state.
+- `-e STREAMS_API_KEYS=...` is a comma-separated list of bearer keys; clients then send
+  `Authorization: Bearer <key>`.
+
+Images are tag-driven: pushing a `vX.Y.Z` git tag publishes `:1.2.3`, `:1.2`, and
+`:latest` with provenance and SBOM attestations. See [Docker](/deployment/docker) for the
+full image reference.
+
+  </Tabs.Tab>
+</Tabs>
+
+## First run, end to end
+
+<Steps>
+
+### Start the server
+
+Pick the binary or Docker path above. With no `STREAMS_API_KEYS`, a loopback bind comes up
+in dev mode with auth disabled.
+
+### Wait for ready
+
+If you have prior durable state, the server replays its WAL before serving. Poll
+`/v0/ready` until it returns `200` (details below).
+
+```bash
+curl -fsS http://127.0.0.1:4000/v0/ready
+# → 200 {"status":"ready", "wal_replay_complete":true, "boxes":0}
+```
+
+### Write a record
+
+A box is created lazily on first write — no setup needed.
+
+```bash
+curl -X POST localhost:4000/v0/boxes/jobs \
+  -H 'content-type: application/json' \
+  -d '{ "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
+```
+
+```json
+{ "box": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
+  "head_seq": 1, "count": 1, "created": true, "deduped": false,
+  "performance": { "server_total_ms": 0.62 } }
+```
+
+</Steps>
+
+From here, the [Quickstart](/getting-started/quickstart) walks through reading from a
+cursor, watching over SSE, fanning out with a router, and deleting.
+
+## The readiness gate
+
+streams separates **liveness** from **readiness** so an orchestrator never routes traffic
+to a process that is still recovering.
+
+- `GET /v0/health` (alias `/healthz`) always returns `200` with
+  `{"status":"ok", "version", "uptime_ms"}` once the process is up. It is liveness only.
+- `GET /v0/ready` (alias `/readyz`) returns `200`
+  `{"status":"ready", "wal_replay_complete":true, "boxes":N}` **only after WAL replay
+  completes**. During replay it returns `503 not_ready` with a `Retry-After` header and a
+  replay progress fraction; while draining for shutdown it returns `503 shutting_down`.
+
+```json
+# GET /v0/ready during WAL replay → HTTP 503
+{ "error": { "code": "not_ready",
+             "detail": { "replay_progress": 0.42 } } }
+```
+
+<Callout type="important">
+  Wire `/v0/ready` to your load balancer / orchestrator readiness probe, **not**
+  `/v0/health`. Replaying a large WAL takes time (roughly sub-second per million records on
+  NVMe, worst case with no snapshot), and you do not want writes hitting a half-recovered
+  process. An acknowledged durable write is always recovered by replay — the gate just makes
+  you wait for it.
+</Callout>
+
+By default the probe endpoints (`/v0/health`, `/v0/ready`, `/v0/metrics`) **skip auth** so
+they work behind a probe with no credentials. Set `STREAMS_PROBE_AUTH=true` to require auth
+on them too.
+
+## Graceful shutdown
+
+On `SIGINT` or `SIGTERM` the server shuts down gracefully: it stops accepting new work,
+drains in-flight requests (returning `503 shutting_down` from `/v0/ready` while it does),
+and **writes a final snapshot** so the next start begins from a current checkpoint with
+minimal WAL to replay. A clean stop and restart therefore comes back ready quickly.
+
+Even a hard crash is safe by design: recovery loads the last snapshot, replays the WAL
+forward, and truncates any torn tail (a frame whose length runs past EOF or whose
+checksum fails to verify). A complete, checksum-valid frame for an acknowledged durable
+write is never lost. See [Recovery](/how-it-works/recovery) for the full sequence.
+
+## Configuration & production
+
+Everything above runs on defaults. To go further:
+
+- **All environment variables** — bind host/port, data and cold-tier directories, body and
+  segment size limits, hot-retention bounds, and every resource cap — are documented in
+  [Configuration](/deployment/configuration).
+- **Production hardening** — API keys (hashed at rest, with optional per-key scopes and a
+  box-name prefix allowlist), the loopback/`STREAMS_ALLOW_INSECURE_NO_AUTH` interlock, TLS
+  via a reverse proxy, and the DoS resource limits — is covered in
+  [Security](/deployment/security).
+
+<Callout type="warning">
+  streams speaks **plain HTTP** — it does not terminate TLS. For any non-loopback exposure,
+  run it behind a TLS-terminating reverse proxy (or bind loopback and tunnel). See
+  [Security](/deployment/security).
+</Callout>
+
+## See also
+
+- [Quickstart](/getting-started/quickstart) — write, read, watch, fan out, and delete in a
+  few `curl` commands.
+- [Configuration](/deployment/configuration) — the complete environment variable set.
+- [Security](/deployment/security) — auth, scopes, prefix allowlist, and TLS.
+- [Recovery](/how-it-works/recovery) — snapshot load, WAL replay, and torn-tail truncation.

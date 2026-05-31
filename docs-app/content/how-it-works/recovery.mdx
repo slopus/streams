@@ -1,0 +1,159 @@
+---
+title: Crash Recovery
+description: How streams rebuilds in-memory state on restart — load the snapshot, replay the WAL from the checkpoint, truncate a torn tail, and reclaim orphan segments — so an acked durable write is never lost.
+---
+
+import { Callout, Steps } from 'nextra/components'
+
+# Crash Recovery
+
+On every restart — clean or after a crash — streams rebuilds all in-memory state from
+disk, loses only data that never reached the WAL, and tolerates a crash at any instant.
+Recovery is a single deterministic pass: load the latest metadata snapshot, replay the
+**write-ahead log** from the last checkpoint, truncate any torn tail at the first invalid
+frame, then reclaim segments that the live set no longer references.
+
+The whole process rests on one anchor: a write is acked only after its frame is committed
+(and, for an `fsync`-class box, fsynced), and every frame carries an **XXH3-64** checksum
+over its bytes. So an acked durable write is, by construction, a complete checksum-valid
+frame on disk — and recovery never discards one.
+
+<Callout type="important">
+  **The recovery invariant:** an acked `fsync`-class (`durable:true`) write is always a
+  complete, checksum-valid WAL frame, so it is **never lost** — recovered for any crash at
+  any instant. A `disk`-class (`durable:false`) box loses only its **un-fsynced tail** (the
+  group-commit window that hadn't reached disk), which surfaces to consumers as ordinary
+  eviction-style gaps, never as a misread or torn record.
+</Callout>
+
+## The recovery pass
+
+Recovery runs once at startup, before the server reports ready. While it runs,
+[`GET /v0/ready`](/api/health-metrics) returns `503 not_ready` with a
+`detail.replay_progress` between `0.0` and `1.0`; it flips to `200` only when the pass
+completes.
+
+<Steps>
+
+### Load the latest metadata snapshot
+
+Open the data dir and load the most recent valid snapshot under `meta/`. It carries the
+box and router definitions, the name↔id mapping, the persisted watermarks
+(`evict_floor` + `earliest_seq`) and `delete_below` per box, the `CURRENT` WAL pointer,
+and `last_checkpoint_seq` — the global lower bound for replay. Snapshots are written
+atomically (`tmp` → fsync → rename → dir-fsync), so the swap is crash-atomic and the
+loaded snapshot is always whole.
+
+A snapshot lets recovery skip replaying the WAL from time zero. After a **graceful**
+shutdown (SIGINT/SIGTERM) a final snapshot is written, so recovery starts from the
+checkpoint and replays only the tail. After a hard kill with no recent snapshot, replay
+starts from offset zero — the worst case (see [Performance](/how-it-works/performance)).
+
+### Rebuild each box's index from its segments
+
+Per box, bulk-load the segment `.idx` files into the in-memory index. Each `.idx` entry is
+a fixed 20 bytes (offset, len, ts, flags, pad), so `seq → entry` is pure arithmetic — a
+sequential read, not a re-parse of payloads. Set `base_seq` from the lowest surviving
+segment, `evict_floor`/`earliest_seq` from the persisted watermarks, and `head_seq` from
+the highest segment seq. The per-box tag index is rebuilt from the surviving tagged
+records.
+
+### Replay the WAL from the checkpoint
+
+Walk the WAL forward from the frame after the last `CheckpointMark`. For each frame, in
+order:
+
+- **`Append`** — push a `RecordLoc` (located in the WAL), index its tag, bump `head_seq`.
+  A frame whose `seq <= head_seq` is **skipped**: it is already materialized in a segment,
+  so re-applying it would be a duplicate. This is what makes a crash *after* checkpointing
+  segments but *before* deleting the absorbed WAL files harmless — those frames replay and
+  are skipped.
+- **`Delete`** — **re-applied**: resolve the `before_seq`/`match`, mark those slots
+  deleted, free their payloads, prune the tag index, and advance `earliest_seq` if the
+  front became dead. **`evict_floor` is untouched** (deletion is voluntary), so a recovered
+  deleted gap still reads silently, never as a tombstone. The deleted seqs are re-derived
+  from the rebuilt index, not stored individually.
+- **`EvictWatermark`** — restore the involuntary floor **monotonically**: the watermark
+  only ever moves forward, so eviction and its tombstone boundary survive the restart
+  exactly as they stood before the crash.
+- **Other control frames** (`BoxCreate`, `BoxDelete`, `RouterCreate`, `RouterDelete`,
+  `ConfigUpdate`) mutate config, routers, and watermarks on the same ordered timeline as
+  the data — there is exactly one truth: WAL order.
+
+### Truncate the torn tail
+
+Stop replay at the **first** frame that fails either of two checks:
+
+- **`frame_len` overruns EOF** — the 4-byte length prefix points past the end of the file,
+  so the trailing write was torn. The `frame_len`-first framing lets recovery validate the
+  boundary without parsing the body.
+- **XXH3-64 mismatch** — the frame's checksum doesn't match its bytes, so the frame is
+  partial or corrupt.
+
+Either way, that frame and everything after it is the logical end of the log. `ftruncate`
+the WAL at that boundary so it is clean and writable for new appends. A partial `write()`
+fails one of these checks and is discarded — it is **never interpreted as data**.
+
+### Reclaim orphan segments
+
+Re-derive which sealed segments are fully or partially below the live set and reclaim them
+— drop a segment whose highest seq is below `earliest_seq`, rewrite a partially-deleted
+one. Reclaim is **idempotent**: a crash between advancing a watermark and unlinking a file
+is harmless, because restart simply recomputes which segments are droppable and unlinks the
+orphans again. A pre-crash reclaim whose `unlink` never completed is finished here.
+
+### Resume
+
+Open the truncated (or fresh) active WAL and start the writer, compactor, and reclaimer.
+`GET /v0/ready` flips to `200`; writes and reads resume.
+
+</Steps>
+
+## Crash-consistency guarantees
+
+These are the properties recovery enforces, each proven by real `kill -9` subprocess tests,
+not only by reasoning.
+
+| Property | How it holds |
+|---|---|
+| **Acked durable write survives any crash** | An `fsync`-class ack waits for `fdatasync`, so a `2xx` means the frame is a complete, checksum-valid frame on disk. Recovery stops only at a torn/invalid frame, so a valid one is never dropped. |
+| **Torn tail is truncated, not misread** | A frame whose `frame_len` overruns EOF or whose XXH3-64 fails ends replay; the WAL is truncated there. No bogus record, no panic. |
+| **Partial `write()` is discarded** | A trailing partial frame fails the length/checksum check and is dropped — never read as data. |
+| **Clean prefix after a non-durable burst** | A SIGKILL mid-burst recovers a contiguous prefix of the log; the un-fsynced tail is gone, but what remains is intact and in-order. |
+| **Checkpoint races are harmless** | `CheckpointMark` is itself checksummed and fsynced. A crash after writing segments but before the mark replays those frames (and skips them by seq); a crash after the mark but before deleting absorbed WAL files replays-and-skips them. |
+| **No silent loss across restart** | A recovered cursor below `evict_floor` still tombstones; a recovered purely-deleted gap still reads silently. The [dual watermark](/guarantees/tombstones) survives intact. |
+
+## What "only data not yet in the WAL is lost" means
+
+The WAL is the durability boundary. Everything downstream — the in-memory index, the
+segment files — is a derivable cache of the WAL plus checkpoints. So the precise loss
+boundary on a crash is *what reached the WAL on disk*, and it differs by
+[durability class](/guarantees/durability):
+
+- **`fsync`** — the ack waits for the group-commit `fdatasync`, so every acked write is on
+  disk. Loss window: none.
+- **`disk`** — the write is acked on frame enqueue, not fsync-gated; a background
+  `fdatasync` follows on the group-commit timer. Loss window on power loss: the un-fsynced
+  tail (the documented fast-path tradeoff), surfacing to consumers as eviction-style gaps.
+- **`memory`** — never written to the WAL at all. On restart the box reappears **empty**
+  (`head_seq` resets to `0`), though its config persists as a control frame. A memory box's
+  data is never resurrected.
+
+<Callout type="info">
+  Recovery time is bounded by the un-checkpointed tail, not the total record count. After a
+  graceful shutdown or a recent snapshot, replay covers only the frames since the
+  checkpoint. The worst case — a hard kill with no snapshot — is a full WAL replay measured
+  at ~0.68–0.94 s for 1 M records on the reference machine; see
+  [Performance](/how-it-works/performance).
+</Callout>
+
+## See also
+
+- [Durability](/guarantees/durability) — the three commit classes and exactly what each
+  guarantees on a crash.
+- [WAL & Group Commit](/how-it-works/wal-and-group-commit) — the write path and frame format
+  that recovery reads back.
+- [Segments & Snapshots](/how-it-works/segments-and-snapshots) — the checkpoint, segment
+  format, and snapshot mechanics recovery loads from.
+- [Tombstones](/guarantees/tombstones) — the dual watermark that recovery restores
+  monotonically.

@@ -1,0 +1,430 @@
+---
+title: Queues
+description: Lease-based, at-least-once job delivery layered on the log — claim, ack, nack, extend, dead-lettering, and the /work SSE push stream.
+---
+
+import { Callout } from 'nextra/components'
+
+# Queues
+
+A **queue** is a box created with `type:"queue"`. It adds lease-based, at-least-once
+job delivery on top of the same persistent log machinery — the WAL, crash recovery,
+SSE, priority, tombstones, and node filtering all still apply. A queue **is** a box, so
+everything in the rest of the API ([writing](/api/writing), [reading](/api/reading),
+[deletion](/api/deletion), [watch](/api/watch)) works on it read-only; the endpoints on
+this page add the lease lifecycle on top.
+
+<Callout type="info">
+  A plain `"log"` box rejects every endpoint on this page with `409 not_a_queue`, so a
+  typo'd box name or a normal log can never silently swallow a claim. Queue endpoints
+  never auto-create — produce with [`POST /v0/boxes/:q`](/api/writing) or create the box
+  with [`PUT /v0/boxes/:q`](/api/boxes) first.
+</Callout>
+
+## The model: two logs
+
+Internally a queue is **two append-only logs**:
+
+- **The jobs log** — the box itself. You `POST` records into it ([Writing](/api/writing));
+  each record is a job, identified by its `$seq`. This is the source of truth for *what
+  work exists*. Its durability follows the box's `durable`/`durability` config.
+- **The leases log** — an append-only log of lifecycle events (`claimed`, `released`,
+  `extended`, `acked`) describing *who holds what*. The live who-holds-what state is the
+  **materialized projection** of this log, held in memory and rebuilt on restart. The
+  leases log is event-sourced, not a separately-mutated table.
+
+You **produce** jobs with a normal append. A worker **claims** up to N jobs; the server
+leases them to that worker's `node` and returns each job's data plus a `lease_id` and a
+`deadline`. The worker **acks** to complete (ack *is* the permanent delete), **nacks** to
+release for immediate or delayed reclaim, or **extends** the lease to keep working. If a
+lease's `deadline` passes with no ack or extend, the job becomes claimable again — the
+**visibility timeout**. After too many redeliveries a job can be **dead-lettered**.
+
+### At-least-once with idempotent consumers
+
+The contract is **at-least-once**. A slow-but-alive worker whose lease expires while it is
+still processing will have its job reclaimed and possibly delivered elsewhere; if the slow
+worker later acks past its deadline, that ack is skipped — but the job was already
+processed twice. **Duplicates are inherent and documented.** Consumers MUST be idempotent
+(dedupe on `$seq` or a job-level key in `data`/`meta`).
+
+<Callout type="warning">
+  **Per-job FIFO is not guaranteed across parallel workers.** Claim order is roughly seq
+  order, but reclaimed (expired-lease) seqs are served ahead of fresh ones, and parallel
+  workers process at different rates. A single worker (`max:1`, one connection) sees
+  near-FIFO; a fleet does not. Exactly-once is not offered.
+</Callout>
+
+### Lease durability is best-effort by design
+
+The **jobs log** is durable per the box config — work is never lost. The **leases log
+defaults non-durable** (`leases_durable:false`) because losing leases on a crash is
+**self-healing**: on restart, a job with no replayed active lease is simply claimable
+again, which is exactly correct visibility-timeout behavior. A transient WAL error on a
+lease append degrades to the baseline at-least-once (reclaim on timeout) rather than
+losing or duplicating work beyond what at-least-once already permits. **Ack durability ==
+the box's `durable`**: an acked+deleted job stays gone across a crash iff its delete was
+durable.
+
+## Creating a queue
+
+Set `type:"queue"` on a box-create. The queue tuning fields go in the same config object
+(see the [box config table](/api/boxes)). `type` is **immutable** once set — a `PUT` that
+changes it returns `409 box_exists_incompatible`.
+
+```bash
+# A durable queue that fails loudly when full, with dead-lettering after 5 deliveries.
+curl -X PUT localhost:4000/v0/boxes/jobs \
+  -H 'content-type: application/json' \
+  -d '{ "type": "queue", "durable": true, "discard": "reject",
+        "lease_ms": 30000, "claim_jitter_ms": 0,
+        "max_deliveries": 5, "dead_letter": "jobs.dlq" }'
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `lease_ms` | `u64` | `30000` | Default lease (visibility-timeout) duration for a claim. Per-claim `lease_ms` overrides. Clamped `[100, 86400000]`. |
+| `claim_jitter_ms` | `u64` | `0` (greedy) | Coalescing-window width. `0` = serve immediately; `>0` = gather a cohort and divide jobs evenly (see [Coalescing](#coalescing-window--even-division)). Clamped `[0, 5000]`. |
+| `max_deliveries` | `u64` | `0` (off) | Dead-letter a job after it has been delivered this many times without an ack. `0` = unlimited redelivery. |
+| `dead_letter` | `string \| null` | `null` | Box to move a job to once it exceeds `max_deliveries`. `null` = no dead-letter (reclaim forever). Must differ from this box. |
+| `leases_durable` | `bool` | `false` | Durability of the leases log. `false` (default) is the self-healing, deliberate perf win described above. |
+
+Produce jobs with a normal write — the queue is just a box:
+
+```bash
+curl -X POST localhost:4000/v0/boxes/jobs \
+  -H 'content-type: application/json' \
+  -d '{ "records": [ { "data": { "type": "resize", "url": "s3://b/x.png" },
+                       "tag": "tenant42:job-8800" } ] }'
+```
+
+## POST /v0/boxes/:q/claim — lease jobs to a worker
+
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:q/claim</span></div>
+
+Lease up to `max` claimable jobs to a worker `node`. A job is **claimable** iff it is not
+acked (still in the jobs log) and not currently leased (no active lease, or its lease has
+expired). Each returned job records a `claimed` event and increments that job's delivery
+counter.
+
+**Request body**
+
+```json
+{ "node": "worker-eu-1", "max": 16, "lease_ms": 30000 }
+```
+
+| Field | Type | Req? | Default | Meaning |
+|---|---|---|---|---|
+| `node` | string | yes | — | The claiming worker's identity. Recorded as the lease holder; used for `nack`/`extend`/`/work` ownership and instant release on `/work` disconnect. |
+| `max` | `u32` | no | `1` | Max jobs to lease this call. Clamped to `1000` (the fixed `MAX_CLAIM` bound). The response may contain **fewer** (or zero) — `count < max` is the reliable "queue (near-)empty" signal, never an error. |
+| `lease_ms` | `u64` | no | box `lease_ms` | Lease duration for jobs claimed by *this* call; overrides the box default. Clamped `[100, 86400000]`. |
+
+**Response** (`200`)
+
+```json
+{
+  "box": "jobs",
+  "claimed": [
+    { "$seq": 480101, "lease_id": "lease_7f3a9c", "deadline": 1748450039000,
+      "$ts": 1748450001000, "$tag": "tenant42:job-8800", "deliveries": 1,
+      "data": { "type": "resize", "url": "s3://b/x.png" }, "meta": { "trace": "z9" } },
+    { "$seq": 480104, "lease_id": "lease_7f3a9d", "deadline": 1748450039000,
+      "$ts": 1748450001050, "deliveries": 2,
+      "data": { "type": "thumbnail", "url": "s3://b/y.png" } }
+  ],
+  "count": 2,
+  "ready": 840,
+  "performance": { "server_total_ms": 0.42, "throttle_wait_ms": 0.0 }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `claimed[]` | The leased jobs, ascending by `$seq`. Each carries the record's `$seq`/`$ts`/`data` (and `$tag`/`meta` when present), plus the lease fields below. |
+| `claimed[].lease_id` | Opaque lease identity for this delivery (`"lease_"` + hex). For logging/observability and disambiguating redeliveries — `ack`/`nack`/`extend` match on `node` + `seqs`, not on `lease_id`. |
+| `claimed[].deadline` | Absolute ms epoch when the lease expires if not acked/extended: `deadline = claim_ts + effective lease_ms`. |
+| `claimed[].deliveries` | How many times this job has now been delivered (this claim counted). Starts at `1`; compared against `max_deliveries`. |
+| `count` | `claimed.length`. |
+| `ready` | Claimable jobs still waiting after this claim (the [observability](#queue-observability) `ready` counter). |
+
+**Errors** — `400 invalid_request` (missing `node`, bad `max`/`lease_ms` type);
+`404 box_not_found`; `409 not_a_queue`; `429 throttled`.
+
+## POST /v0/boxes/:q/ack — complete jobs (ack is the delete)
+
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:q/ack</span></div>
+
+Complete jobs. The **ack is the delete**: the server records an `acked` event and removes
+each seq from the jobs log via the permanent [delete](/api/deletion) path. Ack durability
+equals the box's `durable` — an acked+deleted job stays gone iff its delete was durable.
+
+**Request body**
+
+```json
+{ "node": "worker-eu-1", "seqs": [480101, 480104] }
+```
+
+| Field | Type | Req? | Meaning |
+|---|---|---|---|
+| `node` | string | yes | The worker acking. Must be the current lease holder of each seq for the ack to count. |
+| `seqs` | array&lt;u64&gt; | yes | `1..=1000` (the fixed `MAX_CLAIM` bound) job seqs to complete. |
+
+Only seqs currently leased to `node` are acked. A seq that is not leased to `node` (never
+claimed, already acked, or its lease expired and was leased to someone else) is **silently
+skipped** and reported in `skipped` — ack is idempotent and safe to retry. This is the
+at-least-once seam: a worker acking **past its deadline** may find another worker now holds
+the lease, so its ack is skipped and the job may run twice.
+
+**Response** (`200`)
+
+```json
+{ "box": "jobs", "acked": 2, "skipped": [],
+  "ready": 840, "in_flight": 286,
+  "performance": { "server_total_ms": 0.30, "fsync_ms": 0.21 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `acked` | Count of seqs actually completed + deleted by this call. |
+| `skipped` | Requested seqs that were **not** acked (not held by `node`), for observability. May be empty. |
+| `ready` / `in_flight` | Post-ack [queue counters](#queue-observability). |
+
+`fsync_ms > 0` only on a `durable` queue (the delete is fsynced before the ack returns).
+
+**Errors** — `400 invalid_request` (missing `node`/`seqs`, bad seq type, `seqs` longer
+than `1000` ⇒ `batch_too_large`); `404 box_not_found`; `409 not_a_queue`.
+
+## POST /v0/boxes/:q/nack — release leased jobs
+
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:q/nack</span></div>
+
+Release leased jobs back to the queue for immediate or delayed reclaim, without an ack.
+Records a `released` event. Semantically identical to letting the lease expire, just
+sooner (or after `delay_ms`).
+
+**Request body**
+
+```json
+{ "node": "worker-eu-1", "seqs": [480104], "delay_ms": 0 }
+```
+
+| Field | Type | Req? | Default | Meaning |
+|---|---|---|---|---|
+| `node` | string | yes | — | Must be the current lease holder (else that seq is skipped). |
+| `seqs` | array&lt;u64&gt; | yes | — | Job seqs to release. Bounded to `1000`. |
+| `delay_ms` | `u64` | no | `0` | Hold the job invisible this long before it becomes claimable again (delayed retry / backoff). `0` = claimable immediately. Clamped `[0, 86400000]`. |
+
+A nack drops the active lease and makes the seq claimable again at `now + delay_ms`,
+incrementing the delivery counter on its next claim (and subject to dead-lettering).
+
+**Response** (`200`)
+
+```json
+{ "box": "jobs", "nacked": 1, "skipped": [],
+  "ready": 841, "in_flight": 285,
+  "performance": { "server_total_ms": 0.18 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `nacked` | Seqs released by this call (held by `node`). |
+| `skipped` | Seqs not held by `node` (silently skipped). |
+| `ready` / `in_flight` | Post-nack counters. A delayed nack does **not** count toward `ready` until `delay_ms` elapses. |
+
+**Errors** — `400 invalid_request`; `404 box_not_found`; `409 not_a_queue`.
+
+## POST /v0/boxes/:q/extend — push out a lease deadline
+
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:q/extend</span></div>
+
+The heartbeat for long jobs. Push out the deadline of held leases. Records an `extended`
+event. Extend **sets**, not adds — the worker asserts "I need this much more time from
+now."
+
+**Request body**
+
+```json
+{ "node": "worker-eu-1", "seqs": [480101], "lease_ms": 30000 }
+```
+
+| Field | Type | Req? | Meaning |
+|---|---|---|---|
+| `node` | string | yes | Must be the current lease holder. |
+| `seqs` | array&lt;u64&gt; | yes | Held job seqs to extend. Bounded to `1000`. |
+| `lease_ms` | `u64` | yes | New lease duration from **now**: `deadline = now + lease_ms`. Clamped `[100, 86400000]`. |
+
+A seq whose lease has **already expired** (and was reclaimed) cannot be extended — it is
+skipped; the worker should re-claim. Extending does **not** change the delivery counter.
+
+**Response** (`200`)
+
+```json
+{ "box": "jobs", "extended": 1, "skipped": [],
+  "deadlines": { "480101": 1748450069000 },
+  "performance": { "server_total_ms": 0.12 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `extended` | Seqs whose deadline was pushed out. |
+| `skipped` | Seqs not held by `node` (expired/reclaimed/never-claimed). |
+| `deadlines` | New absolute deadline (ms) per extended seq. |
+
+**Errors** — `400 invalid_request` (missing `lease_ms`); `404 box_not_found`;
+`409 not_a_queue`.
+
+## Visibility timeout: lazy reclaim, self-healing
+
+A lease carries an absolute `deadline`. Once `now > deadline` the lease is **expired** and
+the seq becomes claimable again — this **is** the visibility timeout. There are **no
+per-job timers**: expiry is **lazy**. Expired-lease seqs are collected onto a **reclaim
+freelist** that the next claim pass drains **first**, before handing out fresh jobs, so a
+reclaimed job jumps the queue ahead of never-delivered ones. Each reclaim increments the
+job's delivery counter on its next claim and is subject to dead-lettering.
+
+Because the live lease state is a purely-derived projection of a (default non-durable)
+leases log, **losing the leases log on a crash is self-healing**: on restart the
+projection is rebuilt from whatever lease events survived (possibly none), so any job
+without a replayed active lease is immediately claimable — identical to every lease having
+expired. No job is lost (the jobs log is durable per config); at worst an in-flight job is
+redelivered, which at-least-once already permits.
+
+## Coalescing window & even division
+
+`claim_jitter_ms` is a **fairness/coalescing window**, not a backoff.
+
+- **`claim_jitter_ms = 0` (default, greedy).** A claim is served immediately, lowest
+  latency. First-arrival drains the head of the available set.
+- **`claim_jitter_ms > 0` (coalescing).** A claim **waits up to that window**. The server
+  gathers **every** claimer that arrived during the window into a **cohort**, then in one
+  batched coordinator pass (a single critical section) **divides the available jobs evenly
+  across the whole cohort** — round-robin, proportional to each claimer's `max`. This is
+  *not* first-arrival-drains-the-head: ten workers each asking for `max:10` against 50
+  available jobs get ~5 each, not 10 / 10 / 10 / 10 / 10 / 0 / 0 / 0 / 0 / 0.
+
+The available set for a pass is, in order: (1) the **reclaim freelist** (expired-lease and
+elapsed-`delay_ms` seqs) drained first, then (2) **fresh jobs** handed out by a monotonic
+claim cursor over the jobs log. The single-pass cohort design is also a scalability win —
+one coordinator pass under one lock instead of N independent per-claim atomic races over
+the head. The [`/work` SSE streams](#get-v0boxesqwork--auto-claim-over-sse-push-mode)
+participate in the same cohort, so polling claimers and pushed workers are balanced
+together.
+
+## Dead-lettering
+
+Each job carries a **delivery counter**, incremented on every claim (including reclaims of
+expired leases and re-claims after a nack). When a job is about to be delivered for the
+`(max_deliveries + 1)`-th time and the box has a non-`null` `dead_letter`, it is **not**
+re-delivered. Instead the server **moves** it: appends the job's record to the
+`dead_letter` box (preserving `$tag`/`meta`/`data`) and permanently deletes it from the
+jobs log (the same delete path as an ack). The moved record is stamped with provenance
+meta:
+
+| Stamped key | Meaning |
+|---|---|
+| `meta.$dead_letter_from` | The source queue's box name. |
+| `meta.$dead_letter_deliveries` | The delivery count at the time of the move. |
+| `meta.$dead_letter_src_seq` | The job's `$seq` in the source jobs log. |
+
+With `max_deliveries = 0` (default) or `dead_letter = null`, a job is reclaimed forever and
+never dead-lettered. Each move increments the [`dead_lettered`](#queue-observability)
+counter. The dead-letter box is an ordinary box (log or queue), so a poison job can be
+inspected via [`diff`](/api/reading) / [`watch`](/api/watch), or re-driven by reading it
+and re-producing into the source queue. Forwarded / dead-lettered copies honor the
+**destination** box's [durability class](/guarantees/durability) — a `memory` dead-letter
+box persists nothing.
+
+## Queue observability
+
+[`GET /v0/boxes/:q`](/api/boxes) on a queue returns `type:"queue"` and a `queue`
+sub-object beside the normal box state:
+
+```json
+{
+  "box": "jobs", "type": "queue",
+  "head_seq": 480231, "earliest_seq": 479101, "count": 1130,
+  "config": { "type": "queue", "lease_ms": 30000 },
+  "queue": { "ready": 842, "in_flight": 288, "dead_lettered": 4 },
+  "performance": { "server_total_ms": 0.06 }
+}
+```
+
+| `queue` field | Meaning |
+|---|---|
+| `ready` | Claimable jobs right now — in the jobs log, not acked, with no active lease (includes reclaim-freelist seqs whose lease expired or whose nack `delay_ms` elapsed). |
+| `in_flight` | Jobs with an active (un-expired) lease — currently held by some worker. |
+| `dead_lettered` | Cumulative jobs moved to the `dead_letter` box over this box instance's life (resets on delete + recreate). |
+
+`ready + in_flight` equals the live job `count`, modulo jobs whose nack `delay_ms` has not
+yet elapsed (counted in neither until claimable). The jobs log stays fully readable via
+normal [`diff`](/api/reading) and [`watch`](/api/watch) for monitoring — those paths
+observe the jobs log and never claim, ack, or mutate leases.
+
+## GET /v0/boxes/:q/work — auto-claim over SSE (PUSH mode)
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/boxes/:q/work</span></div>
+
+A streaming alternative to the claim → process → claim poll loop: the server keeps up to
+`max` jobs leased-and-pushed to this one connection, claiming more as the worker acks, and
+applying backpressure at `max` in-flight. **The stream is one-way** (SSE, [read+write
+scope](/deployment/security)) — the worker still **acks** (and may nack/extend) via the
+separate `POST` endpoints above; the stream only *delivers*.
+
+```bash
+curl -N 'localhost:4000/v0/boxes/jobs/work?node=worker-eu-1&max=8' \
+  -H 'accept: text/event-stream'
+```
+
+| Query | Req? | Default | Meaning |
+|---|---|---|---|
+| `node` | yes | — | The worker identity these jobs are leased to. |
+| `max` | no | `1` | Target in-flight depth — the server keeps at most this many jobs leased to this connection at once (the backpressure bound). Clamped to `1000`. |
+| `lease_ms` | no | box `lease_ms` | Lease duration for jobs pushed on this stream. |
+| `token` | no | — | Dev-only `?token=<key>` fallback for browser `EventSource`; prefer the `Authorization: Bearer` header — a query string leaks via logs/history/proxies. |
+
+Response headers are the SSE set (`Content-Type: text/event-stream`, `Cache-Control:
+no-store`, `X-Accel-Buffering: no`). A `retry: 2000` and an initial heartbeat are sent at
+open. The **same coalescing-window logic** feeds connected `/work` streams fairly alongside
+polling claimers.
+
+**`event: job`** — one leased job (the streaming analog of one `claimed[]` entry). `id:` is
+the job `$seq` (an opaque resume hint; the authoritative lease state lives server-side).
+
+```text
+id: 480101
+event: job
+data: {"box":"jobs","$seq":480101,"lease_id":"lease_7f3a9c","deadline":1748450039000,"$ts":1748450001000,"$tag":"tenant42:job-8800","deliveries":1,"data":{"type":"resize","url":"s3://b/x.png"}}
+
+: hb
+```
+
+The worker processes the job and **acks** it via `POST /v0/boxes/:q/ack`; on each ack the
+server claims and pushes replacement jobs to keep the stream at `max` in-flight. To reject,
+the worker `nack`s; to keep a long job alive, it `extend`s. Heartbeats are bare `: hb`
+comments on the standard cadence, suppressed when a real `job` frame went out in the window.
+
+<Callout type="important">
+  **Release-on-disconnect (instant failover).** When the `/work` connection drops — clean
+  close or detected broken pipe — the server **immediately releases all of that node's
+  leases delivered on this connection**, recording `released` events so the jobs are
+  instantly claimable again, rather than waiting for lease expiry. Lease expiry still
+  covers hard crashes where the disconnect is not observed. Because release is keyed to
+  this connection's deliveries, a worker holding leases from a separate `claim` poll is
+  unaffected.
+</Callout>
+
+A per-stream `event: error` carries an HTTP-aligned `code` (same shape as the
+[watch](/api/watch) error frame), e.g. `code: 429` advisory pacing under pressure, or
+`code: 409` if the box ceased to be a queue (deleted + recreated as a log). Terminal errors
+close the stream; the worker reconnects.
+
+**Errors at establishment** — `200` (stream opened); `400 invalid_request` (missing
+`node`, bad `max`); `404 box_not_found`; `406 not_acceptable` (`Accept` not
+`text/event-stream`); `409 not_a_queue`; `429 throttled`.
+
+## See also
+
+- [Job Queue guide](/guides/job-queue) — end-to-end worker recipe with claim/ack/retry.
+- [Writing Records](/api/writing) — how you produce jobs into a queue.
+- [Idempotency](/guarantees/idempotency) — why at-least-once needs idempotent consumers.
+- [Durability classes](/guarantees/durability) — what `durable`/`durability` buys for jobs and acks.

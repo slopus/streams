@@ -1,0 +1,221 @@
+---
+title: Routers
+description: Server-side fan-out rules that forward every record from one box into another — at-least-once, per-source FIFO, DAG-by-default.
+---
+
+import { Callout, Tabs } from 'nextra/components'
+
+# Routers
+
+A **router** is a server-side forwarding rule: every record appended to a `source` box is
+also appended to a `dest` box. Routers make pub/sub and multi-master fan-out safe because
+the forwarded copy keeps its origin `$node`, and [node loop-prevention](/guarantees/node-loop-prevention)
+stops a node from receiving back what it produced. Routers live in their own namespace at
+`/v0/routers` and are managed with the same idempotent `PUT`/`GET`/`DELETE` shape as boxes.
+
+## Forwarding semantics
+
+Before the endpoints, the rules that govern what a router does — these are the contract you
+design against.
+
+- **At-least-once.** The router is driven off the committed `source` log (a server-internal
+  consumer with its own cursor), so it never forwards a record that didn't durably commit
+  to `source`. It persists that forward cursor and resumes from the last durably-forwarded
+  position on restart. A crash between "appended to `dest`" and "advanced the cursor" can
+  re-forward — so **consumers must be idempotent**. There is no exactly-once mode.
+- **Per-source FIFO.** Records forwarded from one `source` into one `dest` preserve
+  `source` commit order. The forwarded copy gets a **fresh** `$seq` and `$ts` in `dest`
+  (its own independent log); the `dest` seq is unrelated to the source seq. If multiple
+  routers or writers feed one `dest`, its order is the interleaving by `dest` commit time —
+  only per-source FIFO is guaranteed (same as Kafka with multiple producers into one
+  partition).
+- **What carries through.** `$node` (verbatim, never rewritten when `preserve_node` — this
+  is what makes loop-prevention work across the route), `$tag` (when `preserve_tag`), `meta`,
+  and `data` pass through unchanged. Original source seq/ts are optionally preserved in
+  reserved meta `$src_box`/`$src_seq` for traceability (off by default to keep payloads lean).
+- **The destination's config governs the forward.** A forward is an ordinary append into
+  `dest`, so it honors `dest`'s [durability class](/guarantees/durability): a `fsync` dest
+  advances the router cursor only after the forwarded record fsyncs; a `disk` dest
+  group-commits it; a `memory` dest persists nothing (the copy is RAM-only, exactly like a
+  direct write). `dest`'s caps and TTL apply too — TTL is measured by `dest.$ts` (forward
+  time), not source time.
+- **Deletes and node filters are per-box.** They do not propagate through a router. A
+  delete on `source` removes records from `source`, but a copy may already have been
+  forwarded to `dest`; to remove it there too, [delete](/api/deletion) on `dest`.
+- **DAG-by-default, with a hop-capped escape hatch.** Creating a router that would
+  introduce a directed cycle is rejected at creation with `409 router_cycle`. For an
+  intentional cyclic topology (an A↔B mirror) set `allow_cycle: true`; the route then uses
+  **runtime hop-cap loop-breaking** — a forwarded record carries a bounded hop counter and
+  a hop set, and a router never forwards a record whose `dest` already appears in its path
+  or whose hop budget is exhausted, so forwarding always terminates. Node-filtering prevents
+  *delivery* of your own events (correctness); the DAG/hop-cap prevents *unbounded
+  forwarding* (resource safety).
+- **Cascade on box delete.** [Deleting a box](/api/boxes) removes every router that names
+  it as `source` or `dest` — a router referencing a missing endpoint cannot exist. The
+  delete response echoes the removed router names in `routers_removed`.
+
+<Callout type="warning">
+  **Partial: forwarding is synchronous, with no background retry driver yet.** The forward
+  runs on the `source` append path. A forward into a `discard:"reject"` dest that is full
+  (or otherwise erroring) is held as **backpressure**: the router does not advance its
+  cursor and the record stays in `source`. There is currently **no background worker** that
+  retries a persistently-failing durable forward from a saved cursor, so a dest that stays
+  full or broken will **lag** behind its source until it recovers or you intervene. A
+  durable fan-out should size `dest` at least as large as `source`, or use `discard:"old"`
+  on `dest`. A durable router-backlog worker is [planned](/getting-started). The delivery
+  guarantee itself is unaffected: forwarding remains at-least-once via the source log.
+</Callout>
+
+## PUT /v0/routers/:router — create or configure a router
+
+<div className="route"><span className="verb put">PUT</span><span className="path">/v0/routers/:router</span></div>
+
+Create a router, or update an existing one. Idempotent and upsertable, exactly like
+[box create](/api/boxes): an identical `PUT` is a no-op `200`, a changed `PUT` applies the
+diff, a new one returns `201`.
+
+**Path** — `:router`, same charset as box names (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$`, plus
+`>` is allowed for the `"<source>-><dest>"` convention). Case-sensitive, byte-exact.
+
+**Request body**
+
+```json
+{ "source": "jobs", "dest": "audit",
+  "preserve_node": true, "preserve_tag": true,
+  "create_dest": true, "filter": null, "allow_cycle": false }
+```
+
+| Field | Type | Req? | Default | Meaning |
+|---|---|---|---|---|
+| `source` | string | yes | — | Source box; records appended here are forwarded. |
+| `dest` | string | yes | — | Destination box; must differ from `source`. |
+| `preserve_node` | bool | no | `true` | Keep the original `$node` on forwarded records (required for loop prevention across the fan-out). `false` clears it. |
+| `preserve_tag` | bool | no | `true` | Keep `$tag` (so a tag delete can be applied at the dest too). |
+| `create_dest` | bool | no | `true` | Auto-create `dest` if absent. `false` ⇒ `404` if missing. |
+| `filter` | tuple \| null | no | `null` | Optional forward-time filter, same tuple language as [delete](/api/deletion) — e.g. `["tag","Glob","public:*"]`. `null` = forward all. |
+| `allow_cycle` | bool | no | `false` | If `false`, a router that would introduce a directed cycle is rejected `409 router_cycle` (DAG-by-default). If `true`, the route is permitted and runtime hop-cap loop-breaking applies instead (for intentional A↔B multi-master). |
+
+**Response** (`201` / `200`)
+
+```json
+{ "router": "jobs->audit", "created": true,
+  "source": "jobs", "dest": "audit",
+  "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
+  "performance": { "server_total_ms": 0.20 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `router` | The router name (the path you addressed). |
+| `created` | `true` only when this call brought the router into existence. |
+| `source` / `dest` | The configured endpoints. |
+| `preserve_node` / `preserve_tag` / `filter` / `allow_cycle` | The resolved config, echoed back. |
+
+**Errors**
+
+| `error.code` | When |
+|---|---|
+| `invalid_request` | Missing `source`/`dest`, `source == dest`, or a malformed `filter` tuple (`400`). |
+| `box_not_found` | `create_dest:false` and `dest` is absent (`404`). |
+| `router_cycle` | The router would close a directed cycle and `allow_cycle` is `false`; `error.detail.cycle` carries the path, e.g. `["A","B","A"]` (`409`). |
+| `forbidden` | The key lacks the `admin` scope, or `source`/`dest` falls outside its prefix allowlist (`403`). |
+
+## GET /v0/routers/:router — get a router
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/routers/:router</span></div>
+
+Read a single router's config plus a lifetime forward counter.
+
+**Response** (`200`)
+
+```json
+{ "router": "jobs->audit", "source": "jobs", "dest": "audit",
+  "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
+  "forwarded_total": 480231,
+  "performance": { "server_total_ms": 0.04 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `forwarded_total` | Records forwarded by this router since it was created. |
+
+**Errors** — `404 router_not_found` if absent; `403 forbidden` (lacks `read` scope or outside the prefix allowlist).
+
+## GET /v0/routers — list routers
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/routers</span></div>
+
+Enumerate routers, opaque-cursor paginated and filterable by `source`/`dest`.
+
+**Query** — `prefix` (string), `source` (string), `dest` (string), `page_size` (default
+`100`, max `1000`), `cursor` (opaque). The result set is filtered to the key's prefix
+allowlist, so a prefix-limited key cannot enumerate cross-tenant routers.
+
+**Response** (`200`)
+
+```json
+{ "routers": [
+    { "router": "jobs->audit",  "source": "jobs", "dest": "audit",  "forwarded_total": 480231 },
+    { "router": "jobs->mirror", "source": "jobs", "dest": "mirror", "forwarded_total": 480231 }
+  ],
+  "next_cursor": "eyJhZnRlciI6ImpvYnMtPmF1ZGl0In0=",
+  "performance": { "server_total_ms": 0.09 } }
+```
+
+`next_cursor` is **present only when more pages exist** — its absence means the last page.
+Pass it back as `?cursor=`.
+
+**Errors** — `400 invalid_request` (malformed/corrupt cursor).
+
+## DELETE /v0/routers/:router — delete a router
+
+<div className="route"><span className="verb delete">DELETE</span><span className="path">/v0/routers/:router</span></div>
+
+Stop forwarding immediately and remove the router. Idempotent. Already-forwarded records in
+`dest` are **untouched** — forwarding is a copy, not a link.
+
+**Response** (`200`)
+
+```json
+{ "router": "jobs->audit", "deleted": true, "performance": { "server_total_ms": 0.06 } }
+```
+
+Deleting an absent router returns `200` with `"deleted": false`.
+
+<Callout type="info">
+  You rarely delete routers by hand to tear down a topology. [Deleting a box](/api/boxes)
+  cascades to every router that references it as `source` or `dest`, and the box-delete
+  response lists the removed routers in `routers_removed`.
+</Callout>
+
+**Errors** — `403 forbidden` (lacks `delete` scope or outside the prefix allowlist).
+
+## Example: mirror a queue into an audit log
+
+A router copies every record appended to `jobs` into `audit`, at-least-once and per-source
+FIFO. The origin `$node` rides through untouched.
+
+<Tabs items={['curl', 'Response']}>
+  <Tabs.Tab>
+```bash
+curl -X PUT localhost:4000/v0/routers/jobs-to-audit \
+  -H 'content-type: application/json' \
+  -d '{ "source": "jobs", "dest": "audit" }'
+```
+  </Tabs.Tab>
+  <Tabs.Tab>
+```json
+{ "router": "jobs-to-audit", "created": true,
+  "source": "jobs", "dest": "audit",
+  "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
+  "performance": { "server_total_ms": 0.20 } }
+```
+  </Tabs.Tab>
+</Tabs>
+
+## See also
+
+- [Pub/Sub guide](/guides/pubsub) — fan one feed out to many consumers with routers.
+- [Multi-master guide](/guides/multi-master) — symmetric N-node topologies that don't echo.
+- [Node loop-prevention](/guarantees/node-loop-prevention) — why preserving `$node` is what makes fan-out safe.
+- [Boxes API](/api/boxes) — the `dest` config that governs a forward.

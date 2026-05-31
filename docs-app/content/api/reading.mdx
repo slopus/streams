@@ -1,0 +1,174 @@
+---
+title: Reading (diff)
+description: Consume a box from a seq cursor with POST /v0/boxes/:box/diff — the cursor is the ack, skipped records still advance, and involuntary loss surfaces as a tombstone.
+---
+
+import { Callout } from 'nextra/components'
+
+# Reading (diff)
+
+The core consume operation. Given a cursor `from_seq`, the diff returns the records after
+it (bounded to a batch), a continuation cursor, the current watermarks, and any
+[tombstone](/guarantees/tombstones). The monotonic `$seq` **is** the cursor — there is no
+opaque token and the server keeps no per-consumer state on this path. Advancing your stored
+`from_seq` is the ack.
+
+This page covers the diff request body, the response fields, the two rules that make the
+cursor model work (the cursor is the ack; skipped records still advance), and the tombstone
+shape. It is a `POST` because the operation is described by the JSON body; it is read-only
+and safe to retry.
+
+## POST /v0/boxes/:box/diff — read from a cursor
+
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:box/diff</span></div>
+
+Return records with `$seq > from_seq`, ascending, bounded to `limit`, after skipping
+TTL-expired, deleted, and own-node records at read time. Bumps the box's auto-priority
+recency clock.
+
+### Request body
+
+```bash
+curl -X POST localhost:4000/v0/boxes/jobs/diff \
+  -H 'content-type: application/json' \
+  -d '{
+        "from_seq": 479100,
+        "limit": 500,
+        "node": "worker-eu-1",
+        "include_tags": false,
+        "include_meta": true,
+        "wait_ms": 0
+      }'
+```
+
+```json
+# → 200 OK
+{
+  "box": "jobs",
+  "records": [
+    { "$seq": 479101, "$ts": 1748450001000, "$node": "worker-us-2",
+      "data": { "type": "resize", "url": "s3://b/x.png" }, "meta": { "trace": "z9" } },
+    { "$seq": 479102, "$ts": 1748450001050,
+      "data": { "type": "thumbnail", "url": "s3://b/y.png" } }
+  ],
+  "next_from_seq": 479102,
+  "head_seq": 480234,
+  "earliest_seq": 479101,
+  "caught_up": false,
+  "tombstone": null,
+  "lag": 1132,
+  "performance": { "server_total_ms": 0.30, "records_scanned": 134 }
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `from_seq` | `u64` | `0` | Exclusive lower bound: return records with `$seq > from_seq`. `0` = from the earliest retained. To tail, pass the current `head_seq`. |
+| `limit` | `u32` | `256` | Max records this call. Clamped to `STREAMS_MAX_LIMIT` (`1000`), not rejected. `0` ⇒ default. |
+| `node` | string \| array | none | Node loop-prevention filter: records whose `$node` is in this set are omitted (but still advance the cursor). Pass an array to filter several of your own identities. |
+| `include_tags` | bool | `false` | Include `$tag` on each returned record. |
+| `include_meta` | bool | `true` | Include each record's `meta`. |
+| `wait_ms` | `u32` | `0` | Long-poll: if nothing is available, block up to this many ms for new records. Clamped to `30000`. The XREAD `BLOCK` analog — [SSE watch](/api/watch) is preferred for true streaming. |
+
+### Response
+
+| Field | Type | Meaning |
+|---|---|---|
+| `records` | array | Up to `limit` records with `$seq > from_seq`, ascending, after skipping TTL-expired, deleted, and own-node records. `$tag` appears only if `include_tags`; `meta` only if `include_meta`; `$node` only when set on the record. |
+| `next_from_seq` | `u64` | Pass back as `from_seq`. Equals the `$seq` of the last **examined** record (filtered records still advance it), so filtered records are never re-scanned. |
+| `head_seq` | `u64` | Highest assigned seq (the log end). For lag math. |
+| `earliest_seq` | `u64` | First currently-live seq (the retained floor) — for fall-off detection. `head_seq + 1` when the box is empty. |
+| `caught_up` | bool | `true` when `next_from_seq == head_seq`. The reliable "no more right now" signal. |
+| `tombstone` | object \| `null` | A gap marker (see below) for involuntary cap/TTL loss, or `null`. |
+| `lag` | `u64` | `head_seq - next_from_seq` — records still behind your cursor. |
+| `performance` | object | Timing block; `records_scanned` counts seqs examined (including silently skipped ones). |
+
+## The cursor is the ack
+
+The default consume model is **cursor-advance = ack-all** (the Kafka offset / NATS `AckAll`
+model): advancing your stored `from_seq` past seq N acks records `1..N`. The client owns its
+cursor; the server keeps **no** per-consumer state on the diff path. There is no opaque
+token to manage and no separate ack call — you persist `next_from_seq` and pass it back.
+
+<Callout type="info">
+  Per-message explicit-ack with leases and visibility timeouts is a different model. For
+  that, use a [queue box](/api/queues) (`type:"queue"`) and the claim/ack/nack/extend
+  endpoints, which layer lease-based at-least-once delivery on the same log.
+</Callout>
+
+## Skipped records still advance the cursor
+
+Node-filtered, deleted, and TTL-expired records are **omitted from `records`** but
+`next_from_seq` advances **past** them. Otherwise a consumer reading a box full of its own
+(node-filtered) events would loop forever.
+
+So `records.length` may be less than the number of seqs traversed, and may even be `0` while
+`next_from_seq` advanced. The takeaway:
+
+<Callout type="warning">
+  **`caught_up` — never `records.length == 0` — is the reliable "no more right now"
+  signal.** An empty `records` array with `caught_up: false` just means this batch was
+  entirely filtered; keep reading from the new `next_from_seq`. See
+  [Ordering & cursors](/guarantees/ordering-and-cursors).
+</Callout>
+
+## Tombstone / gap markers
+
+If `from_seq + 1` fell below the **involuntary** floor — records were evicted (cap) or
+expired (TTL) before you read them — the response carries a `tombstone` object and resumes
+from `earliest_seq`. The tombstone is an in-band `200` signal with the exact lost range; it
+is **never** an HTTP error, and there is at most one per response (the gap is always a single
+contiguous range).
+
+```json
+{
+  "box": "jobs",
+  "records": [ { "$seq": 479101, "$ts": 1748450001000, "data": { "...": "..." } } ],
+  "tombstone": {
+    "gap_from": 478501,
+    "gap_to": 479100,
+    "reason": "cap",
+    "missed_estimate": 600,
+    "earliest_seq": 479101,
+    "head_seq": 480234
+  },
+  "next_from_seq": 479200,
+  "head_seq": 480234,
+  "earliest_seq": 479101,
+  "caught_up": false
+}
+```
+
+| `tombstone` field | Meaning |
+|---|---|
+| `gap_from` | First missing seq (= the stale `from_seq + 1`). |
+| `gap_to` | Last missing seq (= `earliest_seq - 1`). The lost range `[gap_from, gap_to]` is inclusive at both ends. |
+| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), or `"recreated"` (box was deleted then recreated). Best-effort/informational — the **range is authoritative**. |
+| `missed_estimate` | Approximate count of dropped records (approximate because eviction is segment-granular). |
+| `earliest_seq` / `head_seq` | Current watermarks, echoed for convenience. |
+
+<Callout type="important">
+  **Deletion is silent and never tombstones.** A purely-deleted gap (below `earliest_seq`
+  but at or above the involuntary `evict_floor`) reads silently with `tombstone: null` — the
+  cursor simply advances past the deleted seqs. Tombstones are reserved for involuntary
+  cap/TTL loss you did not ask for. See [Tombstones](/guarantees/tombstones) and
+  [Deletion](/guarantees/deletion).
+</Callout>
+
+The same gap is emitted over a live stream as an `event: tombstone` frame — see
+[Watch (SSE)](/api/watch).
+
+### Errors
+
+| `error.code` | HTTP | When |
+|---|---|---|
+| `invalid_request` | `400` | Type errors only. `wait_ms` and `limit` over their max are **clamped**, not errored. |
+| `box_not_found` | `404` | The box does not exist (diff never auto-creates). |
+| `throttled` | `429` | Elastic throttle under CPU pressure (carries `Retry-After`). See [Errors](/api/errors). |
+
+## See also
+
+- [Tombstones](/guarantees/tombstones) — the dual watermark and the exact tombstone trigger.
+- [Ordering & cursors](/guarantees/ordering-and-cursors) — why `caught_up` is the done signal.
+- [Watch (SSE)](/api/watch) — the same data, pushed live over a multiplexed stream.
+- [Writing Records](/api/writing) — produce the records you consume here.

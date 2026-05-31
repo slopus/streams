@@ -1,0 +1,92 @@
+name: Deploy docs to GitHub Pages
+
+# Builds the Nextra docs site in `docs-app/` as a static export and publishes it
+# to GitHub Pages. Runs on pushes to `main` that touch the docs (or this
+# workflow), and on demand from the Actions tab.
+#
+# One-time setup: in the repo Settings → Pages, set "Build and deployment →
+# Source" to "GitHub Actions". A project site is served under
+# `https://<owner>.github.io/<repo>/`; `actions/configure-pages` derives the
+# correct base path automatically (and yields an empty base path if you later
+# attach a custom domain).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs-app/**'
+      - '.github/workflows/docs-pages.yml'
+  workflow_dispatch:
+
+# GITHUB_TOKEN permissions for all jobs: read the repo, publish to Pages, and
+# mint the OIDC token the deploy step needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one concurrent deploy; don't cancel an in-progress one (let it finish).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build static export
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs-app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so Nextra can read per-page git timestamps
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: docs-app/package-lock.json
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        # Derives steps.pages.outputs.base_path: "/<repo>" for a project site,
+        # or "" for a user/org or custom-domain site. enablement turns Pages on
+        # if it isn't already (requires Pages enabled for the repo).
+        with:
+          enablement: true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build static site
+        env:
+          EXPORT: 'true'
+          NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: npm run build
+
+      - name: Build search index (Pagefind)
+        run: npx --yes pagefind --site out
+
+      - name: Disable Jekyll (serve _next / _pagefind dirs)
+        run: touch out/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-app/out
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

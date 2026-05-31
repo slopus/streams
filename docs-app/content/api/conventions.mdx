@@ -1,0 +1,286 @@
+---
+title: Conventions
+description: The cross-cutting rules of the /v0 API — versioning, auth, content types, the $-metadata convention, error body, status codes, cursors, idempotency, and the Box config object.
+---
+
+import { Callout } from 'nextra/components'
+
+# Conventions
+
+These are the rules every `/v0` endpoint shares, specified once so the per-area reference
+pages can stay short. Read this page once and the rest of the API is predictable: a JSON
+body in, a JSON body out, a stable `error.code` on failure, a `performance` block on every
+response, and the monotonic `$seq` as the cursor.
+
+## Base URL & versioning
+
+```
+http://{host}:{port}/v0/...
+```
+
+The API version is the **first path segment** (`/v0`). The default bind is
+`127.0.0.1:4000`, so a local server is `http://localhost:4000/v0/...`. There is no region
+or tenant in the host — streams is single-machine.
+
+Breaking changes would ship as a new prefix (`/v1`) that may run concurrently. Within a
+version, all changes are **additive**: new optional request fields, new response fields,
+new endpoints. **Clients must ignore unknown response fields** — that is the forward-compat
+contract.
+
+## Auth
+
+```
+Authorization: Bearer <API_KEY>
+```
+
+A plain bearer token. Keys are supplied at startup via `STREAMS_API_KEYS`
+(comma-separated). A missing or unknown key returns `401 unauthorized`. If the server starts
+with **no** keys configured, auth is disabled (single-tenant dev mode) and the header is
+ignored — logged loudly at boot. The default loopback bind keeps that dev mode safe; a
+non-loopback bind with no keys **refuses to start** unless you set
+`STREAMS_ALLOW_INSECURE_NO_AUTH=1`.
+
+Keys are **hashed at rest** (SHA-256) — only the digest is kept in memory, never the
+plaintext, which is zeroized after parse and never logged. The comparison is
+**constant-time**, so it leaks neither which key nor how many leading bytes matched. A key
+**may** additionally carry a scope set (`read` / `write` / `delete` / `admin`) and a
+box-name **prefix allowlist**; a request that authenticates but lacks the required scope, or
+names a box outside its allowlist, returns `403 forbidden`.
+
+<Callout type="info">
+  Scopes, the prefix allowlist, key hashing, and the per-route requirements are documented
+  in full on [Security](/deployment/security). Each endpoint page also notes the scope it
+  requires.
+</Callout>
+
+<Callout type="warning">
+  streams speaks **plain HTTP** and does not terminate TLS. Bearer keys are secrets: a token
+  sent over plain HTTP, or in a URL query string, can be observed in transit or in logs. For
+  any non-loopback exposure, run behind a TLS-terminating reverse proxy. See
+  [Security](/deployment/security).
+</Callout>
+
+## Content types & encoding
+
+- **Request bodies** require `Content-Type: application/json; charset=utf-8` on every
+  `POST`/`PUT` with a body. A wrong or missing type returns `415 unsupported_media_type`.
+- **Response bodies** are `application/json`, except the SSE stream, which is
+  `text/event-stream`.
+- **`data` payloads** are arbitrary JSON (object, array, string, number, bool, null), stored
+  and returned **verbatim** — never parsed, indexed, or validated for shape. For binary,
+  put a base64 string in `data` and a hint in `meta`.
+- **Compression** is honored both ways (`Accept-Encoding: gzip` / `Content-Encoding: gzip`)
+  but off by default — on a local-NVMe single-machine deployment the bottleneck is CPU, not
+  bandwidth. Enable it only for large bulk writes over a slow link.
+- **Timestamps and durations** are integer **milliseconds** (`$ts`, `*_ms`). There are no
+  string dates anywhere.
+- **`$seq`** is a `u64` rendered as a JSON number. It fits in an IEEE-754 double well beyond
+  any single-machine box lifetime; clients SHOULD still parse as a 64-bit integer.
+
+## The `$`-prefixed metadata convention
+
+Server-computed, per-record metadata is returned under `$`-prefixed keys so it can never
+collide with your content. `data` and `meta` are **your** namespaces (pure passthrough, same
+key in both directions). On **write**, you set `node`/`tag` as plain top-level keys; on
+**read**, the server echoes them as `$node`/`$tag` to signal they are now server-canonical
+and immutable.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `$seq` | `u64` | Server-assigned sequence id. |
+| `$ts` | `i64` (ms) | Server commit time. |
+| `$node` | `string` | Origin node id supplied by the writer (loop prevention). Omitted when absent. |
+| `$tag` | `string` | Tag supplied by the writer (deletion-match key). Omitted when absent. |
+| `$type` | `string` | `"record"` (default, omitted on plain records) or `"tombstone"`. Used in SSE framing. |
+
+`$node`, `$tag`, and `meta` are **omitted** from a response object when absent — absence,
+not `null`. `data` is always present (and may be JSON `null`).
+
+## The canonical error body
+
+Every non-2xx response (except in-stream SSE errors) carries this exact shape:
+
+```json
+{
+  "error": {
+    "code": "box_not_found",
+    "message": "box \"jobs\" does not exist",
+    "detail": { "box": "jobs" }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `error.code` | Stable, machine-readable snake_case string. **Branch on this.** |
+| `error.message` | Human-readable; may change between versions; never parse it. |
+| `error.detail` | Optional structured context. May be absent. |
+
+Success responses carry **bare data** — there is no `{"status":"ok"}` envelope. The presence
+of a top-level `error` key is the only success/failure discriminator.
+
+<Callout type="important">
+  **Tombstones and gaps are NOT errors.** Cap eviction and TTL expiry surface as in-band
+  `200` payload signals — a `tombstone` object in a diff, an `event: tombstone` frame in SSE.
+  Data loss is always explicit but never an HTTP error. See [Tombstones](/guarantees/tombstones).
+</Callout>
+
+## Status codes
+
+| Code | Meaning | `error.code` examples |
+|---|---|---|
+| `200` | OK (read, idempotent write / create / delete) | — |
+| `201` | Created (box / router created on this call) | — |
+| `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large` |
+| `401` | Missing / invalid bearer token | `unauthorized` |
+| `403` | Authenticated but lacks the required scope, or name is outside the prefix allowlist | `forbidden` |
+| `404` | Box / router does not exist (and was not auto-created) | `box_not_found`, `router_not_found` |
+| `405` | Wrong method for path | `method_not_allowed` |
+| `406` | `Accept` is not `text/event-stream` on an SSE GET | `not_acceptable` |
+| `409` | Conflict: router cycle, config conflict, queue op on a non-queue box | `router_cycle`, `box_exists_incompatible`, `box_not_empty`, `not_a_queue` |
+| `413` | Body exceeds the server hard limit (pre-parse) | `payload_too_large` |
+| `415` | Wrong / missing `Content-Type` | `unsupported_media_type` |
+| `422` | Semantically invalid (write to a full `discard:"reject"` box) | `box_full` |
+| `429` | Elastic throttle under CPU pressure, **or** a resource cap reached | `throttled` |
+| `500` | Internal error (a bug) | `internal` |
+| `503` | Not ready (WAL replay on boot) / shutting down | `not_ready`, `shutting_down` |
+
+`429 throttled` carries a `Retry-After` header. A CPU-pressure throttle adds
+`error.detail.retry_after_ms`; a resource-cap rejection adds `error.detail.limit`. `503`
+also carries `Retry-After`. The full list lives on [Errors](/api/errors).
+
+<Callout type="info">
+  Bulk writers that prefer to push through CPU-pressure backpressure may set
+  `"disable_backpressure": true` in the write body (a trusted-loader opt-out): the server then
+  admits the write but may queue it, trading latency for not failing. See [Writing](/api/writing).
+</Callout>
+
+## Pagination & cursors
+
+Three cursor styles for three read shapes — do not mix them up:
+
+1. **Box reads are seq-cursored, not opaque.** The cursor **is** `from_seq`. `POST .../diff`
+   returns `next_from_seq`; you pass it back. When fully caught up, `next_from_seq ==
+   head_seq` and `"caught_up": true`. The server always returns `next_from_seq`; `caught_up`
+   is the "done for now" flag — for a live log, "done for now" is not "done forever".
+2. **List endpoints use opaque cursors.** `GET /v0/boxes` and `GET /v0/routers` return
+   `next_cursor` (opaque base64), **present only when more pages exist** — its absence means
+   the last page. Pass it back as `?cursor=`. `page_size` defaults to `100`, max `1000`.
+3. **SSE uses a composite cursor.** The multiplex watch encodes the per-box `(box → seq)`
+   positions as a base64url-encoded JSON map, usable as both `Last-Event-ID` and the request
+   `cursor` field. See [Watch](/api/watch).
+
+<Callout type="important">
+  On a diff read, **`caught_up` — not `records.length` — is the reliable "no more right now"
+  signal.** Node-filtered, deleted, and TTL-expired records advance `next_from_seq` without
+  appearing in `records`, so a response can carry zero records while the cursor moved forward.
+  See [Ordering & Cursors](/guarantees/ordering-and-cursors).
+</Callout>
+
+## Idempotency
+
+Two complementary mechanisms; there is no global idempotency-token service.
+
+1. **The control plane is idempotent by construction.** Create / configure is `PUT` and
+   upsertable: an identical `PUT` is a no-op `200`; a changed `PUT` applies the diff. A
+   `DELETE` of an absent resource returns `200` with `"deleted": false`.
+2. **Writes use an optional `idempotency_key`.** If supplied, the server remembers `(box,
+   idempotency_key) → assigned seqs` for `idempotency_window_ms` (default `120000`, per box).
+   A retried write with the same key in-window returns the **original** seqs with
+   `"deduped": true` and does **not** append again. The key may also be sent as the
+   `Idempotency-Key:` header (the body field wins).
+
+<Callout type="info">
+  A log has no "old value," so a dedup key — not a compare-and-set condition — is the right
+  primitive for safe append retries. See [Idempotency](/guarantees/idempotency).
+</Callout>
+
+## The `performance` block
+
+Every JSON response (and most errors) includes a `performance` object, so latency
+observability lives in the response, not a side channel:
+
+```json
+"performance": {
+  "server_total_ms": 0.41,
+  "wal_append_ms": 0.12,
+  "fsync_ms": 0.0,
+  "records_scanned": 128,
+  "throttle_wait_ms": 0.0
+}
+```
+
+| Field | When present | Meaning |
+|---|---|---|
+| `server_total_ms` | always | Total server-side handling time in ms. |
+| `wal_append_ms` | write paths | Time to append the WAL frame; `0` for `memory`-class boxes. |
+| `fsync_ms` | durable write paths | Time parked on the group fsync; `0` for `memory`/`disk` classes. |
+| `records_scanned` | read paths | Records examined (including filtered ones). |
+| `throttle_wait_ms` | under pressure | Time parked behind the elastic scheduler. |
+| `cold_segments_read` | cold reads | Cold-tier segments touched to satisfy the read. |
+
+Fields are best-effort and additive; clients must tolerate any subset. See
+[Performance](/how-it-works/performance) for how these numbers are produced.
+
+## The Box config object
+
+This object appears in box-create requests and box-state responses. All fields are optional
+on create; an omitted field takes the documented default. An empty `{}` creates an
+all-default box.
+
+```json
+{
+  "type": "log",
+  "ttl_ms": 0,
+  "cap_records": 0,
+  "cap_bytes": 0,
+  "discard": "old",
+  "durable": false,
+  "durability": "disk",
+  "priority": null,
+  "auto_priority": true,
+  "auto_create": true,
+  "idempotency_window_ms": 120000,
+  "dedupe_node": true,
+  "lease_ms": 30000,
+  "claim_jitter_ms": 0,
+  "max_deliveries": 0,
+  "dead_letter": null,
+  "leases_durable": false
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | `"log" \| "queue"` | `"log"` | Box kind. `"log"` is the plain append-only log. `"queue"` additionally enables the claim / ack / nack / extend / work endpoints. The five queue-tuning fields below are only meaningful when `type:"queue"` (accepted but inert on a log). **`type` is immutable** — a `PUT` changing it returns `409 box_exists_incompatible`. |
+| `ttl_ms` | `u64` | `0` (off) | Records older than this (by `$ts`) are not delivered. `0` = no TTL. Crossing a consumer's cursor yields a tombstone. |
+| `cap_records` | `u64` | `0` (off) | Max retained record count. On overflow the box evicts per `discard`. `0` = unbounded. |
+| `cap_bytes` | `u64` | `0` (off) | Max retained payload bytes. `0` = unbounded. Whichever of `cap_records`/`cap_bytes` is hit first triggers eviction. |
+| `discard` | `"old" \| "reject"` | `"old"` | Full-box policy. `old` = evict oldest (pub/sub friendly). `reject` = refuse the write with `422 box_full` so durable queues fail loudly rather than drop unconsumed work. |
+| `durable` | `bool` | `false` | Back-compat alias for `durability`. On create: `true` ⇒ class `fsync`, `false` ⇒ class `disk` (consulted only when `durability` is absent). On every response it is reported as `durable == (durability == "fsync")`. Prefer `durability`. |
+| `durability` | `"memory" \| "disk" \| "fsync"` | resolved from `durable` | The commit class. `memory`: never written to the WAL, pure RAM, fastest, **records lost on restart** (the box reappears empty, `head_seq` resets to `0`, config persists). `disk`: WAL + group commit, acked on frame enqueue (not fsync-gated), survives a crash minus the un-fsynced tail. `fsync`: ack is fsync-gated, survives any crash. An explicit `durability` always wins; otherwise derived from `durable`. `memory` is reachable only by setting `durability:"memory"` explicitly. |
+| `priority` | `i32 \| null` | `null` | Manual delivery priority (higher served first under pressure), clamped `[-1000, 1000]`. `null` ⇒ use auto-priority. |
+| `auto_priority` | `bool` | `true` | When `priority` is `null`, derive effective priority from recency of the last read / SSE / state call on this box. A manual `priority` always overrides. |
+| `auto_create` | `bool` | `true` | Whether a write to this box name may lazily create it. A per-write `create` flag can override downward. |
+| `idempotency_window_ms` | `u64` | `120000` | How long `(box, idempotency_key)` dedupe state is retained. |
+| `dedupe_node` | `bool` | `true` | Whether node loop-prevention filtering is enabled on reads of this box. Exposed so a box can opt out of node filtering entirely. |
+| `lease_ms` | `u64` | `30000` | **Queue only.** Default lease (visibility-timeout) duration for a claim, clamped `[100, 86400000]`. A per-claim `lease_ms` overrides it. |
+| `claim_jitter_ms` | `u64` | `0` (greedy) | **Queue only.** Coalescing-window width, clamped `[0, 5000]`. `0` = serve each claim immediately. `>0` = gather the cohort of claimers in the window and divide jobs evenly. |
+| `max_deliveries` | `u64` | `0` (off) | **Queue only.** Dead-letter a job after this many deliveries without an ack. `0` = unlimited redelivery. |
+| `dead_letter` | `string \| null` | `null` | **Queue only.** Box to move a job to when it exceeds `max_deliveries`. `null` = no dead-letter box. Must differ from this box. |
+| `leases_durable` | `bool` | `false` | **Queue only.** Durability of the *leases* log. Defaults `false` because losing leases on a crash is self-healing — in-flight jobs simply become claimable again. The *jobs* log durability is governed by `durable`; **ack durability == box durability**. |
+
+<Callout type="important">
+  Never compute a box's retained floor from `head_seq - cap_records`. Eviction is
+  segment-granular and lazy (it may transiently exceed the cap), and deletes advance
+  `earliest_seq` independently. Read `earliest_seq` from the server. See [Boxes](/api/boxes)
+  and [Tombstones](/guarantees/tombstones).
+</Callout>
+
+## See also
+
+- [API Reference overview](/api) — the full endpoint index.
+- [Boxes](/api/boxes) — the box lifecycle endpoints that use this config object.
+- [Errors](/api/errors) — the complete `error.code` → HTTP-status catalog.
+- [Security](/deployment/security) — auth, scopes, and the prefix allowlist in full.
+- [Durability](/guarantees/durability) — the `memory`/`disk`/`fsync` commit classes.

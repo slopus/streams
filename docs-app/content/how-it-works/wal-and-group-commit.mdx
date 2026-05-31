@@ -1,0 +1,193 @@
+---
+title: WAL & Group Commit
+description: The write-ahead log frame format, the single writer thread, adaptive group commit, and off-lock fsync — how an acked durable write is guaranteed to be on disk.
+---
+
+import { Callout } from 'nextra/components'
+
+# WAL & Group Commit
+
+The **write-ahead log** is the durability boundary of streams: an acknowledged write to a
+durable box is a complete, checksum-valid frame on disk, and recovery loses only data that
+never reached the WAL. This page covers the frame format, the control-frame timeline, the
+single writer thread fed by an MPSC channel, the adaptive group-commit window, and the
+off-lock fsync that lets many concurrent writers coalesce into one flush.
+
+The WAL is **process-global** — one ordered append stream for every box. That is a
+deliberate match to the hardware: the disk is a single sequential resource, so a single
+ordered stream maximizes append throughput, makes group commit trivial, and removes
+write-side lock contention.
+
+## Frame format
+
+Every record and every control mutation is a length-prefixed, checksum-protected frame.
+Multi-byte integers are little-endian. A multi-record write produces many frames committed
+as one batch.
+
+```text
+ off  size  field
+   0    4   frame_len   u32   bytes of this frame EXCLUDING this field
+   4    1   type        u8    1=Append 2=BoxCreate 3=BoxDelete 4=RouterCreate
+                                5=RouterDelete 6=Delete 7=EvictWatermark
+                                8=CheckpointMark 9=ConfigUpdate
+   5    1   flags       u8    bit0=has_tag bit1=has_node bit2=durable
+   6    4   box_id      u32   interned numeric box id (name<->id in the meta store)
+  10    8   seq         u64   server-assigned (0 for non-Append control frames)
+  18    8   ts          u64   server commit ms
+  26    2   node_len    u16
+  28    2   tag_len     u16
+  30    4   data_len    u32
+  34    N   node        bytes (node_len)
+   .    M   tag         bytes (tag_len)
+   .    P   data+meta   bytes (data_len)   -- opaque JSON payload
+   .    8   xxh3        u64   XXH3-64 over bytes [4 .. checksum_start)
+```
+
+Three properties make this crash-safe:
+
+- **`frame_len` comes first.** Recovery can validate frame boundaries without parsing the
+  body. A `frame_len` that overruns the file is a torn tail — the write was interrupted —
+  so the log ends there.
+- **XXH3-64, not CRC32.** The 8-byte trailer is an [XXH3-64](https://github.com/Cyan4973/xxHash)
+  hash over everything between `frame_len` and the checksum. It is fast and 64-bit, with
+  roughly 2³² lower false-accept than a 32-bit CRC. A mismatch means a torn or partial
+  frame — the logical end of the log. This is the crash-consistency anchor.
+- **`box_id` is an interned `u32`,** not the string name, so frames stay small; the name↔id
+  mapping lives in the [metadata store](/how-it-works/segments-and-snapshots).
+
+<Callout type="info">
+  The same XXH3-64 checksum protects WAL frames, segment frames, and metadata snapshots —
+  one integrity scheme across the whole on-disk format. On the **WAL** a checksum mismatch
+  means a torn tail and the log is truncated; on a **sealed segment** it means corruption,
+  which is surfaced rather than silently truncated. See
+  [Crash Recovery](/how-it-works/recovery).
+</Callout>
+
+## Control frames: one ordered timeline
+
+The WAL is not just record data. Config changes, deletes, and eviction watermarks are all
+**control frames** on the same ordered log, so there is exactly one truth — WAL order — for
+data and metadata together. The `type` byte selects the frame:
+
+| `type` | Frame | Records |
+|---|---|---|
+| `1` | `Append` | A record write (carries `seq`, `ts`, `node`, `tag`, payload). |
+| `2` | `BoxCreate` | A box created with its config. |
+| `3` | `BoxDelete` | A box dropped. |
+| `4` | `RouterCreate` | A router defined. |
+| `5` | `RouterDelete` | A router removed. |
+| `6` | `Delete` | A permanent [delete](/guarantees/deletion) (`before_seq` and/or `match`), replayed deterministically on recovery. |
+| `7` | `EvictWatermark` | A cap/TTL watermark advance, so the tombstone boundary survives restart. |
+| `8` | `CheckpointMark` | A checkpoint barrier: which seqs are durably absorbed into segments. |
+| `9` | `ConfigUpdate` | A box config mutation. |
+
+Because a `Delete` is logged as an operation (its `before_seq` / `match` predicate) rather
+than as a list of individual seqs, recovery re-derives the deleted set from the rebuilt
+index and tag index — the removal is replayed, not stored record-by-record.
+
+## The single writer thread
+
+All appends funnel into **one WAL writer thread**, fed by a bounded MPSC channel. The
+request path does the cheap, parallel work; the writer does the one thing that must be
+serialized — touching the disk.
+
+```text
+write request (per HTTP task)
+  -> validate; resolve box_id; assign seq = head_seq.fetch_add(n)   (after a discard:"reject" cap check)
+  -> serialize frame(s) into a reusable per-writer scratch buffer
+  -> enqueue (frames, durability class, commit token) on the MPSC channel
+  -> [single WAL writer] drain the channel, write() the batch, group-commit
+  -> on commit: resolve the commit tokens; publish records into the in-memory index;
+     Notify watchers
+  -> respond { seqs, head_seq, performance }
+```
+
+The `seq` is assigned **before** the WAL commit so it can be returned in the response, but
+the record is only *visible to readers* and *acked* after its commit class is satisfied. The
+guarantee is one-directional and absolute: **if a write was acked, it is in the WAL.**
+
+## Adaptive group commit
+
+Durability is per-box, and the writer collapses two commit classes into one loop. See the
+[durability classes](/guarantees/durability) for the consumer-facing semantics.
+
+| Box class | Commit behavior |
+|---|---|
+| `disk` (`durable:false`) | The batch is `write()`-en into the page cache and acked immediately. A background `fdatasync` hardens the tail on a timer; writers never wait. Loss window on power loss = the un-fsynced tail. |
+| `fsync` (`durable:true`) | The ack is held until the group `fdatasync()` returns. Frames are still **group-committed**: the writer coalesces all pending durable frames in the current window into one `write()` + one `fdatasync()`, then acks them all. |
+
+The commit window is **adaptive** between a floor and ceiling:
+
+- **`gc_min` = 500 µs** — a lone durable write fsyncs almost immediately, so group commit
+  never penalizes a quiet workload.
+- **`gc_max` = 10 ms** — under load the window widens toward this ceiling, amortizing one
+  `fdatasync` across hundreds of durable writes.
+
+Three deliberate choices keep the fsync cost near the NVMe floor:
+
+- **`fdatasync`, not `fsync`** — no inode-metadata flush per commit.
+- **64 MiB preallocated WAL files** — the active file is `fallocate`'d to its full size up
+  front, so an append never extends the inode; the next file is preallocated ahead of
+  rotation, and rotation happens when a batch would exceed the active file's size.
+- **No `O_DIRECT`** — the page cache is wanted for fast read-back and OS write coalescing;
+  durability comes from the explicit `fdatasync`.
+
+<Callout type="info">
+  On NVMe a single `fdatasync` is roughly 50–500 µs, so a 500 µs floor barely registers when
+  quiet and the 10 ms ceiling only matters under sustained durable load — exactly when one
+  fsync is amortizing the most writes. On a laptop with an APFS NVMe the `fdatasync` floor is
+  closer to ~5 ms; that is a hardware property of the disk, not a design cost. See
+  [Performance](/how-it-works/performance).
+</Callout>
+
+## Off-lock fsync
+
+The detail that makes durable throughput hold up under concurrency is **where** the fsync
+wait happens. The per-box lock is held only for the microsecond-scale work; the slow part
+runs without it.
+
+1. **Under the per-box lock (microseconds):** assign the seq and enqueue the frame on the
+   WAL channel. This is short, so it does not serialize unrelated writers for long.
+2. **Off the lock:** the writer waits for the group `fdatasync`. Because the per-box lock is
+   already released, many concurrent writers' fsync waits **coalesce into one batch flush** —
+   the single writer turns N pending durable frames into one `write()` + one `fdatasync()`.
+3. **Publish in ticket order:** each submission holds a commit token; tokens resolve in the
+   order frames were enqueued, so a record becomes visible to readers and the response is
+   returned **in seq order**, never out of order, even though the waits overlapped.
+
+This is why a durable box can sustain far more than `1 / fsync_latency` writes per second:
+the fsyncs are shared, not serialized per-write. The measured coalescing factor is about
+**8.4×** versus a per-write baseline (see [Performance](/how-it-works/performance)).
+
+<Callout type="warning">
+  The single writer is fed by a **bounded** MPSC channel. If durable writes arrive faster
+  than the disk can flush them, that bound is the backpressure point — it shows up as
+  write-ack latency (and, at saturation, a `429 throttled`), never as silent loss. The
+  cardinal rule holds: **degrade latency, never correctness.**
+</Callout>
+
+## What survives a crash
+
+Because a frame is acked only after it is committed (and `fdatasync`'d, for a durable box),
+and because a torn or partial frame fails its `frame_len`/XXH3 check on replay, the boundary
+is exact:
+
+- **`fsync` box:** an acked write waited for `fdatasync`, so it is a complete checksum-valid
+  frame ⇒ **never lost**.
+- **`disk` box:** an acked write is in the page cache but may not be fsynced; a power loss
+  can drop the un-fsynced tail — the documented fast-path tradeoff, surfacing on read as an
+  ordinary eviction-style gap.
+- **`memory` box:** never written to the WAL at all; it reappears empty after a restart.
+
+The full replay-and-truncate procedure is in [Crash Recovery](/how-it-works/recovery).
+
+## See also
+
+- [Segments & Snapshots](/how-it-works/segments-and-snapshots) — how WAL frames are
+  checkpointed into the long-term per-box store.
+- [Crash Recovery](/how-it-works/recovery) — snapshot load, WAL replay, and torn-tail
+  truncation.
+- [Durability](/guarantees/durability) — the `memory` / `disk` / `fsync` classes from the
+  consumer's side.
+- [Performance](/how-it-works/performance) — measured fsync latency and group-commit
+  throughput.

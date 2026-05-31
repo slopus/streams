@@ -1,0 +1,214 @@
+---
+title: Segments & Snapshots
+description: How the WAL is checkpointed into per-box segment files, the .data/.idx format and seq→entry arithmetic, sealing triggers, mmap vs buffered serving, and atomic metadata snapshots.
+---
+
+import { Callout, FileTree } from 'nextra/components'
+
+# Segments & Snapshots
+
+The WAL is fast, append-ordered, and short-lived; it mixes every box's frames into one
+stream. To keep recovery bounded and reads efficient, a background **compactor**
+periodically applies WAL frames into per-box **segment files** — the long-term store and the
+read source for [diff reads](/api/reading). This page covers the checkpoint process, the
+`.data`/`.idx` segment format and its constant-time `seq → entry` arithmetic, the three
+sealing triggers, how reads choose mmap versus buffered I/O, the atomic metadata snapshot,
+and the full on-disk layout.
+
+Segments are a **derivable materialization** of the WAL — the WAL remains the durability
+boundary. Losing a segment is recoverable by replay; losing a WAL frame is not.
+
+## Checkpointing the WAL into segments
+
+The compactor runs on a timer (and on WAL rotation). For each box with new frames since its
+last checkpoint:
+
+```text
+for each box with new frames since last checkpoint:
+    append those records, in seq order, to the box's active segment file
+      (segment frames are a buffered copy of contiguous WAL byte ranges, split by
+       box — no re-serialization)
+    update the box's .idx file
+fsync the touched .data + .idx files
+write a CheckpointMark frame to the WAL (per box: highest seq checkpointed,
+     watermarks, active-segment positions); fsync the WAL
+WAL files whose every frame's seq <= the global min checkpointed seq become deletable
+```
+
+Two things make this cheap. First, a segment record frame is **byte-identical** to a WAL
+`Append` frame minus the `type` byte (every segment frame is an Append), so the compactor
+copies contiguous byte ranges rather than re-serializing records. Second, the
+`CheckpointMark` is itself checksum-protected and fsynced, so a crash anywhere in the
+checkpoint is safe: WAL frames already absorbed into segments are replayed-and-skipped on
+restart (a seq already in the segment index is ignored). See
+[Crash Recovery](/how-it-works/recovery).
+
+## Segment format: `.data` + `.idx`
+
+Each box owns a directory of numbered segment pairs, named by the segment's first seq
+(`seg-<first_seq>`, zero-padded so they sort into seq order). A segment covers a contiguous
+range `[first_seq, end_seq]`.
+
+```text
+seg-<first_seq>.data    append-ordered record frames (the §2.1 WAL Append frame minus the
+                        type byte: frame_len + flags + seq/ts + node/tag/payload + XXH3-64)
+seg-<first_seq>.idx     fixed-stride 20 bytes/entry; entry i  <=>  seq (first_seq + i)
+```
+
+The `.idx` is the on-disk twin of the in-memory location vector — a fixed **20-byte stride**
+per entry:
+
+```rust
+// One .idx entry: 20 bytes, one per seq in the segment's range.
+struct IdxEntry {
+    offset: u32, // byte offset of the record's frame within the .data file
+    len:    u32, // framed length (read one record without touching its neighbors)
+    ts:     u64, // server commit ms — kept inline for the TTL boundary binary search
+    flags:  u8,  // has_tag / has_node / deleted probe, without touching .data
+    // 3 bytes of padding to the 20-byte stride
+}
+```
+
+Because the stride is fixed, **`seq → entry` is pure arithmetic**: entry `i` lives at byte
+offset `(seq - first_seq) * 20`. No scan, no per-record index structure — a direct seek.
+Three consequences fall out of that:
+
+- **Fast restart.** Rebuilding the in-memory index is a bulk sequential read of the `.idx`
+  files, not a re-parse of all record data.
+- **Cheap TTL boundary.** The inline `ts` lets eviction binary-search the TTL crossing
+  without touching `.data`.
+- **Cheap presence probes.** The inline `flags` answer tag/node/deleted questions without a
+  data read.
+
+<Callout type="info">
+  Every `.data` frame carries an XXH3-64 checksum, the same crash anchor as the WAL. A
+  **sealed** segment is immutable, so a checksum mismatch there is genuine corruption and is
+  **surfaced** — not silently truncated the way a torn WAL tail is. Only the active (still
+  appended) segment can have a torn tail.
+</Callout>
+
+## Sealing triggers
+
+The newest segment is **active** (still appended); older segments are **sealed** and
+immutable. A segment seals when any one of three triggers fires:
+
+| Trigger | Env var | Default |
+|---|---|---|
+| Record count | `STREAMS_SEGMENT_MAX_EVENTS` | `10000` |
+| Byte size of `.data` | `STREAMS_SEGMENT_MAX_BYTES` | `67108864` (64 MiB) |
+| Age of an idle/partial segment | `STREAMS_SEGMENT_MAX_AGE_MS` | `3600000` (1 h); `0` disables |
+
+Sealing matters because it is the granularity of two lazy operations: cap/TTL eviction drops
+whole **sealed** segments whose highest seq is below `earliest_seq` (the active segment is
+never dropped), and the hot→cold relocator only ever moves sealed segments. See
+[Storage & Tiering](/deployment/storage-and-tiering).
+
+## Serving reads: mmap vs buffered
+
+A [diff read](/api/reading) is served from whichever layer still holds the record, chosen for
+locality:
+
+- **Sealed segments → mmap** (`memmap2`). The `.data` file is mapped once; each record is a
+  zero-copy slice `[offset .. offset+len]`, page-cache-backed. A diff bound-checks against
+  `evict_floor` (tombstone?) and `earliest_seq` (live floor), slices the index range, and
+  copies framed bytes out of the mmap, skipping deleted/expired/own-node slots, bounded by
+  `limit`.
+- **Active segment → buffered `pread`.** The growing file is usually still in the page cache
+  from the write, and mapping past EOF is unsafe, so the active segment is read with buffered
+  reads rather than mmap.
+- **Newest records (written, not yet checkpointed) → straight from WAL bytes,** via the same
+  location mechanism. A consumer a few milliseconds behind head reads from the WAL/page cache
+  and never waits for a checkpoint — essential to the latency target.
+
+## Metadata snapshots
+
+Box config, the name↔id map, routers, per-box watermarks, and the checkpoint lower bound
+live in a **metadata store** that mirrors the WAL philosophy: every mutation is a control
+frame in the WAL (ordered and crash-consistent with data), and a **periodic snapshot** lets
+recovery start without replaying the WAL from time zero.
+
+```rust
+// The snapshotted metadata (compact bincode). Tiny and changes rarely.
+struct Meta {
+    boxes:        HashMap<String, BoxId>,      // name -> interned u32 id (stable across restart)
+    box_cfg:      HashMap<BoxId, BoxConfig>,
+    watermarks:   HashMap<BoxId, (u64, u64)>,  // persisted (evict_floor, earliest_seq) per box
+    delete_below: HashMap<BoxId, u64>,         // max before_seq applied (snapshot delete)
+    routers:      Vec<Router>,
+    epochs:       HashMap<BoxId, u64>,         // delete+recreate detection
+    next_box_id:  u32,
+    current_wal:  String,
+    last_checkpoint_seq: u64,                  // global lower bound for WAL replay
+}
+```
+
+A snapshot is triggered when either of two thresholds is crossed:
+
+- **64 MiB of WAL bytes written** since the last snapshot, or
+- **60 seconds** elapsed.
+
+The write is **atomic**, so a crash anywhere in the sequence falls back cleanly to the
+previous snapshot:
+
+```text
+encode Meta -> write to snapshot-<n>.bin.tmp -> fsync the tmp file
+            -> rename over the final name -> fsync the directory
+            -> remove the previous snapshot (kept until the new one is durable)
+```
+
+The directory fsync after the rename is what makes the swap crash-atomic: until it returns,
+the rename may roll back on power loss, and recovery simply loads the older snapshot. The
+previous file is removed only after the new one is durably in place.
+
+<Callout type="info">
+  Deletes are **not** standing state. A permanent delete leaves no per-box rule to persist —
+  it is a one-shot `Delete` control frame, reflected immediately in the index and in the two
+  persisted watermarks plus `delete_below`. The only deletion-related runtime structure is
+  the per-box tag index used to *find* matching seqs; it is rebuilt from live records on
+  recovery, never snapshotted.
+</Callout>
+
+## On-disk layout
+
+Putting it together: the WAL is process-global (one ordered stream), while segments are
+per-box (independent eviction, per-box mmap, locality for diff reads). Box directories are
+named by the interned `box_id` (hex), never the box name — so there is no path traversal from
+a user-supplied name.
+
+<FileTree>
+  <FileTree.Folder name="streams-data" defaultOpen>
+    <FileTree.Folder name="meta" defaultOpen>
+      <FileTree.File name="snapshot-7.bin (latest atomic snapshot)" />
+      <FileTree.File name="snapshot-6.bin (previous, kept until next fsync)" />
+    </FileTree.Folder>
+    <FileTree.Folder name="wal" defaultOpen>
+      <FileTree.File name="CURRENT (names the active wal file)" />
+      <FileTree.File name="wal-0000000000001024.log (preallocated, mixed-box)" />
+      <FileTree.File name="wal-0000000000004096.log (active wal file)" />
+    </FileTree.Folder>
+    <FileTree.Folder name="boxes (HOT tier)" defaultOpen>
+      <FileTree.Folder name="0000000A (one dir per box, by box_id hex)">
+        <FileTree.File name="seg-0000000000000001.data" />
+        <FileTree.File name="seg-0000000000000001.idx (20 B/entry)" />
+        <FileTree.File name="seg-0000000000010001.data" />
+        <FileTree.File name="seg-0000000000010001.idx" />
+        <FileTree.File name="seg-0000000000020001.data (active segment) + .idx" />
+      </FileTree.Folder>
+    </FileTree.Folder>
+  </FileTree.Folder>
+</FileTree>
+
+When `STREAMS_COLD_DIR` is set, older sealed segments relocate to a mirror of the per-box
+layout under that directory, keeping the same `seg-<first_seq>` identity. When it is unset
+(the default), tiering is disabled and nothing relocates — everything stays hot, behavior
+unchanged by construction. See [Storage & Tiering](/deployment/storage-and-tiering).
+
+## See also
+
+- [WAL & Group Commit](/how-it-works/wal-and-group-commit) — the durability boundary that
+  segments materialize.
+- [Crash Recovery](/how-it-works/recovery) — snapshot load, WAL replay, and orphan-segment
+  reclaim.
+- [Storage & Tiering](/deployment/storage-and-tiering) — hot/cold tiers and the segment
+  config knobs.
+- [Configuration](/deployment/configuration) — the full `STREAMS_*` env var set.

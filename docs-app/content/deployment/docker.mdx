@@ -1,0 +1,140 @@
+---
+title: Docker
+description: Run the published multi-arch GHCR image, mount the /data volume, and understand the tag-driven release flow.
+---
+
+import { Callout, Tabs } from 'nextra/components'
+
+# Docker
+
+streams is published as a single container image to the GitHub Container Registry at
+**`ghcr.io/slopus/streams`**. The image is **multi-arch** (`linux/amd64` and
+`linux/arm64`), runs as a non-root user, and stores all durable state in a `/data` volume.
+This page covers running it and how releases are cut.
+
+## Pull and run
+
+The image binds `0.0.0.0:4000` inside the container. Because the server **refuses to start
+on a non-loopback bind with no API keys** — it would be an open, unauthenticated event
+store — you must pass either `STREAMS_API_KEYS` (any real deployment) or, for local/dev
+only, `STREAMS_ALLOW_INSECURE_NO_AUTH=1`.
+
+<Tabs items={['Production', 'Local']}>
+  <Tabs.Tab>
+```bash
+# Production: bearer auth on. Clients send `Authorization: Bearer <key>`.
+docker run --rm \
+  -p 4000:4000 \
+  -v streams-data:/data \
+  -e STREAMS_API_KEYS=replace-with-a-real-secret \
+  ghcr.io/slopus/streams:latest
+```
+
+```bash
+# → check it's up (health is always 200 once serving)
+curl -fsS http://127.0.0.1:4000/v0/health
+```
+  </Tabs.Tab>
+  <Tabs.Tab>
+```bash
+# Local / dev only: auth disabled. Never use this on a network-exposed deployment —
+# it leaves the event store open and unauthenticated.
+docker run --rm \
+  -p 4000:4000 \
+  -v streams-data:/data \
+  -e STREAMS_ALLOW_INSECURE_NO_AUTH=1 \
+  ghcr.io/slopus/streams:latest
+```
+  </Tabs.Tab>
+</Tabs>
+
+<Callout type="warning">
+  `STREAMS_ALLOW_INSECURE_NO_AUTH=1` exists only so you can run the `0.0.0.0`-binding image
+  locally without keys. On anything reachable from a network, set `STREAMS_API_KEYS`
+  instead. See [Security](/deployment/security).
+</Callout>
+
+What each flag does:
+
+| Flag | Purpose |
+|---|---|
+| `-p 4000:4000` | Maps the container's listen port (`EXPOSE 4000`) to the host. |
+| `-v streams-data:/data` | A named volume holding the WAL, segments, and snapshots. `STREAMS_DATA_DIR` defaults to `/data` in the image. |
+| `-e STREAMS_API_KEYS=...` | Comma-separated bearer keys (production). |
+| `-e STREAMS_ALLOW_INSECURE_NO_AUTH=1` | Permits a keyless start on the `0.0.0.0` bind (local/dev only). |
+
+## The /data volume
+
+The image sets `STREAMS_DATA_DIR=/data` and declares `/data` as a `VOLUME`. That directory
+holds everything durable — the WAL, sealed segment files, and snapshots. **Reuse the same
+volume across restarts** to preserve durable state; on the next start the server replays
+the WAL from `/data` and recovers acknowledged writes. A fresh empty volume is a clean
+first start.
+
+```bash
+# Inspect the durable state directory inside a running container.
+docker exec -it <container> ls -la /data
+```
+
+For the on-disk layout and optional hot→cold relocation (`STREAMS_COLD_DIR`), see
+[Storage & Tiering](/deployment/storage-and-tiering). For every tunable, see
+[Configuration](/deployment/configuration).
+
+## Image internals
+
+The image is built from a multi-stage `Dockerfile` and is deliberately minimal:
+
+- **Non-root.** The server runs as a dedicated system user (`uid 10001`) that owns `/data`.
+- **Slim runtime.** A `debian:bookworm-slim` base with only `ca-certificates` and `curl`
+  (the latter for the health check). Only the `streams` server binary is shipped — the
+  `streams-probe` test/bench CLI is excluded to keep the image lean.
+- **Defaults baked in.** `STREAMS_HOST=0.0.0.0`, `STREAMS_PORT=4000`, `STREAMS_DATA_DIR=/data`.
+- **`EXPOSE 4000`** for the listen port.
+- **`HEALTHCHECK`.** A built-in liveness probe runs `curl -fsS http://127.0.0.1:$STREAMS_PORT/v0/health`
+  every 30s (5s timeout, 10s start period, 3 retries). `/v0/health` is always 200 once the
+  process is serving.
+
+<Callout type="info">
+  The container `HEALTHCHECK` hits `/v0/health` (liveness). For orchestrator readiness —
+  gating traffic until WAL replay completes — use `/v0/ready`, which returns 503 during
+  recovery and 200 once ready. See [Running streams](/deployment) and
+  [Observability](/deployment/observability).
+</Callout>
+
+## Release flow
+
+Releases are **tag-driven**, built by GitHub Actions, and published to GHCR.
+
+1. Make sure `main` is green (CI runs build + test + clippy on every push and PR).
+2. Tag the commit with a `vX.Y.Z` version and push the tag:
+
+   ```bash
+   git tag v1.2.3
+   git push origin v1.2.3
+   ```
+
+3. The **Publish container image** workflow triggers on the `v*` tag, builds the multi-arch
+   image (`linux/amd64` + `linux/arm64`), attaches provenance and SBOM attestations, and
+   pushes it to GHCR under three tags:
+
+   | Tag | Example | Meaning |
+   |---|---|---|
+   | `:X.Y.Z` | `ghcr.io/slopus/streams:1.2.3` | The exact version. |
+   | `:X.Y` | `ghcr.io/slopus/streams:1.2` | The latest patch of a minor line. |
+   | `:latest` | `ghcr.io/slopus/streams:latest` | The newest tagged release. |
+
+You can also trigger the workflow manually from the Actions tab (`workflow_dispatch`); a
+manual run is tagged with the short commit SHA instead of a version. The workflow uses the
+built-in `GITHUB_TOKEN` with `packages: write`, so no extra secrets are required.
+
+<Callout type="info">
+  Pin a specific `:X.Y.Z` (or `:X.Y`) tag in production for reproducible deploys; reserve
+  `:latest` for evaluation.
+</Callout>
+
+## See also
+
+- [Running streams](/deployment) — start, recovery, binding, and graceful shutdown.
+- [Configuration](/deployment/configuration) — every `STREAMS_*` variable.
+- [Security](/deployment/security) — keys, scopes, the prefix allowlist, and resource limits.
+- [Storage & Tiering](/deployment/storage-and-tiering) — what lives under `/data`.

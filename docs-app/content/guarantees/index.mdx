@@ -1,0 +1,102 @@
+---
+title: Core Guarantees
+description: The load-bearing invariant — involuntary loss yields a tombstone, voluntary removal is silent — plus durability, deletion, ordering, loop-prevention, and idempotency.
+---
+
+import { Callout, Cards } from 'nextra/components'
+
+# Core Guarantees
+
+streams is a durability-focused engine, so its guarantees are the product. This page states
+the one rule the whole data model is built to keep, then summarizes each guarantee and links
+to the page that specifies it in full.
+
+## The load-bearing invariant
+
+One rule sits underneath everything:
+
+<Callout type="important">
+  **Involuntary, capacity-driven loss you didn't ask for** — cap eviction, TTL expiry —
+  **always produces a [tombstone](/guarantees/tombstones)** with the exact
+  `[gap_from, gap_to]` range, in-band at HTTP `200`. **Voluntary removal you did ask for** — a
+  permanent [delete](/guarantees/deletion), your own node's events filtered by
+  [loop-prevention](/guarantees/node-loop-prevention) — **is silently skipped**, never a
+  tombstone.
+</Callout>
+
+Mixing those two would make the gap alarm useless. If a delete you issued looked identical to
+data that fell off a retention window, you could never trust a tombstone to mean "something
+was lost that I wanted." So streams keeps the two structurally separate.
+
+The mechanism is a **dual watermark** per box. `earliest_seq` is the first currently-live seq
+— it advances on eviction, TTL expiry, **and** deletion. `evict_floor` advances **only** on
+involuntary cap/TTL loss, and it is the *sole* tombstone trigger. The invariant
+`evict_floor <= earliest_seq` always holds, which has a precise consequence:
+
+- A cursor below `earliest_seq` but at or above `evict_floor` fell into a **purely-deleted**
+  gap (voluntary) — the read is silent, `tombstone: null`, and the cursor advances past the
+  deleted seqs.
+- A cursor below `evict_floor` lost live records to cap or TTL (involuntary) — the read emits
+  a **tombstone** before resuming from `earliest_seq`.
+
+A consumer that *wants* to detect deletions or node-filtered drops can do so with
+`head_seq`/`earliest_seq` arithmetic — but it never confuses them with data loss, because a
+delete advances `earliest_seq` and never `evict_floor`.
+
+## The seven safety invariants
+
+The full contract, distilled:
+
+1. **`seq` is strictly increasing and gap-free at assignment.** Visibility holes (deleted,
+   expired, node-filtered, evicted) are normal and are *categorized* for the consumer — see
+   [Ordering & cursors](/guarantees/ordering-and-cursors).
+2. **No silent capacity loss.** Any cap eviction or TTL expiry of live records crossing a
+   cursor (`from_seq + 1 < evict_floor`) yields an in-band [tombstone](/guarantees/tombstones)
+   with an authoritative `[gap_from, gap_to]` and a best-effort `reason`. Identical in `diff`
+   and SSE.
+3. **Voluntary removal is silent — and, for deletion, permanent.** Permanent
+   [deletes](/guarantees/deletion) and own-node filtering drop records without a tombstone.
+   Deletion is permanent, effective immediately, asynchronously reclaimed, and point-in-time
+   (never a standing filter).
+4. **The dual watermark separates the two.** `earliest_seq` is the single source of truth for
+   "what can I still read"; `evict_floor` (involuntary only, `evict_floor <= earliest_seq`) is
+   the single tombstone trigger. Cap arithmetic is never authoritative — lazy, segment-granular
+   eviction may exceed cap transiently.
+5. **`$node` is immutable and preserved through routers**, making N-way multi-master fan-out
+   safe by construction — see [Node loop-prevention](/guarantees/node-loop-prevention).
+6. **Routers are at-least-once, per-source FIFO, DAG-by-default**; a `dst` enforces its own
+   retention and `discard:"reject"` applies backpressure rather than silently dropping. Pair
+   that with [idempotent consumers](/guarantees/idempotency).
+7. **Durability is per-box and explicit.** Only data not yet in the WAL (fsynced, for `fsync`
+   boxes) is lost on crash, and such loss appears to consumers as ordinary eviction-style gaps.
+   See [Durability](/guarantees/durability).
+
+## Where each guarantee lives
+
+<Cards>
+  <Cards.Card title="Durability" href="/guarantees/durability" arrow>
+    The three commit classes — `memory`, `disk`, `fsync` — where each lands, when the ack
+    fires, and what a crash costs. An acked write is published; nothing visible is ever
+    un-durable.
+  </Cards.Card>
+  <Cards.Card title="Tombstones" href="/guarantees/tombstones" arrow>
+    Explicit loss: the dual watermark, when a tombstone is emitted, its shape and `reason`
+    values, and why deleted or node-filtered gaps stay silent.
+  </Cards.Card>
+  <Cards.Card title="Deletion" href="/guarantees/deletion" arrow>
+    Permanent, immediate, asynchronously reclaimed, silent, point-in-time removal by `seq`
+    range and/or tag `match`.
+  </Cards.Card>
+  <Cards.Card title="Ordering & cursors" href="/guarantees/ordering-and-cursors" arrow>
+    The monotonic `seq` is the cursor. Cursor-advance is ack-all; `caught_up`, not
+    `records.length`, is the "no more" signal.
+  </Cards.Card>
+  <Cards.Card title="Node loop-prevention" href="/guarantees/node-loop-prevention" arrow>
+    `$node` is byte-exact filtered on read so symmetric nodes mirror over routers without
+    echo — the foundation of multi-master.
+  </Cards.Card>
+  <Cards.Card title="Idempotency" href="/guarantees/idempotency" arrow>
+    Per-node dedupe windows, and why consumers must be idempotent under at-least-once routing
+    and queue delivery.
+  </Cards.Card>
+</Cards>

@@ -1,0 +1,111 @@
+---
+title: API Reference
+description: The complete /v0 HTTP surface — JSON-first, curl-friendly, single-machine, with a full endpoint index and per-area reference pages.
+---
+
+import { Callout, Cards } from 'nextra/components'
+
+# API Reference
+
+streams is a persistent event engine exposed as a **JSON-first HTTP API**: every operation
+is a plain request with a JSON body and a JSON response, so `curl` is a complete client. No
+SDK, no binary framing, no connection modes. This is the index to the full `/v0` surface —
+boxes, writes, diff reads, deletes, routers, multiplexed SSE, and lease queues — with one
+reference page per area.
+
+## Base URL & versioning
+
+```
+http://{host}:{port}/v0/...
+```
+
+The API version is the **first path segment** (`/v0`). The default bind is
+`127.0.0.1:4000`, so a local server lives at `http://localhost:4000/v0/...`. There is no
+region or tenant in the host — streams is single-machine.
+
+Breaking changes would ship as a new prefix (`/v1`) that may run concurrently. Within a
+version, changes are strictly **additive**: new optional request fields, new response
+fields, new endpoints. **Clients must ignore unknown response fields** so an older client
+keeps working against a newer server.
+
+## The JSON-first, curl-friendly ethos
+
+A few conventions hold across every endpoint and make the surface predictable:
+
+- **Bodies are JSON in, JSON out.** `POST`/`PUT` carry `application/json`; responses are
+  `application/json`, except the SSE stream (`text/event-stream`). Your `data` payload is
+  stored and returned **verbatim** — never parsed, indexed, or reshaped.
+- **`POST` describes the operation in the body**, even for reads like `diff`, because the
+  operation is too rich for a query string. Reads are still safe to retry.
+- **Success returns bare data** — no `{"status":"ok"}` envelope. The presence of a
+  top-level `error` key is the only success/failure discriminator.
+- **The monotonic `$seq` is the cursor.** There is no opaque consumer token on the core
+  read path; you advance your own stored `from_seq`.
+- **Every response carries a `performance` block** so latency observability lives in the
+  response, not a side channel.
+
+<Callout type="info">
+  Data loss is **always explicit, never silent**. Capacity loss (cap eviction, TTL expiry)
+  surfaces as an in-band `200` **tombstone** in a diff or an `event: tombstone` SSE frame —
+  never as an HTTP error. See [Tombstones](/guarantees/tombstones).
+</Callout>
+
+These rules — the error body, the status-code table, the `$`-metadata convention,
+pagination, idempotency, and the Box config object — are specified once on
+[Conventions](/api/conventions).
+
+## Endpoint index
+
+The complete `/v0` surface. Auth scopes and per-route requirements are covered on
+[Conventions](/api/conventions) and [Security](/deployment/security).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `PUT` | `/v0/boxes/:box` | Create / configure a box (idempotent upsert) |
+| `GET` | `/v0/boxes/:box` | Get box state (head / earliest / count / config) |
+| `GET` | `/v0/boxes` | List boxes (opaque-cursor paginated) |
+| `DELETE` | `/v0/boxes/:box` | Delete a box (cascades routers) |
+| `POST` | `/v0/boxes/:box` | Append record(s); returns assigned seqs + head |
+| `POST` | `/v0/boxes/:box/diff` | Read difference from a cursor (batched + tombstones) |
+| `POST` | `/v0/boxes/:box/delete` | Permanently delete records by `before_seq` and/or tag `match` |
+| `PUT` | `/v0/routers/:router` | Create / configure a router (idempotent upsert) |
+| `GET` | `/v0/routers/:router` | Get a router |
+| `GET` | `/v0/routers` | List routers (opaque-cursor paginated) |
+| `DELETE` | `/v0/routers/:router` | Delete a router |
+| `POST` | `/v0/watch` | Create a multiplexed SSE watch session |
+| `GET` | `/v0/watch/:wid` | Open the SSE stream for a session |
+| `POST` | `/v0/boxes/:q/claim` | **Queue:** lease up to N claimable jobs to a node |
+| `POST` | `/v0/boxes/:q/ack` | **Queue:** complete jobs (ack == permanent delete) |
+| `POST` | `/v0/boxes/:q/nack` | **Queue:** release leased jobs for (delayed) reclaim |
+| `POST` | `/v0/boxes/:q/extend` | **Queue:** extend lease deadlines (heartbeat) |
+| `GET` | `/v0/boxes/:q/work` | **Queue:** SSE auto-claim / push (PUSH mode) |
+| `GET` | `/v0/health` (`/healthz`) | Liveness |
+| `GET` | `/v0/ready` (`/readyz`) | Readiness (WAL-replay / drain aware) |
+| `GET` | `/v0/metrics` | Prometheus / JSON metrics |
+
+The five queue endpoints (`claim`/`ack`/`nack`/`extend`/`work`) are only available on a box
+created with `type:"queue"`; calling them on a plain log box returns `409 not_a_queue`. See
+[Queues](/api/queues).
+
+## Reference pages
+
+<Cards>
+  <Cards.Card title="Conventions" href="/api/conventions" arrow>
+    Base URL, auth, error body, status codes, cursors, idempotency, and the Box config object.
+  </Cards.Card>
+  <Cards.Card title="Boxes" href="/api/boxes" arrow>
+    Create, configure, inspect, list, and delete boxes — the control plane.
+  </Cards.Card>
+  <Cards.Card title="Writing Records" href="/api/writing" arrow>
+    Append one or many records atomically; seq assignment and idempotency.
+  </Cards.Card>
+  <Cards.Card title="Reading (diff)" href="/api/reading" arrow>
+    The core consume operation: cursor reads, tombstones, and node filtering.
+  </Cards.Card>
+  <Cards.Card title="Watch (SSE)" href="/api/watch" arrow>
+    Multiplexed Server-Sent Events over a single resumable connection.
+  </Cards.Card>
+  <Cards.Card title="Queues" href="/api/queues" arrow>
+    Lease-based at-least-once job delivery: claim, ack, nack, extend, and work.
+  </Cards.Card>
+</Cards>

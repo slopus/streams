@@ -1,0 +1,164 @@
+---
+title: Ordering & Cursors
+description: How seq is assigned (strictly increasing, gap-free at commit) and how the seq cursor works — exclusive lower bound, cursor-advance is ack-all, and caught_up is the only reliable "done for now" signal.
+---
+
+import { Callout } from 'nextra/components'
+
+# Ordering & Cursors
+
+Every record gets a per-box `seq`: a `u64` that is **strictly increasing and gap-free at
+assignment**, assigned at durable commit. The `seq` **is** the cursor — there is no opaque
+token. Advancing your stored cursor past a record acks it. This page covers exactly what the
+seq contract guarantees (and what it does not), the cursor model, the `next_from_seq` /
+`caught_up` semantics, and how seqs behave across restart and box recreate.
+
+## Seq assignment
+
+Each box has its own `u64` counter, `next_seq`, starting at `seq_base` (default `1`; `0` is
+reserved to mean "no records"). On commit of a write of N records, the server atomically
+assigns `next_seq … next_seq + N − 1`, advances `next_seq` by N, and returns the seqs in
+write order.
+
+Three facts hold at assignment time:
+
+- **Strictly increasing.** Each assigned seq is larger than the last. There is no secondary
+  sort; ascending `seq` is the canonical order.
+- **Gap-free.** The assigned sequence has no holes — `next_seq, next_seq+1, …` with no
+  skips.
+- **Atomic per write.** A single write request of N records either commits **all** N with
+  contiguous seqs, or **none**. There is no partial append.
+
+Assignment happens at **commit**, after WAL ordering — so `seq` order equals durable commit
+order equals delivery order. A record's seq, like the record itself, never changes once
+assigned.
+
+<Callout type="info">
+  Seq is rendered as a JSON number. It fits in an IEEE-754 double until ~9 quadrillion, well
+  beyond any single-machine box lifetime, so no string encoding is needed. Clients should
+  still parse it as a 64-bit integer.
+</Callout>
+
+## "Gap-free at assignment" vs "holes are normal"
+
+This is the distinction that confuses people, so it is stated precisely. **Assignment** is
+gap-free. **Visibility** is not.
+
+After eviction, TTL expiry, deletion, or node-filtering, the seqs a consumer *observes* in
+the retained window can have holes — `4097, 4098, 4101, …`. The underlying counter never
+skips; what a reader sees does. A consumer:
+
+- **MUST NOT** assume received seqs are contiguous.
+- **MAY** assume received seqs are strictly increasing.
+- **MAY** assume any missing seq below `head_seq` was either lost **involuntarily**
+  (cap/TTL — a [tombstone](/guarantees/tombstones) fires if it crossed the cursor) or
+  removed **voluntarily** ([deletion](/guarantees/deletion) or
+  [node-filtering](/guarantees/node-loop-prevention) — silently skipped).
+
+<Callout type="important">
+  The split between "you missed data" (involuntary → tombstone) and "data was intentionally
+  removed for you" (voluntary → silent) is the core safety property of streams. A visibility
+  hole is never ambiguous: it is one or the other, and the [dual
+  watermark](/guarantees/tombstones) keeps them structurally separate.
+</Callout>
+
+## The cursor model — seq is the cursor
+
+A **cursor** is a plain `seq`, interpreted as an **exclusive lower bound**: a read returns
+records with `$seq > from_seq`.
+
+- `from_seq = 0` means "from the beginning of what is currently retained" (`earliest_seq`).
+- A tail / only-new cursor is `from_seq = head_seq` at subscription — like Redis `$`. You
+  can read this off box state as `next_seq - 1`.
+
+There is no opaque continuation token on box reads. The client **owns** its cursor; on the
+diff path the server keeps **no** per-consumer state at all. You store the cursor, you pass
+it back, you advance it.
+
+### Cursor-advance is ack-all
+
+The default consume model is **cursor-advance = ack-all** (the Kafka offset / NATS AckAll
+model): advancing your stored `from_seq` past seq N acks records `1..N`. There is no
+per-message ack on this path — moving the cursor *is* the acknowledgment.
+
+This is why a delete or a node-filter must still advance the cursor past the records it
+skips: otherwise a consumer reading a box full of its own (filtered) events would loop
+forever, never able to ack past them.
+
+<Callout type="info">
+  Per-message explicit ack with leases and heartbeats is a separate primitive — it lives in
+  the [lease-based queue](/guides/job-queue) (`claim` / `ack` / `nack` / `extend`), layered
+  on the same log. The plain diff cursor is deliberately the stateless-log primitive
+  underneath it.
+</Callout>
+
+## `next_from_seq` and `caught_up`
+
+A `diff` read returns a continuation cursor and a "done for now" flag. They mean exactly:
+
+| Field | Meaning |
+|---|---|
+| `next_from_seq` | Pass this back as `from_seq`. It equals the `$seq` of the **last examined** record — filtered/deleted/expired records still advance it — so skipped records are never re-scanned. |
+| `caught_up` | `true` when `next_from_seq == head_seq`. The reliable "no more right now" signal. |
+| `head_seq` | The log end (highest assigned seq). |
+| `earliest_seq` | The retained floor (first currently-live seq). |
+| `lag` | `head_seq - next_from_seq` — records still behind your cursor. |
+
+The critical rule:
+
+<Callout type="warning">
+  **`caught_up` — not `records.length` — is the "no more" signal.** Because node-filtered,
+  deleted, and TTL-expired records are omitted from `records` while still advancing
+  `next_from_seq`, a response can have `records.length == 0` (or fewer than `limit`) while
+  the cursor advanced past many seqs. A consumer that loops "until the batch comes back
+  empty" can spin or stall. Loop until `caught_up` is `true`.
+</Callout>
+
+A worked example: you read a box where every record was written by your own node and you
+pass your node id as the filter. Every record is dropped, `records` is `[]`, but
+`next_from_seq` jumps to `head_seq` and `caught_up` is `true` in one call. You are caught up
+— the empty batch was correct, not a stall.
+
+```json
+{ "box": "jobs",
+  "records": [],
+  "next_from_seq": 480234, "head_seq": 480234, "earliest_seq": 479101,
+  "caught_up": true, "tombstone": null, "lag": 0,
+  "performance": { "server_total_ms": 0.21, "records_scanned": 1130 } }
+```
+
+## Restart and recreate
+
+Seqs are stable across the events that reset state, in well-defined ways.
+
+### Restart
+
+After a restart, `next_seq` is recovered as `max(committed seq) + 1`. Records that were
+buffered in the WAL but **not yet durably committed** — possible only on non-durable
+(`disk`/`memory`) boxes — are lost on a crash; **their seqs are never reused**, so seq stays
+monotonic across restarts. A gap left by a lost-but-acked non-durable write looks to a
+consumer exactly like eviction: a hole that, if it crosses the cursor below `evict_floor`,
+tombstones. See [Durability Classes](/guarantees/durability).
+
+A `memory` box is a special case: on restart it reappears **empty**, `head_seq` resets to
+`0`, but the box config persists — so a stale consumer reading from a high cursor is handled
+by the recreate path below.
+
+### Delete + recreate (seq rewind)
+
+If a box is deleted and a new box of the same name is created, the new box restarts
+`next_seq` at `seq_base`. A stale consumer presenting a `from_seq` from the **future**
+relative to the new box (i.e. `from_seq >= new head_seq`) receives a tombstone with
+`reason: "recreated"` — never silent corruption. The server detects the rewind via a
+per-box-instance epoch (bumped on create); absent the epoch it treats `from_seq > head_seq`
+as the recreate signal. The read then proceeds from the new `earliest_seq`.
+
+This is the one case where `earliest_seq` resets downward; over a single box instance's life
+it is otherwise [monotonically non-decreasing](/guarantees/tombstones).
+
+## See also
+
+- [Reading API](/api/reading) — the `diff` endpoint, request/response fields, and tombstones.
+- [Explicit Loss & Tombstones](/guarantees/tombstones) — the dual watermark and the gap contract.
+- [Node Loop-Prevention](/guarantees/node-loop-prevention) — why filtered records still advance the cursor.
+- [Permanent Deletion](/guarantees/deletion) — voluntary, silent removal that advances the cursor.

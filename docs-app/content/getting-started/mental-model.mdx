@@ -1,0 +1,389 @@
+---
+title: Mental Model
+description: The five concepts that are the whole product — Box, Record, seq, Router, Tombstone — plus the Delete operation, and how each composes into the full /v0 surface.
+---
+
+import { Callout, Cards } from 'nextra/components'
+
+# Mental Model
+
+streams has five concepts, and they are the whole product: a **Box** is a named
+append-only log; a **Record** is one immutable event in it; **seq** is the cursor; a
+**Router** forwards records between boxes; and a **Tombstone** is the explicit "you
+missed data" signal. One operation completes the picture — a **Delete** is a permanent,
+point-in-time removal. Learn these and you understand the entire `/v0` surface —
+everything else is operational detail.
+
+One rule underpins them all, and it is worth memorizing before you read on:
+
+> **Involuntary, capacity-driven loss you didn't ask for** (cap eviction, TTL expiry)
+> **always produces a tombstone. Voluntary removal you did ask for** (a permanent delete,
+> your own node's events) **is silently filtered.**
+
+Everything below exists to keep that distinction crisp.
+
+## The `$`-prefixed convention
+
+Before the concepts, one naming rule that runs through every JSON example on this site.
+**Server-computed fields are `$`-prefixed** — `$seq`, `$ts`, `$node`, `$tag`, `$type` —
+so they can never collide with the user-controlled `data` namespace. On **write** you set
+`node` and `tag` as plain top-level keys; on **read** the server echoes them back as the
+canonical, immutable `$node` and `$tag`. The `data` and `meta` objects keep the same key
+both ways (pure passthrough). All times are integer milliseconds since the Unix epoch
+(`$ts`) or integer millisecond durations (any `*_ms` field).
+
+<Callout type="info">
+  `$node`, `$tag`, and `meta` are **omitted** from a response when absent (absence, not
+  `null`). `data` is always present, though it may itself be JSON `null`.
+</Callout>
+
+## Box
+
+A **box** is an append-only log of records ordered by a monotonic `seq`, plus a small
+config and a pair of derived watermarks. Think inbox/outbox. It is the unit of naming,
+durability, retention, and priority — almost every decision in streams is a per-box
+decision.
+
+### Identity & naming
+
+A box is addressed by **name** in the path (`/v0/boxes/:box`); the name *is* the
+identity. Names match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` — 1–255 bytes, starting
+alphanumeric, allowing `.` `_` `:` `-`. The `:` is for namespacing (`jobs:tenantA`). Names
+are case-sensitive and byte-exact, with no Unicode normalization. On disk, files are keyed
+by a numeric box id rather than the name, so a box name can never become a path-traversal
+vector.
+
+### Creation & lifecycle
+
+A box is created **lazily on first write** (turbopuffer-style ergonomics), or explicitly
+with [`PUT /v0/boxes/:box`](/api/boxes) when you want to set config up front. You can opt
+out of lazy creation per-write with `create: false`, which returns `404 box_not_found`
+against a missing box (the Redis `NOMKSTREAM` lesson against typo-boxes).
+
+[Deleting a box](/api/boxes) tears down all of its records, its tag index, its dedupe
+state, and any routers that reference it as `source` or `dest`. It is irreversible. A
+later lazy-create makes a **new, empty** box whose `seq` restarts at the base — and a stale
+consumer pointed at the old box detects the rewind exactly, via a `reason:"recreated"`
+tombstone.
+
+### Config & durability
+
+Box config is `{ ttl_ms, cap_records, cap_bytes, discard, durable, durability, priority,
+auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Every default is safe:
+all caps and TTL are **off** (`ttl_ms`, `cap_records`, `cap_bytes` all `0`), so an
+out-of-the-box box loses nothing — silent loss must be a deliberate choice you opt into.
+
+The load-bearing config knob is the **durability commit class**, resolved once at create:
+
+| Class | Where it lands | Ack timing | Survives a crash? |
+|---|---|---|---|
+| `memory` | never written to the WAL (pure RAM) | immediate; `fsync_ms` is `0` | **No** — records lost on restart; the box reappears EMPTY (config persists, `head_seq` resets to `0`). |
+| `disk` | WAL, group-committed (no per-write fsync) | on WAL-frame enqueue, **not** fsync-gated; `fsync_ms` is `0` | Yes, **minus the un-fsynced tail**. |
+| `fsync` | WAL, **fsync-gated** | after the group `fsync` (real `fsync_ms`) | **Yes, any crash** — an acked write is recovered by WAL replay. |
+
+These are **not** server-wide modes: a `memory` cache box, a `disk` pub/sub feed, and an
+`fsync` job queue coexist in one process, each buying exactly the guarantee it needs. The
+legacy `durable` bool is a back-compat alias (`true ⇒ fsync`, `false ⇒ disk`); reach
+`memory` only by setting `durability: "memory"` explicitly. See
+[Durability](/guarantees/durability) for the full treatment.
+
+### State & watermarks
+
+`GET /v0/boxes/:box` returns the live state: `head_seq` (highest assigned seq; `0` if
+never written), `earliest_seq` (lowest live seq; `head_seq + 1` when empty), `next_seq`,
+`count`, `bytes`, `config`, and `effective_priority`. The two watermarks are central to
+the loss model and are covered under **seq** and **Tombstone** below.
+
+## Record
+
+A **record** is one immutable event in a box. Once it is assigned a `seq`, its fields
+**never change** — neither deletion nor eviction mutates a record; a record is either
+present and unchanged, or removed and gone.
+
+### Fields
+
+| Field | Write key | Read key | Type | Origin | Required |
+|---|---|---|---|---|---|
+| Sequence | — | `$seq` | u64 | server | assigned at commit |
+| Timestamp | — | `$ts` | u64 ms | server | assigned at commit |
+| Origin node | `node` | `$node` | string | client | optional |
+| Tag | `tag` | `$tag` | string | client | optional |
+| Meta | `meta` | `meta` | object | client | optional |
+| Data | `data` | `data` | arbitrary JSON | client | **required** |
+
+A record returned by a read looks like this:
+
+```json
+{ "$seq": 4096, "$ts": 1748470000123, "$node": "worker-7", "$tag": "job:tenantA:1234",
+  "meta": { "content-type": "application/json" },
+  "data": { "url": "https://...", "attempts": 0 } }
+```
+
+`data` is opaque — the product treats it as bytes and never inspects it. `tag` is the
+match key for [deletion](/api/deletion). `node` is the origin id used for
+[loop-prevention](/guarantees/node-loop-prevention). `meta` is small opaque
+metadata/headers.
+
+### Size limits
+
+These are hard limits enforced at write; a violation is a `400`:
+
+| Limit | Default |
+|---|---|
+| `data` + `meta` (canonical bytes) | 1 MiB |
+| `tag` length | 256 bytes |
+| `node` length | 128 bytes |
+| `meta` total | 16 KiB, ≤ 64 keys |
+| Records per write request | 10,000 |
+| Total write body | 64 MiB |
+
+A single record larger than the entire box cap is a permanent `400 record_too_large` (not
+retryable) — distinct from a transient `422 box_full`.
+
+### How it composes
+
+A record is the atom that flows through every other concept: a write assigns it a `seq` and
+publishes it; a [router](#router) copies it into another box preserving `$node`; a
+[delete](#delete) can remove it by `seq` or `tag`; and a read either delivers it or skips
+it (silently, or with a [tombstone](#tombstone) standing in for a lost range).
+
+## seq
+
+A **seq** is a per-box monotonic `u64` assigned by the server at commit. It is two things
+at once: the **order** of the log and the **cursor** you read from. There is no opaque
+cursor token for box reads — the monotonic `seq` *is* the cursor, and you own your
+position.
+
+### Assignment contract
+
+Each box has its own `u64` counter starting at `seq_base` (default `1`; `0` is reserved to
+mean "no records"). On commit of a write of N records, the server atomically assigns
+`next_seq … next_seq + N − 1` and returns them in write order. A single write request is
+**atomic**: all N records commit with contiguous seqs, or none do. Assignment happens at
+commit, *after* WAL ordering, so `seq` order equals durable commit order equals delivery
+order.
+
+<Callout type="important">
+  `seq` is **strictly increasing and gap-free at assignment**. But what a *consumer*
+  observes can have holes (4097, 4098, 4101, …): eviction, TTL, deletion, and node-filtering
+  all remove records from the *visible* set without the assigner ever skipping a number. You
+  MUST NOT assume received seqs are contiguous; you MAY assume they are strictly increasing.
+</Callout>
+
+### Cursors
+
+A cursor is a plain `seq`, interpreted as an **exclusive lower bound**: a read of
+`from_seq` returns records with `$seq > from_seq`. `from_seq = 0` means "from the
+beginning of what's retained"; a tail/only-new cursor is `from_seq = head_seq` at
+subscription (the Redis `$`). Both [diff reads](/api/reading) and SSE also return an
+explicit `next_from_seq` for convenience and batch boundaries.
+
+Advancing your stored `from_seq` **is the ack** — there is no separate acknowledgement
+call for cursor reads. And because skipped records (deleted, expired, node-filtered) still
+advance the cursor, the reliable "no more right now" signal is the `caught_up` flag, **not**
+`records.length`.
+
+### How it composes
+
+`seq` ties everything together. Reads consume by `seq`. Deletes target a `seq` range
+(`before_seq`). Routers reassign a fresh `dst` `seq` to each forwarded copy. SSE resume
+encodes the per-box cursor map in the `id:` field. And the two box watermarks —
+`earliest_seq` (first live seq) and `evict_floor` (the tombstone trigger) — are both `seq`
+values that bound what you can still read. See
+[Ordering & Cursors](/guarantees/ordering-and-cursors).
+
+## Router
+
+A **router** is a server-side forwarding rule `source → dest`: every record committed to
+`source` is copied into `dest`. Routers fan out, and because the origin `$node` rides
+through every forward untouched, N symmetric nodes can mirror to each other without echo or
+loops.
+
+### Forward mechanics & ordering
+
+When record `r` commits to `source` at seq `s`, the router appends a forwarded copy to
+`dest`, which assigns it a **fresh** `dst.$seq` from its own counter — unrelated to `s`.
+The forward is driven off the same committed log as a consumer (a server-internal consumer
+of `source` with its own cursor), so a router never forwards a record that didn't durably
+commit. Delivery is **at-least-once** with **per-source FIFO**: records from a single
+`source` arrive in `dest` in `source` commit order; if multiple routers feed one `dest`,
+its order is the interleaving by `dest` commit time.
+
+<Callout type="warning">
+  At-least-once means a crash between "appended to dest" and "advanced the router cursor"
+  can **re-forward**, producing duplicates in `dest`. Exactly-once is not offered.
+  Consumers must be idempotent — dedupe on `$seq` or a job-level key in `meta`.
+</Callout>
+
+### What carries through
+
+A forwarded copy preserves `$node` (verbatim — this is what makes loop-prevention work
+across the route), `$tag`, `meta`, and `data`. Only `$seq` and `$ts` are reassigned by
+`dest`. A forward is an ordinary append into `dest`, so it **honors the destination box's
+durability class** — a `memory` dest persists nothing, an `fsync` dest fsyncs the copy
+before advancing the router cursor. Deletes and node filters are **per-box** and do not
+propagate: a delete on `source` does not reach copies already forwarded to `dest`.
+
+### Cycle control
+
+Two complementary layers keep fan-out safe. Content-level **node loop-prevention** stops a
+node from *consuming* its own events. Topology-level **cycle control** stops a record from
+being *forwarded* around a cycle forever: creating a router that would introduce a directed
+cycle is rejected at creation with `409 router_cycle`. For intentional mirrors (A↔B), set
+`allow_cycle: true` and the route uses a bounded hop-cap to guarantee forwarding
+terminates. See [Routers](/api/routers) and the [multi-master guide](/guides/multi-master).
+
+<Callout type="info">
+  Router forwarding is **synchronous on the append path** today. A persistently-failing or
+  full `discard:"reject"` destination is treated as backpressure (the record stays in
+  `source`) — there is **no background retry driver yet**, so a chronically-failing dest can
+  lag. Size a durable `dest ≥ source`, or give `dest` `discard:"old"`.
+</Callout>
+
+## Tombstone
+
+A **tombstone** is the explicit "you missed data" signal. If live records you wanted were
+evicted (cap) or expired (TTL) before you read them, the read returns an **in-band**
+tombstone with the exact missed range — at HTTP `200`, never as a silent skip and never as
+an HTTP error. It is the single mechanism for *all* non-silent loss.
+
+### The dual watermark
+
+A tombstone exists because each box tracks **two floors**, which decouples involuntary loss
+from voluntary deletion:
+
+- **`earliest_seq`** — the seq of the first currently-**live** record (not evicted, not
+  expired, **not deleted**). It is monotonically non-decreasing and is advanced by eviction,
+  TTL, **and** deletion. It is `head_seq + 1` when the box is empty.
+- **`evict_floor`** — advanced **only** by involuntary loss: cap eviction and TTL expiry. It
+  is the **sole tombstone trigger**. A voluntary delete advances `earliest_seq` but **never**
+  `evict_floor`.
+
+The invariant `evict_floor <= earliest_seq` holds always, and it produces the whole
+behavior:
+
+- A cursor below `earliest_seq` but at/above `evict_floor` fell into a **purely-deleted**
+  gap (voluntary) → the read is **silent** (`tombstone: null`); the cursor advances past the
+  deleted seqs.
+- A cursor below `evict_floor` lost live records to cap/TTL (involuntary) → a **tombstone**
+  is emitted.
+
+Precisely: a read for cursor `from_seq` emits a tombstone iff `from_seq + 1 < evict_floor`.
+
+### Shape
+
+A tombstone is a small gap marker carrying the exact missed range. In a diff it rides in
+the `tombstone` field of the response:
+
+```json
+{ "gap_from": 478501, "gap_to": 479100,
+  "reason": "cap", "missed_estimate": 600,
+  "earliest_seq": 479101, "head_seq": 480234 }
+```
+
+`gap_from` is what you asked for next; `gap_to` is the last seq before the first live
+record; the range is inclusive on both ends. `missed_estimate` is the approximate dropped
+count (eviction is segment-granular). `reason` ∈ `cap | ttl | mixed | recreated`
+(diff), plus `from_seq_too_old` at SSE connect time. **The reason is best-effort; the
+`[gap_from, gap_to]` range is authoritative.** In a diff this rides in the `tombstone`
+field (`null` when none, at most one per response); in SSE it is a framed
+`event: tombstone` carrying `{box, reason, gap_from, gap_to, earliest_seq, head_seq}`,
+whose `id:` already advances your cursor past the gap so the resume is correct.
+
+### The four loss/removal kinds
+
+| Kind | Detectable? | Mechanism | Consumer sees |
+|---|---|---|---|
+| Cap eviction (involuntary) | **Yes**, never silent | advances `evict_floor` | tombstone `reason:"cap"` |
+| TTL expiry (involuntary) | **Yes**, never silent | advances `evict_floor` by clock | tombstone `reason:"ttl"` |
+| Permanent deletion (voluntary) | **No**, intentionally silent | advances `earliest_seq` only | seqs simply absent |
+| Node loop-prevention (voluntary) | **No**, intentionally silent | own-node records dropped | own seqs absent |
+
+See [Tombstones](/guarantees/tombstones) for the complete contract.
+
+## Delete
+
+A **delete** is a permanent, point-in-time removal of records by `seq` range and/or `tag`
+match. It is the one operation that removes data on your command — and it is deliberately
+**silent**, so it never trips the gap alarm that tombstones own.
+
+### Five defining properties
+
+- **Permanent.** Deleted records are gone for good; there is no un-delete in `/v0`. To
+  "resurrect," write a new record.
+- **Effective immediately.** The delete is invisible to **all** reads at once — `diff`, box
+  state `count`/`bytes`, and SSE. A reader's cursor simply advances past the deleted seqs.
+- **Asynchronous / lazy reclaim.** Records are *logically* gone instantly; the physical
+  memory/disk is reclaimed by a background reclaimer (segment-granular).
+- **Silent.** A delete **never** produces a tombstone. It advances `earliest_seq` but not
+  `evict_floor`, so reading across a purely-deleted gap returns `tombstone: null`.
+- **Point-in-time.** A `match`-only delete is bounded by the **current head** at call time;
+  future records with the same tag are never affected. It is not a standing filter.
+
+### Request grammar
+
+At least one of `before_seq` or `match` is required (else `400 invalid_request`):
+
+- `before_seq` (u64) — delete records with `$seq < before_seq` (snapshot/compaction by
+  seq).
+- `match` — `["tag", "Eq", "X"]` for an exact match, or `["tag", "Glob", "X*"]` for a
+  **trailing-prefix** match (a single trailing `*`, no general globbing). A bare string
+  `"X"` is shorthand for `["tag", "Eq", "X"]`. Records with no tag are never matched.
+
+Combining the two ANDs them — `match` + `before_seq` deletes records that match the tag
+**and** sit below the seq (e.g. publish v2 of a message, then delete its prior versions
+while keeping the new one). A `match` delete is backed by a per-box **tag index**
+(`tag → live seqs`), so it is a point lookup or a bounded prefix range scan — never a full
+log scan.
+
+```bash
+# Cancel one job by exact tag.
+curl -X POST localhost:4000/v0/boxes/jobs/delete \
+  -H 'content-type: application/json' \
+  -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
+```
+
+```json
+{ "box": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
+  "performance": { "server_total_ms": 0.12 } }
+```
+
+### How it composes
+
+A delete is committed and WAL-logged, so it survives a restart. It interacts cleanly with
+everything else: it advances `earliest_seq` (never `evict_floor`), so the
+[tombstone](#tombstone) machinery stays untouched; it does **not** propagate through
+[routers](#router) (delete `dest` separately if you need to); and it is the very same delete
+path a [queue](/api/queues) `ack` reuses to permanently remove a completed job. See
+[Deletion](/guarantees/deletion).
+
+## How the pieces fit
+
+Reading is a single pipeline, applied per candidate seq from your cursor, identically for
+`diff` and SSE:
+
+1. **Live-floor gate** — skip if below the earliest live record. If `from_seq + 1 < evict_floor`,
+   emit a **tombstone**; a purely-deleted gap is skipped silently.
+2. **TTL** — skip if expired (involuntary → feeds the tombstone via `evict_floor`).
+3. **Deleted** — skip if the slot was deleted (voluntary → silent).
+4. **Node filter** — skip if `$node` is in the reader's node set (voluntary → silent).
+5. **Deliver** the surviving record, respecting batch `limit` / SSE flow.
+
+Skipped seqs of *any* kind still advance `next_from_seq`. That is the whole engine: a box
+holds records ordered by seq; reads walk forward from a cursor; involuntary loss tombstones
+and voluntary removal is silent; routers fan records out preserving origin; and durability
+is a per-box choice. Five concepts, one operation, one invariant.
+
+## Where to go next
+
+<Cards>
+  <Cards.Card title="Core Guarantees" href="/guarantees" arrow>
+    The dual watermark, durability classes, deletion, ordering, and idempotency in depth.
+  </Cards.Card>
+  <Cards.Card title="API Reference" href="/api" arrow>
+    Every `/v0` endpoint — its body, its response, and its errors.
+  </Cards.Card>
+  <Cards.Card title="Guides" href="/guides" arrow>
+    Build a job queue, pub/sub, durable streams, or multi-master fan-out.
+  </Cards.Card>
+</Cards>

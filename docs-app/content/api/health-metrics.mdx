@@ -1,0 +1,166 @@
+---
+title: Health & Metrics
+description: Liveness, readiness, and metrics probes — GET /v0/health, /v0/ready (replay-aware), and /v0/metrics (Prometheus + JSON).
+---
+
+import { Callout } from 'nextra/components'
+
+# Health & Metrics
+
+Three operational probes at the version root, with aliases at the server root for load
+balancers. They do **not** require auth by default, so a load balancer can poll liveness
+and readiness without a key — set `STREAMS_PROBE_AUTH=true` to require auth on all three.
+
+<Callout type="info">
+  Distinguish the two health states: **liveness** (`/v0/health`) answers "can this process
+  serve at all?" and is `200` whenever the process is up. **Readiness** (`/v0/ready`)
+  answers "should traffic be routed here *now*?" and returns `503` during WAL replay on
+  boot and while draining on shutdown. Route real traffic on readiness; restart on
+  liveness.
+</Callout>
+
+## GET /v0/health — liveness
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/health</span></div>
+
+Alias: <span className="pill method-get">GET</span> `/healthz`. Returns `200` always while
+the process can serve. Use it for the container/orchestrator liveness probe (restart on
+failure).
+
+```bash
+curl localhost:4000/v0/health
+```
+
+```json
+{ "status": "ok", "version": "0.1.0", "uptime_ms": 84012 }
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | Always `"ok"` while serving. |
+| `version` | string | The running server version. |
+| `uptime_ms` | `u64` | Milliseconds since process start. |
+
+<Callout type="info">
+  Health is `200` even during WAL replay — the process is alive and will become ready. Use
+  `/v0/ready` (below) to gate traffic during replay; use `/v0/health` only to decide
+  whether to **restart** the process.
+</Callout>
+
+## GET /v0/ready — readiness
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/ready</span></div>
+
+Alias: <span className="pill method-get">GET</span> `/readyz`. Returns `200` when the
+server is serving normally, and `503` while it is not yet (or no longer) able to take
+traffic. This is the **load-balancer / Kubernetes readiness gate**: on boot it stays `503`
+until WAL replay finishes, then flips to `200`; on `SIGINT`/`SIGTERM` it returns `503
+shutting_down` while draining.
+
+**Ready** (`200`)
+
+```bash
+curl localhost:4000/v0/ready
+```
+
+```json
+{ "status": "ready", "wal_replay_complete": true, "boxes": 42 }
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `"ready"` when serving. |
+| `wal_replay_complete` | bool | `true` once boot-time WAL replay has finished. |
+| `boxes` | `u64` | Number of boxes currently registered. |
+
+**Not ready — during WAL replay** (`503`)
+
+While replaying the write-ahead log on boot, the probe returns `503 not_ready` with a
+`Retry-After` header and a replay-progress fraction in the error detail:
+
+```json
+{ "error": {
+    "code": "not_ready",
+    "message": "WAL replay in progress",
+    "detail": { "replay_progress": 0.62 } } }
+```
+
+`error.detail.replay_progress` runs `0.0`–`1.0`. The probe flips to `200` the moment
+replay completes. While draining on shutdown it returns `503 shutting_down` (also with
+`Retry-After`).
+
+| Status | `error.code` | When |
+|---|---|---|
+| `200` | — | Serving normally. |
+| `503` | `not_ready` | Boot-time WAL replay in progress (`detail.replay_progress`). |
+| `503` | `shutting_down` | Graceful drain on `SIGINT`/`SIGTERM`. |
+
+## GET /v0/metrics — Prometheus / JSON metrics
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/metrics</span></div>
+
+Returns operational metrics: **Prometheus text exposition** (`text/plain; version=0.0.4`)
+by default, or a JSON snapshot when you send `Accept: application/json`. Returns `200`
+always — even when the server is not yet ready, since metrics describe the recovering
+process.
+
+<Callout type="warning">
+  **The current metric surface is small.** Today `/v0/metrics` exposes essentially a **box
+  count** (the JSON snapshot is `{"boxes": N}`). A richer per-box / scheduler / WAL metric
+  catalog — append counters, eviction and tombstone counters, fsync-latency histograms,
+  SSE connection gauges — is **planned but not yet implemented**. Build dashboards against
+  what the endpoint actually emits at your version; do not assume the full catalog is
+  present. The [`performance` block](/api/errors#the-performance-block) on every response
+  is the most detailed per-request observability available today.
+</Callout>
+
+**Prometheus text** (default)
+
+```bash
+curl localhost:4000/v0/metrics
+```
+
+```text
+# HELP streams_boxes Number of boxes.
+# TYPE streams_boxes gauge
+streams_boxes 42
+```
+
+**JSON snapshot**
+
+```bash
+curl localhost:4000/v0/metrics -H 'accept: application/json'
+```
+
+```json
+{ "boxes": 42 }
+```
+
+<Callout type="important">
+  **Metrics are auth-gated by default when keys are configured.** Unlike `/v0/health` and
+  `/v0/ready` (which stay unauthenticated so a load balancer can poll liveness/readiness),
+  `/v0/metrics` exposes operational state and therefore needs a key with the
+  [`read` scope](/deployment/security) when `STREAMS_API_KEYS` is set (a full-access key
+  suffices). In dev mode (no keys) it is open.
+</Callout>
+
+## Auth on probes — `STREAMS_PROBE_AUTH`
+
+By default the probes skip auth so an external load balancer can poll them without a
+credential:
+
+- `/v0/health` and `/v0/ready` — always unauthenticated.
+- `/v0/metrics` — auth-gated (read scope) when keys are configured; open in dev.
+
+Set `STREAMS_PROBE_AUTH=true` to require auth on **all three**, including health and
+readiness. Use this when even liveness/readiness should be behind a credential (for
+example, the probes are reachable from an untrusted network). See
+[Configuration](/deployment/configuration) for the full env var set and
+[Observability](/deployment/observability) for how to wire these into a monitoring stack.
+
+## See also
+
+- [Observability](/deployment/observability) — wiring probes and metrics into your stack.
+- [Configuration](/deployment/configuration) — `STREAMS_PROBE_AUTH` and the full env var set.
+- [Recovery](/how-it-works/recovery) — what WAL replay does behind the `not_ready` gate.
+- [Errors](/api/errors) — the `503` envelope and the `performance` block.

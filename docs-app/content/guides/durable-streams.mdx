@@ -1,0 +1,172 @@
+---
+title: Durable Streams & Replay
+description: Configure a stream that can never silently lose a record — unbounded + fsync + discard:"reject" so eviction is impossible — and have consumers replay from their last acked cursor.
+---
+
+import { Callout, Steps } from 'nextra/components'
+
+# Durable Streams & Replay
+
+When you need **strong delivery** — every record durably committed, replayable from any point, and *never* silently missed — configure a box so eviction is structurally impossible: **unbounded** (`cap_records: 0`, `cap_bytes: 0`), **`fsync`-durable** (`durable: true`), TTL **off** (`ttl_ms: 0`), and `discard: "reject"`. With no cap and no TTL there is no involuntary loss source at all, so there is **nothing that can ever produce a tombstone**. Consumers persist their cursor and replay from the last acked `from_seq`. This is the ledger / event-sourcing / change-data-capture pattern: append forever, read from the beginning, lose nothing.
+
+This is the strict end of the durability spectrum, the opposite of [pub/sub](/guides/pubsub) (which embraces eviction for bounded memory). Here you trade bounded memory for an absolute guarantee.
+
+## Why this configuration means "no silent loss, ever"
+
+streams tracks two floors per box (the [dual watermark](/guarantees/tombstones)). `evict_floor` is advanced **only** by involuntary cap eviction and TTL expiry — and it is the **sole** trigger for a tombstone. `earliest_seq` (the first live record) is advanced by eviction, TTL, *and* voluntary deletion.
+
+In this config:
+
+- `cap_records: 0` and `cap_bytes: 0` ⇒ the box never evicts for capacity.
+- `ttl_ms: 0` ⇒ no record ever expires.
+- Therefore **`evict_floor` never advances past the base** — and the tombstone condition (`from_seq + 1 < evict_floor`) can never be true. A consumer reading from any `from_seq ≥ 0` always finds the records still there.
+- `discard: "reject"` is the backstop: if a cap is *ever* added later and hit, the producer's write fails **synchronously** with `422 box_full` rather than dropping the oldest data. Nothing is acked-then-dropped.
+
+<Callout type="important">
+  The guarantee chain: **`fsync` durability** means an acknowledged write survives any crash
+  (recovered by WAL replay); **no cap + no TTL** means a written record is never involuntarily
+  removed; **`discard: "reject"`** means a future cap can never silently drop data. Together,
+  an acked record is readable forever — until *you* delete it. See
+  [Durability](/guarantees/durability) and [Tombstones](/guarantees/tombstones).
+</Callout>
+
+## Build it
+
+<Steps>
+
+### Create the durable, unbounded box
+
+```bash
+curl -X PUT localhost:4000/v0/boxes/ledger \
+  -H 'content-type: application/json' \
+  -d '{ "durable": true, "cap_records": 0, "cap_bytes": 0,
+        "ttl_ms": 0, "discard": "reject" }'
+```
+
+```json
+# →
+{ "box": "ledger", "created": true,
+  "config": { "ttl_ms": 0, "cap_records": 0, "cap_bytes": 0, "discard": "reject",
+              "durable": true, "durability": "fsync", "auto_create": true,
+              "idempotency_window_ms": 120000, "dedupe_node": true },
+  "performance": { "server_total_ms": 0.23 } }
+```
+
+`durable: true` resolves to the `fsync` class — the ack is held until the WAL frame is durably synced.
+
+### Append (the write is fsync-gated)
+
+The response is held until the group `fsync` completes, so when you see the `seqs`, they are durably committed. Use an `idempotency_key` so a producer that retries after a timeout doesn't double-append.
+
+```bash
+curl -X POST localhost:4000/v0/boxes/ledger \
+  -H 'content-type: application/json' \
+  -d '{ "idempotency_key": "txn-7f3a",
+        "records": [
+          { "data": { "evt": "account.debit", "acct": "A-1", "cents": 500 }, "tag": "acct:A-1" }
+        ] }'
+```
+
+```json
+# →
+{ "box": "ledger", "first_seq": 1, "last_seq": 1, "seqs": [1],
+  "head_seq": 1, "count": 1, "created": false, "deduped": false,
+  "performance": { "server_total_ms": 5.21, "wal_append_ms": 0.10, "fsync_ms": 5.05 } }
+```
+
+<Callout type="info">
+  `fsync_ms` here (~5 ms on a laptop's APFS NVMe) is the disk's `fdatasync` floor, not a
+  streams overhead — server-grade NVMe syncs in ~50–500 µs, roughly 10× faster. Group commit
+  amortizes one `fsync` across a whole batch of concurrent durable writers, so aggregate
+  throughput stays high even though each individual write waits for the sync. See
+  [Performance](/how-it-works/performance).
+</Callout>
+
+### Consume and persist your cursor
+
+Read from your stored `from_seq`. After processing a batch durably on your side, persist `next_from_seq` — that is your ack.
+
+```bash
+curl -X POST localhost:4000/v0/boxes/ledger/diff \
+  -H 'content-type: application/json' \
+  -d '{ "from_seq": 0, "limit": 500 }'
+```
+
+```json
+# →
+{ "box": "ledger",
+  "records": [
+    { "$seq": 1, "$ts": 1748470000123, "data": { "evt": "account.debit", "acct": "A-1", "cents": 500 } }
+  ],
+  "next_from_seq": 1, "head_seq": 1, "earliest_seq": 1,
+  "caught_up": true, "tombstone": null, "lag": 0,
+  "performance": { "server_total_ms": 0.30 } }
+```
+
+Note `tombstone: null` and `earliest_seq: 1` — and they will *stay* that way. `earliest_seq` never advances on this box (nothing evicts), so a consumer can replay from `from_seq: 0` at any time and see the full history.
+
+</Steps>
+
+## Consumer replay
+
+Replay is not a special mode — it is just reading from an earlier cursor. A consumer that wants to reprocess from the start sends `from_seq: 0`; one resuming from a checkpoint sends its last acked `from_seq`.
+
+```bash
+# Resume exactly where this consumer left off (its last persisted cursor).
+curl -X POST localhost:4000/v0/boxes/ledger/diff -d '{ "from_seq": 480123, "limit": 1000 }'
+
+# Full reprocess from the beginning of retained history.
+curl -X POST localhost:4000/v0/boxes/ledger/diff -d '{ "from_seq": 0, "limit": 1000 }'
+```
+
+The loop is **read → process durably → persist `next_from_seq` → repeat**. Advancing your stored `from_seq` past seq N acks 1..N (cursor-advance = ack-all). The server keeps no per-consumer state, so each consumer replays independently — many consumers can read the same `ledger` at different positions with zero coordination.
+
+<Callout type="warning">
+  A crash on the consumer side re-reads from the last *persisted* cursor, so records since
+  that checkpoint are reprocessed. **Make your processing idempotent** (dedupe on `$seq` or a
+  business key), or persist the cursor in the same transaction as your side effect, so a
+  replay is exactly-once *for your effects* even though delivery is at-least-once. See
+  [Idempotency](/guarantees/idempotency).
+</Callout>
+
+For live consumption rather than polling, tail the same box over [SSE watch](/api/watch) (`from_seq: <last acked>`, not `tail: true`, so you don't skip the backlog) and advance your persisted cursor from the frame `id:`/`to_seq`.
+
+## Compaction without losing the guarantee
+
+"Never silently lose a record" does not mean "grow forever with no control." You can reclaim space *voluntarily* — that is a [delete](/api/deletion), which advances `earliest_seq` but **not** `evict_floor`, so it stays silent and never trips the gap alarm:
+
+```bash
+# After every consumer has durably checkpointed past seq 480000, compact below it.
+curl -X POST localhost:4000/v0/boxes/ledger/delete -d '{ "before_seq": 480000 }'
+```
+
+The distinction is the whole point: **involuntary** cap/TTL loss tombstones (and you've configured it away); **voluntary** deletion is silent and is *your* decision. A consumer whose cursor is below a compacted seq simply advances past it with no tombstone — which is correct, because you deliberately removed records that you knew everyone had already processed.
+
+<Callout type="important">
+  Only compact below a seq that **every** consumer has acked. There is no server-side
+  consumer registry on this path — coordinating "everyone is past seq N" is your
+  responsibility (e.g. track the minimum persisted cursor across consumers). Delete too
+  eagerly and a lagging consumer's `from_seq` falls below `earliest_seq`; it reads silently
+  past the gap (no tombstone, since deletion is voluntary) and **misses those records**.
+</Callout>
+
+## If a cap is ever hit (the `discard:"reject"` backstop)
+
+If you later add a `cap_records`/`cap_bytes` to this box and it fills, `discard: "reject"` makes the producer's write fail loudly instead of dropping data:
+
+```json
+# → 422 Unprocessable Entity
+{ "error": { "code": "box_full",
+    "message": "box \"ledger\" is full (discard=reject)",
+    "detail": { "cap_records": 1000000, "head_seq": 1000000, "earliest_seq": 1 } } }
+```
+
+The producer learns synchronously and **nothing is appended** (all-or-nothing) — it can apply backpressure, scale consumers, or page an operator. This is the "fail loudly, never drop unconsumed work" posture; the alternative, `discard: "old"`, would silently evict the oldest records (and tombstone lagging readers). For a true durable stream, keep the box unbounded and compact deliberately instead.
+
+## See also
+
+- [Durability](/guarantees/durability) — the three commit classes and exactly what each survives.
+- [Tombstones](/guarantees/tombstones) — the dual watermark; why this config has no tombstone source.
+- [Deletion](/api/deletion) — voluntary, silent, point-in-time removal for compaction.
+- [Recovery](/how-it-works/recovery) — how an acked `fsync` write is replayed from the WAL on restart.
+- [Job Queue](/guides/job-queue) — the cursor-queue recipe shares this read/ack loop.

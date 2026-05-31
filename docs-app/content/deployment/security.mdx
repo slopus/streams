@@ -1,0 +1,271 @@
+---
+title: Security
+description: The streams threat model — hashed bearer keys, per-key scopes and a box-name prefix allowlist, the loopback-default no-auth refusal, what is deliberately out of scope, and a hardened-deployment checklist.
+---
+
+import { Callout, Steps } from 'nextra/components'
+
+# Security
+
+This is the operator-facing threat model: what streams protects, what it deliberately does
+**not**, and how to deploy it safely. Authentication (hashed bearer keys), authorization
+(per-key scopes + a box-name prefix allowlist), DoS resource limits, and the loopback-default
+no-auth refusal are **implemented and shipping today**. TLS, hard tenant isolation, and an
+audit/rotation API are **not** — run streams behind a reverse proxy and read the
+[out-of-scope](#whats-not-in-scope) section before you expose it.
+
+<Callout type="warning">
+  streams speaks **plain HTTP** and does not terminate TLS. A bearer token on plain HTTP —
+  or in a `?token=` query string — can be observed in transit or in logs. For any
+  non-loopback exposure, terminate TLS at a reverse proxy in front of a loopback streams
+  bind, or bind loopback and tunnel.
+</Callout>
+
+## Authentication: bearer keys, hashed at rest
+
+Auth is a plain bearer token on every request:
+
+```text
+Authorization: Bearer <API_KEY>
+```
+
+Keys are supplied at startup via the `STREAMS_API_KEYS` environment variable (comma-separated).
+The handling is hardened against a process-memory or crash-dump compromise:
+
+- **Hashed at rest (SHA-256).** Each configured key is parsed into a hashed store **once** at
+  boot; only the SHA-256 digest is held in memory for the process lifetime, never the plaintext.
+- **Plaintext zeroized.** After the keys are parsed into digests, the plaintext is **zeroized
+  and dropped**, so no secret lingers in the process config.
+- **Never logged.** Tokens are never written to the operational logs.
+- **Constant-time compare.** A presented token is hashed and its digest compared against every
+  configured key's digest with **no early exit** (the `subtle` crate's `ConstantTimeEq`), so
+  neither *which* key nor *how many leading bytes* matched leaks via a timing side-channel.
+
+A missing or unknown token returns **`401 unauthorized`**.
+
+<Callout type="info">
+  If the server starts with **no** keys configured, auth is **disabled** (single-tenant dev
+  mode) and the `Authorization` header is ignored — logged loudly at boot. This is the default
+  on a loopback bind; see [the no-auth refusal](#the-loopback-default--no-auth-refusal).
+</Callout>
+
+## Authorization: scopes & the prefix allowlist
+
+A bare key is **full access**, exactly as before — scopes and prefixes are fully additive and
+back-compatible. A key **may** additionally carry a scope set and a box-name prefix allowlist.
+The `STREAMS_API_KEYS` entry syntax is extended with `:`-delimited fields:
+
+```text
+key                       # full access (back-compat): all scopes, all boxes
+key:scopes                # scopes only, all boxes
+key:scopes:prefixes       # scopes + a box-name PREFIX allowlist
+key::prefixes             # empty scopes field = ALL scopes, prefix-restricted
+```
+
+Everything before the **first** `:` is the secret, so a key secret may not itself contain `:`.
+
+### Scopes
+
+`scopes` is a `+`-separated subset of `{read, write, delete, admin}`. Single-letter aliases
+`r` / `w` / `d` / `a` and the alias `rw` are accepted. An **empty** scopes field (e.g.
+`key::tenant42:`) means **all** scopes.
+
+| Scope | Alias | Grants |
+|---|---|---|
+| `read` | `r` | reads, list, watch create + SSE GET, metrics |
+| `write` | `w` | record writes, queue `ack`/`nack`/`extend` |
+| `delete` | `d` | box/router delete, record delete |
+| `admin` | `a` | control-plane create/configure (`PUT`) |
+| `read`+`write` | `rw` | queue `claim` and the `/work` stream (a lease *mutates* then returns jobs) |
+
+### Per-route scope matrix
+
+Each route requires a specific scope. A full-access (bare) key satisfies all of them.
+
+| Scope required | Routes |
+|---|---|
+| `read` | `GET /v0/boxes`, `GET /v0/boxes/:box`, `POST /v0/boxes/:box/diff`, `GET /v0/routers`, `GET /v0/routers/:r`, `POST /v0/watch` (+ the SSE GET, capability-gated), `GET /v0/metrics` |
+| `write` | `POST /v0/boxes/:box` (records), queue `ack` / `nack` / `extend` |
+| `read`+`write` | queue `claim` and the `GET /v0/boxes/:q/work` stream |
+| `delete` | `DELETE /v0/boxes/:box`, `DELETE /v0/routers/:r`, `POST /v0/boxes/:box/delete` |
+| `admin` | `PUT /v0/boxes/:box`, `PUT /v0/routers/:r` |
+
+### The box-name prefix allowlist
+
+`prefixes` is a `|`-separated list of box/router-name prefixes a key may touch (e.g.
+`tenant42:|shared.`). An **empty** prefixes field means **any** name. The match is a **byte
+prefix against the raw name**, so the `tenant:` namespacing convention becomes a real boundary.
+
+The allowlist is enforced on **three** surfaces, not just the URL path:
+
+- **The path name** — the `:box` / `:router` in the URL.
+- **Request-body names** — every box a `POST /v0/watch` subscribes to, and a router's `source`
+  **and** `dest` (which the engine would otherwise auto-create on the key's behalf). A scoped
+  key cannot watch, or route data into, a box outside its allowlist.
+- **List results** — `GET /v0/boxes` and `GET /v0/routers` are **filtered** to the key's
+  allowlist, so a prefix-limited key cannot even enumerate cross-tenant names.
+
+<Callout type="important">
+  A **malformed scope token** in `STREAMS_API_KEYS` makes the server **refuse to start**
+  (fail-closed — it never silently grants the wrong scope). Validate your key strings before
+  rolling them out, or the process will not boot.
+</Callout>
+
+## 401 vs 403
+
+The two failure codes are distinct and stable — branch on `error.code`, not the message.
+
+| Code | `error.code` | Meaning |
+|---|---|---|
+| `401` | `unauthorized` | Missing or **invalid** bearer token — the request is not authenticated. |
+| `403` | `forbidden` | Authenticated, but the key **lacks the required scope** or addresses a box/router name **outside its prefix allowlist** (path or relevant body name). |
+
+A `401` means "I don't know who you are"; a `403` means "I know who you are, and you may not
+do this." A scoped key that writes to a box outside its prefixes, or calls an `admin`-only
+route without `admin`, gets `403` — never `401`.
+
+## The watch `wid` capability binding
+
+The multiplexed watch is a two-step shape: `POST /v0/watch` creates a session and returns a
+`wid`; a `GET /v0/watch/:wid` opens the SSE stream. The `wid` is an **unguessable 128-bit
+random capability** (base64url, e.g. `wid_BuRguGorNdVFWNQULz-rrw`), not a guessable counter.
+
+The `POST` is authenticated normally and enforces the key's prefix allowlist against every box
+named in the body. The returned `wid` is then **bound to the creating key and its scope**:
+
+- **When auth is enabled, the `wid` alone does NOT open the stream.** The SSE GET must present
+  the **creating key** (via the `Authorization: Bearer` header or the dev-only `?token=`
+  fallback below). A `wid` that leaks via logs, history, or a proxy is **not a credential** on
+  its own — defense in depth.
+- A **valid but different** key presented on the GET is rejected, just like an invalid one.
+- The stream can **never exceed** the creating key's scope.
+- In dev mode (no auth), the `wid` alone opens the stream.
+
+### The `?token=` SSE-only caveat
+
+Browser `EventSource` cannot send custom headers, so a **dev-only** `?token=<key>` query
+fallback is accepted **only on the SSE stream GETs** — `/v0/watch/:wid` and
+`/v0/boxes/:q/work`. It is **never** accepted on ordinary data or control-plane routes.
+
+<Callout type="warning">
+  A query string leaks via server logs, browser history, and proxies. **Prefer the
+  `Authorization: Bearer` header** everywhere, and never put a long-lived api key in a URL in
+  production. The parameter is for local browser development only.
+</Callout>
+
+## The loopback default & no-auth refusal
+
+The default bind is **`127.0.0.1:4000` (loopback only)**, so an unconfigured server is never
+an accidental public, unauthenticated event store. Configure the bind via `STREAMS_HOST` /
+`STREAMS_PORT`.
+
+The refusal rule:
+
+- **Loopback + no keys** → starts in dev mode (auth disabled). Friendly for local work.
+- **Non-loopback bind (e.g. `0.0.0.0`) + no keys** → the server **refuses to start** and logs
+  loudly, unless you explicitly set `STREAMS_ALLOW_INSECURE_NO_AUTH=1`.
+
+```bash
+# Refuses to start: public bind, no keys, no explicit override.
+STREAMS_HOST=0.0.0.0 ./streams
+# error: refusing to bind a non-loopback address with no API keys configured.
+
+# Starts: public bind with keys configured (the production shape).
+STREAMS_HOST=0.0.0.0 STREAMS_API_KEYS='prod:write:tenant42:,ops::' ./streams
+```
+
+<Callout type="important">
+  `STREAMS_ALLOW_INSECURE_NO_AUTH=1` exists for trusted private networks only (e.g. a
+  pod-internal bind behind a service mesh). Never set it on anything reachable from an
+  untrusted network — it disables the one guard against an accidental open event store.
+</Callout>
+
+## No path traversal
+
+User-controlled box and router **names never reach the filesystem as path components**.
+On-disk WAL, segment, and snapshot files are keyed by an interned **numeric box id**, not the
+name. Names are strictly validated to a fixed charset at the engine boundary before any
+keyed-by-id filesystem use:
+
+- Boxes: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$`
+- Routers: the same, additionally allowing `>`.
+
+So a name like `../../etc/passwd` is rejected at validation (`400 invalid_request`), and even
+a *valid* name never becomes a path segment — the id mapping is the only thing that touches
+disk.
+
+## What's NOT in scope
+
+streams is honest about its boundaries. Deploy accordingly.
+
+- **No TLS.** streams speaks plain HTTP and does not terminate TLS. For any non-loopback
+  exposure, run it behind a TLS-terminating reverse proxy (nginx / Caddy / Envoy / a cloud
+  LB), or bind loopback and tunnel (SSH / WireGuard). Native TLS is **planned** and is a
+  transport concern (no wire-contract change anticipated when it lands).
+- **No hard tenant isolation.** The prefix allowlist is a **filter**, not a namespace
+  partition: two keys with overlapping prefixes share the same box namespace. A hard
+  per-tenant partition is planned.
+- **No audit log / no key rotation API.** Keys are **static** for the process lifetime (set at
+  startup). Rotate by restarting with a new `STREAMS_API_KEYS`. There is no per-request audit
+  trail beyond the operational tracing logs (which never contain tokens).
+- **Trusted operator.** Anyone who can read the process environment or the boot logs can see
+  the configured key **plaintext** — it is supplied via `STREAMS_API_KEYS`. Hashing-at-rest
+  protects the in-memory/runtime surface and crash dumps, **not** the startup configuration.
+  Manage `STREAMS_API_KEYS` as a secret (a secrets manager, systemd `LoadCredential`, a
+  Kubernetes Secret), never a committed file.
+
+<Callout type="warning">
+  The [data directory](/deployment/storage-and-tiering) contains every record's payload in the
+  WAL and segments **in the clear** — streams does not encrypt payloads. Protect
+  `STREAMS_DATA_DIR` (and any `STREAMS_COLD_DIR`) with filesystem permissions and at-rest disk
+  encryption as your threat model requires.
+</Callout>
+
+## Recommended hardened deployment
+
+<Steps>
+
+### Terminate TLS at a reverse proxy
+
+Put nginx / Caddy / Envoy / a cloud LB in front of streams and have it forward to a **loopback**
+streams bind (`STREAMS_HOST=127.0.0.1`). A leaked plain-HTTP token is then not
+network-observable.
+
+### Set least-privilege keys
+
+Give each client the narrowest scope **and** prefix it needs. Avoid bare full-access keys in
+production.
+
+```bash
+STREAMS_API_KEYS='dash:read:tenant42:,prod:write:tenant42:,ops::'
+# dash → read-only, only tenant42 boxes
+# prod → write-only, only tenant42 boxes
+# ops  → all scopes, all boxes (admin)
+```
+
+### Tune the resource caps
+
+Leave the [DoS resource limits](/deployment/configuration) at their defaults unless you have a
+specific reason. Set a cap to `0` only to deliberately disable it. The defaults are generous; a
+normal deployment never trips them.
+
+### Keep the no-auth refusal on
+
+**Never** set `STREAMS_ALLOW_INSECURE_NO_AUTH=1` outside a trusted private network. It disables
+the guard that prevents an accidental open event store.
+
+### Protect the data directory
+
+Treat `STREAMS_DATA_DIR` (and any `STREAMS_COLD_DIR`) as sensitive — it holds every payload in
+the clear. Apply filesystem permissions and at-rest disk encryption.
+
+</Steps>
+
+## See also
+
+- [Configuration](/deployment/configuration) — the full `STREAMS_*` env-var set, including the
+  resource-limit caps.
+- [Storage & Tiering](/deployment/storage-and-tiering) — what the data directory contains and
+  why it is sensitive.
+- [Docker](/deployment/docker) — the hardened image (non-root uid, loopback-aware entrypoint).
+- [API · Conventions](/api/conventions) — the auth header, error envelope, and status-code table.

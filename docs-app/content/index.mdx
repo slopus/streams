@@ -1,0 +1,180 @@
+---
+title: streams — a persistent event engine in a single binary
+description: An append-only log service over a clean, JSON-first HTTP API. Boxes, routers, multiplexed SSE, lease queues, and per-box durability — one static binary, one machine. Data loss is always explicit, never silent.
+---
+
+import { IconDisk, IconFlag, IconRoute, IconBolt, IconClock, IconCube } from '../components/icons'
+import { withBase } from '../components/base'
+
+<div className="landing">
+
+<section className="hero">
+
+<span className="hero-badge"><span className="dot" />Durable · single binary · JSON over HTTP</span>
+
+# A persistent event engine in a <span className="grad">single binary</span>
+
+<p className="hero-sub">
+**streams** is an append-only log service over a clean, JSON-first HTTP API. Write
+events to named **boxes**, read them back by **sequence**, fan them out with
+**routers**, and watch many boxes at once over one **SSE** connection — all from one
+static binary on one machine, backed by a write-ahead log on local NVMe. Data loss is
+always **explicit, never silent**.
+</p>
+
+<div className="hero-cta">
+  <a className="btn btn-primary" href={withBase("/getting-started/quickstart")}>Quickstart<span className="btn-arrow">→</span></a>
+  <a className="btn btn-ghost" href={withBase("/api")}>API reference</a>
+  <a className="btn btn-ghost" href="https://github.com/slopus/streams" target="_blank" rel="noreferrer">GitHub</a>
+</div>
+
+<div className="hero-terminal">
+  <div className="term-bar"><i /><i /><i /><span className="term-title">bash — write an event, read it back</span></div>
+
+```bash
+# Write a record (the server assigns its $seq). The box is created on first write.
+curl -X POST localhost:4000/v0/boxes/jobs \
+  -H 'content-type: application/json' \
+  -d '{ "records": [ { "data": { "url": "s3://b/a.png" }, "tag": "job-9001" } ] }'
+# → { "box": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1], "head_seq": 1, ... }
+
+# Read everything after a cursor. The monotonic seq IS the cursor.
+curl -X POST localhost:4000/v0/boxes/jobs/diff -d '{ "from_seq": 0 }'
+# → { "records": [ { "$seq": 1, "$ts": 1748470000123, "data": { "url": "s3://b/a.png" } } ],
+#     "next_from_seq": 1, "head_seq": 1, "caught_up": true, "tombstone": null }
+```
+
+</div>
+
+</section>
+
+<section className="section">
+
+<span className="section-eyebrow">Mental model</span>
+<h2 className="section-title">Five concepts. That's the whole product.</h2>
+<p className="section-lede">
+streams is deliberately small. Learn five nouns and you know the system — every
+endpoint is one of these doing its job.
+</p>
+
+<div className="concept-grid">
+  <div className="concept"><div className="c-name">Box</div><p className="c-desc">A named, append-only log of records ordered by a monotonic <code>seq</code>. Created lazily on first write.</p></div>
+  <div className="concept"><div className="c-name">Record</div><p className="c-desc">One immutable event. The server assigns <code>$seq</code> and <code>$ts</code>; you supply opaque <code>data</code>, an optional <code>tag</code> and <code>node</code>.</p></div>
+  <div className="concept"><div className="c-name">seq</div><p className="c-desc">The cursor. Reads are “give me everything after <code>from_seq</code>.” The client owns its position; advancing it is the ack.</p></div>
+  <div className="concept"><div className="c-name">Router</div><p className="c-desc">A server-side <code>source → dest</code> forwarding rule. Fan-out that preserves origin node, so N nodes mirror without echo.</p></div>
+  <div className="concept"><div className="c-name">Tombstone</div><p className="c-desc">The explicit “you missed data” signal. Cap/TTL loss returns an in-band gap range — at HTTP 200, never silently.</p></div>
+</div>
+
+</section>
+
+<section className="section">
+
+<span className="section-eyebrow">What you get</span>
+<h2 className="section-title">A persistence layer for queues, pub/sub, and durable streams</h2>
+
+<div className="card-grid">
+
+<a className="feature-card" href={withBase("/guarantees/durability")}>
+  <span className="fc-icon"><IconDisk /></span>
+  <h3>Per-box durability</h3>
+  <p>Three commit classes — <code>memory</code>, <code>disk</code> (group-commit WAL), and <code>fsync</code> (fsync-gated ack) — chosen per box. They coexist in one process.</p>
+  <span className="fc-more">Durability classes →</span>
+</a>
+
+<a className="feature-card" href={withBase("/guarantees/tombstones")}>
+  <span className="fc-icon"><IconFlag /></span>
+  <h3>Explicit loss, never silent</h3>
+  <p>Involuntary cap/TTL eviction that crosses your cursor always returns a tombstone with the exact <code>[gap_from, gap_to]</code> range. Voluntary deletes are silent by design.</p>
+  <span className="fc-more">Tombstones →</span>
+</a>
+
+<a className="feature-card" href={withBase("/api/routers")}>
+  <span className="fc-icon"><IconRoute /></span>
+  <h3>Server-side routers</h3>
+  <p>Copy every record from <code>source</code> to <code>dest</code>, at-least-once and per-source FIFO. Origin node rides through, so N-way multi-master fan-out is echo-free by construction.</p>
+  <span className="fc-more">Routers →</span>
+</a>
+
+<a className="feature-card" href={withBase("/api/watch")}>
+  <span className="fc-icon"><IconBolt /></span>
+  <h3>Multiplexed SSE</h3>
+  <p>Watch dozens of boxes over one resumable connection with composite cursors, named events, heartbeats, and tombstones — woken on append, not polled.</p>
+  <span className="fc-more">Watch (SSE) →</span>
+</a>
+
+<a className="feature-card" href={withBase("/api/queues")}>
+  <span className="fc-icon"><IconClock /></span>
+  <h3>Lease-based queues</h3>
+  <p>Set <code>type: "queue"</code> for claim/ack/nack/extend with visibility-timeout leases, fair cohort claims, redelivery, and dead-lettering — layered on the same log.</p>
+  <span className="fc-more">Queues →</span>
+</a>
+
+<a className="feature-card" href={withBase("/deployment")}>
+  <span className="fc-icon"><IconCube /></span>
+  <h3>One static binary</h3>
+  <p>WAL + segments + snapshots on local NVMe, restartable at any instant. Loopback-default bind, one Docker image. Only data not yet in the WAL is ever lost.</p>
+  <span className="fc-more">Deployment →</span>
+</a>
+
+</div>
+
+</section>
+
+<section className="section">
+
+<span className="section-eyebrow">The central tradeoff</span>
+<h2 className="section-title">Durability is per box — each box buys exactly the guarantee it needs</h2>
+<p className="section-lede">
+A RAM-only cache, a group-committed pub/sub feed, and an fsync-gated job queue
+coexist in one process. Routers bridge them, honoring the destination box's class.
+</p>
+
+<div className="dura-grid">
+  <div className="dura">
+    <span className="d-tag">memory</span>
+    <h4>RAM-only, fastest</h4>
+    <p>Never touches the WAL. Lost on restart (the box reappears empty, config preserved). For caches, scratch, ephemeral fan-out.</p>
+  </div>
+  <div className="dura">
+    <span className="d-tag">disk</span>
+    <h4>Group-committed WAL</h4>
+    <p>One fsync amortized across a batch of concurrent writers. Survives a crash minus the un-fsynced tail. The pub/sub default.</p>
+  </div>
+  <div className="dura">
+    <span className="d-tag">fsync</span>
+    <h4>fsync-gated ack</h4>
+    <p>The ack waits for the group fsync. An acknowledged write survives any crash and is recovered by WAL replay. For queues and ledgers.</p>
+  </div>
+</div>
+
+</section>
+
+<section className="section">
+
+<span className="section-eyebrow">How it compares</span>
+<h2 className="section-title">The simplicity of one binary, with guarantees most systems leave to you</h2>
+<p className="section-lede">
+streams is a single-machine peer to Redis Streams, Kafka, NATS JetStream, and the
+cloud queues — trading horizontal scale for operational simplicity and an explicit,
+in-band loss signal none of them provide.
+</p>
+
+<div className="card-grid">
+  <a className="feature-card" href={withBase("/comparisons/vs-redis")}><h3>vs Redis Streams</h3><p>Per-write durability classes instead of one global <code>appendfsync</code>; gap tombstones where Redis trims silently.</p><span className="fc-more">Compare →</span></a>
+  <a className="feature-card" href={withBase("/comparisons/vs-kafka")}><h3>vs Apache Kafka</h3><p>One binary, no JVM, no cluster — and in-band “you missed X..Y”, which Kafka leaves to lag metrics.</p><span className="fc-more">Compare →</span></a>
+  <a className="feature-card" href={withBase("/comparisons/vs-nats")}><h3>vs NATS JetStream</h3><p>The closest single-binary peer. streams adds delivery-time gap signals and built-in dead-letter moves.</p><span className="fc-more">Compare →</span></a>
+  <a className="feature-card" href={withBase("/comparisons/vs-cloud-queues")}><h3>vs SQS / Kinesis / Pub/Sub</h3><p>Log + queue + fan-out in one self-hosted API, with fixed cost and full data locality.</p><span className="fc-more">Compare →</span></a>
+</div>
+
+</section>
+
+<div className="cta-band">
+  <h2>Persistence that makes data loss a decision, not an accident</h2>
+  <p>Stand up a durable event store in one <code>docker run</code>. Write your first record in under a minute.</p>
+  <div className="hero-cta">
+    <a className="btn btn-primary" href={withBase("/getting-started/quickstart")}>Get started<span className="btn-arrow">→</span></a>
+    <a className="btn btn-ghost" href={withBase("/guarantees")}>Read the guarantees</a>
+  </div>
+</div>
+
+</div>

@@ -1,0 +1,295 @@
+---
+title: Watch (SSE)
+description: A two-step multiplexed Server-Sent Events watch — POST to create a session, GET to stream new records, tombstones, and heartbeats from many boxes over one connection.
+---
+
+import { Callout, Steps } from 'nextra/components'
+
+# Watch (SSE)
+
+The watch endpoint streams new records from **many boxes over one long-lived connection**,
+with per-box cursors, in-band tombstones for involuntary loss, periodic heartbeats, and
+exact resume after a reconnect. It is a two-step flow: a `POST /v0/watch` creates a session
+and returns a `wid`, and a `GET /v0/watch/:wid` opens the actual
+[`EventSource`](https://developer.mozilla.org/docs/Web/API/EventSource)-compatible stream.
+
+## Why two steps
+
+A multiplexed watch can name dozens of boxes with per-box cursors and options — too much
+for a query string, and a browser `EventSource` is GET-only with no body or custom headers.
+So:
+
+- The **POST** carries the full JSON subscription and returns `400`/`404` *before* any
+  stream is open, while the client can still read a normal error body. It holds the
+  subscription definition plus the last-delivered cursor per box.
+- The **GET** is a tiny `EventSource`-compatible URL keyed by the `wid`. Reconnecting to it
+  resumes exactly from the session's stored cursors.
+
+A session is **reclaimed** after `session_ttl_ms` (default `300000`) of no active GET. The
+idle-session GC runs opportunistically on every `POST /v0/watch` and stream open, so an
+abandoned session cannot pin a session slot until restart. A session with an open stream is
+never reclaimed — its cursor map is in use.
+
+## The `wid` capability and auth binding
+
+The returned `wid` is `wid_` followed by base64url of 16 random bytes — an unguessable
+128-bit bearer capability, e.g. `wid_BuRguGorNdVFWNQULz-rrw`. It is not a guessable counter,
+and the GET stream is found by the `wid` alone.
+
+<Callout type="important">
+  **When auth is enabled the `wid` alone does NOT open the stream.** The POST is
+  authenticated normally and enforces the key's [prefix allowlist](/deployment/security)
+  against every box in the body. The session is bound to **both** the creating key and its
+  scope, so the GET must present that same key (via the `Authorization: Bearer` header), a
+  *different* valid key is rejected, and the stream can never exceed the creating key's
+  scope. A `wid` that leaks via logs or history is therefore not a credential. In dev mode
+  (no keys configured) the `wid` alone opens the stream.
+</Callout>
+
+<Callout type="warning">
+  **`?token=<key>` is a dev-only fallback** for browser `EventSource`, which cannot send
+  custom headers. It is accepted **only on the SSE stream GETs** (`/v0/watch/:wid` and the
+  queue [`/work`](/api/queues) stream) and **never** on ordinary data or control-plane
+  routes. A query string leaks via server logs, browser history, and proxies — prefer the
+  `Authorization: Bearer` header, and never put a long-lived key in a URL in production.
+</Callout>
+
+## POST /v0/watch — create a session
+
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/watch</span></div>
+
+Validate the subscription and return a `wid` plus the per-box starting watermarks.
+
+**Request body**
+
+```json
+{
+  "node": "worker-eu-1",
+  "boxes": {
+    "jobs":   { "from_seq": 4096 },
+    "events": { "tail": true },
+    "audit":  { "from_seq": 1 }
+  },
+  "limit": 256,
+  "max_batch_bytes": 262144,
+  "heartbeat_ms": 15000,
+  "include_meta": true,
+  "include_tags": false,
+  "include_data": true,
+  "consistency": "eventual"
+}
+```
+
+| Field | Type | Req? | Default | Meaning |
+|---|---|---|---|---|
+| `node` | string | no | none | [Node loop-prevention](/guarantees/node-loop-prevention) filter applied to all watched boxes — this node never receives its own records. |
+| `boxes` | object | yes | — | Map of `box → per-box options`. The box name is the key (keeps cursors unambiguous and doubles as the resume map). Up to **256** boxes per watch. |
+| `boxes[b].from_seq` | `u64` | no | `0` | Deliver records with `$seq > from_seq`. `0` = from earliest retained. |
+| `boxes[b].tail` | bool | no | `false` | If `true`, ignore `from_seq` and start at the box's current head (only records after subscribe — the SSE analog of Redis `XREAD $`). |
+| `limit` | `u32` | no | `256` | Max records per `record` frame (per box, per flush). |
+| `max_batch_bytes` | `u64` | no | `262144` | Enforced soft byte budget for a single `record` frame (256 KiB): the per-box read stops once the batch reaches this many payload bytes — at least one record is always delivered. `0` ⇒ server default 1 MiB; hard-clamped to 8 MiB. |
+| `heartbeat_ms` | `u64` | no | `15000` | Heartbeat interval. Clamped to `[1000, 60000]`. |
+| `include_meta` | bool | no | `true` | Include record `meta` in frames. |
+| `include_tags` | bool | no | `false` | Include `$tag` in frames. |
+| `include_data` | bool | no | `true` | If `false`, frames carry only `$seq`/`$ts`/`$tag`/`$node` metadata, not `data` (lightweight tailing). |
+| `consistency` | string | no | `"eventual"` | `"eventual"` (push as soon as in the WAL buffer) or `"strong"` (push only after fsync/commit). |
+
+**Response** (`200`)
+
+```json
+{
+  "wid": "wid_BuRguGorNdVFWNQULz-rrw",
+  "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw",
+  "session_ttl_ms": 300000,
+  "boxes": {
+    "jobs":   { "from_seq": 4096,  "head_seq": 5210,  "earliest_seq": 3001 },
+    "events": { "from_seq": 88123, "head_seq": 88123, "earliest_seq": 80000 },
+    "audit":  { "from_seq": 1,     "head_seq": 990,   "earliest_seq": 1 }
+  },
+  "performance": { "server_total_ms": 0.7 }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `wid` | The session capability — present this on the GET. |
+| `stream_url` | The ready-to-open relative path (`/v0/watch/:wid`). |
+| `session_ttl_ms` | Idle-GC window for the session with no active GET. |
+| `boxes[b].head_seq` / `earliest_seq` | Per-box watermarks, so the client can compute lag and see whether a cursor has already fallen off the start (it gets a tombstone on connect if so). |
+
+**Errors**
+
+| `error.code` | When |
+|---|---|
+| `invalid_request` | Malformed `boxes`, or more than 256 boxes (`400`). |
+| `box_not_found` | A named box is unknown (`404`). |
+| `forbidden` | The key lacks the `read` scope, or a named box is outside its prefix allowlist (`403`). |
+
+## GET /v0/watch/:wid — open the stream
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/watch/:wid</span></div>
+
+Open the SSE stream for a session. The client sends `Accept: text/event-stream` and,
+optionally, a `Last-Event-ID` to resume from a known cursor map.
+
+**Request**
+
+```text
+GET /v0/watch/wid_BuRguGorNdVFWNQULz-rrw HTTP/1.1
+Accept: text/event-stream
+Last-Event-ID: eyJqb2JzIjo1MjEwLCJldmVudHMiOjg4MTMwfQ
+```
+
+**Response headers** (tuned for low latency through proxies)
+
+```text
+HTTP/1.1 200 OK
+Content-Type: text/event-stream; charset=utf-8
+Cache-Control: no-store
+Connection: keep-alive
+X-Accel-Buffering: no
+```
+
+`X-Accel-Buffering: no` disables nginx-style proxy buffering; the server flushes after every
+frame and sets `TCP_NODELAY` to hit the 1–5 ms delivery target.
+
+**Establishment errors**
+
+| HTTP / `error.code` | When |
+|---|---|
+| `200` | Stream opened. |
+| `401 unauthorized` | A bearer or `?token=` *was* presented but does not match the key that created the `wid`. (Omitting the bearer is fine — the `wid` is the capability when auth is off.) |
+| `404 not_found` | The `wid` was GC'd, expired, or is unknown → POST again. |
+| `406 not_acceptable` | `Accept` is not `text/event-stream`. |
+| `429 throttled` | The SSE connection cap was reached, or backpressure under CPU pressure. |
+
+## Resume via the composite cursor
+
+Every **data-bearing** frame carries an `id:` that encodes the **entire per-box cursor map**
+at that moment, as base64url-encoded JSON:
+
+```text
+id = base64url( {"jobs":5210,"events":88130,"audit":990} )
+```
+
+On reconnect the server resolves the starting position in this order:
+
+<Steps>
+
+### Server-side session cursors
+
+Authoritative — they survive a lost `Last-Event-ID`.
+
+### The `Last-Event-ID` header, if present
+
+Used only to **rewind** the session to that exact map, **never to advance past it**. This
+protects the gap between "server flushed" and "client processed."
+
+### The session's initial `from_seq`/`tail`
+
+Used only if neither of the above is available.
+
+</Steps>
+
+Because the `id` is a full map, one reconnect restores all per-box positions atomically.
+Treat the `id` as **opaque** — for very large box sets the server may emit a session
+checkpoint token instead of the inline map.
+
+## Frame types
+
+`retry:` is sent once at open (a deliberate 2 s backoff, not the `EventSource` default 3 s):
+
+```text
+retry: 2000
+```
+
+The four data frames below are what you handle. The heartbeat is a bare comment, and the
+protocol also defines a terminal `error` frame, covered last.
+
+### event: record
+
+New records for one box, batched. The `id` is the post-batch composite cursor. `$tag` is
+present only with `include_tags`; `$node` is present when the record has one; `data` is
+omitted per-record when `include_data:false`.
+
+```text
+id: eyJqb2JzIjo0MDk4fQ
+event: record
+data: {"box":"jobs","records":[{"$seq":4097,"$ts":1748467200111,"$tag":"job:render","$node":"node-B","data":{"url":"..."}},{"$seq":4098,"$ts":1748467200119,"$node":"node-C","data":{"id":42}}],"from_seq":4096,"to_seq":4098,"head_seq":5210}
+```
+
+The payload carries `box`, `records[]`, and a `from_seq`/`to_seq`/`head_seq` triple per
+batch (lag = `head_seq - to_seq`).
+
+### event: tombstone
+
+Explicit, never-silent loss — emitted whenever a gap crosses *this consumer's* cursor for a
+box. The frame's `id` already advances the box cursor to `gap_to`, so a resume after it is
+correct.
+
+```text
+id: eyJldmVudHMiOjgzMDAwfQ
+event: tombstone
+data: {"box":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
+```
+
+`reason` ∈ `cap` | `ttl` | `mixed` | `recreated`, plus `from_seq_too_old` — emitted
+**immediately on connect** when the requested `from_seq + 1 < earliest_seq` (the SSE
+expression of Kafka `OffsetOutOfRange`). The `[gap_from, gap_to]` range is authoritative; the
+`reason` is best-effort. See [Tombstones](/guarantees/tombstones).
+
+### event: caught-up
+
+The box is drained to head; the client is now live. One per box, re-emitted on each
+backlog→tailing transition.
+
+```text
+id: eyJqb2JzIjo1MjEwfQ
+event: caught-up
+data: {"box":"jobs","head_seq":5210}
+```
+
+`caught-up` — not an empty `record` batch — is the reliable "no more right now" signal,
+because [node-filtered and deleted records advance the cursor without appearing](/guarantees/ordering-and-cursors).
+
+### event: box-deleted
+
+The box was deleted while watched. Terminal for **that box only** — the rest of the stream
+continues.
+
+```text
+id: eyJqb2JzLmRscSI6MTJ9
+event: box-deleted
+data: {"box":"jobs.dlq","head_seq":12,"reason":"deleted"}
+```
+
+### Heartbeat
+
+A bare SSE comment with no `id:`, so it never perturbs the resume cursor. It is suppressed
+when real data went out within the heartbeat window.
+
+```text
+: hb
+```
+
+<Callout type="info">
+  The heartbeat is exactly `: hb` — a comment with **no** trailing timestamp. Use it for
+  liveness only. Arm a client watchdog at roughly `2 × heartbeat_ms + slack` (~35 s for the
+  15 s default); any frame resets it, and on timeout you reconnect with `Last-Event-ID`.
+</Callout>
+
+### event: error (protocol-defined)
+
+The protocol also defines an `error` frame for terminal or backpressure conditions — for
+example, a session that was garbage-collected (reconnect by POSTing again), or advisory
+pacing of named boxes under CPU pressure. It carries an HTTP-aligned `code`. Lead your
+client logic with the four data frames above and the heartbeat; handle `error` as the
+terminal/advisory case.
+
+## See also
+
+- [Quickstart](/getting-started/quickstart) — watch many boxes in a couple of `curl` calls.
+- [Reading API](/api/reading) — the `diff` cursor model that watch streams over a connection.
+- [Ordering & cursors](/guarantees/ordering-and-cursors) — why `caught-up`, not batch size, is the "done for now" signal.
+- [Tombstones](/guarantees/tombstones) — the in-band loss signal you receive on both `diff` and SSE.
+- [Pub/Sub guide](/guides/pubsub) — a full fan-out recipe built on watch and routers.

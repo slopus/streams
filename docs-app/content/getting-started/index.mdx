@@ -1,0 +1,104 @@
+---
+title: Introduction
+description: What streams is, the problem it solves, and the load-bearing invariant that data loss is always explicit, never silent.
+---
+
+import { Callout, Cards } from 'nextra/components'
+
+# Introduction
+
+**streams** is a persistent event engine in a single binary. It is an append-only log
+service exposed over a clean, JSON-first HTTP API: you write events to named **boxes**,
+read them back by **sequence**, fan them out with **routers**, and watch many boxes at
+once over a single Server-Sent Events connection — all from one static binary on one
+machine, backed by a write-ahead log on local NVMe.
+
+It is the persistence layer for **job queues**, **pub/sub**, and **durable event
+streams**, with a design that makes data loss **always explicit, never silent**.
+
+<Callout type="info">
+  The full `/v0` API is implemented and durable: boxes, diff reads, deletes, routers,
+  multiplexed SSE, and lease-based queues — backed by a write-ahead log with group
+  commit, segments, snapshots, and crash-recovery replay on a single restartable
+  process. An `fsync` box's writes are fsync-gated: an acknowledged write is committed,
+  and a restart replays the WAL to recover it.
+</Callout>
+
+## The problem it solves
+
+Most messaging systems force a single, awkward choice. In-memory brokers are fast but
+lose everything on restart. Durable logs are safe but heavy to operate. And almost all
+of them share one quiet failure mode: when a slow consumer falls behind a retention
+window, the data it missed simply **disappears with no signal**. You find out from a lag
+metric, if you're watching, long after the fact.
+
+streams takes a different position:
+
+- **Durability is a per-box decision, not a server-wide mode.** A RAM-only cache box, a
+  group-committed pub/sub feed, and an `fsync`-gated job queue coexist in one process.
+  Each box buys exactly the guarantee it needs without taxing the others.
+- **Involuntary loss is never silent.** If records you wanted were evicted (cap) or
+  expired (TTL) before you read them, the read returns an in-band **tombstone** with the
+  exact `[gap_from, gap_to]` range — at HTTP 200, never as a silent skip.
+- **The interface is boring on purpose.** Plain HTTP and JSON, with the monotonic `seq`
+  as the cursor and SSE for live delivery. `curl` is a complete client. No SDK, no binary
+  framing, no subscribe-mode connection rules.
+
+## The load-bearing invariant
+
+One rule sits underneath everything:
+
+> **Involuntary, capacity-driven loss you didn't ask for** (cap eviction, TTL expiry)
+> **always produces a tombstone. Voluntary removal you did ask for** (a permanent
+> delete, your own node's events) **is silently filtered.**
+
+Mixing those would make the gap alarm useless. A delete advances a box's `earliest_seq`
+(its first live seq) but never its `evict_floor` (the cap/TTL tombstone trigger), so
+reading across a purely-deleted gap is silent while reading below an evicted floor
+tombstones. The whole data model — the [dual watermark](/guarantees/tombstones), the
+[deletion semantics](/guarantees/deletion), [node loop-prevention](/guarantees/node-loop-prevention) —
+exists to keep that distinction crisp.
+
+## What's implemented today
+
+streams is honest about maturity. The `/v0` contract is fully implemented; a few
+operational edges are partial or planned.
+
+- **Implemented** — the full `/v0` API (boxes, batched diff reads, permanent deletes,
+  routers, multiplexed SSE, lease-based queues); the WAL with adaptive group commit; the
+  three durability classes (`memory`/`disk`/`fsync`); segments, snapshots, and crash
+  recovery; the per-box tag index; node loop-prevention; bearer auth with keys hashed at
+  rest, optional per-key scopes and a box-name prefix allowlist; DoS-hardening resource
+  limits; optional hot→cold segment tiering; and the loopback-default bind.
+- **Partial** — router forwarding is synchronous on the append path and at-least-once via
+  the source log, but a persistently-failing destination is treated as backpressure with
+  **no background retry driver yet**. Queue lease durability is best-effort
+  (`leases_durable` defaults off, and a transient WAL error on a lease append degrades to
+  the queue's baseline at-least-once rather than losing or duplicating work).
+- **Planned** — native TLS (run behind a TLS-terminating reverse proxy today), hard
+  multi-tenant **namespace** isolation (beyond the prefix-allowlist filter that ships
+  today), and a durable router-backlog worker that retries failed forwards from a
+  persisted cursor.
+
+<Callout type="warning">
+  streams speaks **plain HTTP** — it does not terminate TLS. For any non-loopback
+  exposure, run it behind a TLS-terminating reverse proxy or bind loopback and tunnel.
+  See [Security](/deployment/security).
+</Callout>
+
+## Where to go next
+
+<Cards>
+  <Cards.Card title="Quickstart" href="/getting-started/quickstart" arrow>
+    Run the binary and write, read, watch, and delete your first events.
+  </Cards.Card>
+  <Cards.Card title="Mental Model" href="/getting-started/mental-model" arrow>
+    The five concepts — Box, Record, seq, Router, Tombstone — in depth.
+  </Cards.Card>
+  <Cards.Card title="Core Guarantees" href="/guarantees" arrow>
+    Durability classes, explicit loss, deletion, ordering, and idempotency.
+  </Cards.Card>
+  <Cards.Card title="API Reference" href="/api" arrow>
+    Every `/v0` endpoint, its body, its response, and its errors.
+  </Cards.Card>
+</Cards>

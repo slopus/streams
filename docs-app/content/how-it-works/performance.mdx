@@ -1,0 +1,140 @@
+---
+title: Performance
+description: Measured streams performance — engine-core throughput, the realistic single-box HTTP ceiling by durability class, SSE fan-out latency, and recovery time — framed honestly against the hardware floor.
+---
+
+import { Callout } from 'nextra/components'
+
+# Performance
+
+These are measured numbers, not targets, and they are framed honestly: the in-process
+engine core is fast enough that the live ceiling is the HTTP/serialization path and the
+durability class, not the engine. This page leads with the engine core as the upper bound,
+then gives the realistic single-box HTTP ceiling per durability class, SSE fan-out latency,
+and recovery time — and is explicit about where the hardware, not the design, sets the
+floor.
+
+<Callout type="warning">
+  **All numbers below were measured on one laptop** — Apple M4 Max, 16 cores, 128 GiB,
+  Darwin 25.2.0, APFS NVMe, `--release`, loopback HTTP from a single client process. They
+  are single representative runs; expect run-to-run variance. The `fsync`-class latency in
+  particular is dominated by **this machine's** ~5 ms APFS `fdatasync` floor — server-grade
+  NVMe fsyncs roughly 10× faster (~50–500 µs). Treat these as a self-consistent reference
+  point, not a hardware-independent SLA.
+</Callout>
+
+## Engine core (in-process, the upper bound)
+
+Criterion micro-benchmarks call the engine directly — no HTTP, no network — so they isolate
+the raw CPU cost of the hot paths:
+
+| Path | Throughput | Notes |
+|---|---|---|
+| **Append** | **5.6–5.9 M records/s** | 64 B payloads, batch 100–1000 |
+| **Diff projection** | **12–13 M records/s** | the `getDifference` deliverable walk |
+| Tag-index match (exact) | 267 ns | single posting-list lookup |
+| Tag-index match (prefix, 100 tags) | 67.8 µs | range scan over the matching keys |
+
+The engine core is comfortably above the ~1 M events/s bar. Everything below it — the HTTP
+ceiling — is the cost of the request path and durability, not the engine.
+
+## Single-box HTTP write throughput & latency
+
+Over real loopback HTTP through a single box (16 writers × batch 100), the ceiling drops to
+the HTTP request and `serde_json` serialization path plus the durability class:
+
+| Class | Write-ack p50 | Write-ack p99 | Throughput (1 box) |
+|---|---|---|---|
+| `disk` (`durable:false`) | **0.062 ms** | 0.102 ms | **525–566 K records/s** |
+| `fsync` (`durable:true`) | **5.21 ms** | 6.76 ms | **143 K records/s** |
+
+The `disk`-class p50 of **0.062 ms** (p999 0.148 ms, n=5000) is well under 1 ms — the WAL
+framing and buffered write add only single-digit microseconds when the fsync is off the
+critical path.
+
+The `fsync`-class p50 of **5.21 ms** is **dominated by the APFS `fdatasync` ~5 ms floor on
+this laptop** — the server-reported `performance.fsync_ms` is p50 4.91 ms, so the engine
+adds well under 1 ms on top. This is a hardware floor, not a design miss: a lone durable
+write's group-commit window collapses to its 500 µs minimum, so the latency *is* the fsync.
+
+<Callout type="info">
+  **`fsync`-class throughput is a group-commit win.** Under concurrent durable load the
+  adaptive group commit coalesces many writers' frames into one `fdatasync` — lifting
+  durable throughput to **143 K records/s**, about **8.4×** the 17.9 K records/s baseline of
+  one-fsync-per-write. The latency floor stays at ~5 ms (one physical fsync), but the *count*
+  of fsyncs per second collapses. See [WAL & Group Commit](/how-it-works/wal-and-group-commit).
+</Callout>
+
+## SSE fan-out (write → deliver)
+
+A pulse is serialized **once** and ref-counted to every watcher (never copied into N boxes),
+so per-watcher delivery latency stays flat as fan-out grows:
+
+| Watchers | Deliver p50 | Deliver p99 |
+|---|---|---|
+| 100 | **0.85 ms** | ~1.9 ms |
+| 1000 | **2.21 ms** | ~4.9 ms |
+
+The 1–5 ms delivery target is met out to 100 watchers and sits at the edge (steady-state p99
+~4.9 ms) at 1000. The marginal cost of an extra watcher is a bounded-channel send — tens to
+hundreds of nanoseconds — which is why latency doesn't blow up with N. (A one-time
+client-side connect storm when standing up 1000 SSE connections from one process shows up as
+a max outlier; it is connection setup, not server fan-out.)
+
+## Recovery time
+
+After a hard kill with **no snapshot** — the worst case, a pure full WAL replay from offset
+zero — the server recovers and reports ready in:
+
+| Records replayed | Time-to-ready | Recovered `head_seq` |
+|---|---|---|
+| 1 000 000 | **0.68–0.94 s** | 1 000 000 (no loss) |
+
+That is ~1.1–1.5 M frames/s of CRC-validate + decode + re-index + tag-index rebuild. With a
+graceful shutdown or the periodic snapshotter, recovery starts from the checkpoint and
+replays only the un-checkpointed tail, so real-world time-to-ready is bounded by the snapshot
+interval, not the total record count. See [Crash Recovery](/how-it-works/recovery).
+
+## The ~1 M events/s framing
+
+The often-quoted ~1 M events/s figure is an **aggregate** target — reached via batching and
+sharding across boxes and connections — not a single-origin, single-connection HTTP number.
+Be precise about which ceiling applies:
+
+- **Engine core: met.** In-process append is 5.6–5.9 M records/s; diff projects at 12–13 M
+  records/s. The engine has 5×+ headroom over the bar.
+- **Single-box single-origin HTTP: ~0.5 M records/s** disk-class. The ceiling here is the
+  HTTP request / `serde_json` serialization path and per-request lock acquisition, **not the
+  engine**. Reaching ~1 M/s in aggregate is a matter of multi-connection / multi-box load
+  plus batched writes, not a change to the server.
+- **Latency target (~1 ms): met for the non-durable path** (disk-class write-ack p50
+  0.062 ms; SSE deliver 0.34–0.85 ms out to 100 watchers; tail/caught-up ~0.05 ms). **Not
+  met for the `fsync` class by design** — its ~5 ms p50 is the physical APFS `fdatasync`
+  floor, not engine cost, and no engine work moves it without weakening the acked⇒durable
+  guarantee.
+
+## Correctness gates
+
+Every benchmarked build passes the full gate set — performance is never measured against a
+loosened contract:
+
+| Gate | Result |
+|---|---|
+| `streams-probe conformance` (live release server) | **117 / 117**, exit 0 |
+| `cargo test --workspace` | 310 passed, 0 failed |
+| `cargo test --features test-fs` | 455 passed, 0 failed |
+| `cargo clippy --workspace --all-targets` | clean (0 warnings) |
+
+Crash consistency and zero acked-durable loss across restart are proven by real `kill -9`
+subprocess tests, not benchmarked — see [Crash Recovery](/how-it-works/recovery).
+
+## See also
+
+- [WAL & Group Commit](/how-it-works/wal-and-group-commit) — why the durable throughput
+  ceiling is what it is, and how group commit lifts it.
+- [Scheduler & Backpressure](/how-it-works/scheduler) — the delivery path behind the SSE
+  fan-out numbers, and how it degrades under pressure.
+- [Crash Recovery](/how-it-works/recovery) — the recovery pass behind the time-to-ready
+  numbers.
+- [Durability](/guarantees/durability) — the three commit classes the latency/throughput
+  tables are split by.

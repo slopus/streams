@@ -1,0 +1,166 @@
+---
+title: Multi-Master Fan-out
+description: Mirror events N ways — each node sets its node id, symmetric routers connect the nodes, and node loop-prevention plus a hop-cap make the topology echo-free even with cycles.
+---
+
+import { Callout, Steps } from 'nextra/components'
+
+# Multi-Master Fan-out
+
+**Multi-master** means several symmetric nodes that each write events *and* each consume the union of everyone's events — without a node ever receiving back what it produced, and without a record looping forever around the topology. streams makes this safe by construction with two complementary layers: **node loop-prevention** (content-level — a node never delivers its own records to itself) and **router cycle control** (topology-level — a hop-cap stops unbounded forwarding). The contract is simple: every node sets its own `node` id on writes *and* presents it as a filter on reads, and routers preserve `$node` verbatim through every forward.
+
+Get those two halves right and an A↔B↔C mirror is echo-free and loop-free with no distributed consensus, no clock sync, no leader — just append-only logs and forwarding rules on each box.
+
+<Callout type="important">
+  The whole pattern rests on one rule: **a node must set `node: "X"` on its writes AND pass
+  `node: "X"` as the loop-prevention filter on its reads/watches.** A record carries its
+  origin `$node` unchanged through every router hop, so when it arrives back at a box that X
+  reads, X filters it out — silently (no tombstone, since it's a voluntary, content-based
+  drop). Forget the filter on reads and a node will see its own echoes. See
+  [Node loop-prevention](/guarantees/node-loop-prevention).
+</Callout>
+
+## How the two layers compose
+
+- **Node loop-prevention (correctness).** Every record may carry an origin `$node`, stamped by the writer, **immutable**, and **preserved verbatim** through every router forward. A read that presents a matching `node` drops every record whose `$node` equals it, byte-exact, before delivery. So node A writes `$node=A`; routers fan it to B's and C's boxes; B and C read with their own node filters and receive A's record but never re-emit it as their own. A record that loops back to a box A reads is filtered at A's read. This makes delivery echo-free.
+- **Router cycle control (resource safety).** Node filtering stops a node from *consuming* its own events but does **not** stop a record from being *forwarded* around a cycle forever (wasteful, amplifying). So the server rejects any router that would create a directed cycle with `409 router_cycle` by default — and for an intentional cycle (A↔B), you set `allow_cycle: true`, which switches that route to runtime **hop-cap loop-breaking**: a forwarded record carries a bounded hop counter incremented on every forward, and once it reaches the cap (`MAX_ROUTER_HOPS`, default 8) the record is not forwarded again. Forwarding always terminates.
+
+Complementary: node-filtering prevents *delivery* of your own events; the hop-cap prevents *unbounded forwarding*.
+
+## Recipe — a two-node A↔B mirror
+
+The simplest multi-master: two nodes, each with a shared box, mirrored both ways so each node sees the other's writes.
+
+```text
+   node A                                node B
+   write $node=A ──► ┌────────┐  router A→B  ┌────────┐ ◄── write $node=B
+                     │ box on │ ───────────► │ box on │
+   read node=A   ◄── │  A     │ ◄─────────── │  B     │ ──► read node=B
+                     └────────┘  router B→A  └────────┘
+```
+
+<Steps>
+
+### Each node writes with its own node id
+
+A node stamps every write with its identity. The batch-level `node` is the common one-writer case.
+
+```bash
+# On node A:
+curl -X POST localhost:4000/v0/boxes/events \
+  -H 'content-type: application/json' \
+  -d '{ "node": "A",
+        "records": [ { "data": { "evt": "user.created", "id": 42 } } ] }'
+
+# On node B:
+curl -X POST localhost:4000/v0/boxes/events \
+  -H 'content-type: application/json' \
+  -d '{ "node": "B",
+        "records": [ { "data": { "evt": "order.placed", "id": 7 } } ] }'
+```
+
+The origin `$node` (`A` or `B`) is now immutable and rides through every forward.
+
+### Create symmetric routers between the nodes
+
+One router each direction. Because A→B and B→A together form a directed cycle, set `allow_cycle: true` on both so creation isn't rejected with `409 router_cycle`; the route then uses hop-cap loop-breaking. `preserve_node: true` (the default) is what carries `$node` across the forward — **do not** set it false, or loop-prevention breaks.
+
+```bash
+# Router forwarding A's box into B's box:
+curl -X PUT localhost:4000/v0/routers/a-to-b \
+  -H 'content-type: application/json' \
+  -d '{ "source": "events", "dest": "events-mirror", "allow_cycle": true }'
+
+# Router forwarding B's box back into A's box (symmetric):
+curl -X PUT localhost:4000/v0/routers/b-to-a \
+  -H 'content-type: application/json' \
+  -d '{ "source": "events-mirror", "dest": "events", "allow_cycle": true }'
+```
+
+```json
+# →
+{ "router": "a-to-b", "created": true,
+  "source": "events", "dest": "events-mirror",
+  "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": true,
+  "performance": { "server_total_ms": 0.20 } }
+```
+
+<Callout type="info">
+  In a real deployment each "box" lives on a *separate streams process* on a different
+  machine; a router's `dest` would name a box reached through that node's HTTP endpoint. The
+  semantics are identical — `$node` preservation and the hop-cap work the same whether the
+  hops are in one process or across the network. (streams is single-machine per process; the
+  mirror is built by pointing routers at peer instances.)
+</Callout>
+
+### Each node reads the union, filtering its own events
+
+Each node reads the merged stream and passes **its own** node id as the loop-prevention filter, so it sees the others' events but never its own echoes.
+
+```bash
+# On node A — read everything, drop records A produced:
+curl -X POST localhost:4000/v0/boxes/events/diff \
+  -H 'content-type: application/json' \
+  -d '{ "from_seq": 0, "node": "A" }'
+```
+
+```json
+# →
+{ "box": "events",
+  "records": [
+    { "$seq": 12, "$ts": 1748470000500, "$node": "B",
+      "data": { "evt": "order.placed", "id": 7 } }
+  ],
+  "next_from_seq": 12, "head_seq": 12, "earliest_seq": 1,
+  "caught_up": true, "tombstone": null, "lag": 0,
+  "performance": { "server_total_ms": 0.31 } }
+```
+
+A's own records (`$node: "A"`) were filtered out — but the cursor still advanced **past** them. So `caught_up`, not `records.length`, is the "no more right now" signal.
+
+</Steps>
+
+<Callout type="warning">
+  Node-filtered records are dropped *after* the batch window is selected, so a batch can
+  return fewer than `limit` records — even **zero** — while `next_from_seq` advances. A node
+  reading a box full of its own events would otherwise loop forever. Always rely on
+  `next_from_seq` / `head_seq` / `caught_up`, never on batch fullness. See
+  [Ordering & Cursors](/guarantees/ordering-and-cursors).
+</Callout>
+
+## Scaling to N nodes
+
+The pattern generalizes: each of N nodes sets a distinct `node` id, and you connect them with routers so every node's writes reach every other node. You can use a full mesh (a router from each node to each other), a ring, or a hub — node loop-prevention keeps delivery echo-free in any topology, because the origin `$node` is preserved no matter how many hops a record takes. Reads on each node pass that node's own id (or several ids, `"node": ["A","A-replica"]`, to filter multiple of its own identities).
+
+Watch the merged stream live instead of polling — the loop-prevention filter applies to SSE identically:
+
+```bash
+curl -X POST localhost:4000/v0/watch \
+  -H 'content-type: application/json' \
+  -d '{ "node": "A", "boxes": { "events": { "from_seq": 0 } } }'
+# → returns a wid; GET it to stream. Records with $node "A" are never delivered to A.
+```
+
+## Loop-breaking: why it never runs forever
+
+Two independent guarantees stop runaway forwarding:
+
+- **The DAG default.** Without `allow_cycle: true`, the server rejects any router that would close a directed cycle at creation time (`409 router_cycle`, with `error.detail.cycle` naming the loop). A non-cyclic fan-out can never loop by construction.
+- **The runtime hop-cap.** On an `allow_cycle: true` route, each forwarded record carries a bounded hop counter, incremented on every forward; once it reaches the cap (`MAX_ROUTER_HOPS`, default **8**) the record is not forwarded again. So even a fully symmetric A↔B↔C mesh terminates every record after a bounded number of hops.
+
+Node-filtering ensures correctness (you never *consume* your own event); the hop-cap ensures resource safety (a record is never *forwarded* without bound). You need both — node-filtering alone would let a record circulate forever even though no one delivers it.
+
+## Gotchas
+
+- **You must set `node` on reads too.** Setting it only on writes stamps the records but does nothing to filter them — a node will see its own echoes. The filter is opt-in per read/watch.
+- **Don't clear `$node` on forwards.** `preserve_node` defaults `true`; setting it `false` strips the origin id and breaks loop-prevention across that route.
+- **Deletes and filters are per-box.** A delete on one node's box does **not** propagate through routers — a copy may already have been forwarded. To remove a record everywhere, delete it on each box (or design idempotent consumers). See [Routers](/api/routers).
+- **Forwarding is at-least-once.** A crash between "appended to dest" and "advanced router cursor" can re-forward, so a record may arrive twice. Combined with the hop-cap and node-filtering, duplicates are the only residue — **consumers must be idempotent** (dedupe on `$node` + a key in `data`/`meta`).
+- **Per-box durability still applies independently.** Each box in the mirror chooses its own [durability class](/guarantees/durability); a forward honors the *destination* box's class (a `memory` dest persists no copy).
+
+## See also
+
+- [Node loop-prevention](/guarantees/node-loop-prevention) — the byte-exact `$node` filter and why it's silent.
+- [Routers](/api/routers) — forward mechanics, `preserve_node`, `allow_cycle`, cycle rejection, the hop-cap.
+- [Ordering & Cursors](/guarantees/ordering-and-cursors) — why filtered records advance the cursor.
+- [Pub/Sub](/guides/pubsub) — single-publisher fan-out, the simpler cousin of this recipe.

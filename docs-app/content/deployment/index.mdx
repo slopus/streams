@@ -1,0 +1,124 @@
+---
+title: Running streams
+description: How the durable single binary starts, recovers, binds, and shuts down — plus where to go for Docker, configuration, security, storage, and observability.
+---
+
+import { Callout, Steps, Cards } from 'nextra/components'
+
+# Running streams
+
+streams ships as one **durable single binary**: the complete `/v0` API backed by a
+write-ahead log on local disk, with no external dependencies — no database, no broker, no
+sidecar. You build it once, point it at a data directory, and run it. This page covers
+what the process does on start, how it binds and authenticates, and how it shuts down.
+
+## Build and run
+
+The binary is named `streams`. Build it with a Rust toolchain, then run it. On a loopback
+bind with no keys configured it starts in **dev mode** (auth disabled) — the default — so
+the [Quickstart](/getting-started/quickstart) commands work verbatim.
+
+```bash
+# Build the single binary.
+cargo build --release
+
+# Run it. Defaults: bind 127.0.0.1:4000 (loopback), auth disabled (dev mode);
+# WAL + segments + snapshots live under ./streams-data.
+./target/release/streams
+```
+
+If you'd rather not build from source, run the published container image instead — see
+[Docker](/deployment/docker).
+
+## What happens on start
+
+The process is a state machine that **recovers before it serves**. On start it:
+
+<Steps>
+
+### Opens the data directory
+
+It opens `STREAMS_DATA_DIR` (default `./streams-data`), which holds the WAL, segment
+files, and snapshots. A missing or empty directory is a clean first start.
+
+### Loads the latest snapshot
+
+A snapshot is a checkpointed image of all box state. Loading it lets recovery skip
+replaying the entire WAL from the beginning.
+
+### Replays the WAL forward
+
+From the snapshot's checkpoint, it replays every WAL frame in order — re-applying appends,
+deletes, and watermark moves — and **truncates any torn tail** (a frame whose length runs
+past end-of-file, or whose XXH3-64 checksum doesn't match). A complete, checksum-valid
+frame for an acknowledged durable write is never lost.
+
+### Gates readiness until replay completes
+
+Until recovery finishes, `GET /v0/ready` returns **503 `not_ready`** with a
+`Retry-After` header and a `detail.replay_progress` value in `[0.0, 1.0]`. Once recovery
+completes it returns **200** `{ "status": "ready", "wal_replay_complete": true, "boxes": N }`.
+
+</Steps>
+
+<Callout type="important">
+  Put `GET /v0/ready` (alias `/readyz`) in front of any load balancer or orchestrator
+  readiness check. It returns 503 during WAL replay and only flips to 200 once an
+  acknowledged durable write is fully recovered — so traffic never hits a partially-recovered
+  server. `GET /v0/health` (alias `/healthz`) is a liveness probe and returns 200 as soon as
+  the process is serving.
+</Callout>
+
+## Binding and dev-mode auth
+
+The default bind is **loopback** (`127.0.0.1:4000`), so an unconfigured server is never
+accidentally a public, unauthenticated event store. Two rules follow from that:
+
+- On a loopback bind with **no** `STREAMS_API_KEYS`, the server runs in **dev mode** with
+  auth disabled. This is the local-development default.
+- Binding a **non-loopback** address (anything other than `127.0.0.1`) with **no** keys
+  makes the server **refuse to start** — it logs the reason loudly — unless you set
+  `STREAMS_ALLOW_INSECURE_NO_AUTH=1`. That flag is for local/dev only; never set it on a
+  network-exposed deployment.
+
+Set `STREAMS_HOST`, `STREAMS_PORT`, and `STREAMS_API_KEYS` to bind elsewhere and turn auth
+on. See [Configuration](/deployment/configuration) for every variable and
+[Security](/deployment/security) for the key, scope, and prefix-allowlist model.
+
+<Callout type="warning">
+  streams speaks **plain HTTP** — it does not terminate TLS. For any non-loopback exposure,
+  run it behind a TLS-terminating reverse proxy, or bind loopback and tunnel. Native TLS is
+  planned. See [Security](/deployment/security).
+</Callout>
+
+## Graceful shutdown
+
+On `SIGINT` or `SIGTERM`, the server drains gracefully and **writes a final snapshot**, so
+a clean restart starts from a current checkpoint with minimal WAL to replay. While
+draining, `GET /v0/ready` returns **503 `shutting_down`**.
+
+Because durability is WAL-first, you don't depend on the shutdown snapshot for correctness:
+an acknowledged durable (`disk`/`fsync`) write is already in the WAL and is recovered by
+replay even after an abrupt kill. The final snapshot is a recovery-speed optimization, not
+a correctness requirement. (A `memory`-class box is intentionally not persisted and
+reappears empty — see [Durability](/guarantees/durability).)
+
+## Where next
+
+<Cards>
+  <Cards.Card title="Docker" href="/deployment/docker" arrow>
+    The GHCR multi-arch image, run commands, the `/data` volume, and the tag-driven release flow.
+  </Cards.Card>
+  <Cards.Card title="Configuration" href="/deployment/configuration" arrow>
+    Every `STREAMS_*` environment variable, its exact default, and what it controls.
+  </Cards.Card>
+  <Cards.Card title="Security" href="/deployment/security" arrow>
+    Bearer keys hashed at rest, per-key scopes, the box-name prefix allowlist, and resource limits.
+  </Cards.Card>
+  <Cards.Card title="Storage & Tiering" href="/deployment/storage-and-tiering" arrow>
+    The data directory layout and optional hot→cold segment relocation.
+  </Cards.Card>
+  <Cards.Card title="Observability" href="/deployment/observability" arrow>
+    Health, readiness, and the Prometheus metrics endpoint.
+  </Cards.Card>
+</Cards>

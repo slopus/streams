@@ -1,0 +1,202 @@
+---
+title: Storage & Tiering
+description: The on-disk layout — WAL, metadata snapshots, and per-box segment files — plus optional hot/cold tiering, the segment-sealing triggers, and the hard invariant that cold reads never affect writes or live delivery.
+---
+
+import { Callout, FileTree } from 'nextra/components'
+
+# Storage & Tiering
+
+streams persists everything under one data directory: a process-global **write-ahead log**,
+periodic **metadata snapshots**, and per-box **segment files** that are the long-term store and
+read source. Segments **seal** (become immutable) after a size, count, or age trigger. An
+optional **cold tier** relocates older sealed segments to a second directory — **disabled by
+default**, and governed by one hard invariant: **cold reads never affect writes or live
+delivery.**
+
+<Callout type="info">
+  The WAL is the durability boundary — "only data not yet in the WAL is lost." Everything
+  downstream (the in-memory index, segments, snapshots) is a **derivable cache** of the WAL plus
+  checkpoints. See [WAL & Group Commit](/how-it-works/wal-and-group-commit) and
+  [Recovery](/how-it-works/recovery) for the mechanics.
+</Callout>
+
+## On-disk layout
+
+Everything lives under `STREAMS_DATA_DIR` (default `./streams-data`), the **hot tier**. Three
+top-level subtrees: `meta/`, `wal/`, and `boxes/`.
+
+<FileTree>
+  <FileTree.Folder name="streams-data (STREAMS_DATA_DIR)" defaultOpen>
+    <FileTree.Folder name="meta" defaultOpen>
+      <FileTree.File name="snapshot.0007.bin" />
+      <FileTree.File name="snapshot.0006.bin" />
+    </FileTree.Folder>
+    <FileTree.Folder name="wal" defaultOpen>
+      <FileTree.File name="CURRENT" />
+      <FileTree.File name="wal-0000000000001024.log" />
+      <FileTree.File name="wal-0000000000004096.log" />
+    </FileTree.Folder>
+    <FileTree.Folder name="boxes" defaultOpen>
+      <FileTree.Folder name="0000000A" defaultOpen>
+        <FileTree.File name="seg-0000000000000001.data" />
+        <FileTree.File name="seg-0000000000000001.idx" />
+        <FileTree.File name="seg-0000000000010001.data" />
+        <FileTree.File name="seg-0000000000010001.idx" />
+      </FileTree.Folder>
+      <FileTree.Folder name="0000000B" />
+    </FileTree.Folder>
+  </FileTree.Folder>
+</FileTree>
+
+- **`wal/`** — the WAL is **process-global**: one ordered, append-only, mixed-box stream. A
+  single sequential disk resource maps to a single ordered append stream, which makes group
+  commit trivial. Files are named `wal-<first-frame-seq>.log` (zero-padded); the
+  highest-numbered is active, and the tiny `CURRENT` file (atomically renamed) names it. Files
+  are **64 MiB preallocated** so appends never extend the inode.
+- **`meta/`** — atomic metadata snapshots (`snapshot.<n>.bin`): the box name↔id mapping, per-box
+  config, the dual watermarks (`evict_floor`, `earliest_seq`), `delete_below`, routers, epochs,
+  and the WAL replay floor. The previous snapshot is kept until the next is durably written.
+  Snapshots are written via temp → fsync → rename → dir-fsync for a crash-atomic swap.
+- **`boxes/`** — one directory **per box**, named by the interned **numeric box id** (hex), not
+  the box name (this is what makes [path traversal impossible](/deployment/security#no-path-traversal)).
+  Segments are per-box so eviction, mmap, and read locality are independent across boxes.
+
+<Callout type="warning">
+  The data directory holds **every record's payload in the clear** (WAL frames and segment
+  `.data` files). streams does not encrypt payloads. Protect it with filesystem permissions and
+  at-rest disk encryption — see [Security](/deployment/security#whats-not-in-scope).
+</Callout>
+
+## Segments
+
+WAL frames are periodically checkpointed into per-box **segment files** to keep recovery bounded
+and reads efficient. Each segment is a numbered pair, named by its first seq so the files sort
+into seq order:
+
+| File | Contents |
+|---|---|
+| `seg-<first_seq>.data` | Append-ordered record frames (a close variant of the WAL frame: every frame is an Append, so there is no `type` byte). Each frame ends in an XXH3-64 checksum — the same crash anchor as the WAL. |
+| `seg-<first_seq>.idx` | A fixed-stride index, **20 bytes per entry**: `[offset:u32, len:u32, ts:u64, flags:u8, pad:3]`. Entry `i` ↔ seq `first_seq + i`. |
+
+The `.idx` is the on-disk twin of the in-memory box index. Because it is fixed-stride,
+`seq → entry` is direct arithmetic — `(seq − first_seq) × 20` — a seek, never a scan. That makes
+rebuilding the in-memory index on restart a **bulk read of `.idx` files** rather than a re-parse
+of all payload data. The inline `ts` enables binary search for the TTL boundary, and the inline
+`flags` a cheap tag/node presence probe, without touching the `.data` file.
+
+### Sealing triggers
+
+The **newest** segment for a box is "active" — still being appended. A segment **seals**
+(becomes immutable) when **any** of three triggers fires:
+
+| Trigger | Default | Env knob |
+|---|---|---|
+| Record count | `10000` records | `STREAMS_SEGMENT_MAX_EVENTS` |
+| `.data` size | `64 MiB` | `STREAMS_SEGMENT_MAX_BYTES` |
+| Age (idle/partial) | `1 h` (`3600000` ms) | `STREAMS_SEGMENT_MAX_AGE_MS` (`0` disables) |
+
+The byte trigger is a guard for boxes with large payloads (the count trigger alone could let a
+segment grow huge); the age trigger seals an idle box's partial segment so it can be relocated or
+reclaimed.
+
+<Callout type="important">
+  A **sealed** segment is immutable, and a checksum mismatch on it is treated as **corruption —
+  surfaced, not silently truncated**. This differs from the WAL's torn tail, where a checksum
+  mismatch at the end is the expected logical end-of-log and is truncated cleanly on recovery.
+</Callout>
+
+Cap/TTL eviction and deletion reclaim disk at **segment granularity, lazily**: a whole sealed
+segment whose highest seq is below the live floor is dropped (its `.data` + `.idx` unlinked); a
+partially-deleted segment is reclaimed by a background rewrite. The active segment is never
+dropped. A box may therefore briefly retain slightly more than its cap (only whole sealed
+segments drop) — the documented, accepted approximation. See
+[Segments & Snapshots](/how-it-works/segments-and-snapshots).
+
+## Hot/cold tiering
+
+A box's segments can be split across **two tiers**:
+
+- **HOT** — the active segment plus recent sealed segments, on fast local NVMe (the per-box
+  directory under `STREAMS_DATA_DIR`). The live tail (active segment + in-memory index + a
+  bounded recent-record cache) is always hot and independent of cold access.
+- **COLD** — older sealed segments, on a slower tier. Today the cold tier is simply a **different
+  configured folder**, `STREAMS_COLD_DIR`. (An object-store backend such as S3 is explicitly
+  future work; only the local-folder cold store exists now. Both tiers sit behind one
+  `SegmentStore` trait, so S3 drops in later without touching the engine.)
+
+<Callout type="info">
+  **Tiering is disabled by default.** When `STREAMS_COLD_DIR` is **unset**, nothing relocates and
+  behavior is unchanged by construction — every segment stays hot. You opt in by setting the cold
+  directory.
+</Callout>
+
+When enabled, the cold tier mirrors the per-box layout under `STREAMS_COLD_DIR` using the **same**
+`seg-<first_seq>` naming, so a relocated segment keeps its identity:
+
+<FileTree>
+  <FileTree.Folder name="STREAMS_COLD_DIR" defaultOpen>
+    <FileTree.Folder name="boxes" defaultOpen>
+      <FileTree.Folder name="0000000A" defaultOpen>
+        <FileTree.File name="seg-0000000000000001.data" />
+        <FileTree.File name="seg-0000000000000001.idx" />
+      </FileTree.Folder>
+    </FileTree.Folder>
+  </FileTree.Folder>
+</FileTree>
+
+### Hot retention
+
+Sealed segments beyond the hot-retention bound relocate to cold:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `STREAMS_HOT_RETAIN_SEGMENTS` | `4` | Keep this many newest sealed segments hot before relocating older ones to cold. |
+| `STREAMS_HOT_RETAIN_BYTES` | `0` (off) | Optional hot sealed-byte bound. When both are set, the **stricter** wins. |
+
+Relocation is **crash-safe and idempotent**: copy the segment to cold → fsync → durably flip the
+tier pointer → delete the hot copy. If interrupted, restart prefers the surviving copy (a
+per-box tier resolver favors the HOT copy when both exist during the transient mid-relocation
+window), so a segment is never lost. Cap/TTL/delete reclaim drops a whole segment file in
+**either** tier. The WAL remains the durability boundary throughout; segments are a derivable
+materialization.
+
+### The hard invariant
+
+<Callout type="important">
+  **Cold reads MAY degrade `getDifference` / historical reads, but MUST NOT affect writes or
+  live delivery (SSE / tail).** Cold I/O and the relocator run on a **separate blocking/IO
+  pool**; they never hold a box write lock or block an SSE push during a slow cold fetch. The
+  live tail is always hot.
+</Callout>
+
+This is the load-bearing rule of the tiering design. A consumer reading deep history from a slow
+cold segment can be slower, and that latency surfaces honestly in the response (a
+`cold_segments_read` field appears in the `performance` block when a read touched cold storage —
+see [Observability](/deployment/observability)). But a writer appending to the box, and a watcher
+tailing the live head, are never slowed by that cold read. The in-memory index keeps memory
+bounded by the index **entry count**, not the payload volume — older payloads are read from
+segments on demand.
+
+## Segment config knobs
+
+The complete set of storage-related environment variables. All are also documented in
+[Configuration](/deployment/configuration).
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `STREAMS_DATA_DIR` | `./streams-data` | Hot tier + WAL + meta root. |
+| `STREAMS_COLD_DIR` | *(unset)* | Cold tier root. **Unset ⇒ tiering disabled (all hot).** |
+| `STREAMS_SEGMENT_MAX_EVENTS` | `10000` | Seal a segment after this many records. |
+| `STREAMS_SEGMENT_MAX_BYTES` | `67108864` (64 MiB) | Seal after this many `.data` bytes. |
+| `STREAMS_SEGMENT_MAX_AGE_MS` | `3600000` (1 h) | Seal an idle/partial segment after this age; `0` disables. |
+| `STREAMS_HOT_RETAIN_SEGMENTS` | `4` | Newest sealed segments kept hot before relocating to cold. |
+| `STREAMS_HOT_RETAIN_BYTES` | `0` (off) | Optional hot sealed-byte bound; stricter of the two wins. |
+
+## See also
+
+- [Segments & Snapshots](/how-it-works/segments-and-snapshots) — how checkpointing, sealing, and reclaim work internally.
+- [WAL & Group Commit](/how-it-works/wal-and-group-commit) — the durability boundary and the commit path.
+- [Recovery](/how-it-works/recovery) — how the data directory is replayed on restart.
+- [Configuration](/deployment/configuration) — the full `STREAMS_*` env-var set.
+- [Durability](/guarantees/durability) — the `memory` / `disk` / `fsync` commit classes.

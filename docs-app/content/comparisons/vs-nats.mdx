@@ -1,0 +1,233 @@
+---
+title: vs NATS JetStream
+description: How streams compares to NATS JetStream — the closest single-binary peer — on subjects vs boxes, durability, consumers, dead-letter, gap detection, KV/Object store, RAFT replication, and isolation.
+---
+
+import { Callout } from 'nextra/components'
+
+# vs NATS JetStream
+
+NATS JetStream is the fairest peer to streams: both are persistence layers that live
+inside a **single server binary**, write to local files, and serve as the substrate for
+log, queue, and fan-out patterns. The honest split is that JetStream also **clusters**
+for replicated HA and scale-out, while streams is single-machine; and that streams gives
+you a **delivery-time gap signal** and a **built-in dead-letter move**, which JetStream
+leaves to advisories you wire up yourself.
+
+<Callout type="info">
+  This page describes JetStream (the persistence/streaming layer inside `nats-server`),
+  not core NATS subject messaging. JetStream can run as one binary — that's why it's the
+  closest comparison — but it is also designed to run as a RAFT-replicated cluster, which
+  streams is not.
+</Callout>
+
+## The shape of each system
+
+streams writes records to named **boxes** addressed directly by name (`jobs`,
+`audit`). A box has a per-box [durability class](/guarantees/durability) and is read by
+its monotonic `seq` cursor over plain HTTP/JSON, with live delivery over
+[multiplexed SSE](/api/watch).
+
+JetStream defines **streams** that bind one or more **subjects** —
+`orders.*.created`, `orders.>` — and capture every message published to a matching
+subject, decoupled from any particular publisher. You interact through the NATS protocol
+and a NATS client library; consumers are objects the server tracks on your behalf.
+
+That subject-binding model is genuinely powerful and has no equivalent in streams: a
+JetStream stream pulls in traffic by wildcard pattern without the producer naming the
+stream. In streams you write to a box by name, and [routers](/api/routers) handle
+fan-out after the fact.
+
+## Subjects vs boxes
+
+| | streams | NATS JetStream |
+|---|---|---|
+| Addressing | Write to a **box** by name | Stream **binds subjects** (`orders.>`) and captures matching publishes |
+| Producer coupling | Producer names the box | Producer publishes to a subject; the stream captures it |
+| Fan-out | Server-side [routers](/api/routers) copy box→box | Multiple streams can bind overlapping subjects; consumers filter by subject |
+| Wildcards | Tag prefix match on reads/deletes; box names are literal | First-class subject wildcards (`*`, `>`) |
+| Transport | Plain HTTP/JSON + SSE — `curl` is a client | NATS wire protocol + a NATS client library |
+
+Subject wildcard capture is a clear JetStream win. The streams win is reach: any HTTP
+client, no protocol or SDK, and SSE for live tailing.
+
+## Per-stream vs per-box durability
+
+JetStream sets storage **per stream** — `file` or `memory`. That is a binary choice for
+the whole stream.
+
+streams resolves a [durability class](/guarantees/durability) **per box**, with three
+levels rather than two:
+
+- `memory` — pure RAM, lost on restart (box reappears empty, config persists).
+- `disk` — WAL + group commit, acked on frame enqueue, survives a crash minus the
+  un-fsynced tail.
+- `fsync` — ack is held until the group `fdatasync` completes, so an acknowledged write
+  survives any crash.
+
+A RAM cache box, a group-committed feed, and an `fsync`-gated job queue coexist in one
+process, each paying only for the guarantee it needs. JetStream's `file` storage is
+closer to streams' `disk`/`fsync` end; the per-box granularity and the explicit `disk`
+middle tier are a streams distinction.
+
+## Consumers + AckWait vs lease queues
+
+JetStream consumers are **server-tracked**. The server remembers each consumer's
+position and acknowledgements:
+
+- Ack policies `AckNone`, `AckAll`, `AckExplicit`.
+- `AckWait` is a redelivery deadline — a lease: if you don't ack within the window, the
+  message is redelivered. `BackOff` lets you schedule escalating redelivery intervals.
+- Push and pull consumers, durable or ephemeral.
+
+These are mature, well-worn ack semantics, and the server holding consumer state is a
+real convenience.
+
+streams splits this into two explicit models:
+
+- **Cursor reads** ([diff](/api/reading)): the consumer owns its `from_seq` cursor.
+  Advancing it is the ack. The server tracks no per-consumer position — it's stateless
+  on the read path, which is what lets `curl` be a complete client.
+- **Lease queues** ([queues](/api/queues)): `claim` hands out a lease with a deadline
+  (`lease_ms`, default 30 000 ms); `ack` is the permanent delete; `nack` requeues;
+  `extend` renews the lease. This is the closest analog to `AckWait` redelivery, and it
+  is production-ready today.
+
+JetStream's win here is server-side consumer bookkeeping and `BackOff` scheduling out of
+the box. The streams win is that the cursor model needs no server-side consumer object at
+all, and the queue model gives you per-message leases with the same redelivery guarantee.
+
+## MaxDeliver advisory vs built-in dead-letter MOVE
+
+This is a concrete behavioral difference.
+
+In JetStream, `MaxDeliver` caps redelivery attempts. When a message exhausts them,
+JetStream **publishes an advisory** (`$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.…`).
+There is no built-in destination — you subscribe to the advisory and build your own
+dead-letter handling.
+
+streams moves the message for you. When a queue job is about to be delivered for the
+`(max_deliveries + 1)`-th time and the box has a `dead_letter` target, the job is
+**moved** into the dead-letter box — stamped with `meta.$dead_letter_from`,
+`$dead_letter_deliveries`, and `$dead_letter_src_seq` — and deleted from the source
+queue. No advisory consumer to operate; the poison message lands in a box you can inspect
+and replay.
+
+<Callout type="info">
+  The dead-letter copy honors the **destination** box's durability class. Point
+  `dead_letter` at an `fsync` box if you need poison messages to survive a crash.
+</Callout>
+
+## Gap detection
+
+JetStream — like every system on these comparison pages — has **no in-band gap signal**.
+When retention (Limits / `DiscardOld`) evicts messages a consumer hasn't reached, the
+consumer infers the loss from a **jump in the stream sequence number**. There is no
+delivery-time "you missed X..Y" frame.
+
+streams makes involuntary loss **explicit**. If cap eviction or TTL expiry removed records
+below a consumer's cursor, the read returns an in-band [tombstone](/guarantees/tombstones)
+with the exact `[gap_from, gap_to]` range — at HTTP 200, on the same response that
+carries the surviving records. A purely **deleted** gap reads silently (you asked for that
+removal); only **involuntary** loss tombstones. That distinction is the
+[load-bearing invariant](/getting-started) of the whole data model.
+
+streams also lets a box **reject** instead of evicting: with `discard:"reject"`, a full
+box fails the producer with `422 box_full` **before** a seq is assigned, rather than
+dropping the oldest record. JetStream's `DiscardNew` similarly refuses new messages on a
+full stream; the difference is that streams pairs rejection-on-write with a tombstone
+on the read side when eviction *does* happen.
+
+## KV / Object store
+
+JetStream ships **KV** and **Object** stores built on top of streams-as-subjects — a
+genuine convenience for config, sessions, and large blobs without bolting on another
+system.
+
+streams has **no** KV or Object abstraction. A box is an append-only log; the closest
+thing to "latest value for a key" is a tag plus a [point-in-time delete](/api/deletion),
+which is not the same as a KV bucket. If you want a key/value or object API in the same
+binary, JetStream wins outright.
+
+## RAFT replication / HA
+
+This is the central honest difference.
+
+JetStream streams can be **RAFT-replicated** with `replicas: 1 | 3 | 5`. A 3- or 5-replica
+stream survives the loss of a node, with automatic leader election and failover — real
+high availability.
+
+streams has **no replication, no failover, no HA**. A single machine is the entire
+durability and failure domain. An `fsync` box survives any crash of *that* machine and
+replays its WAL on restart, but if the machine or its disk is gone, the data is gone
+until you restore a backup. There is no quorum, no follower, no automatic failover.
+
+<Callout type="warning">
+  If you need to survive the loss of a node without operator intervention, you need
+  replication — and that is JetStream (or another replicated system), not streams.
+  streams trades HA for the simplicity of one binary and one disk.
+</Callout>
+
+## Accounts isolation + native TLS, and scale
+
+JetStream has **first-class accounts** — hard multi-tenant isolation, where subjects and
+streams in one account are invisible to another. Auth is `nkeys`/JWT, and the server
+terminates **TLS** natively (plus WebSocket and MQTT gateways). For scale, NATS forms
+**clusters, superclusters, and leaf nodes** that span regions.
+
+streams is more modest on all three axes, and says so:
+
+- **Isolation** is a [prefix allowlist](/deployment/security) per API key — a *filter*,
+  not a partition. Two keys can be scoped to non-overlapping box-name prefixes, but this
+  is not hard tenant isolation; namespace partitioning is planned, not shipped.
+- **TLS** is **not** terminated by streams. Run it behind a TLS-terminating reverse proxy
+  for any non-loopback exposure. Auth is bearer keys, hashed SHA-256 at rest and compared
+  in constant time, with [per-key scopes](/deployment/security) (`read`/`write`/`delete`/`admin`).
+- **Scale** is **vertical only** — one NVMe box. The engine core sustains
+  millions of records/sec in-process and a single HTTP origin tops out around
+  0.5 M rec/sec disk-class, but you scale up, not out. See [Performance](/how-it-works/performance).
+
+## Verdict
+
+<div className="verdict-grid">
+  <div className="verdict win">
+    <h4>streams wins when</h4>
+    <ul>
+      <li>You want a <strong>delivery-time gap signal</strong> — an explicit tombstone
+        with the exact <code>[gap_from, gap_to]</code> range — not a silent
+        stream-sequence jump to reverse-engineer.</li>
+      <li>You want a <strong>built-in dead-letter move</strong> for poison messages, not
+        a <code>MaxDeliver</code> advisory you have to consume and route yourself.</li>
+      <li>You want <strong>plain HTTP/JSON + SSE</strong> — <code>curl</code> is the
+        client — with no NATS protocol or client library.</li>
+      <li>You want <strong>per-box durability classes</strong> (memory / disk / fsync)
+        rather than one per-stream file/memory switch.</li>
+      <li>You want a producer to <strong>fail fast</strong> (<code>discard:"reject"</code>,
+        <code>422 box_full</code>) before a seq is assigned on a full box.</li>
+      <li>You want one small binary and one disk, with no cluster to operate.</li>
+    </ul>
+  </div>
+  <div className="verdict lose">
+    <h4>NATS JetStream wins when</h4>
+    <ul>
+      <li>You need <strong>replicated HA</strong> — RAFT <code>replicas: 3/5</code> with
+        automatic leader election and failover.</li>
+      <li>You need <strong>scale-out</strong> across clusters, superclusters, or
+        region-spanning leaf nodes.</li>
+      <li>You want <strong>subject wildcard capture</strong> (<code>orders.&gt;</code>) that
+        decouples streams from producers.</li>
+      <li>You want a built-in <strong>KV or Object store</strong> in the same binary.</li>
+      <li>You want <strong>server-tracked consumers</strong> with mature
+        <code>AckWait</code>/<code>BackOff</code> redelivery semantics.</li>
+      <li>You need <strong>hard account isolation</strong> and <strong>native TLS</strong>
+        (plus WebSocket/MQTT), not a prefix-allowlist filter behind a proxy.</li>
+    </ul>
+  </div>
+</div>
+
+## See also
+
+- [Comparisons overview](/comparisons) — the full capability matrix across all four systems.
+- [vs Apache Kafka](/comparisons/vs-kafka) — the distributed-cluster end of the spectrum.
+- [Tombstones](/guarantees/tombstones) — the explicit gap signal in depth.
+- [Queues API](/api/queues) — lease, ack, nack, extend, and dead-letter.

@@ -1,0 +1,140 @@
+---
+title: Architecture Overview
+description: How streams is built — the design principles, the layered HTTP → engine → WAL → segments shape, and where to read the internals in depth.
+---
+
+import { Callout, Cards } from 'nextra/components'
+
+# Architecture Overview
+
+streams is a single Rust process on a single machine: an append-only log engine that
+keeps a **write-ahead log** as its durability boundary and materializes everything else —
+the in-memory index, the per-box segment files, the metadata snapshots — as a derivable
+cache of that log. This page covers the design principles the whole system is built on
+and the layered shape that enforces them, then points you at the deep dives.
+
+The assumptions are deliberate and narrow: **one process, one machine, a good CPU, and
+local NVMe** (not a spinning disk, not a network volume). Everything below trades the
+generality of a distributed system for the latency and crash-consistency you can get when
+the disk is a single sequential resource you fully control.
+
+## Design principles
+
+Four ideas drive every layer. They are not aspirations — they are invariants the storage
+layer is structured to make cheap to enforce.
+
+### 1. Never silent loss
+
+Every **involuntary** loss that passes a consumer's cursor — a cap eviction or a TTL
+expiry — surfaces as an in-band [tombstone](/guarantees/tombstones) carrying the exact
+`[gap_from, gap_to]` range, at HTTP 200, never a silent skip. The engine keeps two floors
+per box and makes both cheaply queryable as atomics: `earliest_seq` (the first live seq)
+and `evict_floor` (the sole tombstone trigger, advanced only by involuntary cap/TTL loss).
+A voluntary [delete](/guarantees/deletion) advances `earliest_seq` but never `evict_floor`,
+so a purely-deleted gap reads **silently** while an evicted gap **tombstones**. That single
+distinction is the reason the data model has two watermarks instead of one.
+
+### 2. The WAL is the durability boundary
+
+"Only data not yet in the WAL is lost." The write-ahead log is the one source of truth;
+the in-memory index, the segment files, and the metadata snapshots are all materializations
+of WAL frames plus checkpoints. An acked write on a durable box is a complete,
+checksum-valid frame on disk — so it is recoverable by replaying the WAL on the next
+restart. See [WAL & Group Commit](/how-it-works/wal-and-group-commit) and
+[durability classes](/guarantees/durability).
+
+### 3. Trim at segment granularity, lazily
+
+Cap/TTL eviction never rewrites data or deletes individual records on the hot path. It
+advances a watermark (an atomic store plus a front-drain of the in-memory index) and drops
+whole **sealed** segment files in the background. A box may therefore briefly retain
+slightly more than its cap — only whole sealed segments drop — which is the documented,
+accepted approximation (the same one Redis `~` and Kafka make). Voluntary deletion is
+likewise *logically immediate but physically lazy*: the payload is freed and `earliest_seq`
+advances synchronously, while disk reclaim happens off the hot path. See
+[Segments & Snapshots](/how-it-works/segments-and-snapshots).
+
+### 4. Single machine, sequential disk
+
+Seqs are mostly-sequential `u64`, so the seq→location map is a base+offset vector, not a
+hash map — O(1) lookup with no hashing on the read path. The disk is a single sequential
+resource, so a **single WAL writer thread** matches the hardware, makes group commit
+trivial, and removes write-side lock contention. Boxes are sharded across cores for
+everything else.
+
+<Callout type="important">
+  The load-bearing invariant: **involuntary loss you didn't ask for tombstones; voluntary
+  removal you did ask for is silent.** Every structural choice — the dual floor, the tag
+  index, lazy segment reclaim — exists to keep that distinction crisp. See the
+  [Core Guarantees](/guarantees).
+</Callout>
+
+## The layered shape
+
+A write flows down through four layers; a read is served from whichever layer still holds
+the bytes.
+
+```text
+        HTTP / SSE  (axum + hyper)
+              │  validate, resolve box_id, assign seq
+              ▼
+        Engine      (per-box index, dual floor, tag index, scheduler)
+              │  enqueue frame under the per-box lock
+              ▼
+        WAL         (single writer thread, adaptive group commit, fdatasync)
+              │  checkpoint: copy contiguous byte ranges per box
+              ▼
+        Segments    (.data + .idx, mmap reads)  +  metadata snapshots
+```
+
+- **HTTP / SSE.** A typed [`/v0` API](/api) over axum/hyper. The request path validates the
+  body, resolves the box name to an interned `u32` id, and assigns the monotonic `$seq`
+  before the frame is handed off — so the seq can be returned even though the record is not
+  yet *visible* until its commit class is satisfied.
+- **Engine.** Each box holds a base+offset location vector, the dual floor as atomics
+  (`head_seq`, `earliest_seq`, `evict_floor`), a per-box tag index for efficient match
+  deletes, and the wakeup primitive that drives SSE and long-poll diffs without polling. A
+  [priority scheduler](/how-it-works/scheduler) governs the post-write propagation that has
+  to hit the 1–5 ms target.
+- **WAL.** A process-global append-only log of length-prefixed, XXH3-64-checksummed frames.
+  Seq assignment and frame enqueue happen under the per-box lock (microseconds); the fsync
+  wait happens **off the lock**, so many writers' waits coalesce into one group flush.
+- **Segments & snapshots.** A background compactor copies committed WAL bytes into per-box
+  segment files (`.data` + a fixed-stride `.idx`), and a metadata snapshot lets recovery
+  start without replaying the WAL from time zero. Sealed segments are immutable and served
+  by mmap.
+
+Reads are served from the layer that still holds the record: the newest records (written,
+not yet checkpointed) come straight from the WAL/page cache; the active segment is read with
+buffered `pread`; sealed segments are mmap'd zero-copy. A consumer a few milliseconds behind
+head never waits for a checkpoint.
+
+## Concurrency in one paragraph
+
+State is **sharded, not globally locked**. Boxes are partitioned across cores via a
+`DashMap` registry; each box has its own `RwLock` so two writers on two boxes proceed in
+parallel, and each shard has a small ready-set mutex held only for an O(1) splice. The one
+serialization point is the single WAL writer thread, fed by an MPSC channel — which is
+correct, because the disk is one sequential resource. Cold-tier I/O and the segment
+relocator run on a **separate blocking pool** under a hard invariant: cold reads may degrade
+historical reads but **never** block writes or live SSE delivery.
+
+## Where to read the internals
+
+<Cards>
+  <Cards.Card title="WAL & Group Commit" href="/how-it-works/wal-and-group-commit" arrow>
+    The frame format, the single writer thread, adaptive group commit, and off-lock fsync.
+  </Cards.Card>
+  <Cards.Card title="Segments & Snapshots" href="/how-it-works/segments-and-snapshots" arrow>
+    Checkpointing the WAL into per-box `.data`/`.idx` segments and atomic metadata snapshots.
+  </Cards.Card>
+  <Cards.Card title="Crash Recovery" href="/how-it-works/recovery" arrow>
+    Snapshot load, WAL replay, torn-tail truncation, and orphan-segment reclaim.
+  </Cards.Card>
+  <Cards.Card title="Scheduler & Backpressure" href="/how-it-works/scheduler" arrow>
+    The banded weighted-fair scheduler and the elastic throttle that sheds latency, not data.
+  </Cards.Card>
+  <Cards.Card title="Performance" href="/how-it-works/performance" arrow>
+    Measured engine, HTTP, fsync, and SSE numbers, framed honestly with their caveats.
+  </Cards.Card>
+</Cards>

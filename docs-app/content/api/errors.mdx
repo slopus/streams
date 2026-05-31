@@ -1,0 +1,188 @@
+---
+title: Errors
+description: The canonical error envelope, the full status-code to error.code table, the 429 throttle, 503 states, and the performance block.
+---
+
+import { Callout } from 'nextra/components'
+
+# Errors
+
+Every non-2xx response carries one fixed JSON shape, and every `error.code` is a stable
+machine-readable string you can branch on. This page is the canonical mapping of HTTP
+status to `error.code`, plus the two backpressure signals (`429`, `503`) and the
+`performance` block that rides on success responses too.
+
+## The error envelope
+
+Every non-2xx response — except in-stream [SSE](/api/watch) errors, which are delivered as
+an `event: error` frame — carries this exact shape:
+
+```json
+{
+  "error": {
+    "code": "box_not_found",
+    "message": "box \"jobs\" does not exist",
+    "detail": { "box": "jobs" }
+  }
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `error.code` | string | Stable, machine-readable snake_case string. **Branch on this.** |
+| `error.message` | string | Human-readable; may change between versions, never parse it. |
+| `error.detail` | object | Optional structured context (e.g. the offending box name, a `limit`, a `retry_after_ms`). May be absent. |
+
+Success responses carry **bare data** — there is no `{"status":"ok"}` envelope. The
+presence of a top-level `error` key is the only success/failure discriminator.
+
+<Callout type="important">
+  **Tombstones and gaps are NOT errors.** Involuntary cap-eviction and TTL crossings
+  surface as in-band `200` payload signals — a `tombstone` object in a
+  [diff](/api/reading) response, or an `event: tombstone` frame in [SSE](/api/watch).
+  [Data loss is always explicit, but never an HTTP error](/guarantees/tombstones). A
+  voluntary [delete](/api/deletion) is silent (no tombstone at all).
+</Callout>
+
+## Status codes
+
+The complete status → `error.code` mapping. Clients branch on `error.code`, not the prose
+message.
+
+| Code | Meaning | `error.code` |
+|---|---|---|
+| `200` | OK (read, idempotent write / create / delete) | — |
+| `201` | Created (box/router created on this call) | — |
+| `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large` |
+| `401` | Missing or invalid bearer token | `unauthorized` |
+| `403` | Authenticated, but the key lacks the required scope, or the box/router name is outside its prefix allowlist | `forbidden` |
+| `404` | Box/router does not exist (and was not auto-created) | `box_not_found`, `router_not_found` |
+| `405` | Wrong method for the path | `method_not_allowed` |
+| `406` | `Accept` not `text/event-stream` on an SSE GET | `not_acceptable` |
+| `409` | Conflict: router cycle, config conflict, queue op on a non-queue box | `router_cycle`, `box_exists_incompatible`, `box_not_empty`, `not_a_queue` |
+| `413` | Body exceeds the server hard limit (rejected pre-parse) | `payload_too_large` |
+| `415` | Wrong or missing `Content-Type` | `unsupported_media_type` |
+| `422` | Semantically invalid — e.g. a write to a full `discard:"reject"` box | `box_full` |
+| `429` | Elastic throttle under CPU pressure, **or** a resource cap reached | `throttled` |
+| `500` | Internal error (a bug) | `internal` |
+| `503` | Not ready (WAL replay on boot) or shutting down | `not_ready`, `shutting_down` |
+
+A few codes are worth calling out:
+
+- **`401` vs `403`** — `401` means no/invalid token; `403` means the token authenticates
+  but lacks the required [scope](/deployment/security), or names a box/router outside its
+  prefix allowlist (enforced on the path **and** relevant request-body names). On
+  [watch](/api/watch), `401` is returned only when a bearer or `?token=` *was* presented
+  but does not match the key that created the `wid` — omitting the bearer entirely is fine,
+  since the `wid` is the capability.
+- **`409 not_a_queue`** — a [queue](/api/queues) endpoint (`claim`/`ack`/`nack`/`extend`/
+  `work`) was called on a plain `"log"` box.
+- **`409 box_exists_incompatible`** — a `PUT` tried to change a box's immutable `type`
+  (`log` ↔ `queue`).
+- **`409 router_cycle`** — creating the router would introduce a directed cycle;
+  `error.detail.cycle` lists the offending path, e.g. `["A","B","A"]`.
+
+## 429 — throttle and resource caps
+
+`429 throttled` is the single backpressure signal, raised in two situations. Both carry a
+`Retry-After` header; the **`error.detail`** distinguishes them so a client can react
+correctly.
+
+**CPU-pressure throttle** — the elastic scheduler is shedding load. The detail carries a
+suggested wait:
+
+```json
+{ "error": {
+    "code": "throttled",
+    "message": "throttled under CPU pressure",
+    "detail": { "retry_after_ms": 1500 } } }
+```
+
+**Resource cap reached** — a configurable [resource limit](/deployment/configuration) (max
+boxes, routers, watch sessions, SSE connections, in-flight requests per key, or total
+retained bytes) would be exceeded. The detail names the cap:
+
+```json
+{ "error": {
+    "code": "throttled",
+    "message": "max boxes reached",
+    "detail": { "limit": "max_boxes", "max": 100000 } } }
+```
+
+| `error.detail` field | When | Meaning |
+|---|---|---|
+| `retry_after_ms` | CPU-pressure throttle | Suggested wait before retrying (ms). |
+| `limit` | Resource cap | Which cap was hit (e.g. `"max_boxes"`, `"max_total_bytes"`). |
+| `max` | Resource cap | The configured ceiling for that cap. |
+
+<Callout type="info">
+  Because both situations reuse the same `429 throttled` signal, a client that already
+  backs off on `429` needs no change. Bulk writers that prefer to push through CPU pressure
+  may set `"disable_backpressure": true` in the write body (a trusted-loader opt-out): the
+  server then admits the write but may queue it, trading latency for not failing. Resource
+  caps are **not** bypassable this way.
+</Callout>
+
+## 503 — not ready / shutting down
+
+`503` is the lifecycle backpressure signal, raised by the
+[readiness](/api/health-metrics#get-v0ready--readiness) gate and by ordinary endpoints
+during boot or drain. It always carries a `Retry-After` header.
+
+- **`not_ready`** — boot-time WAL replay is in progress. The detail carries
+  `replay_progress` (`0.0`–`1.0`):
+
+  ```json
+  { "error": {
+      "code": "not_ready",
+      "message": "WAL replay in progress",
+      "detail": { "replay_progress": 0.62 } } }
+  ```
+
+- **`shutting_down`** — the server received `SIGINT`/`SIGTERM` and is draining in-flight
+  work before writing a final snapshot and exiting.
+
+Route traffic on `/v0/ready` so a `503`-during-replay node is taken out of rotation until
+it flips to `200`. See [Health & Metrics](/api/health-metrics) and
+[Recovery](/how-it-works/recovery).
+
+## The `performance` block
+
+Every JSON response — and most errors — includes a `performance` object, so per-request
+observability lives in the response rather than a side channel:
+
+```json
+"performance": {
+  "server_total_ms": 0.41,
+  "wal_append_ms": 0.12,
+  "fsync_ms": 0.0,
+  "records_scanned": 128,
+  "throttle_wait_ms": 0.0
+}
+```
+
+Fields are **best-effort and additive** — clients must tolerate any subset, and each field
+is omitted when it does not apply.
+
+| Field | Always? | Meaning |
+|---|---|---|
+| `server_total_ms` | yes | Total server-side handling time for the request (ms). |
+| `wal_append_ms` | when relevant | Time spent enqueuing the WAL frame. `0` on `memory` boxes. |
+| `fsync_ms` | when relevant | Time the ack was held for the group `fsync`. `0` for non-`fsync` boxes (the fast path). |
+| `records_scanned` | on reads | Records examined to build the response (includes filtered/skipped ones). |
+| `throttle_wait_ms` | when throttled | Time parked behind the elastic scheduler before handling. |
+| `cold_segments_read` | on cold reads | Cold-tier segments touched to satisfy a read (omitted when none). |
+
+<Callout type="info">
+  `fsync_ms` is the clearest signal of which [durability class](/guarantees/durability) a
+  box is using: it is `0.0` on `memory` and `disk` boxes (whose ack is not fsync-gated) and
+  a real value on `fsync` boxes. `cold_segments_read > 0` tells you a read fell through to
+  the [cold tier](/deployment/storage-and-tiering).
+</Callout>
+
+## See also
+
+- [API Conventions](/api/conventions) — auth, content types, the `$`-metadata convention, idempotency.
+- [Health & Metrics](/api/health-metrics) — the `503` readiness gate in detail.
+- [Tombstones](/guarantees/tombstones) — why involuntary loss is a `200` signal, not an error.
+- [Security](/deployment/security) — scopes and prefix allowlist behind `401`/`403`.

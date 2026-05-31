@@ -1,0 +1,203 @@
+---
+title: Observability
+description: Operating streams in production — liveness and readiness probes for load balancers and Kubernetes, the auth-gated metrics endpoint, and the per-response performance block as inline observability.
+---
+
+import { Callout, Tabs } from 'nextra/components'
+
+# Observability
+
+streams exposes three operational endpoints — **liveness**, **readiness**, and **metrics** —
+plus an inline `performance` block on every JSON response. The probes are designed for
+load-balancer and Kubernetes health checks, and crucially the readiness probe gates traffic
+during **WAL replay** on boot. The metrics surface is **deliberately small today** (essentially
+a box count) with a richer catalog planned — this page is honest about exactly what ships now.
+
+## Liveness — health
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/health</span></div>
+
+Returns `200` **always** while the process can serve a request. Use it for a load balancer's
+"is this process up" check. There is a root alias `GET /healthz` for proxies that probe the
+server root.
+
+```bash
+curl localhost:4000/v0/health
+```
+
+```json
+{ "status": "ok", "version": "0.1.0", "uptime_ms": 84012 }
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | Always `"ok"` on a `200`. |
+| `version` | string | The running build version. |
+| `uptime_ms` | `u64` | Milliseconds since the process started. |
+
+<Callout type="info">
+  Liveness answers "is the process running," **not** "is it ready to serve." A booting server
+  replaying its WAL returns `200` from `/v0/health` but `503` from `/v0/ready` — use the right
+  probe for the right question.
+</Callout>
+
+## Readiness — ready
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/ready</span></div>
+
+Returns `200` only when the server is **actually serving**. During boot, streams replays the WAL
+to rebuild in-memory state; until that completes the server is not ready, and `/v0/ready` returns
+`503` so a load balancer or Kubernetes keeps traffic away. Root alias: `GET /readyz`.
+
+```bash
+curl -i localhost:4000/v0/ready
+```
+
+```json
+# → 200 OK when serving
+{ "status": "ready", "wal_replay_complete": true, "boxes": 42 }
+```
+
+While replaying the WAL, it returns `503 not_ready` with a `Retry-After` header and a replay
+progress fraction:
+
+```json
+# → 503 Service Unavailable during WAL replay
+{ "error": {
+    "code": "not_ready",
+    "message": "WAL replay in progress",
+    "detail": { "replay_progress": 0.62 }
+} }
+```
+
+| State | HTTP | `error.code` | Body |
+|---|---|---|---|
+| Serving | `200` | — | `{ status, wal_replay_complete: true, boxes }` |
+| Booting (WAL replay) | `503` | `not_ready` | `Retry-After` + `error.detail.replay_progress` (0.0–1.0) |
+| Draining (shutdown) | `503` | `shutting_down` | `Retry-After` |
+
+<Callout type="important">
+  Wire `/v0/ready` to your Kubernetes **readinessProbe** (not the livenessProbe). On restart,
+  replaying a large WAL can take a fraction of a second to roughly a second; gating on readiness
+  keeps the pod out of the Service endpoints until replay finishes, so requests are never served
+  against a half-rebuilt state. Use `/v0/health` for the livenessProbe so a slow replay does not
+  trigger a restart loop.
+</Callout>
+
+### Probe wiring
+
+<Tabs items={['Kubernetes', 'Load balancer']}>
+  <Tabs.Tab>
+```yaml
+livenessProbe:
+  httpGet:
+    path: /v0/health
+    port: 4000
+readinessProbe:
+  httpGet:
+    path: /v0/ready
+    port: 4000
+  # /v0/ready returns 503 during WAL replay; readiness keeps the pod
+  # out of rotation until replay completes.
+```
+  </Tabs.Tab>
+  <Tabs.Tab>
+```text
+Liveness check    → GET /healthz   (expect 200, "is the process up")
+Readiness/traffic → GET /readyz    (expect 200; 503 means "do not route yet")
+```
+  </Tabs.Tab>
+</Tabs>
+
+By default the probes **skip auth** so a load balancer can poll liveness/readiness without a
+key. Set `STREAMS_PROBE_AUTH=true` to require auth on the health/ready/metrics endpoints too.
+
+## Metrics
+
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/metrics</span></div>
+
+Returns metrics for scraping. **Prometheus text exposition** (`text/plain; version=0.0.4`) by
+default, or a JSON snapshot if you send `Accept: application/json`. It returns `200` **always**,
+even when the server is not ready — metrics describe the recovering process.
+
+```bash
+# Prometheus text (default)
+curl localhost:4000/v0/metrics
+
+# JSON snapshot
+curl -H 'accept: application/json' localhost:4000/v0/metrics
+```
+
+<Callout type="warning">
+  **The current metric surface is small.** Unlike `/v0/health` and `/v0/ready`, the metrics
+  endpoint exposes operational state and is **auth-gated by default** when keys are configured:
+  it requires a key with the `read` scope (a full-access key suffices). In dev mode (no keys) it
+  is open. The JSON snapshot today contains essentially a **box count**
+  (`{ "boxes": N }`); the Prometheus text exposition is correspondingly minimal. A richer
+  per-box / scheduler / WAL metric catalog is **planned but not yet implemented** — do not build
+  dashboards against metrics not listed here.
+</Callout>
+
+```json
+# Accept: application/json — the current JSON snapshot
+{ "boxes": 42 }
+```
+
+In the interim, the per-response [`performance` block](#the-performance-block-inline-observability)
+below is the richest observability streams ships today — it surfaces per-call latency, fsync
+cost, scan counts, and cold-read counts inline, with no separate scrape.
+
+## The performance block (inline observability)
+
+Every JSON response (and most errors) carries a `performance` object, so observability lives in
+the response itself, not a side channel. This is the primary way to observe per-call cost in
+streams today.
+
+```json
+"performance": {
+  "server_total_ms": 0.41,
+  "wal_append_ms": 0.12,
+  "fsync_ms": 0.0,
+  "records_scanned": 128,
+  "throttle_wait_ms": 0.0
+}
+```
+
+Fields are **best-effort and additive** — a client must tolerate any subset; a field is omitted
+when it does not apply to that call.
+
+| Field | When present | Meaning |
+|---|---|---|
+| `server_total_ms` | always | Total server-side handling time for the request. |
+| `wal_append_ms` | writes | Time to serialize and enqueue the WAL frame(s). |
+| `fsync_ms` | durable writes | Time parked on the group-commit fsync. `0.0` on non-durable (`disk`/`memory`) boxes. |
+| `records_scanned` | reads | Records examined (including filtered/deleted/own-node ones the cursor advanced past). |
+| `throttle_wait_ms` | under pressure | Time parked behind the elastic scheduler before the call ran. |
+| `cold_segments_read` | cold-tier reads | Number of [cold-tier](/deployment/storage-and-tiering#hotcold-tiering) segments touched. Present only when a read reached cold storage. |
+
+A few patterns these enable without any external metrics:
+
+- **Durability cost** — a non-zero `fsync_ms` on a write is the cost of the `fsync` commit class.
+  If `fsync_ms` is the bulk of `server_total_ms`, you are fsync-bound (a hardware floor on the
+  disk, not a server bug).
+- **Read efficiency** — `records_scanned` far exceeding the records returned means a lot of
+  filtered/deleted/own-node records sit in the scanned range; the cursor still advanced past them.
+- **Backpressure** — a non-zero `throttle_wait_ms` means the elastic scheduler paced the call
+  under CPU pressure. The work was deferred, never dropped.
+- **Cold reads** — a present `cold_segments_read` confirms a read reached the cold tier. By the
+  [hard tiering invariant](/deployment/storage-and-tiering#the-hard-invariant), this slows only
+  that historical read, never writes or live delivery.
+
+<Callout type="info">
+  `429 throttled` responses carry a `Retry-After` header; a CPU-pressure throttle adds
+  `error.detail.retry_after_ms`, and a [resource-cap](/deployment/configuration) throttle adds
+  `error.detail.limit` naming the cap that was hit. Branch on `error.code` and respect
+  `Retry-After`. See [Errors](/api/errors).
+</Callout>
+
+## See also
+
+- [API · Health & Metrics](/api/health-metrics) — the endpoint reference for the probes and metrics.
+- [Configuration](/deployment/configuration) — `STREAMS_PROBE_AUTH` and the resource-limit caps.
+- [Storage & Tiering](/deployment/storage-and-tiering) — what `cold_segments_read` reflects.
+- [Performance](/how-it-works/performance) — measured latency and throughput numbers.

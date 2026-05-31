@@ -1,0 +1,171 @@
+---
+title: Writing Records
+description: Append one or many records to a box with POST /v0/boxes/:box — atomic batches, inline create, idempotency, backpressure opt-out, and the seq response.
+---
+
+import { Callout } from 'nextra/components'
+
+# Writing Records
+
+Append records to a box. A single `POST /v0/boxes/:box` carries one or many records, the
+server assigns each a monotonic `$seq` and a `$ts`, and the whole batch commits
+**atomically** — all of it or none of it. The same endpoint can lazily create the box and
+carry an idempotency key, so the common write path needs no separate calls.
+
+This page covers the write request body, atomicity, full-box behavior, the response shape,
+the hard batching limits, and the errors. For how durable a write actually is, see
+[Durability](/guarantees/durability); for retry-safe writes, see
+[Idempotency](/guarantees/idempotency).
+
+## POST /v0/boxes/:box — append records
+
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:box</span></div>
+
+Append one or many records. The server assigns the `seq`s and returns them. Inline `config`
+(applied only on a lazy create) means the common case needs no separate `PUT`.
+
+**Path** — `:box`, name `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts
+alphanumeric, allows `. _ : -`). Case-sensitive, byte-exact.
+
+### Request body
+
+```bash
+curl -X POST localhost:4000/v0/boxes/jobs \
+  -H 'content-type: application/json' \
+  -d '{
+        "node": "worker-eu-1",
+        "idempotency_key": "client-batch-7f3a",
+        "records": [
+          { "data": { "type": "resize", "url": "s3://b/a.png", "w": 256 },
+            "tag": "tenant42:job-9001", "meta": { "trace": "abc123" } },
+          { "data": "raw-opaque-or-base64", "tag": "tenant42:job-9002" }
+        ]
+      }'
+```
+
+```json
+# → 200 OK (or 201 if this write created the box)
+{
+  "box": "jobs",
+  "first_seq": 480232, "last_seq": 480233,
+  "seqs": [480232, 480233],
+  "head_seq": 480233, "count": 2,
+  "created": false, "deduped": false,
+  "performance": { "server_total_ms": 0.62, "wal_append_ms": 0.10, "fsync_ms": 0.39 }
+}
+```
+
+| Field | Type | Req? | Default | Meaning |
+|---|---|---|---|---|
+| `records` | array | yes | — | 1..=`MAX_BATCH_RECORDS`. Seqs assigned in array order, contiguously. |
+| `records[].data` | any JSON | yes | — | Opaque payload, stored and returned verbatim. May be JSON `null`. |
+| `records[].tag` | string | no | — | Match key for [deletion](/api/deletion). ≤ `MAX_TAG_BYTES`. |
+| `records[].node` | string | no | batch `node` | Per-record origin node; overrides the batch-level `node`. ≤ `MAX_NODE_BYTES`. |
+| `records[].meta` | object | no | — | Small headers, returned verbatim. ≤ `MAX_META_BYTES`, ≤ 64 keys. |
+| `node` | string | no | — | Batch-level default origin node (the common one-writer case). Recorded as `$node`. |
+| `idempotency_key` | string | no | — | Dedupe key scoped to this box. ≤ 256 chars. May also be sent as header `Idempotency-Key:` (the body field wins). |
+| `create` | bool | no | box's `auto_create` | Overrides `auto_create` for this write only. `true` ⇒ auto-create if absent; `false` ⇒ `404 box_not_found` if absent (the Redis `NOMKSTREAM` analog — prevents typo-boxes). |
+| `config` | Box config | no | — | Applied **only if this write creates the box**. Ignored if the box already exists (config changes go through [`PUT`](/api/boxes)). |
+| `disable_backpressure` | bool | no | `false` | If `true`, opt out of `429 throttled` for this write; the server may queue it instead, trading latency for not failing (a trusted-loader opt-out). |
+
+<Callout type="info">
+  `node` is the load-bearing field for fan-out. A record's `$node` is recorded at write
+  time, and on later reads or SSE presenting that **same** node, these records are filtered
+  out — so N symmetric nodes can write to and watch a shared topology without echo. See
+  [node loop-prevention](/guarantees/node-loop-prevention).
+</Callout>
+
+### Atomicity
+
+A write is **all-or-nothing**. All N records in `records` commit with contiguous seqs, or
+none do — there is no partial append. `first_seq` and `last_seq` bound the assigned range,
+and `seqs[i]` is the seq of `records[i]`.
+
+For a **durable** box the response is held until the write is committed per the box's
+[durability class](/guarantees/durability): an `fsync` box holds the ack until the WAL frame
+is durably synced; a `disk` box acks on group-commit enqueue; a `memory` box acks on the
+buffered in-RAM append. A non-durable box never blocks on `fsync`.
+
+### Full-box behavior
+
+When the box is at its `cap_records` / `cap_bytes` limit, the `discard` policy decides what
+happens to the incoming write:
+
+| `discard` | On a full box | Writer sees |
+|---|---|---|
+| `"old"` (default) | Evicts the oldest records to make room; the write **succeeds**. | `200`/`201` as normal. The eviction may later surface to a lagging consumer as a [tombstone](/guarantees/tombstones). |
+| `"reject"` | Refuses the write; **nothing is appended** (all-or-nothing). | `422 box_full` synchronously — learned at write time, never ack-then-drop. |
+
+`discard:"reject"` is the durable-queue choice: unconsumed work fails the producer loudly
+rather than being silently dropped. `discard:"old"` is the pub/sub choice: the newest data
+always lands, and any consumer that fell below the eviction floor gets an explicit tombstone
+on its next read.
+
+### Response
+
+```json
+{
+  "box": "jobs",
+  "first_seq": 480232, "last_seq": 480234,
+  "seqs": [480232, 480233, 480234],
+  "head_seq": 480234, "count": 3,
+  "created": false, "deduped": false,
+  "performance": { "server_total_ms": 0.62, "wal_append_ms": 0.10, "fsync_ms": 0.39 }
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `box` | string | The box name. |
+| `first_seq` | `u64` | Seq of the first record in this batch. |
+| `last_seq` | `u64` | Seq of the last record in this batch. |
+| `seqs` | array | Per-record assigned seqs, in `records` order. Suppressed with `?return_seqs=false` (then only `first_seq`/`last_seq` are returned — useful for huge batches). |
+| `head_seq` | `u64` | Highest assigned seq in the box after this write (the log end). |
+| `count` | int | Number of records appended by this call. |
+| `created` | bool | `true` only when this call brought the box into existence (paired with `201`). |
+| `deduped` | bool | `true` when an `idempotency_key` matched a prior in-window write; `seqs` are then the **original** seqs and **no new append happened**. |
+| `performance` | object | Timing block. `fsync_ms` is `0.0` for non-durable boxes; clients must tolerate any subset of its fields. |
+
+<Callout type="info">
+  `deduped: true` is the safe-retry signal. If you replay a write with the same
+  `idempotency_key` inside the box's `idempotency_window_ms` (default `120000`), you get the
+  original seqs back with `deduped: true` and the log is not double-appended. A log has no
+  "previous value," so a dedupe key — not a CAS condition — is the right append-retry
+  primitive. See [Idempotency](/guarantees/idempotency).
+</Callout>
+
+### Batching limits
+
+Hard, documented limits. Design your batches within them; exceeding one is a `400`
+(`batch_too_large` / `record_too_large`) or, for the raw body, a `413`. These are fixed
+protocol limits — only the raw request-body cap is tunable, via `STREAMS_MAX_BODY_BYTES`
+(default `64 MiB`); see [Configuration](/deployment/configuration).
+
+| Limit | Value |
+|---|---|
+| Max records per write | `10000` |
+| Max single record `data`+`meta` | `1 MiB` |
+| Max total request body | `64 MiB` (env-tunable: `STREAMS_MAX_BODY_BYTES`) |
+| Max `meta` per record | `16 KiB`, ≤ 64 keys |
+| Max `tag` length | `256` bytes |
+| Max `node` length | `128` bytes |
+
+### Errors
+
+| `error.code` | HTTP | When |
+|---|---|---|
+| `invalid_request` | `400` | Bad JSON, bad field type, or a value out of range. |
+| `batch_too_large` | `400` | `records` exceeds `MAX_BATCH_RECORDS`. |
+| `record_too_large` | `400` | A single record's `data`+`meta` exceeds `MAX_RECORD_BYTES`, or a per-field cap (`meta`/`tag`/`node`) is exceeded. |
+| `box_not_found` | `404` | `create:false` (or `auto_create:false`) and the box does not exist. |
+| `payload_too_large` | `413` | The raw request body exceeds `STREAMS_MAX_BODY_BYTES` (rejected pre-parse). |
+| `unsupported_media_type` | `415` | Missing or wrong `Content-Type` (must be `application/json`). |
+| `box_full` | `422` | Write to a full `discard:"reject"` box. Nothing was appended. |
+| `throttled` | `429` | Elastic throttle under CPU pressure, or a resource cap reached (carries `Retry-After`). Opt out per-write with `disable_backpressure`. See [Errors](/api/errors). |
+
+## See also
+
+- [Reading (diff)](/api/reading) — consume what you wrote with `POST /v0/boxes/:box/diff`.
+- [Durability](/guarantees/durability) — what an acknowledged write survives, per class.
+- [Idempotency](/guarantees/idempotency) — `idempotency_key`, the dedupe window, and `deduped`.
+- [Boxes](/api/boxes) — create and configure a box with `PUT`, and the full config object.

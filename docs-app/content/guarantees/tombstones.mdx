@@ -1,0 +1,181 @@
+---
+title: Explicit Loss & Tombstones
+description: How streams makes involuntary loss explicit — the dual watermark, when a tombstone fires, its shape and reason values, and why deleted or node-filtered gaps stay silent.
+---
+
+import { Callout } from 'nextra/components'
+
+# Explicit Loss & Tombstones
+
+A **tombstone** is an in-band, HTTP `200` signal that tells a consumer: "there is a gap below
+where you're reading — you missed `[gap_from, gap_to]`, and here is why." It is the single
+mechanism for *all* non-silent loss, and it fires for exactly one cause: **involuntary**
+capacity loss (cap eviction or TTL expiry) of live records that crossed your cursor. Voluntary
+removal — a [delete](/guarantees/deletion), your own node's [filtered](/guarantees/node-loop-prevention)
+records — is never a tombstone.
+
+## The dual watermark
+
+Every box tracks **two floors** so that involuntary loss is decoupled from voluntary removal.
+
+- **`earliest_seq`** — the seq of the **first currently-live record**: not eviction-reclaimed,
+  not TTL-expired, and **not deleted**. It is reported in box state and in every `diff`
+  response. If no live record exists it is `head_seq + 1`. It is **monotonically
+  non-decreasing** over a box instance's life — eviction, TTL expiry, **and deletion** all
+  advance it — and resets only on delete+recreate.
+- **`evict_floor`** — advanced **only** by **involuntary** loss of live records: cap eviction
+  and TTL expiry. It is the **sole tombstone trigger**. Voluntary deletion advances
+  `earliest_seq` but **never** `evict_floor`.
+
+The invariant is **`evict_floor <= earliest_seq`, always.** That single relationship is what
+keeps the two kinds of loss from ever being confused:
+
+| Cursor position | What happened | Read result |
+|---|---|---|
+| at or above `earliest_seq` | nothing lost below you | normal records |
+| below `earliest_seq`, at/above `evict_floor` | a **purely-deleted** gap (voluntary) | **silent** — `tombstone: null`, cursor advances past the deleted seqs |
+| below `evict_floor` | live records lost to **cap/TTL** (involuntary) | **tombstone**, then resume from `earliest_seq` |
+
+`evict_floor` is itself driven by two involuntary sub-floors, tracked separately so a
+tombstone can report *why*: the highest seq removed by **cap** eviction, and the highest
+**TTL-expired** seq (which moves continuously with wall-clock time, even with no writes).
+Formally, `evict_floor = max(cap-evicted seq, TTL-expired seq) + 1`. Popping
+**already-deleted** slots off the front of the log does **not** advance `evict_floor` —
+only evicting **live** records does.
+
+## When a tombstone is emitted
+
+A `diff` or SSE delivery for cursor `from_seq` emits a tombstone **iff**:
+
+```text
+from_seq + 1 < evict_floor
+```
+
+That is the exact predicate. A cursor that fell below `earliest_seq` but stays **at or above**
+`evict_floor` fell into a purely-deleted gap — **no** tombstone; the cursor simply advances
+past the deleted seqs. After emitting a tombstone the read continues from `earliest_seq` (the
+cursor is advanced to `earliest_seq - 1`), so the next records returned begin at the first live
+seq.
+
+There is **at most one tombstone per response**: because `earliest_seq` is monotonic, the gap
+is always one contiguous range.
+
+## Tombstone shape
+
+A tombstone is a pseudo-record carrying a resumable position (so SSE `id:` works on it too).
+In a `diff` response it is the `tombstone` field (`null` when there is no gap):
+
+```json
+{
+  "box": "events",
+  "records": [ { "$seq": 479101, "$ts": 1748450001000, "data": { "...": "..." } } ],
+  "tombstone": {
+    "gap_from": 478501,
+    "gap_to": 479100,
+    "reason": "cap",
+    "missed_estimate": 600,
+    "earliest_seq": 479101,
+    "head_seq": 480234
+  },
+  "next_from_seq": 479200,
+  "head_seq": 480234,
+  "earliest_seq": 479101,
+  "caught_up": false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `gap_from` | First missing seq (= the stale `from_seq + 1`). |
+| `gap_to` | Last missing seq (= `earliest_seq - 1`). The lost range `[gap_from, gap_to]` is inclusive at both ends. |
+| `reason` | Why the gap formed — see below. Best-effort/informational; **the range is authoritative**. |
+| `missed_estimate` | Approximate count of dropped records (approximate because eviction is segment-granular). |
+| `earliest_seq` / `head_seq` | Current watermarks, echoed for convenience. |
+
+In a diff the `records` begin at `earliest_seq` and `next_from_seq` continues normally — the
+tombstone is delivered *alongside* the records that follow it, never as an error.
+
+### `reason` values
+
+| `reason` | Meaning | Where |
+|---|---|---|
+| `cap` | Live records were evicted for capacity (`cap_records` / `cap_bytes`). | diff + SSE |
+| `ttl` | Live records were TTL-expired (`now - $ts > ttl_ms`, strict). | diff + SSE |
+| `mixed` | Both cap and TTL contributed to the gap. | diff + SSE |
+| `recreated` | The box was deleted and recreated; a stale cursor is from the old instance. | diff + SSE |
+| `from_seq_too_old` | Connect-time variant: the requested `from_seq + 1 < earliest_seq` was detected when the watch opened (the SSE expression of Kafka `OffsetOutOfRange`). | SSE only |
+
+Some seqs inside `[gap_from, gap_to]` may have been *deleted* rather than evicted — the
+consumer cannot tell, and does not need to. The tombstone fires because *some* live data below
+the cursor was lost involuntarily; the contiguous range is the contract, the `reason` is a hint.
+
+## In `diff` versus SSE
+
+The contract is identical across the two read paths; only the framing differs.
+
+In a `diff` response, the tombstone is the `tombstone` field shown above. In a
+[watch](/api/watch) SSE stream it is a framed `event: tombstone`, emitted whenever a gap
+crosses *this consumer's* cursor for a box:
+
+```text
+id: eyJldmVudHMiOjgzMDAwfQ
+event: tombstone
+data: {"box":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
+```
+
+The frame's `id:` already advances the box cursor to `gap_to`, so a reconnect resuming after
+it is correct. The `from_seq_too_old` variant is emitted **immediately on connect** when the
+requested `from_seq` has already fallen off the start of the retained range. A consumer
+handles `record` and `tombstone` frames uniformly — both carry a resumable `id:`.
+
+<Callout type="info">
+  The SSE heartbeat is a bare comment with no `id:` and no payload, so it never perturbs the
+  resume cursor:
+
+  ```text
+  : hb
+  ```
+</Callout>
+
+## Why deleted and node-filtered gaps are silent
+
+Tombstones are reserved for loss the consumer **did not ask for**. Two kinds of removal are
+deliberate, so they drop records without a tombstone:
+
+- **Permanent [deletion](/guarantees/deletion)** — records removed by `before_seq` or a tag
+  `match`. A delete advances `earliest_seq` but **never** `evict_floor`, so reading across a
+  purely-deleted gap returns `tombstone: null`. A lagging consumer cannot "miss a deletion"
+  because the record is gone for *all* readers at once — there is nothing to alarm about.
+- **[Node loop-prevention](/guarantees/node-loop-prevention)** — a reader's own-node records
+  are dropped (byte-exact `$node` string equality). The reader asked for this filter, so the
+  drops are silent.
+
+In both cases the cursor still advances past the skipped seqs. The read pipeline evaluates each
+candidate seq in a fixed order — live-floor gate (which fires the tombstone), then TTL, then
+deleted, then node filter — and **every** skipped seq advances `next_from_seq`, including the
+silently-skipped ones. So `records.length` can be less than the number of seqs traversed, and
+`caught_up` — not `records.length` — is the reliable "no more right now" signal. See
+[Ordering & cursors](/guarantees/ordering-and-cursors).
+
+A consumer that genuinely wants to detect a delete or a node-filtered drop can compare its
+received seqs against `head_seq` / `earliest_seq` arithmetic — but it will never confuse those
+with capacity loss, because the tombstone trigger (`evict_floor`) moves only on involuntary
+eviction or expiry.
+
+<Callout type="important">
+  The four removal kinds, as a hard contract: **cap eviction** and **TTL expiry** are
+  involuntary → always a tombstone; **permanent deletion** and **node-filtering** are voluntary
+  → intentionally silent. Mixing the two is structurally impossible, because `evict_floor` only
+  ever moves on involuntary loss.
+</Callout>
+
+## See also
+
+- [Core Guarantees](/guarantees) — the load-bearing invariant in one paragraph.
+- [Deletion](/guarantees/deletion) — the silent, permanent, point-in-time removal that
+  advances `earliest_seq` but not `evict_floor`.
+- [Ordering & cursors](/guarantees/ordering-and-cursors) — why `caught_up`, not
+  `records.length`, is the "no more" signal.
+- [Read difference](/api/reading) — the full `diff` request/response, including the `tombstone`
+  field.
+- [Watch (SSE)](/api/watch) — the `event: tombstone` frame and resumable `id:` cursor.

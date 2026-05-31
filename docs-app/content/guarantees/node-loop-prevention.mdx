@@ -1,0 +1,128 @@
+---
+title: Node Loop-Prevention
+description: How the origin $node and byte-exact read-side filtering make multi-master fan-out safe — a node never receives back the events it produced, silently and with the cursor still advancing.
+---
+
+import { Callout } from 'nextra/components'
+
+# Node Loop-Prevention
+
+A record may carry an **origin node** — the `$node` string the writer stamped on it.
+A reader that presents the **same** node id is filtered: it never receives back the events
+it produced. Combined with [routers](/api/routers) that preserve `$node` verbatim across
+every forward, this makes N-way multi-master fan-out safe by construction — no echo, no
+infinite loop. This page covers the byte-exact match, why the filter is silent, how it
+interacts with the cursor, the multi-master guarantee, and the `dedupe_node` opt-out.
+
+## The origin node
+
+Every record **may** carry an origin `node` string, set by the writing client (per-record,
+or a batch-level default). The server records it as `$node`: immutable, never rewritten, and
+echoed on reads when present.
+
+```bash
+curl -X POST localhost:4000/v0/boxes/jobs \
+  -H 'content-type: application/json' \
+  -d '{ "node": "worker-eu-1",
+        "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
+```
+
+The `$node` is a loop-prevention **key**, not data — it is bounded to 128 bytes and treated
+as an opaque identity token, never parsed.
+
+## Byte-exact filtering
+
+A read (`diff` or `watch`) may carry a reader `node` id — the **filter**. When present, the
+read drops every record whose `$node` equals the filter, **byte-exact**, before delivery:
+
+```bash
+# worker-eu-1 reads the box it also writes to; its own records are filtered out.
+curl -X POST localhost:4000/v0/boxes/jobs/diff \
+  -H 'content-type: application/json' \
+  -d '{ "from_seq": 0, "node": "worker-eu-1" }'
+```
+
+The matching rules are strict:
+
+- **Exact equality only.** No prefix, no glob, no normalization — byte-for-byte string
+  equality. A node id is an opaque identity token.
+- **Records with no `$node`, or a different `$node`, pass through** unaffected.
+- **A reader may pass multiple node ids** (`"node": ["a","b"]`) to filter several of its own
+  identities at once. The semantics are "drop if `$node` ∈ set."
+
+The filter is applied **after** retention and TTL filtering, on the record's content.
+
+## Silent skip + cursor advance
+
+Node-filtering is **voluntary** — the reader asked for it by supplying its own node id — so
+it is **silent**: it never emits a [tombstone](/guarantees/tombstones). Dropped seqs are
+simply absent from `records`; nothing signals their removal beyond their absence.
+
+Crucially, the **cursor still advances past filtered records.** `next_from_seq` moves past
+every examined seq, including the ones that were node-filtered, so they are never re-scanned.
+Without this, a node reading a box full of its own events would loop forever, unable to
+advance past records it can never see.
+
+<Callout type="warning">
+  Because filtered records are dropped *after* the bounded batch window is selected, a batch
+  can return fewer than `limit` records — even **zero** — while still advancing the cursor.
+  Rely on `caught_up` / `next_from_seq` / `head_seq`, **never** on batch fullness, to know
+  whether you are caught up. See [Ordering & Cursors](/guarantees/ordering-and-cursors). The
+  filter never scans ahead to "fill" a batch.
+</Callout>
+
+This is the same uniform contract for both [`diff`](/api/reading) and
+[SSE watch](/api/watch): `node` on the watch session is applied to every box it watches, and
+the resume cursor advances past filtered records identically.
+
+## Multi-master safety
+
+Loop-prevention exists for one job: make router fan-out across N symmetric nodes safe
+(multi-master replication). The mechanism is that **`$node` is preserved verbatim through
+every router forward** — a router never rewrites it (with the default `preserve_node: true`).
+
+Consider three symmetric nodes A, B, C, each writing to and watching a shared topology:
+
+1. Node A writes a record stamped `$node: "A"`.
+2. Routers fan that record out to boxes that B and C watch. The forwarded copies still carry
+   `$node: "A"` — the router did not touch it.
+3. B and C read with their own node filters (`"B"`, `"C"`). They receive A's record (it is
+   not theirs) and act on it, but never re-emit it as their own.
+4. If a forwarded copy loops back to a box that **A** reads, A's own filter drops it.
+
+Because no router ever changes `$node`, a record that loops around a cyclic router graph is
+always filtered at the read by its origin node. That makes N-way multi-master safe **even
+with cyclic router graphs** — provided every node sets and filters its own node id. That is
+the documented contract for the multi-master use case.
+
+<Callout type="info">
+  Node-filtering prevents *delivery* of your own events (correctness). It does **not** stop a
+  record from being *forwarded* around a cycle forever (resource waste). Those are two
+  different problems: the router graph is DAG-by-default (a cycle is rejected `409
+  router_cycle`), with an explicit hop-capped `allow_cycle` escape hatch for intentional
+  A↔B mirrors. See the [Routers API](/api/routers) and the [Multi-Master
+  guide](/guides/multi-master).
+</Callout>
+
+## The `dedupe_node` opt-out
+
+Node loop-prevention is enabled per box via the `dedupe_node` config field, which defaults
+to `true`. Set `dedupe_node: false` if you genuinely want echoes — a box where a node *does*
+receive back its own records.
+
+```bash
+curl -X PUT localhost:4000/v0/boxes/echo \
+  -H 'content-type: application/json' \
+  -d '{ "dedupe_node": false }'
+```
+
+With `dedupe_node: false`, the reader's `node` filter is ignored on that box and every
+record is delivered regardless of `$node`. This is rarely what you want; it exists so a box
+can deliberately opt out of filtering entirely.
+
+## See also
+
+- [Node loop-prevention API](/api/reading) — the `node` filter on `diff` and its exact semantics.
+- [Routers API](/api/routers) — `preserve_node` and how `$node` carries through a forward.
+- [Multi-Master guide](/guides/multi-master) — building a safe N-way symmetric topology.
+- [Ordering & Cursors](/guarantees/ordering-and-cursors) — why filtered records still advance the cursor.
