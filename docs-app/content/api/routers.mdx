@@ -77,6 +77,16 @@ design against.
   forwarding remains at-least-once via the source cursor.
 </Callout>
 
+<Callout type="warning">
+  **Legacy opt-out (`STREAMS_FORWARD_V2=0`).** The async + derived model above is the **shipped
+  default**. Setting `STREAMS_FORWARD_V2=0` (`false`/`no`/`off`) reverts to the legacy
+  **synchronous in-line** forward: each forwarded copy is its own WAL append written on the
+  source write/ack path — durable-by-construction but **WAL-amplified** (an N-way fan-out costs
+  N WAL writes, and the source ack waits on them). The legacy path also permits **multi-source
+  fan-in** into one `dest` (no `router_dest_fan_in` rule). It exists only for back-compat; the
+  derived default is recommended.
+</Callout>
+
 ## PUT /v0/routers/:router — create or configure a router
 
 <div className="route"><span className="verb put">PUT</span><span className="path">/v0/routers/:router</span></div>

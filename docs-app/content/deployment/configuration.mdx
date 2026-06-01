@@ -72,7 +72,7 @@ rotation; the hot-retention knobs govern when sealed segments relocate to cold s
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `STREAMS_FORWARD_V2` | `0` | Selects the **async + derived** router-forwarding path (durable per-router cursor, forwarded copies not WAL-logged so one source append is one WAL write, single-source-per-dest, replay-from-cursor recovery) described in [Routers](/api/routers). Default `0` keeps the legacy synchronous in-line forward; set `1` to enable the cursor-driven async path. |
+| `STREAMS_FORWARD_V2` | `1` (on) | The **async + derived** router-forwarding path (durable per-router cursor, forwarded copies not WAL-logged so one source append is one WAL write regardless of fan-out, single-source-per-dest, replay-from-cursor recovery) described in [Routers](/api/routers) is now the **default**. Set `STREAMS_FORWARD_V2=0` (`false`/`no`/`off`) to **opt out** to the legacy synchronous in-line forward: durable-by-construction but **WAL-amplified** (N WAL writes per N-way fan-out, on the source ack path) and it permits multi-source fan-in into one dest. |
 
 ## Resource limits
 

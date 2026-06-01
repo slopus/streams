@@ -301,7 +301,7 @@ Configuration is read from the environment:
 | `STREAMS_SEGMENT_MAX_AGE_MS` | `3600000` (1 h) | Also seal a partially-filled active segment after this wall-clock age. `0` disables the age trigger. |
 | `STREAMS_HOT_RETAIN_SEGMENTS` | `4` | Keep at most this many most-recent sealed segments hot before relocating older ones to the cold tier (the active segment is always hot). |
 | `STREAMS_HOT_RETAIN_BYTES` | `0` (count-only) | Optionally bound hot sealed-segment bytes; the stricter of the two retention bounds wins. |
-| `STREAMS_FORWARD_V2` | `0` | Selects the async + derived router-forwarding path (durable per-router cursor, forwarded copies not WAL-logged, single-source-per-dest) described in [Routers](#features). Default `0` keeps the legacy synchronous in-line forward; set `1` to enable the cursor-driven async path. |
+| `STREAMS_FORWARD_V2` | `1` (on) | The async + derived router-forwarding path (durable per-router cursor, forwarded copies not WAL-logged, single-source-per-dest) described in [Routers](#features) is now the **default**: one WAL append per source append regardless of fan-out, off the source ack path. Set `STREAMS_FORWARD_V2=0` (`false`/`no`/`off`) to **opt out** back to the legacy synchronous in-line forward (durable-by-construction but WAL-amplified — N WAL writes per N-way fan-out, on the ack path — and it permits multi-source fan-in into one dest). |
 | `STREAMS_MAX_BOXES` | `100000` | Max boxes (DoS hardening). `0` = unlimited. Creating past it ⇒ `429 throttled`. |
 | `STREAMS_MAX_ROUTERS` | `10000` | Max routers. `0` = unlimited. |
 | `STREAMS_MAX_WATCH_SESSIONS` | `10000` | Max live watch sessions. `0` = unlimited. |
@@ -465,9 +465,10 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
   per-source FIFO, cycle-rejecting by default; `$node` is preserved (loop prevention), with
   a hop cap. A derived destination is **single-source**: a second router with a *different*
   source into the same dest is rejected with `409 box_exists_incompatible`
-  (`error.detail.reason: "router_dest_fan_in"`). (This async/derived
-  path is gated behind `STREAMS_FORWARD_V2`; the current default is the legacy synchronous
-  in-line forward — see the config table.)
+  (`error.detail.reason: "router_dest_fan_in"`). This async/derived model is the
+  **shipped default**; set `STREAMS_FORWARD_V2=0` to opt out to the legacy synchronous
+  in-line forward (durable-by-construction but WAL-amplified, on the ack path, and it
+  permits multi-source fan-in) — see the config table.
 - **Lease-based queues** — set `type: "queue"` to layer claim/ack/nack/extend (and a
   `/work` auto-claim SSE stream) on the same log: visibility-timeout leases,
   coalesced fair fan-out, redelivery, and optional dead-lettering (see API §10).

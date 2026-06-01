@@ -1,9 +1,10 @@
 # Async + Derived Router Forwarding — Design Note
 
-Status: STAGE 4 (IMPLEMENTED + HARDENED behind `STREAMS_FORWARD_V2`, default OFF).
-The async + derived forwarding path is fully wired, tested, and the codex review
-findings are fixed; the legacy synchronous `forward_from` path remains the default
-so every existing suite stays green. The flag is captured per-engine at construction
+Status: SHIPPED DEFAULT (IMPLEMENTED + HARDENED; `STREAMS_FORWARD_V2` default ON).
+The async + derived forwarding path is fully wired, tested, the codex review findings
+are fixed, and it is now THE default forwarding model. The legacy synchronous
+`forward_from` path remains available as an explicit opt-out via `STREAMS_FORWARD_V2=0`
+(`false`/`no`/`off`). The flag is captured per-engine at construction
 (`Engine::forward_v2`).
 
 What Stage 4 fixed (codex findings):
@@ -305,7 +306,7 @@ order), with no fsync on it.
 
 | File | Change |
 |---|---|
-| `src/config.rs` | Add `ROUTER_TICK_INTERVAL_MS`, `ROUTER_BATCH` consts; a `forward_v2` runtime flag (env `STREAMS_FORWARD_V2`, default off in Stage 1). |
+| `src/config.rs` | Add `ROUTER_TICK_INTERVAL_MS`, `ROUTER_BATCH` consts; a `forward_v2` runtime flag (env `STREAMS_FORWARD_V2`). Was default off in Stage 1; the cutover flipped it to **default ON** (`STREAMS_FORWARD_V2=0` is now the legacy opt-out). |
 | `src/engine/router.rs` | `RouterGraph`: add `dest_base: HashMap<String,u64>` and per-router `Mutex` (or move per-router advance state into a small `RouterRuntime`). Add `dest_base(name)`, `set_dest_base`, `pending_deferred` bookkeeping. `note_forwarded` keeps advancing cursor+total; add `cursor(name)`. |
 | `src/engine/mod.rs` | New `advance_router(&self, name)` (the idempotent forward step, per-router-mutex-guarded) carrying the per-record transform + filter + backpressure-prefix logic extracted from `forward_from`. New `catch_up_dest(&self, dest)` called at the top of `diff`/SSE/queue/`box_state` GET read paths. New `drain_router_sources(&self)` for the worker. `write()`: when `forward_v2`, **drop** the inline `forward_from` call (lines ~2143-2154) — just `mark_dirty` the source. Keep `forward_from` as the v1 path under the flag so all tests stay green until cutover. |
 | `src/engine/box_state.rs` | `publish_staged`: advance head + notify, then materialize **after** the caller releases the gate; split out `seal_pending()` to run the seal/fsync off-gate. Add a per-box `pending_seal` marker the maintenance worker / read path drains. |

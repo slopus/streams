@@ -655,7 +655,7 @@ past the deleted seqs. `evict_floor <= earliest_seq` always.)
 |---|---|
 | `gap_from` | First missing seq (= stale `from_seq + 1`). |
 | `gap_to` | Last missing seq (= `earliest_seq - 1`). The lost range `[gap_from, gap_to]` is inclusive both ends. |
-| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), or `"recreated"` (box was deleted+recreated). Best-effort/informational; the range is authoritative. |
+| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), `"recreated"` (box was deleted+recreated), or `"source_trim"` (a router dest could not re-materialize a forwarded record because the **source** had already evicted/trimmed it below the router's cursor — the derived dest faithfully reflects source retention rather than silently skipping; default async/derived router model). Best-effort/informational; the range is authoritative. |
 | `missed_estimate` | Approximate count of dropped records (approximate because eviction is segment-granular). |
 | `earliest_seq` / `head_seq` | Current watermarks, echoed for convenience. |
 
@@ -787,6 +787,14 @@ copies are re-derived on recovery by replaying from a **durable per-router curso
 cursor" can re-forward; consumers must be idempotent — see DESIGN §6). A derived `dest` is
 **single-source**: a second router with a *different* `source` into the same `dest` is rejected
 `409 box_exists_incompatible` with `error.detail.reason: "router_dest_fan_in"`.
+
+> **Legacy opt-out (`STREAMS_FORWARD_V2=0`).** The async + derived model above is the shipped
+> default. Setting `STREAMS_FORWARD_V2=0` (`false`/`no`/`off`) reverts to the legacy
+> **synchronous in-line** forward: each forwarded copy is its own WAL append, written on the
+> source write/ack path (durable-by-construction but **WAL-amplified** — N WAL writes for an
+> N-way fan-out, and the source ack waits on them). The legacy path also permits **multi-source
+> fan-in** into a single `dest` (no `router_dest_fan_in` rule). It exists only for back-compat;
+> the derived default is recommended.
 
 ### 6.1 Create / configure — `PUT /v0/routers/:router`
 

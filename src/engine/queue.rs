@@ -204,11 +204,9 @@ impl QueueProjection {
             // acked (job is deleted from the jobs log; drop all lease state) — only
             // if it acks the current lease. A stale ack for an old delivery must not
             // drop a newer lease's state.
-            3 => {
-                if current_lease_matches(self) {
-                    self.leases.remove(&seq);
-                    self.deliveries.remove(&seq);
-                }
+            3 if current_lease_matches(self) => {
+                self.leases.remove(&seq);
+                self.deliveries.remove(&seq);
             }
             _ => {}
         }

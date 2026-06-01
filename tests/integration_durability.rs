@@ -1987,12 +1987,15 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
 // Phase-7 Stage-1: the three critical durability fixes.
 // ===========================================================================
 
-/// Bug #3 (forwarded copies were in-memory-only): a routed copy into a DURABLE
-/// destination box now goes through the same WAL-first durable append path as a
-/// user write, so it is durable BY CONSTRUCTION and survives a restart via WAL
-/// replay — it no longer vanishes on a no-snapshot crash. Recovery replays the
-/// dest's own Append frame (it does NOT re-derive the forward), so the copy is
-/// present exactly once.
+/// A forwarded copy into a destination box survives a restart and is present
+/// EXACTLY ONCE with $node/$tag fidelity. This is the observable recovery contract
+/// the product guarantees regardless of forwarding mode. Under the v2 default
+/// (async + derived) recovery RE-DERIVES the copy from the still-retained source
+/// record + the durable per-router cursor (the forwarded copy is never separately
+/// WAL-logged); the legacy opt-out (`STREAMS_FORWARD_V2=0`) instead replays the
+/// dest's own Append frame. Either way the survivor is the same single record — the
+/// legacy-specific "durable dest WAL frame" mechanism is exercised by
+/// `legacy_forwarded_copy_recovers_from_dest_wal_frame` in `integration_legacy_forward.rs`.
 #[test]
 fn forwarded_copy_into_durable_dest_survives_restart() {
     let dir = tempfile::tempdir().unwrap();

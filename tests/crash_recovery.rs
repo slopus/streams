@@ -334,21 +334,48 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     );
 
     // The router DEFINITION survived (a WAL control frame), so forwarding is
-    // wired again on restart. Its forward cursor is re-initialized to the
-    // recovered source head (`note_forwarded(.., 0)`), matching live
-    // `put_router` semantics, so it does not re-forward replayed history — the
-    // `forwarded_total` counter is best-effort runtime state and resets on a
-    // no-snapshot crash (it is durable only via a snapshot; see
-    // `routers_survive_snapshot_restart`). What matters durably: the router edge
-    // exists and forwarding works for new writes.
+    // wired again on restart. The router was created on an EMPTY source, so its
+    // durable create-time cursor is 0 (genuine v2 `Some(0)`, codex P0 #3): on
+    // restart `reforward_routers_on_recovery` re-derives `source[0..head]` into the
+    // dest. What matters durably: the router edge exists, and because the source's
+    // `fwd:1` record is still in source retention, recovery RE-MATERIALIZES the
+    // pre-crash derived copy (the v2 at-least-once contract — a forwarded copy is
+    // never WAL-logged, it is re-derived from the durable source + the cursor).
     assert_eq!(post_router["source"], json!("src"));
     assert_eq!(post_router["dest"], json!("dst"));
     let _ = &pre_router; // (definition compared above; total is non-durable here)
 
+    // v2 RE-MATERIALIZATION: the pre-crash forwarded `fwd:1` copy reappears in dst
+    // after restart, re-derived from the still-retained source record (NOT a silent
+    // loss). Forwarding is async; the dst diff drives the read-path catch-up, plus a
+    // beat for the recovery re-forward / background worker.
+    std::thread::sleep(Duration::from_millis(50));
+    let dst_diff1: Value = c
+        .post(format!("{base}/v0/boxes/dst/diff"))
+        .json(&json!({ "from_seq": 0, "include_tags": true }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let fwd1 = dst_diff1["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["data"] == json!({ "fwd": 1 }))
+        .expect("pre-crash forwarded copy re-materialized from retained source after restart");
+    assert_eq!(
+        fwd1["$tag"],
+        json!("ftag"),
+        "re-derived copy preserves $tag"
+    );
+    assert_eq!(
+        fwd1["$node"],
+        json!("writerA"),
+        "re-derived copy preserves $node"
+    );
+
     // Forwarding still works after restart: a NEW durable write to src is
-    // forwarded to dst with $node/$tag preserved. (The pre-crash forwarded copy
-    // is an in-memory derived cache and may be lost on a no-snapshot crash — the
-    // documented at-least-once tradeoff; recovery does not re-forward history.)
+    // forwarded to dst with $node/$tag preserved.
     assert!(c
         .post(format!("{base}/v0/boxes/src"))
         .json(&json!({ "records": [{ "data": { "fwd": 2 }, "tag": "ftag2", "node": "writerB" }] }))
@@ -356,7 +383,8 @@ fn sigkill_durable_writes_survive_with_identical_state() {
         .unwrap()
         .status()
         .is_success());
-    // Give the synchronous in-process forward a beat to land in dst.
+    // Forwarding is async under the v2 default; the dst diff below drives the
+    // read-path router catch-up, but give the background worker a beat too.
     std::thread::sleep(Duration::from_millis(50));
     let dst_diff2: Value = c
         .post(format!("{base}/v0/boxes/dst/diff"))

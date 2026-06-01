@@ -836,14 +836,12 @@ impl BoxState {
         // right after a publish), so single-writer behavior is unchanged.
         let start = index.base_seq + index.records.len() as u64;
         let mut added_bytes: u64 = 0;
-        let mut seq = start;
-        for rec in records {
+        for (seq, rec) in (start..).zip(records) {
             added_bytes = added_bytes.saturating_add(rec.bytes);
             if let Some(tag) = &rec.tag {
                 index.index_tag(seq, tag);
             }
             index.records.push_back(rec);
-            seq += 1;
         }
         StagedAppend {
             start,

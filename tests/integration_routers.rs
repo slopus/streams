@@ -153,16 +153,19 @@ fn get_router_and_404_when_missing() {
 #[test]
 fn list_routers_filters_by_source_and_dest() {
     let h = Harness::start();
+    // v2 contract: a derived dest is single-source, so two routers cannot share a
+    // dest. The topology below keeps source/dest/prefix filter coverage (source `a`
+    // fans to two distinct dests `b`,`c`; a separate `x->d`) under that rule.
     h.put("/v0/routers/a->b", json!({ "source": "a", "dest": "b" }));
     h.put("/v0/routers/a->c", json!({ "source": "a", "dest": "c" }));
-    h.put("/v0/routers/x->c", json!({ "source": "x", "dest": "c" }));
+    h.put("/v0/routers/x->d", json!({ "source": "x", "dest": "d" }));
 
     // No filter -> all three.
     let (status, body) = h.get("/v0/routers");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["routers"].as_array().unwrap().len(), 3);
 
-    // Filter by source=a -> two.
+    // Filter by source=a -> two (fan-out from one source to two dests).
     let (_s, body) = h.get("/v0/routers?source=a");
     let names: Vec<&str> = body["routers"]
         .as_array()
@@ -176,7 +179,7 @@ fn list_routers_filters_by_source_and_dest() {
         "source filter + sorted by name"
     );
 
-    // Filter by dest=c -> two (a->c and x->c).
+    // Filter by dest=c -> one (a single-source derived dest).
     let (_s, body) = h.get("/v0/routers?dest=c");
     let names: Vec<&str> = body["routers"]
         .as_array()
@@ -184,11 +187,32 @@ fn list_routers_filters_by_source_and_dest() {
         .iter()
         .map(|r| r["router"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["a->c", "x->c"]);
+    assert_eq!(names, vec!["a->c"]);
+
+    // Filter by dest=d -> one (the unrelated x->d edge).
+    let (_s, body) = h.get("/v0/routers?dest=d");
+    let names: Vec<&str> = body["routers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["router"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["x->d"]);
 
     // Prefix filter narrows to the `a->` namespace.
     let (_s, body) = h.get("/v0/routers?prefix=a->");
     assert_eq!(body["routers"].as_array().unwrap().len(), 2);
+
+    // The single-source rule is enforced: a second router with a DIFFERENT source
+    // into an existing derived dest is refused 409 router_dest_fan_in.
+    let (status, body) = h.put("/v0/routers/x->c", json!({ "source": "x", "dest": "c" }));
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "multi-source fan-in into dest c is refused under v2: {body}"
+    );
+    assert_eq!(body["error"]["code"], "box_exists_incompatible");
+    assert_eq!(body["error"]["detail"]["reason"], "router_dest_fan_in");
 }
 
 // --------------------------------------------------------------------------

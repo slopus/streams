@@ -1118,24 +1118,43 @@ impl Engine {
     /// publish + materialize into the segment writer, but write **NO WAL frame**
     /// (the no-amplification property — a forwarded dest record is derived off the
     /// source WAL + the per-router cursor, never separately logged). Used only by
-    /// `advance_router` under the per-router advance lock, so the dest is a
-    /// single-writer derived box: no publish-ticket gate is needed (no concurrent
-    /// stagers compete for seq order). The seal/fsync runs off any gate by
-    /// construction. Returns the assigned dest seqs.
+    /// `advance_router` under the per-router advance lock, so there is no second
+    /// DERIVED stager competing for the dest. But a dest can ALSO take DIRECT writes
+    /// (a mixed / `allow_cycle` box), so derived publishes MUST go through the SAME
+    /// publish-ticket gate as direct writes (codex P0 #2): otherwise a direct writer
+    /// could stage a higher seq and publish (advancing `head_seq`) in the window
+    /// between this derived batch's stage and its publish, after which an un-gated
+    /// derived `head_seq.store` of the LOWER seq would regress the head and hide the
+    /// direct write. The ticket serializes all `head_seq` advances for the box into
+    /// stage order, so the head is monotonic regardless of writer kind. The
+    /// seal/fsync still runs off the gate. Returns the assigned dest seqs.
     fn derived_append(&self, dest: &BoxState, records: Vec<StoredRecord>, now: i64) -> Vec<u64> {
         if records.is_empty() {
             return Vec::new();
         }
-        // Stage under the dest append lock (orders seq assignment against any other
-        // derived stager — there is none in practice, but keep it correct), then
-        // publish (no WAL) + materialize off the lock.
-        let (staged, seqs) = {
+        // Stage + take a publish ticket UNDER the append lock (the seq-order critical
+        // section), so this batch's ticket orders strictly after any direct write
+        // that staged earlier and strictly before any that stages later — identical
+        // to the direct write path. No WAL frame is enqueued (derived = no
+        // amplification), so there is no fsync token to await.
+        let (staged, seqs, ticket) = {
             let _guard = dest.append_lock.lock();
             let staged = dest.stage_append(records);
             let seqs = staged.seqs();
-            (staged, seqs)
+            let mut ticket = dest.next_publish_ticket();
+            // Roll this staged batch back in place on an unexpected unwind (R14 /
+            // codex P0 #2) — matches the direct/forward write paths.
+            ticket.arm_append(&staged);
+            (staged, seqs, ticket)
         };
-        if let Some((start, end)) = dest.publish_staged_no_seal(staged, now) {
+        // Publish UNDER the gate (head advance ordered against direct writers), seal
+        // the segment AFTER releasing the gate (R6: a slow seal never serializes
+        // same-box writers).
+        let mut ticket = ticket;
+        ticket.wait_turn();
+        let pub_range = dest.publish_staged_no_seal(staged, now);
+        ticket.done();
+        if let Some((start, end)) = pub_range {
             dest.materialize_published(start, end);
         }
         seqs
@@ -1556,13 +1575,14 @@ impl Engine {
             allow_cycle: op.allow_cycle,
         };
         // A frame written by the current encoder carries the create-time cursor +
-        // dest_base it was seeded at (codex P0 #3). A LEGACY frame carries `0`/`0`
-        // (the trailing fields were absent on the wire); for that we fall back to the
-        // source head at replay time (the pre-fix behavior — correct for the
-        // single-shard layout those frames came from). Detect "legacy" as BOTH zero,
-        // which is also the genuine value for a router created against an empty source
-        // with an empty dest, where the source-head fallback yields the same `0`.
-        let legacy_frame = op.initial_cursor == 0 && op.initial_dest_base == 0;
+        // dest_base it was seeded at as `Some(_)` (codex P0 #3). A LEGACY frame carries
+        // `None`/`None` (the trailing fields were absent on the wire); for that we fall
+        // back to the source head at replay time (the pre-fix behavior — correct for
+        // the single-shard layout those frames came from). The distinction is the
+        // wire-level PRESENCE of the pair, NOT its value: a genuine v2 router created
+        // against an empty source logs `Some(0)`/`Some(0)`, which must be honored
+        // verbatim (recomputing from the live source head could skip records appended
+        // after creation when WAL sharding replays them onto a different shard first).
         // v1 (sync) recovery: seed the cursor to the source's current head so a
         // replayed router doesn't re-forward historical records (matches live
         // `put_router`). v2 (derived) recovery re-materializes the dest by replaying
@@ -1578,18 +1598,14 @@ impl Engine {
                 // dest_base only for a fresh (post-snapshot) router so re-derivation
                 // numbers dest seqs from the right base. Use the LOGGED create-time
                 // values (durable, replay-order independent) when present; only a
-                // legacy frame recomputes from the live source head.
+                // legacy frame (absent pair) recomputes from the live source head.
                 if created {
-                    let cursor = if legacy_frame {
+                    let cursor = op.initial_cursor.unwrap_or_else(|| {
                         self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0)
-                    } else {
-                        op.initial_cursor
-                    };
-                    let dest_base = if legacy_frame {
+                    });
+                    let dest_base = op.initial_dest_base.unwrap_or_else(|| {
                         self.get_box(&op.dest).map(|b| b.head_seq()).unwrap_or(0)
-                    } else {
-                        op.initial_dest_base
-                    };
+                    });
                     graph.note_forwarded(&op.name, cursor, 0);
                     graph.seed_dest_base(&op.name, dest_base);
                 }
@@ -3258,6 +3274,33 @@ impl Engine {
             }
         }
 
+        // Re-pointing an existing router's source or dest is REJECTED (codex P0 #1):
+        // the running forward cursor is a seq in the OLD source and `dest_base` is
+        // anchored in the OLD dest, so silently rebinding either would either skip
+        // records or assign colliding/non-deterministic dest seqs that recovery
+        // cannot re-derive. Changing other knobs (filter, preserve_*, allow_cycle)
+        // on an idempotent re-PUT is fine. Read-only + pre-slot, so a refused router
+        // leaves no phantom box. Delete + recreate to intentionally re-point.
+        if let Some(existing) = self.routers.lock().get(name).cloned() {
+            if existing.source != req.source || existing.dest != req.dest {
+                return Err(Error::new(
+                    ErrorCode::BoxExistsIncompatible,
+                    format!(
+                        "router {name:?} already exists with source/dest \
+                         {:?} -> {:?}; re-pointing to {:?} -> {:?} is not allowed \
+                         (delete and recreate the router instead)",
+                        existing.source, existing.dest, req.source, req.dest
+                    ),
+                )
+                .with_detail(serde_json::json!({
+                    "router": name,
+                    "reason": "router_repoint_forbidden",
+                    "existing_source": existing.source,
+                    "existing_dest": existing.dest,
+                })));
+            }
+        }
+
         let router = Router {
             name: name.to_string(),
             source: req.source.clone(),
@@ -3285,7 +3328,16 @@ impl Engine {
         let created = {
             let mut graph = self.routers.lock();
             let created = graph.upsert_capped(router, self.config.limits.max_routers)?;
-            graph.note_forwarded(name, src_head, 0);
+            // Seed the forward cursor at the source head ONLY on a fresh create, so
+            // a router forwards just records committed after this PUT (FIFO "from
+            // now", no historical backfill). An idempotent re-PUT of an existing
+            // router MUST preserve its running cursor + forwarded_total: resetting
+            // the cursor to the current source head here would silently skip any
+            // records appended since the last forward that the async worker has not
+            // yet drained (codex P0 #1).
+            if created {
+                graph.note_forwarded(name, src_head, 0);
+            }
             created
         };
 
@@ -3339,8 +3391,11 @@ impl Engine {
                     create_dest: req.create_dest,
                     allow_cycle: req.allow_cycle,
                     filter: req.filter.as_ref().map(filter_to_matchsel),
-                    initial_cursor: logged_cursor,
-                    initial_dest_base: logged_dest_base,
+                    // Always `Some(_)` for a live create/re-PUT: the frame is v2 and
+                    // carries its durable cursor/base verbatim (codex P0 #3). Only
+                    // historical on-disk frames decode to `None` (legacy fallback).
+                    initial_cursor: Some(logged_cursor),
+                    initial_dest_base: Some(logged_dest_base),
                 },
                 ts: self.clock.now_ms().max(0) as u64,
             },
@@ -3372,6 +3427,20 @@ impl Engine {
     /// `GET /v0/routers/:router`.
     pub fn get_router(&self, name: &str) -> Result<RouterGetResponse> {
         let start = Instant::now();
+        // Read-path catch-up (forward_v2): drive THIS router to its source head so
+        // the reported `forwarded_total` is read-your-writes consistent on a router
+        // GET after a source write (forwarding is otherwise async/eventual). No-op
+        // under the legacy opt-out (`advance_router` returns 0 when v2 is off). Drive
+        // it BEFORE taking the graph lock — `advance_router` locks the graph itself.
+        if self.forward_v2 {
+            let mut guard = 0u32;
+            while self.advance_router(name) > 0 {
+                guard += 1;
+                if guard > 1_000_000 {
+                    break;
+                }
+            }
+        }
         let graph = self.routers.lock();
         let r = graph
             .get(name)

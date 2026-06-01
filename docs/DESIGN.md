@@ -526,6 +526,14 @@ idempotent; a per-record flip is sector-atomic).
 A router is a forwarding rule `src → dst`: every record committed to `src` is forwarded (appended)
 to `dst`. `{ name, source, dest, preserve_node, preserve_tag, filter, allow_cycle, created_ts }`.
 
+The **async + derived** model described below is the **shipped default**. A legacy opt-out
+(`STREAMS_FORWARD_V2=0`, also `false`/`no`/`off`) reverts to the older **synchronous in-line**
+forward: each forwarded copy is its own WAL append, written on the source write/ack path. That
+path is durable-by-construction but **WAL-amplified** (an N-way fan-out costs N WAL writes, and the
+source ack waits on them) and it permits **multi-source fan-in** into a single `dst` (no
+`router_dest_fan_in` rule). The opt-out exists only for back-compat; the derived default is
+recommended (one WAL write per source append, off the ack path, no silent loss).
+
 ### 8.1 Forward mechanics & ordering
 
 - Forwarding is **async** and **off the source write/ack path**: a write to `src` acks
@@ -579,9 +587,11 @@ A forward into `dst` is an ordinary append obeying `dst`'s config:
 - `dst.discard = "reject"`: the forward is rejected (`dst` full); the router **does not advance**
   its cursor and **retries with backoff** (the record is still in `src`) — backpressure up the
   route rather than data loss. If `src` itself then caps out under `discard:"old"`, an unforwarded
-  src record can evict before being forwarded; the router records the skip and emits an internal
-  warning metric (a durable fan-out should size `dst ≥ src` or use `discard:"old"` on `dst`). The
-  single-process design favors local backpressure over unbounded buffering.
+  src record can evict before being forwarded; under the default async/derived model the dest
+  surfaces the un-derivable range as a **`source_trim` tombstone** on diff/SSE (an in-band,
+  reader-visible signal — never a silent skip; see API §3), reflecting source retention faithfully.
+  A durable fan-out should size `dst ≥ src` or use `discard:"old"` on `dst`. The single-process
+  design favors local backpressure over unbounded buffering.
 - `dst` TTL applies to forwarded records by `dst.$ts` (forward time), not src time.
 
 ### 8.5 Loop prevention across routers — two complementary layers

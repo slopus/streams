@@ -145,16 +145,20 @@ pub struct RouterOp {
     /// different shard than this control frame, so recomputing the cursor from
     /// "whatever source head exists when this frame replays" would backfill pre-create
     /// history or skip post-create records depending on shard interleave. Persisting
-    /// the create-time cursor pins it. A legacy frame predating the field carries
-    /// `0` (the trailing field is absent on the wire); recovery then falls back to
-    /// the source head at replay time (the pre-fix behavior, correct for the
-    /// single-shard layout these frames came from).
-    pub initial_cursor: u64,
+    /// the create-time cursor pins it. `None` for a LEGACY frame predating the field (the
+    /// trailing pair is absent on the wire); recovery then falls back to the source
+    /// head at replay time (the pre-fix behavior, correct for the single-shard layout
+    /// these frames came from). `Some(0)` is a genuine v2 router created against an
+    /// empty source — distinct from a legacy frame, so recovery must NOT recompute it
+    /// from the live source head (codex P0 #3: an explicit presence bit, not a value
+    /// heuristic).
+    pub initial_cursor: Option<u64>,
     /// The deterministic dest-seq base the router was seeded at when this frame was
     /// logged (`forward_v2`; codex P0 #3). The next derived dest seq is `dest_base +
     /// forwarded_total + 1`, so the base MUST be durable to keep dest seqs stable
-    /// across a restart. A legacy frame carries `0`.
-    pub initial_dest_base: u64,
+    /// across a restart. `None` for a legacy frame (absent on
+    /// the wire); `Some(0)` is a genuine v2 base of zero.
+    pub initial_dest_base: Option<u64>,
 }
 
 /// A box create/config payload logged with [`WalRecord::BoxConfig`]. The opaque
@@ -526,9 +530,14 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
             // Trailing `initial_cursor` + `initial_dest_base` (forward_v2, codex P0
             // #3): appended after the legacy fields so an old reader stops cleanly
             // (it never reads past `filter`) and a new reader picks them up when
-            // present. A legacy frame omits them ⇒ decode falls back to `0`.
-            data_buf.extend_from_slice(&op.initial_cursor.to_le_bytes());
-            data_buf.extend_from_slice(&op.initial_dest_base.to_le_bytes());
+            // present. `None` ⇒ a legacy-shaped frame that omits the pair entirely;
+            // `Some(_)` always writes BOTH 8-byte fields (even `Some(0)`), so the
+            // decoder distinguishes "genuine v2 zero" from "legacy absent" by the
+            // bytes' PRESENCE, not their value.
+            if let (Some(cursor), Some(base)) = (op.initial_cursor, op.initial_dest_base) {
+                data_buf.extend_from_slice(&cursor.to_le_bytes());
+                data_buf.extend_from_slice(&base.to_le_bytes());
+            }
             data = &data_buf;
         }
         WalRecord::RouterDelete { name, ts: rts } => {
@@ -786,9 +795,11 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
             let initial_cursor = read_u64(data, &mut pos);
             let initial_dest_base = read_u64(data, &mut pos);
             let (initial_cursor, initial_dest_base) = match (initial_cursor, initial_dest_base) {
-                (Some(c), Some(b)) => (c, b),
-                (None, None) => (0, 0),
-                // A half-present pair is a torn trailing field.
+                // Both present ⇒ a v2 frame; carry the exact logged values (incl. a
+                // genuine zero). Both absent ⇒ a legacy frame (`None`), which recovery
+                // recomputes from the source head. A half-present pair is torn.
+                (Some(c), Some(b)) => (Some(c), Some(b)),
+                (None, None) => (None, None),
                 _ => return DecodeStep::Torn,
             };
             match (name, source, dest, bools, filter) {
@@ -2119,8 +2130,28 @@ mod tests {
                     create_dest: true,
                     allow_cycle: false,
                     filter: Some(MatchSel::Glob("t:".into())),
-                    initial_cursor: 42,
-                    initial_dest_base: 7,
+                    initial_cursor: Some(42),
+                    initial_dest_base: Some(7),
+                },
+                ts: 5,
+            },
+            true,
+        );
+        // A genuine v2 zero cursor/base must round-trip as `Some(0)` (NOT collapse to
+        // a legacy `None`): the presence bit is what recovery keys on (codex P0 #3).
+        roundtrip(
+            WalRecord::RouterCreate {
+                op: RouterOp {
+                    name: "fresh->derived".into(),
+                    source: "fresh".into(),
+                    dest: "derived".into(),
+                    preserve_node: false,
+                    preserve_tag: false,
+                    create_dest: true,
+                    allow_cycle: false,
+                    filter: None,
+                    initial_cursor: Some(0),
+                    initial_dest_base: Some(0),
                 },
                 ts: 5,
             },
