@@ -1,12 +1,23 @@
 # streams
 
-A persistent event engine in a single binary. **streams** is an append-only log
-service exposed over a clean, JSON-first HTTP API: write events to named **topics**,
-read them back by sequence, fan them out with **routers**, and watch many topics at
-once over a single Server-Sent Events connection — all from one static binary on one
-machine, backed by a write-ahead log on local NVMe. It is the persistence layer for
-job queues, pub/sub, and durable event streams, with a design that makes data loss
-**always explicit, never silent**.
+**Millions of events a second, with the simplicity of SQLite.** streams is a persistent,
+append-only event log exposed over a clean, JSON-first HTTP API: write events to named
+**topics**, read them back by sequence, fan them out with **routers**, and watch many
+topics at once over a single Server-Sent Events connection. It runs as one process on one
+machine — no cluster, no coordination, the way SQLite is one file instead of a database
+fleet — backed by a write-ahead log on local NVMe. It's the persistence layer for queues,
+pub/sub, and durable event streams, and data loss is **always explicit, never silent**.
+
+Three deliberate bets define it:
+
+- **A small API** — create a topic, write to it, read it back by sequence, watch it, delete
+  what you don't need. JSON in and out, server-assigned IDs; `curl` is a complete client.
+- **One node, not a fleet** — SQLite's operating model with a network port: a single server
+  you point at a directory, not a distributed system to operate. Scaling up is a bigger
+  machine, not more of them. In-process the engine appends and projects records at millions a
+  second.
+- **Durability you choose** — per topic: best-effort `memory`, crash-surviving `disk`, or
+  fsync-gated `fsync`. Strong where it matters, fast where it doesn't.
 
 > Status: **implemented and durable.** The full `/v0` API is built and tested
 > (topics, diff reads, deletes, routers, multiplexed SSE, and lease-based queues),
@@ -64,7 +75,11 @@ across a purely-deleted gap is silent while reading below an evicted floor tombs
 
 What streams **aims** for — the design targets the implementation is built and tuned against:
 
-- **Throughput: ~1,000,000 events/sec (batched).** Writes are batched (a single `POST`
+- **Throughput: millions of events/sec.** The in-process engine appends and projects records
+  at **millions a second** (micro-benchmarks: ~5.6–5.9 M appends/s, ~12–13 M diff
+  projections/s); over HTTP the realistic ceiling is the request/serialization path and the
+  durability class, with the often-quoted ~1 M/s reached in aggregate via batching and
+  sharding. Writes are batched (a single `POST`
   carries up to thousands of records) and the WAL is **sharded** (`STREAMS_WAL_SHARDS`,
   default `min(num_cpus, 8)`) into independent ordered writers, each with **adaptive group
   commit** — one `fsync` amortized across a whole batch of concurrent durable writers — so
@@ -96,26 +111,28 @@ buys exactly the guarantee it needs without taxing the others:
   For queues / ledgers / anything that must not lose acknowledged work.
 
 These are **not** global modes: a `memory` cache topic, a `disk` pub/sub feed, and an `fsync`
-job queue coexist in one process, and routers bridge them (forwarding honors the destination
+ledger coexist in one process, and routers bridge them (forwarding honors the destination
 topic's class).
 
 ---
 
 ## Quickstart
 
-Assume the binary is running on `localhost:4000` with auth disabled (dev mode).
+Point `$STREAMS` at the server (`export STREAMS=http://localhost:4000`), running with auth
+disabled (dev mode — the default on a loopback bind). These commands record an online
+store's orders.
 
 ### 1. Create a topic (optional — first write auto-creates it)
 
 ```bash
-curl -X PUT localhost:4000/v0/topics/jobs \
+curl -X PUT $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
-  -d '{ "durable": true, "cap_records": 1000000, "ttl_ms": 0 }'
+  -d '{ "durable": true, "cap_records": 0, "ttl_ms": 0 }'
 ```
 
 ```json
-{ "topic": "jobs", "created": true,
-  "config": { "ttl_ms": 0, "cap_records": 1000000, "cap_bytes": 0,
+{ "topic": "orders", "created": true,
+  "config": { "ttl_ms": 0, "cap_records": 0, "cap_bytes": 0,
               "discard": "old", "durable": true, "durability": "fsync", "priority": null,
               "auto_priority": true, "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true },
@@ -125,17 +142,16 @@ curl -X PUT localhost:4000/v0/topics/jobs \
 ### 2. Write records (server assigns the seqs)
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs \
+curl -X POST $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
-  -d '{ "node": "worker-eu-1",
-        "records": [
-          { "data": { "url": "s3://b/a.png", "w": 256 }, "tag": "tenant42:job-9001" },
-          { "data": { "url": "s3://b/b.png", "w": 512 }, "tag": "tenant42:job-9002" }
+  -d '{ "records": [
+          { "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 }, "tag": "order-7731" },
+          { "data": { "sku": "FELLOW-KETTLE", "qty": 1, "total": 16500 }, "tag": "order-7732" }
         ] }'
 ```
 
 ```json
-{ "topic": "jobs", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
+{ "topic": "orders", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
   "head_seq": 2, "count": 2, "created": false, "deduped": false,
   "performance": { "server_total_ms": 0.62, "fsync_ms": 0.39 } }
 ```
@@ -143,11 +159,11 @@ curl -X POST localhost:4000/v0/topics/jobs \
 ### 3. Read current state (head, earliest, count, config)
 
 ```bash
-curl localhost:4000/v0/topics/jobs
+curl $STREAMS/v0/topics/orders
 ```
 
 ```json
-{ "topic": "jobs", "head_seq": 2, "earliest_seq": 1, "next_seq": 3,
+{ "topic": "orders", "head_seq": 2, "earliest_seq": 1, "next_seq": 3,
   "count": 2, "bytes": 184, "effective_priority": 500, "config": { "...": "..." },
   "performance": { "server_total_ms": 0.05 } }
 ```
@@ -155,35 +171,36 @@ curl localhost:4000/v0/topics/jobs
 ### 4. Read the difference from a cursor (batched, with tombstones)
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs/diff \
+curl -X POST $STREAMS/v0/topics/orders/diff \
   -H 'content-type: application/json' \
-  -d '{ "from_seq": 0, "limit": 500, "node": "worker-eu-1" }'
+  -d '{ "from_seq": 0, "limit": 500 }'
 ```
 
 ```json
-{ "topic": "jobs",
+{ "topic": "orders",
   "records": [
-    { "$seq": 1, "$ts": 1748470000123, "$tag": "tenant42:job-9001",
-      "data": { "url": "s3://b/a.png", "w": 256 } },
-    { "$seq": 2, "$ts": 1748470000140, "$tag": "tenant42:job-9002",
-      "data": { "url": "s3://b/b.png", "w": 512 } }
+    { "$seq": 1, "$ts": 1748470000123, "$tag": "order-7731",
+      "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 } },
+    { "$seq": 2, "$ts": 1748470000140, "$tag": "order-7732",
+      "data": { "sku": "FELLOW-KETTLE", "qty": 1, "total": 16500 } }
   ],
   "next_from_seq": 2, "head_seq": 2, "earliest_seq": 1,
   "caught_up": true, "tombstone": null, "lag": 0,
   "performance": { "server_total_ms": 0.30 } }
 ```
 
-(Records written by `worker-eu-1` are filtered out when `worker-eu-1` reads — loop
-prevention. The cursor still advances past them.)
+`caught_up` — not `records.length` — is the reliable "nothing more right now" signal,
+because skipped records (deleted, expired, node-filtered) still advance the cursor. Tag a
+write with a `node` id and a reader passing that same `node` won't get its own events back —
+that's how mirrored nodes stay echo-free (loop prevention).
 
 ### 5. Watch many topics over one SSE stream
 
 ```bash
 # Step 1: create the watch session (carries the full subscription)
-curl -X POST localhost:4000/v0/watch \
+curl -X POST $STREAMS/v0/watch \
   -H 'content-type: application/json' \
-  -d '{ "node": "worker-eu-1",
-        "topics": { "jobs": { "from_seq": 0 }, "events": { "tail": true } } }'
+  -d '{ "topics": { "orders": { "from_seq": 0 }, "notifications": { "tail": true } } }'
 # -> { "wid": "wid_BuRguGorNdVFWNQULz-rrw", "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw", ... }
 # The wid is an unguessable random capability that names the GET stream. In dev
 # mode (no auth) the wid alone opens it. When auth is ON the GET also requires the
@@ -191,19 +208,19 @@ curl -X POST localhost:4000/v0/watch \
 # a leaked wid is not a credential; the stream can never exceed the creator's scope.
 
 # Step 2: open the stream (EventSource-compatible)
-curl -N localhost:4000/v0/watch/wid_BuRguGorNdVFWNQULz-rrw
+curl -N $STREAMS/v0/watch/wid_BuRguGorNdVFWNQULz-rrw
 ```
 
 ```
 retry: 2000
 
-id: eyJqb2JzIjoxfQ
+id: eyJvcmRlcnMiOjF9
 event: record
-data: {"topic":"jobs","records":[{"$seq":1,"$ts":1748470000123,"data":{"url":"s3://b/a.png"}}],"from_seq":0,"to_seq":1,"head_seq":2}
+data: {"topic":"orders","records":[{"$seq":1,"$ts":1748470000123,"data":{"sku":"AEROPRESS-GO","qty":1,"total":3499}}],"from_seq":0,"to_seq":1,"head_seq":2}
 
-id: eyJqb2JzIjoyfQ
+id: eyJvcmRlcnMiOjJ9
 event: caught-up
-data: {"topic":"jobs","head_seq":2}
+data: {"topic":"orders","head_seq":2}
 
 : hb 1748470015000
 ```
@@ -211,56 +228,51 @@ data: {"topic":"jobs","head_seq":2}
 ### 6. Delete records (permanent, point-in-time, by seq and/or tag)
 
 ```bash
-# cancel one job (exact tag match — removes records present right now)
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+# cancel one order (exact tag match — removes records present right now)
+curl -X POST $STREAMS/v0/topics/orders/delete \
   -H 'content-type: application/json' \
-  -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
-
-# cancel an entire tenant (trailing-prefix match)
-curl -X POST localhost:4000/v0/topics/jobs/delete \
-  -H 'content-type: application/json' \
-  -d '{ "match": ["tag", "Glob", "tenant42:*"] }'
+  -d '{ "match": ["tag", "Eq", "order-7731"] }'
 ```
 
 ```json
-{ "topic": "jobs", "deleted": 1, "earliest_seq": 3, "head_seq": 2, "count": 0, "bytes": 0,
+{ "topic": "orders", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
   "performance": { "server_total_ms": 0.12 } }
 ```
 
-(Both records carried `tenant42:` tags, so after the two deletes the topic is empty:
-`count` 0 and `earliest_seq` = `head_seq + 1` = 3. `deleted` is the count removed by
-*this* call.)
+(`deleted` is the count removed by *this* call; `earliest_seq` advances past the removed seq
+while `head_seq` is unchanged.)
 
 The delete is **permanent** (no un-delete), **silent** (no tombstone), takes effect
 **immediately** on all reads, and is **point-in-time**: a `match`-only delete is
-bounded by the current head, so a job enqueued a moment later by an in-flight producer
+bounded by the current head, so a record written a moment later by an in-flight producer
 is *not* deleted. Three patterns:
 
 ```bash
 # Snapshot / compaction: drop everything before a seq (e.g. after a checkpoint)
-curl -X POST localhost:4000/v0/topics/jobs/delete -d '{ "before_seq": 480000 }'
+curl -X POST $STREAMS/v0/topics/orders/delete -d '{ "before_seq": 480000 }'
 
-# Message update: publish v2, then delete the prior versions but keep the new one
-curl -X POST localhost:4000/v0/topics/chat/delete \
-  -d '{ "match": ["tag", "Eq", "msg-123"], "before_seq": 5012 }'   # 5012 = seq of v2
+# Message update: publish v2, then delete the prior version but keep the new one
+curl -X POST $STREAMS/v0/topics/chat:general/delete \
+  -d '{ "match": ["tag", "Eq", "user-1042:msg-5"], "before_seq": 5012 }'   # 5012 = seq of v2
 
 # Chat revoke: a kicked user's whole sub-stream (prefix), point-in-time
-curl -X POST localhost:4000/v0/topics/chat/delete \
-  -d '{ "match": ["tag", "Glob", "chat-42:*"] }'
+curl -X POST $STREAMS/v0/topics/chat:general/delete \
+  -d '{ "match": ["tag", "Glob", "user-1042:*"] }'
 ```
 
 ---
 
 ## Running it
 
-The build is a **durable single binary**: the complete `/v0` API backed by a
-write-ahead log on local disk. On start it opens the data directory, loads the
-latest snapshot, and **replays the WAL forward** (truncating any torn tail) before
-serving — so an acknowledged durable write survives a restart. The readiness gate
-(`GET /v0/ready`) returns `503` during replay and `200` once recovery completes.
+streams is one self-contained server with no external dependencies — no database, no
+broker, no sidecar: the complete `/v0` API backed by a write-ahead log on local disk. On
+start it opens the data directory, loads the latest snapshot, and **replays the WAL
+forward** (truncating any torn tail) before serving — so an acknowledged durable write
+survives a restart. The readiness gate (`GET /v0/ready`) returns `503` during replay and
+`200` once recovery completes.
 
 ```bash
-# build the single binary
+# build it (a Rust toolchain is required)
 cargo build --release
 
 # run it (defaults to 127.0.0.1:4000 loopback, auth disabled in dev mode;
@@ -330,7 +342,7 @@ of class, **an acknowledged write is published; a
 write that fails to commit publishes nothing visible** (no readable-but-not-durable
 state). The server shuts down gracefully on `SIGINT`/`SIGTERM`, writing a final
 snapshot so a clean restart starts from a current checkpoint. The quickstart
-commands above work verbatim.
+commands above work verbatim once `$STREAMS` points at your server.
 
 ### Security
 
@@ -406,12 +418,12 @@ so the suite runs at full `--test-threads` with no port-bind races.
 ### Job queue (Bull-style)
 
 ```bash
-curl -X PUT localhost:4000/v0/topics/jobs -d '{ "durable": true, "cap_records": 0 }'
+curl -X PUT $STREAMS/v0/topics/transcode -d '{ "durable": true, "cap_records": 0 }'
 ```
-Producers `POST /v0/topics/jobs`. Each worker calls
-`POST /v0/topics/jobs/diff {from_seq, node:"worker-N", limit:50}`, processes the batch,
-then persists `next_from_seq` as its ack (cursor-advance = ack-all). Cancel a job with a
-`match ["tag","Eq",jobid]` delete; cancel a tenant with a `match ["tag","Glob","tenant*"]`
+Producers `POST /v0/topics/transcode`. Each worker calls
+`POST /v0/topics/transcode/diff {from_seq, node:"transcode-1", limit:50}`, processes the
+batch, then persists `next_from_seq` as its ack (cursor-advance = ack-all). Cancel a job with
+a `match ["tag","Eq",<id>]` delete; cancel a batch with a `match ["tag","Glob","clip-90*"]`
 delete (both permanent and point-in-time). Durable + unbounded cap means nothing is lost
 to eviction; replay is just reading from an earlier `from_seq`.
 
@@ -423,18 +435,19 @@ if not acked, and optionally dead-lettered. See [docs/API.md](docs/API.md) §10.
 ### Pub/sub (Redis-style, weak guarantees)
 
 ```bash
-curl -X PUT localhost:4000/v0/topics/feed \
+curl -X PUT $STREAMS/v0/topics/notifications \
   -d '{ "ttl_ms": 5000, "cap_records": 10000, "discard": "old", "durable": false }'
-curl -X PUT localhost:4000/v0/routers/feed-to-a -d '{ "source":"feed", "dest":"sub-a" }'
-curl -X PUT localhost:4000/v0/routers/feed-to-b -d '{ "source":"feed", "dest":"sub-b" }'
+curl -X PUT $STREAMS/v0/routers/notifications-to-web    -d '{ "source":"notifications", "dest":"notifications:web" }'
+curl -X PUT $STREAMS/v0/routers/notifications-to-mobile -d '{ "source":"notifications", "dest":"notifications:mobile" }'
 ```
-Subscribers `POST /v0/watch` on `sub-a` / `sub-b` with `tail: true`. Small cap + TTL keep
-memory bounded; subscribers tolerate gaps, which arrive as explicit `tombstone` frames.
+Subscribers `POST /v0/watch` on `notifications:web` / `notifications:mobile` with `tail: true`.
+Small cap + TTL keep memory bounded; subscribers tolerate gaps, which arrive as explicit
+`tombstone` frames.
 
 ### Strong delivery / replay
 
 ```bash
-curl -X PUT localhost:4000/v0/topics/ledger \
+curl -X PUT $STREAMS/v0/topics/ledger \
   -d '{ "durable": true, "cap_records": 0, "ttl_ms": 0, "discard": "reject" }'
 ```
 Unbounded + durable + `discard:"reject"` means eviction is impossible and TTL is off, so
@@ -481,8 +494,9 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
   nothing visible is ever un-durable. Crash-recovery via snapshot + WAL replay on start.
 - **Priority + elastic throttling** — manual or recency-based auto priority; under CPU
   pressure delivery degrades in latency, never in correctness.
-- **Single static binary** — WAL + segments on local NVMe, restartable at any instant;
-  only data not yet in the WAL is lost.
+- **Single-machine, self-contained** — one server you point at a directory (it ships as a
+  single static binary with no external dependencies); WAL + segments on local NVMe,
+  restartable at any instant, and only data not yet in the WAL is ever lost.
 - **Hardened auth + resource model** — bearer keys hashed at rest (SHA-256) and constant-time
   compared; optional per-key scopes (`read`/`write`/`delete`/`admin`) + a topic-name prefix
   allowlist enforced per route; configurable DoS-hardening limits on topics / routers / watch
