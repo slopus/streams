@@ -1,19 +1,50 @@
 ---
 title: API Reference
-description: The complete /v0 HTTP surface — JSON-first, curl-friendly, single-machine, with a full endpoint index and per-area reference pages.
+description: The complete /v0 HTTP surface, explained at three levels — a one-sentence model, the six everyday operations, then every endpoint. JSON-first, curl-friendly, single-machine.
 ---
 
 import { Callout, Cards } from 'nextra/components'
 
 # API Reference
 
-streams is a persistent event engine exposed as a **JSON-first HTTP API**: every operation
-is a plain request with a JSON body and a JSON response, so `curl` is a complete client. No
-SDK, no binary framing, no connection modes. This is the index to the full `/v0` surface —
-topics, writes, diff reads, deletes, routers, multiplexed SSE, and lease queues — with one
-reference page per area.
+streams is a persistent event log exposed as a **JSON-first HTTP API**: every operation is a
+plain request with a JSON body and a JSON response, so `curl` is a complete client. No SDK,
+no binary framing, no connection modes.
 
-## Base URL & versioning
+This page is built to be read **top to bottom, getting more detailed as you go** — a
+one-sentence model, then the six everyday operations, then the complete endpoint surface and
+the conventions that hold across all of it.
+
+## Level 1 — the one-sentence model
+
+> A **topic** is a log you `POST` events to and read back by number. The server assigns each
+> event a monotonic **`seq`**; reading is "give me everything after `from_seq`," and
+> advancing your stored `from_seq` is the ack.
+
+If you remember only that, you can use streams. Everything below is that idea expanded.
+
+## Level 2 — the six everyday operations
+
+Nearly everything you'll do is one of these six calls. Each links to its full reference page.
+
+| Operation | Call | What it does |
+|---|---|---|
+| **Create** | [`PUT /v0/topics/:topic`](/api/topics) | Configure a topic up front — or skip it; a topic is created lazily on first write. |
+| **Write** | [`POST /v0/topics/:topic`](/api/writing) | Append a batch of records; the server numbers each and returns the assigned seqs. |
+| **Read** | [`POST /v0/topics/:topic/diff`](/api/reading) | Get the records after `from_seq`, the next cursor, and any tombstone. |
+| **Watch** | [`POST /v0/watch`](/api/watch) → `GET /v0/watch/:wid` | Follow one or many topics live over one resumable SSE stream. |
+| **Delete** | [`POST /v0/topics/:topic/delete`](/api/deletion) | Permanently remove records by seq range and/or tag — immediate, point-in-time. |
+| **Fan out** | [`PUT /v0/routers/:router`](/api/routers) | Copy every record from one topic into another, server-side, preserving origin. |
+
+<Callout type="info">
+  Need lease-based job delivery instead of a shared cursor? Create the topic with
+  `type: "queue"` and the same surface gains `claim` / `ack` / `nack` / `extend` / `work` —
+  visibility-timeout leases, redelivery, and dead-lettering. See [Queues](/api/queues).
+</Callout>
+
+## Level 3 — the complete surface
+
+### Base URL & versioning
 
 ```
 http://{host}:{port}/v0/...
@@ -28,7 +59,7 @@ version, changes are strictly **additive**: new optional request fields, new res
 fields, new endpoints. **Clients must ignore unknown response fields** so an older client
 keeps working against a newer server.
 
-## The JSON-first, curl-friendly ethos
+### The JSON-first, curl-friendly ethos
 
 A few conventions hold across every endpoint and make the surface predictable:
 
@@ -54,7 +85,7 @@ These rules — the error body, the status-code table, the `$`-metadata conventi
 pagination, idempotency, and the Topic config object — are specified once on
 [Conventions](/api/conventions).
 
-## Endpoint index
+### Endpoint index
 
 The complete `/v0` surface. Auth scopes and per-route requirements are covered on
 [Conventions](/api/conventions) and [Security](/deployment/security).
@@ -87,7 +118,7 @@ The five queue endpoints (`claim`/`ack`/`nack`/`extend`/`work`) are only availab
 created with `type:"queue"`; calling them on a plain log topic returns `409 not_a_queue`. See
 [Queues](/api/queues).
 
-## Reference pages
+### Reference pages
 
 <Cards>
   <Cards.Card title="Conventions" href="/api/conventions" arrow>
