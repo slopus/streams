@@ -89,6 +89,7 @@ impl Params {
             .unwrap_or_default()
             .as_str()
         {
+            "ephemeral" => Durability::Ephemeral,
             "disk" => Durability::Disk,
             "memory" => Durability::Memory,
             _ => Durability::Fsync,
@@ -234,6 +235,7 @@ fn measure_once(p: &Params, shards: usize) -> (f64, Diag) {
 fn main() {
     let p = Params::from_env();
     let cls = match p.durability {
+        Durability::Ephemeral => "ephemeral",
         Durability::Fsync => "fsync",
         Durability::Disk => "disk",
         Durability::Memory => "memory",

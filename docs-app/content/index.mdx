@@ -78,7 +78,7 @@ learn. topics makes three deliberate bets, and everything else follows from them
 <a className="feature-card" href={withBase("/guarantees/durability")}>
   <span className="fc-icon"><IconDisk /></span>
   <h3>Durability you choose</h3>
-  <p>Decide <em>per topic</em> how much crash-safety a write buys: best-effort in memory, crash-survivable on disk, or fsync'd against power loss. And you are never lied to — lost data always comes with a signal.</p>
+  <p>Decide <em>per topic</em> how much crash-safety a write buys: resident-only in RAM, best-effort on the WAL path, crash-survivable on disk, or fsync'd against power loss. And you are never lied to — lost data always comes with a signal.</p>
   <span className="fc-more">Durability classes →</span>
 </a>
 
@@ -148,17 +148,22 @@ can share it — but running it is one process and one directory, not a cluster 
 <span className="section-eyebrow">Durability you choose</span>
 <h2 className="section-title">Decide what an "ok" means — one topic at a time</h2>
 <p className="section-lede">
-Every write travels the same road: from your process, into the kernel, onto the physical
-disk. The only question is how far along that road topics waits before it answers "ok." You
-decide <strong>per topic</strong>, so a throwaway cache and a financial ledger can live side
-by side in one process without paying for each other's guarantees.
+Every write either stays resident-only in RAM or travels the disk path: from your process,
+into the kernel, onto the physical disk. You decide <strong>per topic</strong>, so a live
+fan-out feed, a throwaway cache, and a financial ledger can live side by side in one process
+without paying for each other's guarantees.
 </p>
 
 <div className="dura-grid">
   <div className="dura">
+    <span className="d-tag">ephemeral</span>
+    <h4>RAM-only live feed</h4>
+    <p>Records stay resident and skip the WAL/segment path. The topic config persists and seqs stay monotonic, but records are intentionally gone after restart.</p>
+  </div>
+  <div className="dura">
     <span className="d-tag">memory</span>
-    <h4>Fastest — no promise</h4>
-    <p>Acked the instant topics accepts it, with <strong>no durability guarantee</strong>: after a restart its records may survive or may be gone. For caches, scratch, and ephemeral fan-out where losing a little is fine.</p>
+    <h4>Fastest disk-like</h4>
+    <p>Uses the WAL path with <strong>no durability guarantee</strong>: after a restart its records may survive or may be gone. For caches and scratch state where losing a little is fine.</p>
   </div>
   <div className="dura">
     <span className="d-tag">disk</span>
@@ -173,8 +178,8 @@ by side in one process without paying for each other's guarantees.
 </div>
 
 <p className="section-lede" style={{ marginTop: '1.4rem' }}>
-Whatever the class, an acked write is published and nothing visible is ever un-durable. Read
-the full contract on <a href={withBase("/guarantees/durability")}>Durability Classes</a>.
+Whatever the class, an acked write is published under the contract you picked. Read the full
+contract on <a href={withBase("/guarantees/durability")}>Durability Classes</a>.
 </p>
 
 </section>

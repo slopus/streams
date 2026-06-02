@@ -1,6 +1,6 @@
 ---
 title: Durability Classes
-description: The three commit classes — memory, disk, and fsync — where each lands, when the ack fires, what a crash costs, and how routers honor the destination class.
+description: The four commit classes — ephemeral, memory, disk, and fsync — where each lands, when the ack fires, what a crash costs, and how routers honor the destination class.
 ---
 
 import { Callout } from 'nextra/components'
@@ -8,16 +8,19 @@ import { Callout } from 'nextra/components'
 # Durability Classes
 
 Durability in topics is a **per-topic** decision, not a server-wide mode. Each topic picks one
-of three **commit classes** — `memory`, `disk`, or `fsync` — and they form a weak → strong
-spectrum that trades write latency against crash survival.
+of four **commit classes** — `ephemeral`, `memory`, `disk`, or `fsync` — and they form a
+weak → strong spectrum that trades write latency against crash survival.
 
 ## Where "ok" lands
 
-Every write travels the same road — from your process, to the kernel, to the physical disk —
-and the three classes differ only in **how far along that road topics waits before it acks**:
+Every write either stays resident-only in RAM or travels the disk path — from your process, to
+the kernel, to the physical disk. The classes differ in **where the record lands and how far
+topics waits before it acks**:
 
-- **`memory`** acks immediately and makes **no durability promise**. Fastest; after a restart
-  its records may survive or be gone.
+- **`ephemeral`** publishes resident-only records and skips the WAL / segment path. The topic
+  config persists, records are intentionally gone after restart, and seqs remain monotonic.
+- **`memory`** uses the WAL path but makes **no durability promise**. Fastest disk-like class;
+  after a restart its records may survive or be gone.
 - **`disk`** acks once the write is in the group-committed write-ahead log and on its way to the
   kernel. It **survives a process crash**, minus the most recent un-fsynced tail. The default.
 - **`fsync`** waits for the data to be **fsynced to the platter** before acking, so it
@@ -26,20 +29,37 @@ and the three classes differ only in **how far along that road topics waits befo
 Pick the weakest class a topic can tolerate and it pays the least latency; reach for `fsync`
 only where an acknowledgment must be a promise you can never take back. Because the choice is
 per topic, a throwaway cache (`memory`), a pub/sub feed (`disk`), and a financial ledger
-(`fsync`) coexist in one process without taxing each other.
+(`fsync`) coexist with a RAM-only live feed (`ephemeral`) in one process without taxing each
+other.
 
 The class is resolved from the topic's **current config** (`durability_class()`) and reported on
 every topic-state and topic-create response. The topic `type` is immutable, but durability/config can
 be **updated in place** — the resolved class always reflects the current config.
 
-## The three classes
+## The four classes
 
 <Callout type="info">
-  The defining promise across all three: **an acked write is published, and nothing visible
-  is ever un-durable.** A write that fails to commit publishes nothing — there is no
-  readable-but-not-yet-durable state. What differs between classes is *when* the ack fires and
-  *what a crash costs*, not whether an acked write is real.
+  The defining promise across all four: **an acked write is published under the class you
+  selected, and topics never claims a stronger crash guarantee than that class provides.** A
+  write that fails to commit publishes nothing. What differs between classes is *where* the
+  record lands, *when* the ack fires, and *what a crash costs*.
 </Callout>
+
+### `ephemeral`
+
+Resident-only records. A `durability:"ephemeral"` topic publishes from RAM and intentionally
+skips the record WAL, snapshots, and HOT segments. It is fully queryable while the process is
+running, including `getState`, `getDifference`, SSE, and router destinations, but records are
+empty after restart by design.
+
+The topic **config always persists** as a control frame, and checkpoints preserve the published
+head without payloads. That means post-restart writes keep moving forward and do not reuse seqs,
+even though the old resident records are gone. The ack is never `fsync`-gated, so `fsync_ms` is
+`0`.
+
+Reach for `ephemeral` for RAM-only live fan-out where the wire contract and monotonic seqs
+matter, but replay across restart does not. It is reachable **only** by setting
+`durability:"ephemeral"` explicitly — no legacy bool produces it.
 
 ### `memory`
 
@@ -55,8 +75,8 @@ no-fabrication / no-future-seq: a recovered record is always one that was actual
 the head never hands out a seq past what was acked (a best-effort restart may legitimately
 regress the head if the un-fsynced tail was lost — there is no durable seq reservation).
 
-Effectively `disk` minus the durability promise. Reach for `memory` for caches, scratch state,
-and ephemeral fan-out where occasional loss is an acceptable trade for the lowest latency. It is
+Effectively `disk` minus the durability promise. Reach for `memory` for caches and scratch
+state where occasional loss is an acceptable trade for the lowest disk-like latency. It is
 reachable **only** by setting `durability:"memory"` explicitly — no legacy bool produces it.
 
 ### `disk`
@@ -95,6 +115,7 @@ than one fsync per record. See [WAL & group commit](/how-it-works/wal-and-group-
 
 | Class | WAL? | Ack fires | Survives a crash? | `fsync_ms` |
 |---|---|---|---|---|
+| `ephemeral` | records: no; config/control frames: yes | immediately, **not** fsync-gated | records: **no**; config persists and seqs do not reuse after checkpointed heads | `0` |
 | `memory` | yes, group-committed (same path as `disk`) | immediately, **not** fsync-gated | **best-effort** — records MAY survive OR be lost (no guarantee); config always persists | `0` |
 | `disk` | yes, group-committed (no per-write fsync) | on WAL-frame enqueue, **not** fsync-gated | yes, **minus the un-fsynced tail** | `0` |
 | `fsync` | yes, fsync-gated | after the group `fsync` | **yes, any crash** — an acked write is always recovered | real value |
@@ -119,8 +140,8 @@ curl -X PUT $TOPICS/v0/topics/payments \
 ```
 
 The class defaults to `disk` when neither `durability` nor `durable` is set, so an
-auto-created topic (one materialized lazily on first write) is `disk`. To get `memory`, you
-must say so explicitly.
+auto-created topic (one materialized lazily on first write) is `disk`. To get `ephemeral` or
+`memory`, you must say so explicitly.
 
 ### The legacy `durable` bool
 
@@ -128,6 +149,7 @@ must say so explicitly.
 
 - `durable: true` ⇒ `fsync`
 - `durable: false` ⇒ `disk`
+- `ephemeral` is reachable **only** via `durability:"ephemeral"`
 - `memory` is reachable **only** via `durability:"memory"`
 
 An explicit `durability` always wins over `durable`. On the way out, `durable` is normalized
@@ -139,7 +161,8 @@ Internally, `is_durable()` is simply `class == "fsync"`.
   Durability only governs **persistence across a crash or restart**. It is independent of
   retention: `ttl_ms` and the `cap_records`/`cap_bytes` caps still apply to every class, and
   involuntary eviction or expiry of live records always surfaces as a
-  [tombstone](/guarantees/tombstones) — even on a `memory` topic, for as long as that topic lives.
+  [tombstone](/guarantees/tombstones) — even on `ephemeral` and `memory` topics, for as long
+  as those topics live.
 </Callout>
 
 ## Routers and dead-letter honor the destination class
@@ -154,11 +177,14 @@ dead-lettered job) is retained and recovered — not the source's:
 - A `disk` destination retains it group-committed, recovered minus the un-fsynced tail.
 - A `memory` destination keeps a **best-effort** copy — **may survive or be lost** on a restart
   (the dest config always persists), exactly like a direct write to that topic.
+- An `ephemeral` destination keeps the copy resident-only while the process is running and loses
+  it on restart by design.
 
-So if you route an `fsync` source into a `memory` destination, the forwarded copies are
-best-effort while the durable source recovers in full. The durability of the copy follows where
-it lands, not where it came from. Size and class your destinations deliberately. See
-[Routers](/api/routers) and the [Multi-master guide](/guides/multi-master).
+So if you route an `fsync` source into a `memory` or `ephemeral` destination, the forwarded
+copies follow that weaker destination contract while the source recovers in full. The
+durability of the copy follows where it lands, not where it came from. Size and class your
+destinations deliberately. See [Routers](/api/routers) and the
+[Multi-master guide](/guides/multi-master).
 
 <Callout type="info">
   Router forwarding is at-least-once via the durable per-router cursor. A persistently-failing
@@ -175,9 +201,9 @@ On restart the engine loads the latest snapshot, replays the WAL forward from th
 checkpoint, truncates a torn tail (any frame whose length runs past EOF or whose XXH3-64
 checksum fails to verify), and reclaims orphaned segments. An acked durable write is, by
 construction, a **complete, checksum-valid WAL frame** — so it is never lost. The only data a
-crash can cost is what a class explicitly does not promise: a `memory` topic's records, or a
-`disk` topic's un-fsynced tail. Both surface to consumers as ordinary eviction-style gaps. See
-[Recovery](/how-it-works/recovery).
+crash can cost is what a class explicitly does not promise: an `ephemeral` topic's resident
+records, a `memory` topic's records, or a `disk` topic's un-fsynced tail. Those losses surface
+to consumers as ordinary eviction-style gaps. See [Recovery](/how-it-works/recovery).
 
 ## See also
 

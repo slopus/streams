@@ -43,16 +43,18 @@ whole instance.
 
 topics makes durability a **per-topic** decision via [durability classes](/guarantees/durability):
 
+- **`ephemeral`** — resident-only records: queryable while the process runs, with durable
+  config and monotonic seqs, but intentionally empty after restart.
 - **`memory`** — _disk-like but best-effort_: the same group-committed WAL path as `disk`, fully
   queryable, but with no durability guarantee — records MAY survive OR be lost on restart (the
-  config always persists). Fastest (never fsync-gated).
+  config always persists). Fastest disk-like class (never fsync-gated).
 - **`disk`** — WAL with adaptive group commit; the ack happens on frame enqueue, not gated
   on `fsync`. Survives a crash minus the un-fsynced tail.
 - **`fsync`** — the ack is **fsync-gated**: it is held until the group `fsync` completes, so
   an acknowledged write is committed and survives any crash, recovered by WAL replay.
 
-A best-effort `memory` cache topic, a group-committed feed, and an `fsync`-gated job queue
-coexist in one process, each buying exactly the guarantee it needs.
+A RAM-only live feed, a best-effort cache topic, a group-committed feed, and an
+`fsync`-gated ledger topic coexist in one process, each buying exactly the guarantee it needs.
 
 <Callout type="warning">
   This is the central trade in Redis's favor on the *availability* axis: Redis replicates
@@ -181,6 +183,6 @@ lighter; if you ever need replay, Pub/Sub cannot give it to you and topics can.
 ## See also
 
 - [Comparisons overview](/comparisons) — the full capability matrix.
-- [Durability classes](/guarantees/durability) — `memory` / `disk` / `fsync` per topic.
+- [Durability classes](/guarantees/durability) — `ephemeral` / `memory` / `disk` / `fsync` per topic.
 - [Tombstones](/guarantees/tombstones) — the explicit gap signal Redis trimming lacks.
 - [Queues API](/api/queues) — lease-based work distribution.

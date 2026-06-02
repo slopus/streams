@@ -46,6 +46,8 @@ function of how many machines hold the data, so a single broker can fail without
 topics' durability is **per-topic and single-machine**, expressed as a
 [durability class](/guarantees/durability):
 
+- **`ephemeral`** — resident-only records: queryable while the process runs, durable config,
+  monotonic seqs, and intentionally empty after restart.
 - **`memory`** — same group-committed WAL path as `disk`, but best-effort: not fsync-gated and no durability guarantee (records may survive or be lost on restart).
 - **`disk`** — WAL with adaptive group commit; ack on enqueue, survives a crash minus the
   un-fsynced tail.
@@ -178,5 +180,5 @@ multiplexed SSE, and lease queues, all on one substrate reachable with `curl`.
 
 - [Comparisons overview](/comparisons) — the full capability matrix.
 - [Tombstones](/guarantees/tombstones) — the gap signal Kafka does not emit.
-- [Durability classes](/guarantees/durability) — per-topic `memory` / `disk` / `fsync`.
+- [Durability classes](/guarantees/durability) — per-topic `ephemeral` / `memory` / `disk` / `fsync`.
 - [Performance](/how-it-works/performance) — how to frame the throughput numbers.

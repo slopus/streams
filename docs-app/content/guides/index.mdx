@@ -13,7 +13,7 @@ The point of this section: topics is not four products. It is one append-only lo
 
 ## The substrate, in one paragraph
 
-A **topic** is a named append-only log. You `POST` records into it and read them back from a `from_seq` cursor with [`/diff`](/api/reading), or live over [SSE watch](/api/watch). What turns a plain topic into a queue, a pub/sub feed, or a durable stream is **config**: the [durability class](/guarantees/durability) (`memory` / `disk` / `fsync`), the retention caps (`cap_records` / `cap_bytes` / `ttl_ms`), the full-topic policy (`discard: "old"` vs `"reject"`), and whether it is a [lease queue](/api/queues) (`type: "queue"`). [Routers](/api/routers) copy one topic's records into another, at-least-once and per-source FIFO, preserving the origin `$node` so [loop-prevention](/guarantees/node-loop-prevention) makes mirroring echo-free.
+A **topic** is a named append-only log. You `POST` records into it and read them back from a `from_seq` cursor with [`/diff`](/api/reading), or live over [SSE watch](/api/watch). What turns a plain topic into a queue, a pub/sub feed, or a durable stream is **config**: the [durability class](/guarantees/durability) (`ephemeral` / `memory` / `disk` / `fsync`), the retention caps (`cap_records` / `cap_bytes` / `ttl_ms`), the full-topic policy (`discard: "old"` vs `"reject"`), and whether it is a [lease queue](/api/queues) (`type: "queue"`). [Routers](/api/routers) copy one topic's records into another, at-least-once and per-source FIFO, preserving the origin `$node` so [loop-prevention](/guarantees/node-loop-prevention) makes mirroring echo-free.
 
 <Callout type="info">
   Every recipe here is plain HTTP and JSON against `$TOPICS` (your server's base URL — see

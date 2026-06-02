@@ -122,7 +122,7 @@ operational edges are partial or planned.
   **async + derived router forwarding** (off the write/ack path, forwarded copies not
   WAL-logged so one source append is one WAL write, durable per-router cursor with
   replay-from-cursor recovery, single-source-per-dest); the
-  three durability classes (`memory`/`disk`/`fsync`); segments, snapshots, and crash
+  four durability classes (`ephemeral`/`memory`/`disk`/`fsync`); segments, snapshots, and crash
   recovery; advisory single-writer fencing on the data directory; the per-topic tag index;
   node loop-prevention; bearer auth with keys hashed at
   rest, optional per-key scopes and a topic-name prefix allowlist; DoS-hardening resource

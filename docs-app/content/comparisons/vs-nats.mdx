@@ -56,9 +56,11 @@ client, no protocol or SDK, and SSE for live tailing.
 JetStream sets storage **per stream** — `file` or `memory`. That is a binary choice for
 the whole stream.
 
-topics resolves a [durability class](/guarantees/durability) **per topic**, with three
+topics resolves a [durability class](/guarantees/durability) **per topic**, with four
 levels rather than two:
 
+- `ephemeral` — resident-only records: queryable while the process runs, durable config,
+  monotonic seqs, and intentionally empty after restart.
 - `memory` — disk-like but best-effort: same group-committed WAL path as `disk`, no durability
   guarantee (records may survive or be lost on restart; config always persists).
 - `disk` — WAL + group commit, acked on frame enqueue, survives a crash minus the
@@ -66,10 +68,10 @@ levels rather than two:
 - `fsync` — ack is held until the group `fdatasync` completes, so an acknowledged write
   survives any crash.
 
-A RAM cache topic, a group-committed feed, and an `fsync`-gated job queue coexist in one
-process, each paying only for the guarantee it needs. JetStream's `file` storage is
-closer to topics' `disk`/`fsync` end; the per-topic granularity and the explicit `disk`
-middle tier are a topics distinction.
+A RAM-only live feed, a best-effort cache topic, a group-committed feed, and an
+`fsync`-gated ledger topic coexist in one process, each paying only for the guarantee it
+needs. JetStream's `file` storage is closer to topics' `disk`/`fsync` end; the per-topic
+granularity and the explicit `disk` middle tier are a topics distinction.
 
 ## Consumers + AckWait vs lease queues
 
@@ -202,7 +204,7 @@ topics is more modest on all three axes, and says so:
         a <code>MaxDeliver</code> advisory you have to consume and route yourself.</li>
       <li>You want <strong>plain HTTP/JSON + SSE</strong> — <code>curl</code> is the
         client — with no NATS protocol or client library.</li>
-      <li>You want <strong>per-topic durability classes</strong> (memory / disk / fsync)
+      <li>You want <strong>per-topic durability classes</strong> (ephemeral / memory / disk / fsync)
         rather than one per-stream file/memory switch.</li>
       <li>You want a producer to <strong>fail fast</strong> (<code>discard:"reject"</code>,
         <code>422 topic_full</code>) before a seq is assigned on a full topic.</li>

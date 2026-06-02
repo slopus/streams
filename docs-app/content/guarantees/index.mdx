@@ -10,9 +10,10 @@ import { Callout, Cards } from 'nextra/components'
 topics is a durability-focused engine, so its guarantees are the product. Two of them are the
 headline, and they answer the two questions that matter most about any log:
 
-- **How durable is a write?** Durability is a **dial you turn per topic** — `memory`
-  (best-effort), `disk` (survives a crash), or `fsync` (survives power loss). Weak where you
-  want speed, strong where an ack must be a promise. See [Durability Classes](/guarantees/durability).
+- **How durable is a write?** Durability is a **dial you turn per topic** — `ephemeral`
+  (resident-only), `memory` (best-effort), `disk` (survives a crash), or `fsync` (survives
+  power loss). Weak where you want speed, strong where an ack must be a promise. See
+  [Durability Classes](/guarantees/durability).
 - **What happens when data is lost?** Loss is **always explicit, never silent** — anything you
   didn't ask to lose, you are told about in band, with the exact range. That is the
   load-bearing invariant stated next.
@@ -76,17 +77,17 @@ The full contract, distilled:
 6. **Routers are at-least-once, per-source FIFO, DAG-by-default**; a `dst` enforces its own
    retention and `discard:"reject"` applies backpressure rather than silently dropping. Pair
    that with [idempotent consumers](/guarantees/idempotency).
-7. **Durability is per-topic and explicit.** Only data not yet in the WAL (fsynced, for `fsync`
-   topics) is lost on crash, and such loss appears to consumers as ordinary eviction-style gaps.
+7. **Durability is per-topic and explicit.** Only data a topic class does not promise to keep
+   is lost on crash: `ephemeral` resident records, `memory` best-effort records, or the
+   un-fsynced tail of `disk`. Such loss appears to consumers as ordinary eviction-style gaps.
    See [Durability](/guarantees/durability).
 
 ## Where each guarantee lives
 
 <Cards>
   <Cards.Card title="Durability" href="/guarantees/durability" arrow>
-    The three commit classes — `memory`, `disk`, `fsync` — where each lands, when the ack
-    fires, and what a crash costs. An acked write is published; nothing visible is ever
-    un-durable.
+    The four commit classes — `ephemeral`, `memory`, `disk`, `fsync` — where each lands, when
+    the ack fires, and what a crash costs.
   </Cards.Card>
   <Cards.Card title="Tombstones" href="/guarantees/tombstones" arrow>
     Explicit loss: the dual watermark, when a tombstone is emitted, its shape and `reason`
