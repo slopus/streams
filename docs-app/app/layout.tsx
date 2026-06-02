@@ -14,7 +14,7 @@ export const metadata: Metadata = {
     template: '%s — streams'
   },
   description:
-    'streams is an append-only log service over a clean, JSON-first HTTP API. Boxes, routers, multiplexed SSE, lease queues, and per-box durability — one static binary, one machine. Data loss is always explicit, never silent.'
+    'streams is an append-only log service over a clean, JSON-first HTTP API. Topics, routers, multiplexed SSE, lease queues, and per-topic durability — one static binary, one machine. Data loss is always explicit, never silent.'
 }
 
 const GITHUB_URL = 'https://github.com/slopus/streams'
@@ -34,7 +34,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
         <div className="footer-brand">
           <Logo small />
           <p>
-            A persistent event engine in a single binary. Append-only boxes, explicit
+            A persistent event engine in a single binary. Append-only topics, explicit
             loss, durable on local NVMe.
           </p>
         </div>

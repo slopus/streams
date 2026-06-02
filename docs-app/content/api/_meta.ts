@@ -1,7 +1,7 @@
 export default {
   index: 'Overview',
   conventions: 'Conventions',
-  boxes: 'Boxes',
+  topics: 'Topics',
   writing: 'Writing Records',
   reading: 'Reading (diff)',
   deletion: 'Deletion',

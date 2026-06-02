@@ -66,7 +66,7 @@ fn h2c_client_can_write_and_diff() {
 
     // Write two records over h2 (auto-create -> 201).
     let w = c
-        .post(format!("{base}/v0/boxes/h2box"))
+        .post(format!("{base}/v0/topics/h2box"))
         .json(&json!({ "records": [{ "data": { "v": 1 } }, { "data": { "v": 2 } }] }))
         .send()
         .expect("h2 write request");
@@ -78,7 +78,7 @@ fn h2c_client_can_write_and_diff() {
 
     // Diff over h2 returns both records.
     let d = c
-        .post(format!("{base}/v0/boxes/h2box/diff"))
+        .post(format!("{base}/v0/topics/h2box/diff"))
         .json(&json!({ "from_seq": 0 }))
         .send()
         .expect("h2 diff request");
@@ -112,7 +112,7 @@ fn h1_client_still_works_and_is_http1() {
 
     // Write + diff over h1 on the same dual-protocol listener.
     let w = c
-        .post(format!("{base}/v0/boxes/h1box"))
+        .post(format!("{base}/v0/topics/h1box"))
         .json(&json!({ "records": [{ "data": 1 }] }))
         .send()
         .expect("h1 write");
@@ -120,7 +120,7 @@ fn h1_client_still_works_and_is_http1() {
     assert_eq!(w.status().as_u16(), 201);
 
     let d = c
-        .post(format!("{base}/v0/boxes/h1box/diff"))
+        .post(format!("{base}/v0/topics/h1box/diff"))
         .json(&json!({ "from_seq": 0 }))
         .send()
         .expect("h1 diff");

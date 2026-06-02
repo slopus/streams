@@ -2,7 +2,7 @@
 //! SSE stream GET is authorized by *possessing* the wid (no api key in the URL),
 //! bound — when auth is enabled — to the principal that created the session.
 //!
-//! These are black-box tests against the real bound server (the exact
+//! These are black-topic tests against the real bound server (the exact
 //! `http::build_router` the binary serves), exercising:
 //!   * the `wid` shape is the random-capability form (`wid_` + base64url), not the
 //!     old guessable monotonic counter;
@@ -58,11 +58,11 @@ fn auth_harness(key: &str) -> Harness {
 #[test]
 fn wid_is_unguessable_random_capability() {
     let h = Harness::start(); // dev mode (no auth)
-    h.post("/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }));
+    h.post("/v0/topics/jobs", json!({ "records": [{ "data": 1 }] }));
 
     let (status, body) = h.post(
         "/v0/watch",
-        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+        json!({ "topics": { "jobs": { "from_seq": 0 } } }),
     );
     assert_eq!(status, StatusCode::OK);
     let wid = body["wid"].as_str().expect("wid");
@@ -82,7 +82,7 @@ fn wid_is_unguessable_random_capability() {
     // Two sessions get distinct, non-sequential wids.
     let (_, body2) = h.post(
         "/v0/watch",
-        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+        json!({ "topics": { "jobs": { "from_seq": 0 } } }),
     );
     let wid2 = body2["wid"].as_str().unwrap();
     assert_ne!(wid, wid2, "wids are random/unique, not monotonic");
@@ -93,13 +93,13 @@ fn stream_requires_creating_key_not_just_wid_when_auth_on() {
     let h = auth_harness("s3cr3t");
     // Seed + create the session WITH a valid key (POST is authenticated).
     h.post_auth(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": 1 }] }),
         "s3cr3t",
     );
     let (status, body) = h.post_auth(
         "/v0/watch",
-        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+        json!({ "topics": { "jobs": { "from_seq": 0 } } }),
         "s3cr3t",
     );
     assert_eq!(status, StatusCode::OK);
@@ -127,7 +127,7 @@ fn post_watch_still_requires_auth() {
     // Anonymous POST /v0/watch is rejected even though the GET is capability-gated.
     let (status, body) = h.post(
         "/v0/watch",
-        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+        json!({ "topics": { "jobs": { "from_seq": 0 } } }),
     );
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "unauthorized");
@@ -137,13 +137,13 @@ fn post_watch_still_requires_auth() {
 fn stream_rejects_wrong_bearer_but_accepts_right_one() {
     let h = auth_harness("s3cr3t");
     h.post_auth(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": 1 }] }),
         "s3cr3t",
     );
     let (_, body) = h.post_auth(
         "/v0/watch",
-        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+        json!({ "topics": { "jobs": { "from_seq": 0 } } }),
         "s3cr3t",
     );
     let stream_url = body["stream_url"].as_str().unwrap().to_string();
@@ -167,13 +167,13 @@ fn stream_rejects_wrong_bearer_but_accepts_right_one() {
 fn stream_token_query_param_fallback_is_validated() {
     let h = auth_harness("s3cr3t");
     h.post_auth(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": 1 }] }),
         "s3cr3t",
     );
     let (_, body) = h.post_auth(
         "/v0/watch",
-        json!({ "boxes": { "jobs": { "from_seq": 0 } } }),
+        json!({ "topics": { "jobs": { "from_seq": 0 } } }),
         "s3cr3t",
     );
     let stream_url = body["stream_url"].as_str().unwrap().to_string();

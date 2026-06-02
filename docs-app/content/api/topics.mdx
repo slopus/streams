@@ -1,31 +1,31 @@
 ---
-title: Boxes
-description: The box control plane — create and configure (PUT), inspect state (GET), list (GET), and delete (DELETE), with full request/response shapes and errors.
+title: Topics
+description: The topic control plane — create and configure (PUT), inspect state (GET), list (GET), and delete (DELETE), with full request/response shapes and errors.
 ---
 
 import { Callout } from 'nextra/components'
 
-# Boxes
+# Topics
 
-A **box** is a named append-only log. This page covers its lifecycle: creating and
+A **topic** is a named append-only log. This page covers its lifecycle: creating and
 configuring one (`PUT`), reading its current state (`GET`), listing them (`GET`), and
 deleting one (`DELETE`). Writing and reading *records* live on [Writing](/api/writing) and
 [Reading](/api/reading); this is the control plane.
 
-Box names match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` — 1–255 chars, starting alphanumeric,
+Topic names match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` — 1–255 chars, starting alphanumeric,
 allowing `. _ : -`. The `:` enables namespacing like `jobs:tenantA`. Names are
-case-sensitive and byte-exact. A box is created lazily on first write, so the `PUT` here is
+case-sensitive and byte-exact. A topic is created lazily on first write, so the `PUT` here is
 optional — use it to set config up front.
 
-## PUT /v0/boxes/:box — create or configure a box
+## PUT /v0/topics/:topic — create or configure a topic
 
-<div className="route"><span className="verb put">PUT</span><span className="path">/v0/boxes/:box</span></div>
+<div className="route"><span className="verb put">PUT</span><span className="path">/v0/topics/:topic</span></div>
 
-Create a box, or update an existing box's config. Idempotent and upsertable. Requires the
+Create a topic, or update an existing topic's config. Idempotent and upsertable. Requires the
 `admin` scope when auth is enabled.
 
-**Request body** — the [Box config object](/api/conventions#the-box-config-object). All
-fields are optional; an empty `{}` creates an all-default box. Set `"type":"queue"` to make
+**Request body** — the [Topic config object](/api/conventions#the-topic-config-object). All
+fields are optional; an empty `{}` creates an all-default topic. Set `"type":"queue"` to make
 this a queue (and supply the queue-tuning fields here too).
 
 ```json
@@ -40,22 +40,22 @@ A durable, unbounded `jobs` queue that fails loudly rather than dropping unconsu
 ```
 
 ```bash
-curl -X PUT localhost:4000/v0/boxes/jobs \
+curl -X PUT localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "durable": true, "cap_records": 1000000, "ttl_ms": 0 }'
 ```
 
 **Behavior**
 
-- Box **absent** → created with the given config merged over defaults → `201`.
-- Box **exists, identical config** → no-op → `200`.
-- Box **exists, different config** → updated → `200`. Changes apply going forward; they
+- Topic **absent** → created with the given config merged over defaults → `201`.
+- Topic **exists, identical config** → no-op → `200`.
+- Topic **exists, different config** → updated → `200`. Changes apply going forward; they
   never rewrite stored records, but a tightened `cap`/`ttl` makes existing records eligible
   for lazy eviction/expiry.
 
 <Callout type="warning">
-  **`type` is the one immutable field.** A `PUT` that changes `type` on an existing box
-  (`log`→`queue` or `queue`→`log`) returns `409 box_exists_incompatible`. Every other field
+  **`type` is the one immutable field.** A `PUT` that changes `type` on an existing topic
+  (`log`→`queue` or `queue`→`log`) returns `409 topic_exists_incompatible`. Every other field
   is mutable in `/v0`, applied going forward.
 </Callout>
 
@@ -63,7 +63,7 @@ curl -X PUT localhost:4000/v0/boxes/jobs \
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "created": true,
   "config": { "type": "log", "ttl_ms": 0, "cap_records": 1000000, "cap_bytes": 0,
               "discard": "old", "durable": true, "durability": "fsync", "priority": null,
@@ -77,38 +77,38 @@ curl -X PUT localhost:4000/v0/boxes/jobs \
 
 | Field | Type | Meaning |
 |---|---|---|
-| `box` | string | The box name. |
-| `created` | bool | `true` only when this call brought the box into existence. |
-| `config` | object | The full resolved config, including the queue-tuning fields (inert on a `"log"` box) and the resolved `durability` class. |
+| `topic` | string | The topic name. |
+| `created` | bool | `true` only when this call brought the topic into existence. |
+| `config` | object | The full resolved config, including the queue-tuning fields (inert on a `"log"` topic) and the resolved `durability` class. |
 
 **Errors**
 
 | `error.code` | When |
 |---|---|
-| `invalid_request` | Bad name, field, or value (e.g. `dead_letter` equal to this box). |
-| `box_exists_incompatible` | A `PUT` changed `type`, or made another incompatible change. |
+| `invalid_request` | Bad name, field, or value (e.g. `dead_letter` equal to this topic). |
+| `topic_exists_incompatible` | A `PUT` changed `type`, or made another incompatible change. |
 | `forbidden` | The key lacks the `admin` scope or the name is outside its prefix allowlist. |
 
-## GET /v0/boxes/:box — get box state
+## GET /v0/topics/:topic — get topic state
 
-<div className="route"><span className="verb get">GET</span><span className="path">/v0/boxes/:box</span></div>
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/topics/:topic</span></div>
 
 Read current state: head seq, earliest retained seq, count, byte size, and config. The cheap
-"where am I / how much lag" call. Requires the `read` scope. By default it bumps the box's
+"where am I / how much lag" call. Requires the `read` scope. By default it bumps the topic's
 auto-priority recency clock.
 
 **Query** — `touch` (bool, default `true`): set `false` to **not** update auto-priority
-recency (for monitoring scrapes that should not make a box look "hot").
+recency (for monitoring scrapes that should not make a topic look "hot").
 
 ```bash
-curl localhost:4000/v0/boxes/jobs
+curl localhost:4000/v0/topics/jobs
 ```
 
-**Response** (`200`) — a plain log box
+**Response** (`200`) — a plain log topic
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "type": "log",
   "head_seq": 480231,
   "earliest_seq": 479101,
@@ -126,8 +126,8 @@ curl localhost:4000/v0/boxes/jobs
 | Field | Meaning |
 |---|---|
 | `type` | `"log"` (default, may be omitted) or `"queue"`. |
-| `head_seq` | Highest assigned seq (log end). `0` for a fresh empty box. |
-| `earliest_seq` | Seq of the first currently-live record — not evicted, not TTL-expired, **not deleted** (log start). When the box is empty, `earliest_seq = head_seq + 1`. |
+| `head_seq` | Highest assigned seq (log end). `0` for a fresh empty topic. |
+| `earliest_seq` | Seq of the first currently-live record — not evicted, not TTL-expired, **not deleted** (log start). When the topic is empty, `earliest_seq = head_seq + 1`. |
 | `next_seq` | Seq the next append will receive (`head_seq + 1`). A handy tail cursor: read from `next_seq - 1` to get only new records. |
 | `count` / `bytes` | Currently retained records and payload bytes (approximate under lazy eviction). |
 | `effective_priority` | The priority the scheduler is using right now (manual, or auto-derived). |
@@ -144,12 +144,12 @@ curl localhost:4000/v0/boxes/jobs
 
 ### The `queue` sub-object
 
-A **queue** box (`type:"queue"`) additionally returns a `queue` sub-object with live
+A **queue** topic (`type:"queue"`) additionally returns a `queue` sub-object with live
 counters:
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "type": "queue",
   "head_seq": 480231, "earliest_seq": 479101, "next_seq": 480232,
   "count": 1130, "bytes": 2310912,
@@ -165,45 +165,45 @@ counters:
 |---|---|
 | `ready` | Jobs claimable right now. |
 | `in_flight` | Jobs currently leased to a claimer (awaiting ack / reclaim). |
-| `dead_lettered` | Jobs moved to the dead-letter box. |
+| `dead_lettered` | Jobs moved to the dead-letter topic. |
 
-The `queue` sub-object is **absent** on a `"log"` box. See [Queues](/api/queues) for the
+The `queue` sub-object is **absent** on a `"log"` topic. See [Queues](/api/queues) for the
 claim / ack / nack / extend lifecycle behind these counters.
 
 **Errors**
 
 | `error.code` | When |
 |---|---|
-| `box_not_found` | The box does not exist (a state read **never** auto-creates). |
+| `topic_not_found` | The topic does not exist (a state read **never** auto-creates). |
 | `forbidden` | The key lacks the `read` scope or the name is outside its prefix allowlist. |
 
-## GET /v0/boxes — list boxes
+## GET /v0/topics — list topics
 
-<div className="route"><span className="verb get">GET</span><span className="path">/v0/boxes</span></div>
+<div className="route"><span className="verb get">GET</span><span className="path">/v0/topics</span></div>
 
-Enumerate boxes with summary state. Opaque-cursor paginated. Requires the `read` scope; a
+Enumerate topics with summary state. Opaque-cursor paginated. Requires the `read` scope; a
 prefix-restricted key sees only the names inside its allowlist.
 
 **Query**
 
 | Param | Type | Default | Meaning |
 |---|---|---|---|
-| `prefix` | string | none | Only boxes whose name starts with this prefix. |
+| `prefix` | string | none | Only topics whose name starts with this prefix. |
 | `page_size` | int | `100` | Page size, max `1000`. |
 | `cursor` | string | none | Opaque continuation cursor from a prior page's `next_cursor`. |
 | `touch` | bool | `false` | Listing does not bump auto-priority unless set `true`. |
 
 ```bash
-curl 'localhost:4000/v0/boxes?prefix=jobs&page_size=100'
+curl 'localhost:4000/v0/topics?prefix=jobs&page_size=100'
 ```
 
 **Response** (`200`)
 
 ```json
 {
-  "boxes": [
-    { "box": "jobs",   "head_seq": 480231, "earliest_seq": 479101, "count": 1130, "bytes": 2310912, "durable": true,  "effective_priority": 500 },
-    { "box": "events", "head_seq": 99,     "earliest_seq": 1,      "count": 99,   "bytes": 8112,    "durable": false, "effective_priority": 3 }
+  "topics": [
+    { "topic": "jobs",   "head_seq": 480231, "earliest_seq": 479101, "count": 1130, "bytes": 2310912, "durable": true,  "effective_priority": 500 },
+    { "topic": "events", "head_seq": 99,     "earliest_seq": 1,      "count": 99,   "bytes": 8112,    "durable": false, "effective_priority": 3 }
   ],
   "next_cursor": "eyJhZnRlciI6ImpvYnMifQ==",
   "performance": { "server_total_ms": 0.18 }
@@ -212,7 +212,7 @@ curl 'localhost:4000/v0/boxes?prefix=jobs&page_size=100'
 
 | Field | Meaning |
 |---|---|
-| `boxes[]` | Summary state per box (a subset of the full box-state object). |
+| `topics[]` | Summary state per topic (a subset of the full topic-state object). |
 | `next_cursor` | Opaque continuation cursor. **Omitted on the final page** — its absence means done. Pass it back as `?cursor=`. |
 
 **Errors**
@@ -222,54 +222,54 @@ curl 'localhost:4000/v0/boxes?prefix=jobs&page_size=100'
 | `invalid_request` | Malformed or corrupt `cursor`. |
 | `forbidden` | The key lacks the `read` scope. |
 
-## DELETE /v0/boxes/:box — delete a box
+## DELETE /v0/topics/:topic — delete a topic
 
-<div className="route"><span className="verb delete">DELETE</span><span className="path">/v0/boxes/:box</span></div>
+<div className="route"><span className="verb delete">DELETE</span><span className="path">/v0/topics/:topic</span></div>
 
-Permanently remove a box and **all** its records, dedupe state, the per-box tag index, and
+Permanently remove a topic and **all** its records, dedupe state, the per-topic tag index, and
 every router referencing it as `source` or `dest`. Idempotent and irreversible. Requires the
 `delete` scope.
 
 <Callout type="warning">
-  This deletes the whole box, not records within it. To remove records by seq range or tag
-  while keeping the box, use [`POST /v0/boxes/:box/delete`](/api/deletion) instead.
+  This deletes the whole topic, not records within it. To remove records by seq range or tag
+  while keeping the topic, use [`POST /v0/topics/:topic/delete`](/api/deletion) instead.
 </Callout>
 
 **Query** — `if_empty` (bool, default `false`): when `true`, delete only if `count == 0`,
-else `409 box_not_empty`.
+else `409 topic_not_empty`.
 
 ```bash
-curl -X DELETE localhost:4000/v0/boxes/jobs
+curl -X DELETE localhost:4000/v0/topics/jobs
 ```
 
 **Response** (`200`)
 
 ```json
-{ "box": "jobs", "deleted": true,
+{ "topic": "jobs", "deleted": true,
   "routers_removed": ["jobs->audit", "jobs->mirror"],
   "performance": { "server_total_ms": 0.31 } }
 ```
 
 | Field | Meaning |
 |---|---|
-| `deleted` | `true` if the box existed and was removed; `false` if it was already absent. |
-| `routers_removed` | Names of routers cascaded away by this delete (those referencing the box). Empty when none. |
+| `deleted` | `true` if the topic existed and was removed; `false` if it was already absent. |
+| `routers_removed` | Names of routers cascaded away by this delete (those referencing the topic). Empty when none. |
 
-Deleting an absent box returns `200` with `"deleted": false` and an empty `routers_removed` —
-the idempotent path. A later lazy-create makes a **new, empty** box (seq restarts at the
+Deleting an absent topic returns `200` with `"deleted": false` and an empty `routers_removed` —
+the idempotent path. A later lazy-create makes a **new, empty** topic (seq restarts at the
 beginning); stale consumers detect this via the `recreated` tombstone on their next read.
 
 **Errors**
 
 | `error.code` | When |
 |---|---|
-| `box_not_empty` | `if_empty=true` and the box still holds records. |
+| `topic_not_empty` | `if_empty=true` and the topic still holds records. |
 | `forbidden` | The key lacks the `delete` scope or the name is outside its prefix allowlist. |
 
 ## See also
 
-- [Conventions](/api/conventions) — the Box config object, error body, status codes, and cursors.
-- [Writing Records](/api/writing) — append records (and lazily create a box).
+- [Conventions](/api/conventions) — the Topic config object, error body, status codes, and cursors.
+- [Writing Records](/api/writing) — append records (and lazily create a topic).
 - [Reading (diff)](/api/reading) — consume from a cursor; tombstones and node filtering.
-- [Deletion](/api/deletion) — remove records by `before_seq` and/or tag without dropping the box.
+- [Deletion](/api/deletion) — remove records by `before_seq` and/or tag without dropping the topic.
 - [Durability](/guarantees/durability) — what the `durable`/`durability` config buys you.

@@ -1,7 +1,7 @@
-//! API-key authentication: optional **scopes** + **box-name prefix allowlist**,
+//! API-key authentication: optional **scopes** + **topic-name prefix allowlist**,
 //! with keys stored **hashed at rest** (SHA-256) and compared in **constant
 //! time**. All of this is *additive* and *back-compatible*: a bare key (no
-//! scopes, no prefixes) authorizes **full access** to every box/router, exactly
+//! scopes, no prefixes) authorizes **full access** to every topic/router, exactly
 //! as before this module existed.
 //!
 //! # `STREAMS_API_KEYS` syntax (extended, back-compatible)
@@ -9,18 +9,18 @@
 //! Comma-separated entries; each entry is one of:
 //!
 //! ```text
-//! key                       # full access (back-compat: no scopes, all boxes)
-//! key:scopes                # scopes only, all boxes
-//! key:scopes:prefixes       # scopes + a box-name PREFIX allowlist
+//! key                       # full access (back-compat: no scopes, all topics)
+//! key:scopes                # scopes only, all topics
+//! key:scopes:prefixes       # scopes + a topic-name PREFIX allowlist
 //! key::prefixes             # all scopes (empty scopes field), prefix-restricted
 //! ```
 //!
 //! - **`scopes`** is a `+`-separated subset of `{read, write, delete, admin}`
 //!   (also accepts the single letters `r`, `w`, `d`, `a` and the alias `rw`).
 //!   An **empty** scopes field means **all** scopes (full read/write/delete/admin).
-//! - **`prefixes`** is a `|`-separated list of box-name prefixes the key may
+//! - **`prefixes`** is a `|`-separated list of topic-name prefixes the key may
 //!   touch (e.g. `tenant42:|shared.`). An **empty** prefixes field means **any**
-//!   box name. Prefixes are matched against the raw box/router name as a byte
+//!   topic name. Prefixes are matched against the raw topic/router name as a byte
 //!   prefix (the `tenant:` convention in API §3 becomes a real boundary here).
 //!
 //! The key itself may not contain `,` or `:` (the delimiters); everything before
@@ -48,8 +48,8 @@ use subtle::ConstantTimeEq;
 /// - **writes** (POST records, queue ack/nack/extend) need [`Scope::WRITE`];
 /// - **queue claim / `/work`** is a *read+write* (it leases — mutates — then
 ///   returns jobs), so it needs **both** [`Scope::READ`] and [`Scope::WRITE`];
-/// - **deletes** (DELETE box/router, POST `.../delete`) need [`Scope::DELETE`];
-/// - **control-plane** (PUT box/router) needs [`Scope::ADMIN`].
+/// - **deletes** (DELETE topic/router, POST `.../delete`) need [`Scope::DELETE`];
+/// - **control-plane** (PUT topic/router) needs [`Scope::ADMIN`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Scope(u8);
 
@@ -112,7 +112,7 @@ impl Scope {
 }
 
 /// A configured API key: the SHA-256 digest of the secret (never the plaintext),
-/// the granted [`Scope`] set, and an optional box-name **prefix allowlist**.
+/// the granted [`Scope`] set, and an optional topic-name **prefix allowlist**.
 ///
 /// A key with **no scopes and no prefixes** (`scopes == Scope::NONE` and
 /// `prefixes` empty) is a back-compat **full-access** key.
@@ -122,7 +122,7 @@ pub struct ApiKey {
     hash: [u8; 32],
     /// Granted scope bits. [`Scope::NONE`] (no bits) ⇒ full access (back-compat).
     scopes: Scope,
-    /// Box-name prefix allowlist. Empty ⇒ any box name is permitted.
+    /// Topic-name prefix allowlist. Empty ⇒ any topic name is permitted.
     prefixes: Vec<String>,
 }
 
@@ -134,7 +134,7 @@ impl ApiKey {
         h.finalize().into()
     }
 
-    /// A full-access key (no scopes, all boxes) from a plaintext secret — the
+    /// A full-access key (no scopes, all topics) from a plaintext secret — the
     /// back-compat shape used when an entry is a bare `key`.
     pub fn full_access(secret: &str) -> ApiKey {
         ApiKey {
@@ -165,7 +165,7 @@ impl ApiKey {
         }
     }
 
-    /// The box-name prefix allowlist (empty ⇒ any box name).
+    /// The topic-name prefix allowlist (empty ⇒ any topic name).
     pub fn prefixes(&self) -> &[String] {
         &self.prefixes
     }
@@ -232,7 +232,7 @@ impl KeyId {
 
 /// The authenticated principal carried in request extensions: a stable
 /// non-secret [`KeyId`], the matched key's effective [`Scope`] set, and its
-/// box-name prefix allowlist. Carries **no** secret (the token is not retained
+/// topic-name prefix allowlist. Carries **no** secret (the token is not retained
 /// past the match), so it is safe to clone and to bind to a created resource
 /// (e.g. a watch session). The dev-mode principal has `key_id == None`.
 #[derive(Debug, Clone)]
@@ -245,7 +245,7 @@ pub struct Principal {
 }
 
 impl Principal {
-    /// The dev-mode principal (auth disabled): full access, all boxes, no key id.
+    /// The dev-mode principal (auth disabled): full access, all topics, no key id.
     /// Used so a handler's scope/prefix checks are uniform whether or not auth is
     /// enabled.
     pub fn full_access() -> Principal {
@@ -261,7 +261,7 @@ impl Principal {
         self.scopes.contains(needed)
     }
 
-    /// Whether this principal may touch a box/router named `name`: true when the
+    /// Whether this principal may touch a topic/router named `name`: true when the
     /// allowlist is empty (any name) or `name` starts with one of the prefixes.
     pub fn allows_name(&self, name: &str) -> bool {
         self.prefixes.is_empty() || self.prefixes.iter().any(|p| name.starts_with(p.as_str()))

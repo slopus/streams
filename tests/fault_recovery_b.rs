@@ -48,10 +48,10 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp};
 use streams::storage::wal::encode_frame;
 use streams::storage::{
-    write_snapshot_with, BoxConfigOp, Checkpoint, File, Fs, OpenOpts, Snapshot, WalReader,
+    write_snapshot_with, TopicConfigOp, Checkpoint, File, Fs, OpenOpts, Snapshot, WalReader,
     WalRecord,
 };
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_wal_append_b.rs)
@@ -91,10 +91,10 @@ fn sync_dirs(disk: &FakeDisk) {
     let _ = fs.sync_dir(&meta_dir());
 }
 
-/// A durable append frame for box id 1 at `seq`.
+/// A durable append frame for topic id 1 at `seq`.
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -189,11 +189,11 @@ fn write_req(v: &str) -> WriteRequest {
     }
 }
 
-fn durable_box(name: &str, cap: u64) -> (&str, BoxConfig) {
+fn durable_topic(name: &str, cap: u64) -> (&str, TopicConfig) {
     (
         name,
-        BoxConfig {
-            r#type: BoxType::Log,
+        TopicConfig {
+            r#type: TopicType::Log,
             durable: true,
             cap_records: cap,
             ..Default::default()
@@ -298,8 +298,8 @@ fn f_wal_eio_open() {
     // Phase 1: a durable acked workload on a healthy disk ⇒ real WAL data exists.
     {
         let engine = open_engine(&disk);
-        let (n, c) = durable_box("jobs", 0);
-        engine.put_box(n, c).unwrap();
+        let (n, c) = durable_topic("jobs", 0);
+        engine.put_topic(n, c).unwrap();
         for i in 1..=3 {
             engine
                 .write("jobs", write_req(&i.to_string()), true)
@@ -347,7 +347,7 @@ fn f_wal_eio_open() {
 // F-WAL-MISDIRECTED-FRAME  (corruption, sev high)
 // A frame's bytes land at the wrong offset (right data, wrong place) producing a
 // frame whose logged seq is NOT contiguous with the prior frames. We craft this
-// directly: a valid prefix (box-create + appends seq 1..=3) followed by a single
+// directly: a valid prefix (topic-create + appends seq 1..=3) followed by a single
 // valid-CRC Append frame carrying a misdirected seq.
 //
 // Oracle: replay's seq-skip (`seq <= head` ⇒ skip) catches a duplicate/stale
@@ -365,22 +365,22 @@ fn f_wal_eio_open() {
 // adopting seq 99 as head.
 // ===========================================================================
 
-/// Build a raw WAL byte image: a BoxConfig create for box id 1 ("jobs") then the
+/// Build a raw WAL byte image: a TopicConfig create for topic id 1 ("jobs") then the
 /// given append seqs, plus a trailing custom-seq Append (the misdirected frame).
 fn craft_wal_with_misdirected(append_seqs: &[u64], misdirected_seq: u64) -> Vec<u8> {
     let mut out = Vec::new();
     let mut frame = Vec::new();
 
-    let cfg_bytes = serde_json::to_vec(&BoxConfig {
-        r#type: BoxType::Log,
+    let cfg_bytes = serde_json::to_vec(&TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         cap_records: 0,
         ..Default::default()
     })
     .unwrap();
-    let create = WalRecord::BoxConfig {
-        box_id: 1,
-        op: BoxConfigOp {
+    let create = WalRecord::TopicConfig {
+        topic_id: 1,
+        op: TopicConfigOp {
             name: "jobs".to_string(),
             config: cfg_bytes,
         },
@@ -422,7 +422,7 @@ fn f_wal_misdirected_frame() {
             "a misdirected DUPLICATE seq (<= head) is skipped by replay; survivors \
              stay a dense prefix, no double-insert, no gap"
         );
-        let st = engine.box_state("jobs", false).unwrap();
+        let st = engine.topic_state("jobs", false).unwrap();
         assert_eq!(st.head_seq, 3, "head reflects only the contiguous frames");
         drop(engine);
     }
@@ -456,7 +456,7 @@ fn f_wal_misdirected_frame() {
         }
         // And the recovered head must never jump to the misdirected future seq 99
         // (that would leave seqs 4..=98 as a fabricated gap / phantom head).
-        let st = engine.box_state("jobs", false).unwrap();
+        let st = engine.topic_state("jobs", false).unwrap();
         assert!(
             st.head_seq < 99,
             "recovered head {} must not adopt the misdirected future seq 99 \
@@ -492,8 +492,8 @@ fn f_wal_eio_midlog_read_recovery() {
     // a real frame, not the tail).
     {
         let engine = open_engine(&disk);
-        let (n, c) = durable_box("jobs", 0);
-        engine.put_box(n, c).unwrap();
+        let (n, c) = durable_topic("jobs", 0);
+        engine.put_topic(n, c).unwrap();
         for i in 1..=6 {
             engine
                 .write("jobs", write_req(&i.to_string()), true)
@@ -581,8 +581,8 @@ fn f_snap_checkpoint_ahead_of_wal() {
     // snapshot's checkpoint records (wal_idx, wal_offset) at capture time.
     {
         let engine = open_engine(&disk);
-        let (n, c) = durable_box("jobs", 0);
-        engine.put_box(n, c).unwrap();
+        let (n, c) = durable_topic("jobs", 0);
+        engine.put_topic(n, c).unwrap();
         for i in 1..=4 {
             engine
                 .write("jobs", write_req(&i.to_string()), true)
@@ -602,7 +602,7 @@ fn f_snap_checkpoint_ahead_of_wal() {
 
     // Phase 2: rewrite the snapshot with a checkpoint offset pushed FAR past the
     // actual WAL end (simulating lost WAL writes after the recorded position). The
-    // materialized box set is unchanged (it was durable); only the replay boundary
+    // materialized topic set is unchanged (it was durable); only the replay boundary
     // now points beyond EOF.
     let mut bad = snap.clone();
     bad.checkpoint = Checkpoint {
@@ -625,7 +625,7 @@ fn f_snap_checkpoint_ahead_of_wal() {
         "checkpoint past EOF ⇒ recovery presents the snapshot's durable set; \
          no panic, no gap, no resurrection: {seqs:?}"
     );
-    let st = engine.box_state("jobs", false).unwrap();
+    let st = engine.topic_state("jobs", false).unwrap();
     assert_eq!(
         st.head_seq, 4,
         "head = snapshot's materialized head, not a phantom"
@@ -654,7 +654,7 @@ fn rewrite_latest_snapshot(disk: &FakeDisk, snap: &Snapshot) {
 // `if evict_floor > floors.evict_floor` guard in recovery::replay_frame), so the
 // floor settles at the NEWER value and never regresses to the older one.
 //
-// We craft a raw WAL: box-create, appends 1..=6, then two EvictWatermark frames
+// We craft a raw WAL: topic-create, appends 1..=6, then two EvictWatermark frames
 // in the adversarial (decreasing) order — high floor first, low floor second.
 // After recovery the involuntary floor (observable via earliest_seq + a from-0
 // tombstone) reflects the HIGH floor, not the low one.
@@ -662,7 +662,7 @@ fn rewrite_latest_snapshot(disk: &FakeDisk, snap: &Snapshot) {
 
 fn evict_frame(evict_floor: u64, earliest_seq: u64) -> WalRecord {
     WalRecord::EvictWatermark {
-        box_id: 1,
+        topic_id: 1,
         evict_floor,
         // A cap-eviction frame: no TTL component (R7 split).
         expiry_floor: 0,
@@ -671,21 +671,21 @@ fn evict_frame(evict_floor: u64, earliest_seq: u64) -> WalRecord {
     }
 }
 
-/// Craft a raw WAL: box-create("jobs"), appends 1..=6, then `evicts` in order.
+/// Craft a raw WAL: topic-create("jobs"), appends 1..=6, then `evicts` in order.
 fn craft_wal_with_evicts(evicts: &[WalRecord]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut frame = Vec::new();
 
-    let cfg_bytes = serde_json::to_vec(&BoxConfig {
-        r#type: BoxType::Log,
+    let cfg_bytes = serde_json::to_vec(&TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         cap_records: 0,
         ..Default::default()
     })
     .unwrap();
-    let create = WalRecord::BoxConfig {
-        box_id: 1,
-        op: BoxConfigOp {
+    let create = WalRecord::TopicConfig {
+        topic_id: 1,
+        op: TopicConfigOp {
             name: "jobs".to_string(),
             config: cfg_bytes,
         },
@@ -737,7 +737,7 @@ fn f_evict_floor_monotone_replay() {
     );
     // earliest_seq = evict_floor + 1 = 6, reflecting the monotone (non-regressing)
     // floor, never the older floor 2 (which would give earliest_seq 3).
-    let st = engine.box_state("jobs", false).unwrap();
+    let st = engine.topic_state("jobs", false).unwrap();
     assert_eq!(
         st.earliest_seq, 6,
         "earliest_seq = evict_floor+1 = 6 (the monotone, non-regressing floor)"

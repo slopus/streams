@@ -1,7 +1,7 @@
 //! Router graph: DAG cycle checking, at-least-once per-source FIFO forwarding,
 //! and `allow_cycle` hop-cap loop-breaking (DESIGN §8, API §6).
 //!
-//! Phase 2 forwarding is an in-process append into the dest box, driven off the
+//! Phase 2 forwarding is an in-process append into the dest topic, driven off the
 //! committed source log via a per-router cursor.
 
 use crate::error::{Error, Result};
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 pub struct RouterGraph {
     /// Router name → definition.
     routers: HashMap<String, Router>,
-    /// Per-router forward cursor over its source box (seq last forwarded). In the
+    /// Per-router forward cursor over its source topic (seq last forwarded). In the
     /// async/derived (`forward_v2`) model this is the durable progress marker: the
     /// source seq each router has forwarded *through*. It advances ONLY by the
     /// count actually committed into the dest (no silent loss — the R2 fix), so a
@@ -133,28 +133,28 @@ impl RouterGraph {
         existed
     }
 
-    /// Names of all routers referencing `box_name` as source or dest, WITHOUT
-    /// removing them (sorted). Used to pre-compute a box-delete cascade so its WAL
+    /// Names of all routers referencing `topic_name` as source or dest, WITHOUT
+    /// removing them (sorted). Used to pre-compute a topic-delete cascade so its WAL
     /// tombstones can be durably logged *before* the in-memory removal (codex P0:
     /// a delete must not become a false idempotent success on a WAL failure).
-    pub fn routers_touching_box(&self, box_name: &str) -> Vec<String> {
+    pub fn routers_touching_topic(&self, topic_name: &str) -> Vec<String> {
         let mut names: Vec<String> = self
             .routers
             .values()
-            .filter(|r| r.source == box_name || r.dest == box_name)
+            .filter(|r| r.source == topic_name || r.dest == topic_name)
             .map(|r| r.name.clone())
             .collect();
         names.sort();
         names
     }
 
-    /// Remove and return the names of all routers referencing `box_name` as
-    /// source or dest (box-delete cascade, API §1.4).
-    pub fn remove_touching_box(&mut self, box_name: &str) -> Vec<String> {
+    /// Remove and return the names of all routers referencing `topic_name` as
+    /// source or dest (topic-delete cascade, API §1.4).
+    pub fn remove_touching_topic(&mut self, topic_name: &str) -> Vec<String> {
         let mut removed: Vec<String> = self
             .routers
             .values()
-            .filter(|r| r.source == box_name || r.dest == box_name)
+            .filter(|r| r.source == topic_name || r.dest == topic_name)
             .map(|r| r.name.clone())
             .collect();
         removed.sort();
@@ -167,28 +167,28 @@ impl RouterGraph {
         removed
     }
 
-    /// All routers whose source is `box_name` (forwarding fan-out on append).
+    /// All routers whose source is `topic_name` (forwarding fan-out on append).
     /// Returns owned definitions so the caller can drop the graph lock before
-    /// touching dest boxes (avoids holding the router lock across an append).
-    pub fn routers_for_source(&self, box_name: &str) -> Vec<Router> {
+    /// touching dest topics (avoids holding the router lock across an append).
+    pub fn routers_for_source(&self, topic_name: &str) -> Vec<Router> {
         self.routers
             .values()
-            .filter(|r| r.source == box_name)
+            .filter(|r| r.source == topic_name)
             .cloned()
             .collect()
     }
 
-    /// Whether ANY router has `box_name` as its source — a cheap existence check
+    /// Whether ANY router has `topic_name` as its source — a cheap existence check
     /// for the write fast path. The common case (no routers) lets the writer skip
     /// snapshotting/cloning every record purely for forwarding (codex P0 #2): a
     /// no-router write never deep-clones its payloads. Short-circuits on the first
     /// match instead of collecting owned `Router`s.
-    pub fn has_routers_for_source(&self, box_name: &str) -> bool {
-        self.routers.values().any(|r| r.source == box_name)
+    pub fn has_routers_for_source(&self, topic_name: &str) -> bool {
+        self.routers.values().any(|r| r.source == topic_name)
     }
 
-    /// The distinct set of box names that are the SOURCE of at least one router.
-    /// Used to refresh the per-box `is_router_source` atomic after any graph
+    /// The distinct set of topic names that are the SOURCE of at least one router.
+    /// Used to refresh the per-topic `is_router_source` atomic after any graph
     /// mutation, so the write hot path can check that atomic instead of taking the
     /// graph lock on every append (codex P1).
     pub fn source_names(&self) -> std::collections::HashSet<String> {
@@ -263,7 +263,7 @@ impl RouterGraph {
     }
 
     /// Whether adding `source -> dest` would create a directed cycle in the
-    /// existing graph. Returns the offending cycle path (box names) if so.
+    /// existing graph. Returns the offending cycle path (topic names) if so.
     pub fn would_create_cycle(&self, source: &str, dest: &str) -> Option<Vec<String>> {
         self.would_create_cycle_excluding(source, dest, None)
     }
@@ -283,7 +283,7 @@ impl RouterGraph {
         if source == dest {
             return Some(vec![source.to_string(), dest.to_string()]);
         }
-        // Adjacency over box names: src -> dst for every router except `exclude`.
+        // Adjacency over topic names: src -> dst for every router except `exclude`.
         let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
         for r in self.routers.values() {
             if exclude == Some(r.name.as_str()) {
@@ -348,7 +348,7 @@ pub fn validate_router(source: &str, dest: &str) -> Result<()> {
         return Err(Error::invalid_request("router source and dest must differ"));
     }
     if !crate::config::is_valid_name(source) || !crate::config::is_valid_name(dest) {
-        return Err(Error::invalid_request("invalid source or dest box name"));
+        return Err(Error::invalid_request("invalid source or dest topic name"));
     }
     Ok(())
 }

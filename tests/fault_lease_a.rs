@@ -43,7 +43,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Plumbing (mirrors tests/crash_oracle.rs: FakeDisk-backed Engine + recovery)
@@ -85,21 +85,21 @@ fn sync_wal_dir(disk: &FakeDisk) {
     let _ = fs.sync_dir(&PathBuf::from(DATA_DIR).join("meta"));
 }
 
-/// A durable **queue** box config. `leases_durable` toggles whether claim/ack/nack
+/// A durable **queue** topic config. `leases_durable` toggles whether claim/ack/nack
 /// events are written to the durable leases log (the projection that recovery
 /// rebuilds) or are purely in-memory (self-healing on restart).
-fn queue_cfg(leases_durable: bool) -> BoxConfig {
-    BoxConfig {
-        r#type: BoxType::Queue,
+fn queue_cfg(leases_durable: bool) -> TopicConfig {
+    TopicConfig {
+        r#type: TopicType::Queue,
         durable: true, // jobs log durable — we must never lose a job record.
         lease_ms: 30_000,
         leases_durable,
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     }
 }
 
 /// Produce `n` untagged jobs into queue `q`, returning the assigned seqs. The jobs
-/// box is durable, so this blocks on the group fsync ⇒ the jobs survive a crash.
+/// topic is durable, so this blocks on the group fsync ⇒ the jobs survive a crash.
 fn produce(engine: &Engine, q: &str, n: usize) -> Vec<u64> {
     let records: Vec<RecordIn> = (0..n)
         .map(|i| RecordIn {
@@ -127,9 +127,9 @@ fn produce(engine: &Engine, q: &str, n: usize) -> Vec<u64> {
 }
 
 /// The recovered queue counters of `q`: `(count, ready, in_flight)` at the engine's
-/// clock. `count` is the live jobs-log record count (never lost for a durable box).
+/// clock. `count` is the live jobs-log record count (never lost for a durable topic).
 fn queue_dump(engine: &Engine, q: &str) -> (u64, u64, u64) {
-    let st = engine.box_state(q, false).expect("queue box present");
+    let st = engine.topic_state(q, false).expect("queue topic present");
     let qs = st.queue.expect("queue counters");
     (st.count, qs.ready, qs.in_flight)
 }
@@ -168,7 +168,7 @@ fn f_lease_crash_after_claim() {
 
     let (held_seq, lease_id, deadline) = {
         let engine = open_engine(&disk);
-        engine.put_box("jobs", queue_cfg(true)).unwrap();
+        engine.put_topic("jobs", queue_cfg(true)).unwrap();
         let produced = produce(&engine, "jobs", 3);
         assert_eq!(produced, vec![1, 2, 3]);
 
@@ -199,7 +199,7 @@ fn f_lease_crash_after_claim() {
     // so the replayed lease is un-expired.
     let engine = open_engine_at(&disk, BOOT_MS + 1_000);
 
-    // Jobs log fully preserved (durable box): all 3 jobs present.
+    // Jobs log fully preserved (durable topic): all 3 jobs present.
     let (count, ready, in_flight) = queue_dump(&engine, "jobs");
     assert_eq!(count, 3, "durable jobs log preserved all 3 jobs");
     // The replayed Lease(Claimed) keeps exactly one job in flight — NO double-claim.
@@ -240,7 +240,7 @@ fn f_lease_nondurable_selfheal() {
 
     {
         let engine = open_engine(&disk);
-        engine.put_box("jobs", queue_cfg(false)).unwrap();
+        engine.put_topic("jobs", queue_cfg(false)).unwrap();
         let produced = produce(&engine, "jobs", 4);
         assert_eq!(produced, vec![1, 2, 3, 4]);
 
@@ -308,7 +308,7 @@ fn f_lease_torn_event() {
 
         {
             let engine = open_engine(&disk);
-            engine.put_box("jobs", queue_cfg(true)).unwrap();
+            engine.put_topic("jobs", queue_cfg(true)).unwrap();
             produce(&engine, "jobs", 2);
 
             // Claim both (durable Lease(Claimed) frames fsynced), then NACK one
@@ -380,11 +380,11 @@ fn f_lease_ack_crash() {
 
     let acked_seq = {
         let engine = open_engine(&disk);
-        engine.put_box("jobs", queue_cfg(true)).unwrap();
+        engine.put_topic("jobs", queue_cfg(true)).unwrap();
         produce(&engine, "jobs", 3);
 
         // Claim one, then ack it: durable Delete + Lease(Acked) frames are fsynced
-        // (the jobs box is durable, so the ack's delete blocks on its group fsync).
+        // (the jobs topic is durable, so the ack's delete blocks on its group fsync).
         let r = engine.claim("jobs", "w1", 1, None).unwrap();
         let seq = r.claimed[0].seq;
         let a = engine.ack("jobs", "w1", &[seq]).unwrap();
@@ -452,7 +452,7 @@ fn f_lease_reorder_events() {
 
         {
             let engine = open_engine(&disk);
-            engine.put_box("jobs", queue_cfg(true)).unwrap();
+            engine.put_topic("jobs", queue_cfg(true)).unwrap();
             produce(&engine, "jobs", 2);
 
             // Claim both (durable Claimed frames), then extend one (durable

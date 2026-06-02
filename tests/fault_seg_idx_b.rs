@@ -19,7 +19,7 @@
 //! Strategies implemented (see docs/FAULT_TESTING.md / streams-fault-catalog.json):
 //!   - F-SEG-IDX-WITHOUT-DATA  stray `.idx` with no `.data`: `list()` requires the
 //!       `.data` part, so the orphan `.idx` is NOT reported as a complete segment;
-//!       `BoxTier::resolve` returns `None`; orphan reclaim removes it; nothing
+//!       `TopicTier::resolve` returns `None`; orphan reclaim removes it; nothing
 //!       panics.
 //!   - F-SWEEP-SEGMENT-SEAL    exhaustive crash-point sweep across a single
 //!       `LocalSegmentStore.put` (.data tmp/fsync/rename, .idx tmp/fsync/rename,
@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::{
-    decode_data_frame, idx_name, lookup, BoxTier, File, Fs, LocalSegmentStore, OpenOpts,
+    decode_data_frame, idx_name, lookup, TopicTier, File, Fs, LocalSegmentStore, OpenOpts,
     SegmentBuilder, SegmentId, SegmentPart, SegmentRecord, SegmentStore, StoreError, Tier,
 };
 
@@ -114,7 +114,7 @@ fn open_store(disk: &FakeDisk) -> LocalSegmentStore {
 // corruption or a relocation that copied the `.idx` part first). Oracle:
 //   - `list()` keys on the `.data` part, so the orphan `.idx` is NOT reported as
 //     a complete segment (an `.idx` that indexes nothing must never be served);
-//   - `BoxTier::resolve` (which requires `.data`) returns `None` for the id;
+//   - `TopicTier::resolve` (which requires `.data`) returns `None` for the id;
 //   - a read that needs the `.data` is a clean `NotFound`, never a panic;
 //   - orphan reclaim (`delete`) removes the stray `.idx` idempotently.
 // ===========================================================================
@@ -154,10 +154,10 @@ fn f_seg_idx_without_data() {
         "an orphan .idx with no .data is NOT a complete (listable) segment"
     );
 
-    // ORACLE 2: `BoxTier::resolve` (HOT-only) keys on the `.data` part too, so the
+    // ORACLE 2: `TopicTier::resolve` (HOT-only) keys on the `.data` part too, so the
     // orphan resolves to NO tier — it is non-authoritative and never served.
     let hot = Box::new(LocalSegmentStore::open_with(ROOT, disk.arc()).unwrap());
-    let tier = BoxTier::new(hot, None);
+    let tier = TopicTier::new(hot, None);
     assert_eq!(
         tier.resolve(id),
         None,
@@ -409,9 +409,9 @@ fn assert_seg_complete_or_incomplete(disk: &FakeDisk, id: SegmentId, n: u64) {
             ),
             "a .data read with no .data file is a clean NotFound"
         );
-        // `BoxTier::resolve` agrees: no `.data` ⇒ no tier ⇒ never served.
+        // `TopicTier::resolve` agrees: no `.data` ⇒ no tier ⇒ never served.
         let hot = Box::new(LocalSegmentStore::open_with(ROOT, disk.arc()).unwrap());
-        let tier = BoxTier::new(hot, None);
+        let tier = TopicTier::new(hot, None);
         assert_eq!(tier.resolve(id), None, "no .data ⇒ resolve None");
     } else {
         // `.data` present but `.idx` absent: a listed-but-incomplete segment (the
@@ -432,7 +432,7 @@ fn assert_seg_complete_or_incomplete(disk: &FakeDisk, id: SegmentId, n: u64) {
         // resolve still keys on `.data`, so the segment resolves HOT — but it is
         // non-authoritative for reads until the `.idx` is re-materialized.
         let hot = Box::new(LocalSegmentStore::open_with(ROOT, disk.arc()).unwrap());
-        let tier = BoxTier::new(hot, None);
+        let tier = TopicTier::new(hot, None);
         assert_eq!(
             tier.resolve(id),
             Some(Tier::Hot),

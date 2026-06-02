@@ -61,7 +61,7 @@ type ServerHello = {
   serverId: string;
   clientId: string;
   streamsUrl: string;
-  boxes: {
+  topics: {
     ingress: string;
     client: string;
   };
@@ -72,7 +72,7 @@ type ServerHello = {
 type ServerInfo = {
   serverId: string;
   streamsUrl: string;
-  ingressBox: string;
+  ingressTopic: string;
 };
 
 type StreamsErrorBody = {
@@ -116,7 +116,7 @@ type SavedState = {
 
 type ClientSession = {
   clientId: string;
-  clientBox: string;
+  clientTopic: string;
   routerName: string;
   stateFile: string;
   cursor: number;
@@ -130,7 +130,7 @@ const publicDir = path.join(__dirname, "public");
 const args = new Set(process.argv.slice(2));
 const streamsUrl = trimTrailingSlash(process.env.STREAMS_URL ?? "http://127.0.0.1:4000");
 const streamPrefix = process.env.STREAM_PREFIX ?? "socketio.chat";
-const ingressBox = `${streamPrefix}.ingress`;
+const ingressTopic = `${streamPrefix}.ingress`;
 const serverId =
   process.env.SERVER_ID ??
   `${os.hostname().replace(/[^A-Za-z0-9_.:-]/g, "-")}-${process.pid}-${crypto
@@ -162,7 +162,7 @@ io.on("connection", (socket) => {
 });
 
 async function main() {
-  await ensureIngressBox();
+  await ensureIngressTopic();
 
   httpServer.listen(requestedPort, host, async () => {
     const address = httpServer.address();
@@ -174,8 +174,8 @@ async function main() {
     console.log(`socketio-typescript server ${serverId}`);
     console.log(`web app: ${url}`);
     console.log(`streams: ${streamsUrl}`);
-    console.log(`ingress box: ${ingressBox}`);
-    console.log("each browser client gets its own durable box and router from ingress");
+    console.log(`ingress topic: ${ingressTopic}`);
+    console.log("each browser client gets its own durable topic and router from ingress");
 
     if (shouldOpenBrowser) {
       try {
@@ -215,7 +215,7 @@ async function handleConnection(socket: ChatSocket) {
       void saveClientState(session);
     });
 
-    await tailClientBox(socket, session, abortController.signal);
+    await tailClientTopic(socket, session, abortController.signal);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     socket.emit("chat:error", { message });
@@ -223,9 +223,9 @@ async function handleConnection(socket: ChatSocket) {
   }
 }
 
-async function ensureIngressBox() {
+async function ensureIngressTopic() {
   await waitForStreams();
-  await streamsJson(`/v0/boxes/${encodeURIComponent(ingressBox)}`, {
+  await streamsJson(`/v0/topics/${encodeURIComponent(ingressTopic)}`, {
     method: "PUT",
     body: JSON.stringify(durableLogConfig()),
   });
@@ -233,7 +233,7 @@ async function ensureIngressBox() {
 
 async function createClientSession(clientId: string): Promise<ClientSession> {
   const clientSlug = cleanName(clientId) || `client-${crypto.randomUUID()}`;
-  const clientBox = `${streamPrefix}.client.${clientSlug}`;
+  const clientTopic = `${streamPrefix}.client.${clientSlug}`;
   const routerName = `${streamPrefix}.route.${clientSlug}`;
   const stateFile = path.join(
     appRoot,
@@ -243,7 +243,7 @@ async function createClientSession(clientId: string): Promise<ClientSession> {
 
   const session: ClientSession = {
     clientId,
-    clientBox,
+    clientTopic,
     routerName,
     stateFile,
     cursor: 0,
@@ -256,15 +256,15 @@ async function createClientSession(clientId: string): Promise<ClientSession> {
 }
 
 async function ensureClientSubscription(session: ClientSession) {
-  await streamsJson(`/v0/boxes/${encodeURIComponent(session.clientBox)}`, {
+  await streamsJson(`/v0/topics/${encodeURIComponent(session.clientTopic)}`, {
     method: "PUT",
     body: JSON.stringify(durableLogConfig()),
   });
   await streamsJson(`/v0/routers/${encodeURIComponent(session.routerName)}`, {
     method: "PUT",
     body: JSON.stringify({
-      source: ingressBox,
-      dest: session.clientBox,
+      source: ingressTopic,
+      dest: session.clientTopic,
       preserve_node: true,
       preserve_tag: true,
       create_dest: false,
@@ -303,7 +303,7 @@ async function waitForStreams() {
 }
 
 async function appendToIngress(message: ChatMessage): Promise<WriteResponse> {
-  return streamsJson<WriteResponse>(`/v0/boxes/${encodeURIComponent(ingressBox)}`, {
+  return streamsJson<WriteResponse>(`/v0/topics/${encodeURIComponent(ingressTopic)}`, {
     method: "POST",
     body: JSON.stringify({
       node: serverId,
@@ -322,12 +322,12 @@ async function appendToIngress(message: ChatMessage): Promise<WriteResponse> {
   });
 }
 
-async function tailClientBox(socket: ChatSocket, session: ClientSession, signal: AbortSignal) {
+async function tailClientTopic(socket: ChatSocket, session: ClientSession, signal: AbortSignal) {
   while (!signal.aborted && !shuttingDown && socket.connected) {
     try {
       const previousCursor = session.cursor;
       const diff = await streamsJson<DiffResponse>(
-        `/v0/boxes/${encodeURIComponent(session.clientBox)}/diff`,
+        `/v0/topics/${encodeURIComponent(session.clientTopic)}/diff`,
         {
           method: "POST",
           signal,
@@ -440,7 +440,7 @@ function buildServerInfo(): ServerInfo {
   return {
     serverId,
     streamsUrl,
-    ingressBox,
+    ingressTopic,
   };
 }
 
@@ -449,9 +449,9 @@ function buildHello(session: ClientSession): ServerHello {
     serverId,
     clientId: session.clientId,
     streamsUrl,
-    boxes: {
-      ingress: ingressBox,
-      client: session.clientBox,
+    topics: {
+      ingress: ingressTopic,
+      client: session.clientTopic,
     },
     router: session.routerName,
     cursor: session.cursor,

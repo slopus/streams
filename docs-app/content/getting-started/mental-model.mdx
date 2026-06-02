@@ -1,15 +1,15 @@
 ---
 title: Mental Model
-description: The five concepts that are the whole product — Box, Record, seq, Router, Tombstone — plus the Delete operation, and how each composes into the full /v0 surface.
+description: The five concepts that are the whole product — Topic, Record, seq, Router, Tombstone — plus the Delete operation, and how each composes into the full /v0 surface.
 ---
 
 import { Callout, Cards } from 'nextra/components'
 
 # Mental Model
 
-streams has five concepts, and they are the whole product: a **Box** is a named
+streams has five concepts, and they are the whole product: a **Topic** is a named
 append-only log; a **Record** is one immutable event in it; **seq** is the cursor; a
-**Router** forwards records between boxes; and a **Tombstone** is the explicit "you
+**Router** forwards records between topics; and a **Tombstone** is the explicit "you
 missed data" signal. One operation completes the picture — a **Delete** is a permanent,
 point-in-time removal. Learn these and you understand the entire `/v0` surface —
 everything else is operational detail.
@@ -39,44 +39,44 @@ both ways (pure passthrough). All times are integer milliseconds since the Unix 
   `null`). `data` is always present, though it may itself be JSON `null`.
 </Callout>
 
-## Box
+## Topic
 
-A **box** is an append-only log of records ordered by a monotonic `seq`, plus a small
+A **topic** is an append-only log of records ordered by a monotonic `seq`, plus a small
 config and a pair of derived watermarks. Think inbox/outbox. It is the unit of naming,
-durability, retention, and priority — almost every decision in streams is a per-box
+durability, retention, and priority — almost every decision in streams is a per-topic
 decision.
 
 ### Identity & naming
 
-A box is addressed by **name** in the path (`/v0/boxes/:box`); the name *is* the
+A topic is addressed by **name** in the path (`/v0/topics/:topic`); the name *is* the
 identity. Names match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` — 1–255 bytes, starting
 alphanumeric, allowing `.` `_` `:` `-`. The `:` is for namespacing (`jobs:tenantA`). Names
 are case-sensitive and byte-exact, with no Unicode normalization. On disk, files are keyed
-by a numeric box id rather than the name, so a box name can never become a path-traversal
+by a numeric topic id rather than the name, so a topic name can never become a path-traversal
 vector.
 
 ### Creation & lifecycle
 
-A box is created **lazily on first write** (turbopuffer-style ergonomics), or explicitly
-with [`PUT /v0/boxes/:box`](/api/boxes) when you want to set config up front. You can opt
-out of lazy creation per-write with `create: false`, which returns `404 box_not_found`
-against a missing box (the Redis `NOMKSTREAM` lesson against typo-boxes).
+A topic is created **lazily on first write** (turbopuffer-style ergonomics), or explicitly
+with [`PUT /v0/topics/:topic`](/api/topics) when you want to set config up front. You can opt
+out of lazy creation per-write with `create: false`, which returns `404 topic_not_found`
+against a missing topic (the Redis `NOMKSTREAM` lesson against typo-topics).
 
-[Deleting a box](/api/boxes) tears down all of its records, its tag index, its dedupe
+[Deleting a topic](/api/topics) tears down all of its records, its tag index, its dedupe
 state, and any routers that reference it as `source` or `dest`. It is irreversible. A
-later lazy-create makes a **new, empty** box whose `seq` restarts at the base — and a stale
-consumer pointed at the old box detects the rewind exactly, via a `reason:"recreated"`
+later lazy-create makes a **new, empty** topic whose `seq` restarts at the base — and a stale
+consumer pointed at the old topic detects the rewind exactly, via a `reason:"recreated"`
 tombstone.
 
 ### Config & durability
 
-Box config is `{ ttl_ms, cap_records, cap_bytes, discard, durable, durability, priority,
+Topic config is `{ ttl_ms, cap_records, cap_bytes, discard, durable, durability, priority,
 auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Every default is safe:
 all caps and TTL are **off** (`ttl_ms`, `cap_records`, `cap_bytes` all `0`), so an
-out-of-the-box box loses nothing — silent loss must be a deliberate choice you opt into.
+out-of-the-topic topic loses nothing — silent loss must be a deliberate choice you opt into.
 
-The load-bearing config knob is the **durability commit class**, resolved from the box's
-current config (the box `type` is immutable, but durability/config can be updated in place):
+The load-bearing config knob is the **durability commit class**, resolved from the topic's
+current config (the topic `type` is immutable, but durability/config can be updated in place):
 
 | Class | Where it lands | Ack timing | Survives a crash? |
 |---|---|---|---|
@@ -84,7 +84,7 @@ current config (the box `type` is immutable, but durability/config can be update
 | `disk` | WAL, group-committed (no per-write fsync) | on WAL-frame enqueue, **not** fsync-gated; `fsync_ms` is `0` | Yes, **minus the un-fsynced tail**. |
 | `fsync` | WAL, **fsync-gated** | after the group `fsync` (real `fsync_ms`) | **Yes, any crash** — an acked write is recovered by WAL replay. |
 
-These are **not** server-wide modes: a `memory` cache box, a `disk` pub/sub feed, and an
+These are **not** server-wide modes: a `memory` cache topic, a `disk` pub/sub feed, and an
 `fsync` job queue coexist in one process, each buying exactly the guarantee it needs. The
 legacy `durable` bool is a back-compat alias (`true ⇒ fsync`, `false ⇒ disk`); reach
 `memory` only by setting `durability: "memory"` explicitly. See
@@ -92,14 +92,14 @@ legacy `durable` bool is a back-compat alias (`true ⇒ fsync`, `false ⇒ disk`
 
 ### State & watermarks
 
-`GET /v0/boxes/:box` returns the live state: `head_seq` (highest assigned seq; `0` if
+`GET /v0/topics/:topic` returns the live state: `head_seq` (highest assigned seq; `0` if
 never written), `earliest_seq` (lowest live seq; `head_seq + 1` when empty), `next_seq`,
 `count`, `bytes`, `config`, and `effective_priority`. The two watermarks are central to
 the loss model and are covered under **seq** and **Tombstone** below.
 
 ## Record
 
-A **record** is one immutable event in a box. Once it is assigned a `seq`, its fields
+A **record** is one immutable event in a topic. Once it is assigned a `seq`, its fields
 **never change** — neither deletion nor eviction mutates a record; a record is either
 present and unchanged, or removed and gone.
 
@@ -140,26 +140,26 @@ These are hard limits enforced at write; a violation is a `400`:
 | Records per write request | 10,000 |
 | Total write body | 64 MiB |
 
-A single record larger than the entire box cap is a permanent `400 record_too_large` (not
-retryable) — distinct from a transient `422 box_full`.
+A single record larger than the entire topic cap is a permanent `400 record_too_large` (not
+retryable) — distinct from a transient `422 topic_full`.
 
 ### How it composes
 
 A record is the atom that flows through every other concept: a write assigns it a `seq` and
-publishes it; a [router](#router) copies it into another box preserving `$node`; a
+publishes it; a [router](#router) copies it into another topic preserving `$node`; a
 [delete](#delete) can remove it by `seq` or `tag`; and a read either delivers it or skips
 it (silently, or with a [tombstone](#tombstone) standing in for a lost range).
 
 ## seq
 
-A **seq** is a per-box monotonic `u64` assigned by the server at commit. It is two things
+A **seq** is a per-topic monotonic `u64` assigned by the server at commit. It is two things
 at once: the **order** of the log and the **cursor** you read from. There is no opaque
-cursor token for box reads — the monotonic `seq` *is* the cursor, and you own your
+cursor token for topic reads — the monotonic `seq` *is* the cursor, and you own your
 position.
 
 ### Assignment contract
 
-Each box has its own `u64` counter starting at `seq_base` (default `1`; `0` is reserved to
+Each topic has its own `u64` counter starting at `seq_base` (default `1`; `0` is reserved to
 mean "no records"). On commit of a write of N records, the server atomically assigns
 `next_seq … next_seq + N − 1` and returns them in write order. A single write request is
 **atomic**: all N records commit with contiguous seqs, or none do. Assignment happens at
@@ -190,7 +190,7 @@ advance the cursor, the reliable "no more right now" signal is the `caught_up` f
 
 `seq` ties everything together. Reads consume by `seq`. Deletes target a `seq` range
 (`before_seq`). Routers reassign a fresh `dst` `seq` to each forwarded copy. SSE resume
-encodes the per-box cursor map in the `id:` field. And the two box watermarks —
+encodes the per-topic cursor map in the `id:` field. And the two topic watermarks —
 `earliest_seq` (first live seq) and `evict_floor` (the tombstone trigger) — are both `seq`
 values that bound what you can still read. See
 [Ordering & Cursors](/guarantees/ordering-and-cursors).
@@ -210,7 +210,7 @@ commits to `source` at seq `s`, a background per-router worker appends a forward
 copy is **derived**: it is **not separately WAL-logged**, so one source append is **one WAL
 write regardless of fan-out**, and the copies are re-derived on recovery by replaying from a
 **durable per-router cursor**. A derived `dest` is **single-source** (a second router with a
-different `source` into one `dest` is rejected `409 box_exists_incompatible`,
+different `source` into one `dest` is rejected `409 topic_exists_incompatible`,
 `error.detail.reason: "router_dest_fan_in"`). Delivery is **at-least-once** with **per-source
 FIFO**: records from a single `source` arrive in `dest` in `source` commit order.
 
@@ -225,10 +225,10 @@ FIFO**: records from a single `source` arrive in `dest` in `source` commit order
 A forwarded copy preserves `$node` (verbatim — this is what makes loop-prevention work
 across the route), `$tag`, `meta`, and `data`. Only `$seq` and `$ts` are reassigned by
 `dest`. Because forwarding is async and the copies are derived (not WAL-logged), the source
-ack never waits on the destination; the destination box's **durability class** governs only
+ack never waits on the destination; the destination topic's **durability class** governs only
 how/whether the re-derived copy is retained and recovered — a `memory` dest keeps a
 best-effort copy (may survive or be lost), an `fsync` dest fsyncs it. Deletes and node
-filters are **per-box** and do not propagate: a delete on `source` does not reach copies
+filters are **per-topic** and do not propagate: a delete on `source` does not reach copies
 already forwarded to `dest`.
 
 ### Cycle control
@@ -256,12 +256,12 @@ an HTTP error. It is the single mechanism for *all* non-silent loss.
 
 ### The dual watermark
 
-A tombstone exists because each box tracks **two floors**, which decouples involuntary loss
+A tombstone exists because each topic tracks **two floors**, which decouples involuntary loss
 from voluntary deletion:
 
 - **`earliest_seq`** — the seq of the first currently-**live** record (not evicted, not
   expired, **not deleted**). It is monotonically non-decreasing and is advanced by eviction,
-  TTL, **and** deletion. It is `head_seq + 1` when the box is empty.
+  TTL, **and** deletion. It is `head_seq + 1` when the topic is empty.
 - **`evict_floor`** — advanced **only** by involuntary loss: cap eviction and TTL expiry. It
   is the **sole tombstone trigger**. A voluntary delete advances `earliest_seq` but **never**
   `evict_floor`.
@@ -295,7 +295,7 @@ source_trim` (diff; `source_trim` is a derived-router dest reflecting source-sid
 plus `from_seq_too_old` at SSE connect time. **The reason is best-effort; the
 `[gap_from, gap_to]` range is authoritative.** In a diff this rides in the `tombstone`
 field (`null` when none, at most one per response); in SSE it is a framed
-`event: tombstone` carrying `{box, reason, gap_from, gap_to, earliest_seq, head_seq}`,
+`event: tombstone` carrying `{topic, reason, gap_from, gap_to, earliest_seq, head_seq}`,
 whose `id:` already advances your cursor past the gap so the resume is correct.
 
 ### The four loss/removal kinds
@@ -319,7 +319,7 @@ match. It is the one operation that removes data on your command — and it is d
 
 - **Permanent.** Deleted records are gone for good; there is no un-delete in `/v0`. To
   "resurrect," write a new record.
-- **Effective immediately.** The delete is invisible to **all** reads at once — `diff`, box
+- **Effective immediately.** The delete is invisible to **all** reads at once — `diff`, topic
   state `count`/`bytes`, and SSE. A reader's cursor simply advances past the deleted seqs.
 - **Asynchronous, no compaction / no reclaim.** Records are *logically* gone instantly (the
   work runs off the call path), but a deleted record **stays on disk, just marked** — there is
@@ -343,19 +343,19 @@ At least one of `before_seq` or `match` is required (else `400 invalid_request`)
 
 Combining the two ANDs them — `match` + `before_seq` deletes records that match the tag
 **and** sit below the seq (e.g. publish v2 of a message, then delete its prior versions
-while keeping the new one). A `match` delete is backed by a per-box **tag index**
+while keeping the new one). A `match` delete is backed by a per-topic **tag index**
 (`tag → live seqs`), so it is a point lookup or a bounded prefix range scan — never a full
 log scan.
 
 ```bash
 # Cancel one job by exact tag.
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
 ```
 
 ```json
-{ "box": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
+{ "topic": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
   "performance": { "server_total_ms": 0.12 } }
 ```
 
@@ -380,10 +380,10 @@ Reading is a single pipeline, applied per candidate seq from your cursor, identi
 4. **Node filter** — skip if `$node` is in the reader's node set (voluntary → silent).
 5. **Deliver** the surviving record, respecting batch `limit` / SSE flow.
 
-Skipped seqs of *any* kind still advance `next_from_seq`. That is the whole engine: a box
+Skipped seqs of *any* kind still advance `next_from_seq`. That is the whole engine: a topic
 holds records ordered by seq; reads walk forward from a cursor; involuntary loss tombstones
 and voluntary removal is silent; routers fan records out preserving origin; and durability
-is a per-box choice. Five concepts, one operation, one invariant.
+is a per-topic choice. Five concepts, one operation, one invariant.
 
 ## Where to go next
 

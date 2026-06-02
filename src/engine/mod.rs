@@ -1,11 +1,11 @@
-//! Engine facade: the box registry, lazy auto-create, and dispatch of
+//! Engine facade: the topic registry, lazy auto-create, and dispatch of
 //! write/diff/state/delete plus router forwarding.
 //!
-//! Phase 2 keeps all state in memory behind a [`DashMap`] of boxes and a
+//! Phase 2 keeps all state in memory behind a [`DashMap`] of topics and a
 //! single lock over the router graph. Module boundaries are kept clean so a
 //! WAL/storage layer can slide underneath in phase 4.
 
-pub mod box_state;
+pub mod topic_state;
 pub mod broadcast;
 pub mod eviction;
 pub mod filters;
@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::sched::Scheduler;
 use crate::storage::{MatchSel, RouterOp, ShardedWalWriter, WalRecord};
 use crate::types::*;
-use box_state::{BoxState, DedupeEntry, RetentionAdvance, StoredRecord};
+use topic_state::{TopicState, DedupeEntry, RetentionAdvance, StoredRecord};
 use dashmap::DashMap;
 use eviction::AdmitDecision;
 use parking_lot::Mutex;
@@ -33,49 +33,49 @@ pub mod snapshot;
 pub mod wal_glue;
 pub use wal_glue::WalHandle;
 
-/// Default first seq for a fresh box instance (`0` is reserved for "no
+/// Default first seq for a fresh topic instance (`0` is reserved for "no
 /// records").
 pub const SEQ_BASE: u64 = 1;
 
 /// The shared engine handle.
 pub struct Engine {
-    /// Box registry by name. `Arc<BoxState>` so handlers hold a box without
+    /// Topic registry by name. `Arc<TopicState>` so handlers hold a topic without
     /// keeping the shard locked.
-    boxes: DashMap<String, Arc<BoxState>>,
+    topics: DashMap<String, Arc<TopicState>>,
     /// Router registry + forwarding graph.
     routers: Mutex<RouterGraph>,
-    /// Monotonic interned box-id allocator (used by WAL framing, ARCHITECTURE §2.1).
-    next_box_id: AtomicU64,
-    /// Live box count, maintained as an atomic gauge so the `max_boxes` cap can be
+    /// Monotonic interned topic-id allocator (used by WAL framing, ARCHITECTURE §2.1).
+    next_topic_id: AtomicU64,
+    /// Live topic count, maintained as an atomic gauge so the `max_topics` cap can be
     /// enforced with an **atomic reserve-then-insert** (codex P2 #10): the reserve
     /// CAS happens-before the registry insert and only on the vacant-create path, so
     /// the surviving count can never exceed the cap under a concurrent create race
-    /// (the old `box_count()` read-then-insert was a TOCTOU that overshot the cap by
-    /// the racer count). Kept in lockstep with `boxes`: bumped only on an actual new
+    /// (the old `topic_count()` read-then-insert was a TOCTOU that overshot the cap by
+    /// the racer count). Kept in lockstep with `topics`: bumped only on an actual new
     /// insert, decremented on every removal (live delete + recovery).
-    box_count: AtomicU64,
-    /// Serializes the FRESH-CREATE critical section of `put_box` (codex P1 #3): the
-    /// existence check → cap reserve → WAL-first `BoxConfig` create frame → registry
+    topic_count: AtomicU64,
+    /// Serializes the FRESH-CREATE critical section of `put_topic` (codex P1 #3): the
+    /// existence check → cap reserve → WAL-first `TopicConfig` create frame → registry
     /// insert. Without it, two concurrent creates of the SAME new name could BOTH
     /// pass the existence check and BOTH log a create frame under their OWN (distinct)
-    /// box id; the loser would then mutate the winner's config in memory WITHOUT a
-    /// WAL frame for the winner's id, so replay would materialize an orphan box for
+    /// topic id; the loser would then mutate the winner's config in memory WITHOUT a
+    /// WAL frame for the winner's id, so replay would materialize an orphan topic for
     /// the loser's id and the live config would diverge from the durable log. Held
-    /// only across the (rare) create path — appends/updates of an existing box take
-    /// the per-box `append_lock`, never this.
+    /// only across the (rare) create path — appends/updates of an existing topic take
+    /// the per-topic `append_lock`, never this.
     create_lock: Mutex<()>,
-    /// Live total retained record bytes across all boxes, maintained as an atomic
+    /// Live total retained record bytes across all topics, maintained as an atomic
     /// gauge so the global `max_total_bytes` quota can be enforced with an **atomic
     /// reserve** against the running total (codex P2 #10): a write reserves its bytes
     /// against this counter before staging and rolls the reservation back on any
     /// failure, so the committed total can never exceed the cap by the racer count
-    /// (the old `total_bytes()` read-then-write was a TOCTOU). Each box also tracks
-    /// its own `bytes()` for per-box accounting/recovery; this gauge is the sum,
-    /// reconciled on recovery + box delete.
+    /// (the old `total_bytes()` read-then-write was a TOCTOU). Each topic also tracks
+    /// its own `bytes()` for per-topic accounting/recovery; this gauge is the sum,
+    /// reconciled on recovery + topic delete.
     total_bytes_live: AtomicU64,
     /// The sharded WAL writer, present once a data dir is configured (durability
-    /// layer, phase 4). Routes each record to its box's shard by a stable hash of
-    /// the interned `box_id`. `None` ⇒ pure in-memory mode (engine unit tests /
+    /// layer, phase 4). Routes each record to its topic's shard by a stable hash of
+    /// the interned `topic_id`. `None` ⇒ pure in-memory mode (engine unit tests /
     /// phase-2 shape): mutating ops skip WAL append and `fsync_ms`/`wal_append_ms`
     /// report `0.0`.
     wal: Option<ShardedWalWriter>,
@@ -135,48 +135,48 @@ pub struct Engine {
     router_advance_locks: DashMap<String, Arc<Mutex<()>>>,
     /// Snapshot ⇄ router-advance barrier (`forward_v2`; codex P0 #1). `advance_router`
     /// publishes a router's derived dest records and THEN advances that router's
-    /// cursor; a snapshot captures box state (incl. derived dest records) first and
+    /// cursor; a snapshot captures topic state (incl. derived dest records) first and
     /// router cursors second. Without coordination a snapshot could capture a dest
     /// with the OLD cursor (⇒ duplicate re-forward on recovery) or capture a NEW
     /// cursor after the OLD dest (⇒ silent loss). `advance_router` holds this lock
     /// SHARED for its whole pass (dest publish + cursor advance are one unit);
-    /// snapshot `capture` holds it EXCLUSIVE across BOTH box capture and cursor
+    /// snapshot `capture` holds it EXCLUSIVE across BOTH topic capture and cursor
     /// capture, so the (derived dest, cursor) pair is one consistent checkpoint unit.
     /// A `parking_lot::RwLock` (reader-preferring is fine: capture is rare). Inert
     /// under v2-off (no `advance_router` ever runs).
     router_snapshot_lock: parking_lot::RwLock<()>,
 }
 
-/// Aggregate per-engine metrics gathered in one pass over the box registry for
-/// the Prometheus exporter (M3). Per-box totals are summed; class + queue counts
+/// Aggregate per-engine metrics gathered in one pass over the topic registry for
+/// the Prometheus exporter (M3). Per-topic totals are summed; class + queue counts
 /// are tallied.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EngineMetrics {
-    /// Summed live (net-of-delete) record count across all boxes.
+    /// Summed live (net-of-delete) record count across all topics.
     pub records_live: u64,
-    /// Summed retained payload bytes across all boxes.
+    /// Summed retained payload bytes across all topics.
     pub bytes_live: u64,
-    /// Boxes by durability class.
-    pub boxes_memory: u64,
-    pub boxes_disk: u64,
-    pub boxes_fsync: u64,
-    /// Number of queue boxes (carry a lease projection).
-    pub queue_boxes: u64,
-    /// Jobs with an active (un-expired) lease across all queue boxes.
+    /// Topics by durability class.
+    pub topics_memory: u64,
+    pub topics_disk: u64,
+    pub topics_fsync: u64,
+    /// Number of queue topics (carry a lease projection).
+    pub queue_topics: u64,
+    /// Jobs with an active (un-expired) lease across all queue topics.
     pub leases_in_flight: u64,
 }
 
-/// Per-box gauge snapshot for the Prometheus exporter (M3 / codex P2 #1). One
-/// entry per box (bounded by a cardinality cap), labeled by box name.
+/// Per-topic gauge snapshot for the Prometheus exporter (M3 / codex P2 #1). One
+/// entry per topic (bounded by a cardinality cap), labeled by topic name.
 #[derive(Debug, Clone)]
-pub struct PerBoxMetrics {
+pub struct PerTopicMetrics {
     pub name: String,
     pub class: Durability,
     pub head_seq: u64,
     pub earliest_seq: u64,
     pub records_live: u64,
     pub bytes_live: u64,
-    /// `Some` only for a queue box: ready (claimable) jobs and in-flight (leased).
+    /// `Some` only for a queue topic: ready (claimable) jobs and in-flight (leased).
     pub queue_ready: Option<u64>,
     pub queue_in_flight: Option<u64>,
 }
@@ -190,10 +190,10 @@ impl Engine {
         // secret lingers in the engine's retained config (codex MEDIUM #9).
         config.finalize_keys();
         Arc::new(Engine {
-            boxes: DashMap::new(),
+            topics: DashMap::new(),
             routers: Mutex::new(RouterGraph::new()),
-            next_box_id: AtomicU64::new(1),
-            box_count: AtomicU64::new(0),
+            next_topic_id: AtomicU64::new(1),
+            topic_count: AtomicU64::new(0),
             create_lock: Mutex::new(()),
             total_bytes_live: AtomicU64::new(0),
             wal: None,
@@ -262,10 +262,10 @@ impl Engine {
             .unwrap_or_else(|| config::DEFAULT_DATA_DIR.to_string());
 
         let engine = Arc::new(Engine {
-            boxes: DashMap::new(),
+            topics: DashMap::new(),
             routers: Mutex::new(RouterGraph::new()),
-            next_box_id: AtomicU64::new(1),
-            box_count: AtomicU64::new(0),
+            next_topic_id: AtomicU64::new(1),
+            topic_count: AtomicU64::new(0),
             create_lock: Mutex::new(()),
             total_bytes_live: AtomicU64::new(0),
             wal: None,
@@ -291,7 +291,7 @@ impl Engine {
 
         // Recover from any existing WAL, then open the writer for new appends.
         // The engine stays `not ready` for the whole of this call; recovery
-        // rebuilds the box indexes, watermarks, routers, deletes, and name<->id
+        // rebuilds the topic indexes, watermarks, routers, deletes, and name<->id
         // table BEFORE we mark ready and accept data-plane traffic. An injected
         // `fs` (the crash harness) routes recovery + the resumed writer through a
         // fake disk; `None` (production) uses `RealFs` transparently.
@@ -321,13 +321,13 @@ impl Engine {
             e
         };
         // Reconcile the live byte gauge from the fully-recovered registry (snapshot
-        // restore seeds it per box, but WAL replay then mutates per-box bytes via
+        // restore seeds it per topic, but WAL replay then mutates per-topic bytes via
         // appends/deletes/evictions). Recompute the authoritative sum once here so
         // the `max_total_bytes` reservation counter starts exactly at the recovered
         // live total (codex P2 #10). Single-threaded at this point.
         engine.total_bytes_live.store(
             engine
-                .boxes
+                .topics
                 .iter()
                 .map(|b| b.value().bytes())
                 .fold(0u64, |a, x| a.saturating_add(x)),
@@ -444,10 +444,10 @@ impl Engine {
     /// Whether an auto-snapshot threshold has been crossed: either
     /// [`config::SNAPSHOT_BYTES_THRESHOLD`] of WAL bytes written, or
     /// [`config::SNAPSHOT_INTERVAL_MS`] elapsed, since the last snapshot. Used by
-    /// the background snapshotter (no-op when there are no boxes to snapshot).
+    /// the background snapshotter (no-op when there are no topics to snapshot).
     pub fn snapshot_due(&self) -> bool {
         let Some(w) = &self.wal else { return false };
-        if self.boxes.is_empty() {
+        if self.topics.is_empty() {
             return false;
         }
         let written = w.bytes_written();
@@ -460,11 +460,11 @@ impl Engine {
         since_ms >= config::SNAPSHOT_INTERVAL_MS
     }
 
-    /// Number of boxes currently registered. Reads the atomic gauge kept in
+    /// Number of topics currently registered. Reads the atomic gauge kept in
     /// lockstep with the registry (bumped on an actual create, decremented on every
-    /// removal), which is also the reservation point for the `max_boxes` cap.
-    pub fn box_count(&self) -> u64 {
-        self.box_count.load(Ordering::Relaxed)
+    /// removal), which is also the reservation point for the `max_topics` cap.
+    pub fn topic_count(&self) -> u64 {
+        self.topic_count.load(Ordering::Relaxed)
     }
 
     /// Number of routers currently defined (resource-limit / observability).
@@ -472,12 +472,12 @@ impl Engine {
         self.routers.lock().len() as u64
     }
 
-    /// Sum of retained record bytes across all boxes — the authoritative live total
-    /// (codex HIGH #5). O(boxes). Used to seed/reconcile the `total_bytes_live`
+    /// Sum of retained record bytes across all topics — the authoritative live total
+    /// (codex HIGH #5). O(topics). Used to seed/reconcile the `total_bytes_live`
     /// reservation gauge (recovery, and the self-correcting reconcile on a refused
     /// reservation); the hot write path reserves against the gauge, not this scan.
     pub fn total_bytes(&self) -> u64 {
-        self.boxes
+        self.topics
             .iter()
             .map(|b| b.value().bytes())
             .fold(0u64, |a, x| a.saturating_add(x))
@@ -493,9 +493,9 @@ impl Engine {
     /// push the committed total over the cap (the prior `total_bytes()` read-then-
     /// write was a TOCTOU that admitted everything). The gauge is a reservation
     /// counter (incremented at admission, released on write failure, decremented on
-    /// box delete). It also COUNTS in-flight reservations (a write that reserved but
+    /// topic delete). It also COUNTS in-flight reservations (a write that reserved but
     /// has not yet published), so a hard reservation cap is correct under
-    /// concurrency. `discard:"old"` eviction reduces *actual* box bytes without
+    /// concurrency. `discard:"old"` eviction reduces *actual* topic bytes without
     /// touching the gauge, which can only make the gauge an OVER-estimate — the
     /// quota then errs strict (refuses slightly early), never loose (it can never
     /// overshoot the cap). The authoritative `total_bytes()` sum reconciles the
@@ -554,40 +554,40 @@ impl Engine {
         self.wal.as_ref().map(|w| w.aggregated_metrics())
     }
 
-    /// One O(boxes) pass collecting the aggregate engine metrics for the
+    /// One O(topics) pass collecting the aggregate engine metrics for the
     /// Prometheus exporter (M3): summed live record count / retained bytes, the
-    /// per-class box count, and queue totals (queue boxes + currently in-flight
-    /// leased jobs). A single scan keeps `/v0/metrics` cheap even with many boxes.
+    /// per-class topic count, and queue totals (queue topics + currently in-flight
+    /// leased jobs). A single scan keeps `/v0/metrics` cheap even with many topics.
     pub fn metrics_snapshot(&self) -> EngineMetrics {
         let now = self.clock.now_ms();
         let mut m = EngineMetrics::default();
-        for entry in self.boxes.iter() {
+        for entry in self.topics.iter() {
             let b = entry.value();
             m.records_live = m.records_live.saturating_add(b.count());
             m.bytes_live = m.bytes_live.saturating_add(b.bytes());
             match b.config.read().durability_class() {
-                Durability::Memory => m.boxes_memory += 1,
-                Durability::Disk => m.boxes_disk += 1,
-                Durability::Fsync => m.boxes_fsync += 1,
+                Durability::Memory => m.topics_memory += 1,
+                Durability::Disk => m.topics_disk += 1,
+                Durability::Fsync => m.topics_fsync += 1,
             }
             if let Some(q) = &b.queue {
-                m.queue_boxes += 1;
+                m.queue_topics += 1;
                 m.leases_in_flight = m.leases_in_flight.saturating_add(q.lock().in_flight(now));
             }
         }
         m
     }
 
-    /// Per-box gauge snapshot for the Prometheus exporter (M3 / codex P2 #1),
-    /// bounded to `limit` boxes to cap label cardinality on a deployment with many
-    /// boxes. Returns `(snapshot, total_boxes)` so the exporter can note when the
-    /// series were truncated. Each entry carries the box's live head/earliest/
-    /// record/byte gauges plus, for a queue box, its ready/in-flight counts.
-    pub fn per_box_metrics(&self, limit: usize) -> (Vec<PerBoxMetrics>, usize) {
+    /// Per-topic gauge snapshot for the Prometheus exporter (M3 / codex P2 #1),
+    /// bounded to `limit` topics to cap label cardinality on a deployment with many
+    /// topics. Returns `(snapshot, total_topics)` so the exporter can note when the
+    /// series were truncated. Each entry carries the topic's live head/earliest/
+    /// record/byte gauges plus, for a queue topic, its ready/in-flight counts.
+    pub fn per_topic_metrics(&self, limit: usize) -> (Vec<PerTopicMetrics>, usize) {
         let now = self.clock.now_ms();
-        let total = self.boxes.len();
+        let total = self.topics.len();
         let mut out = Vec::with_capacity(total.min(limit));
-        for entry in self.boxes.iter() {
+        for entry in self.topics.iter() {
             if out.len() >= limit {
                 break;
             }
@@ -598,7 +598,7 @@ impl Engine {
             } else {
                 (None, None)
             };
-            out.push(PerBoxMetrics {
+            out.push(PerTopicMetrics {
                 name: b.name.clone(),
                 class: b.config.read().durability_class(),
                 head_seq: b.head_seq(),
@@ -612,27 +612,27 @@ impl Engine {
         (out, total)
     }
 
-    /// Look up a box by name.
-    pub fn get_box(&self, name: &str) -> Option<Arc<BoxState>> {
-        self.boxes.get(name).map(|b| b.clone())
+    /// Look up a topic by name.
+    pub fn get_topic(&self, name: &str) -> Option<Arc<TopicState>> {
+        self.topics.get(name).map(|b| b.clone())
     }
 
-    /// Allocate the next interned box id (ARCHITECTURE §2.1).
-    fn alloc_box_id(&self) -> u32 {
-        self.next_box_id.fetch_add(1, Ordering::Relaxed) as u32
+    /// Allocate the next interned topic id (ARCHITECTURE §2.1).
+    fn alloc_topic_id(&self) -> u32 {
+        self.next_topic_id.fetch_add(1, Ordering::Relaxed) as u32
     }
 
-    /// Build a per-box [`segwriter::SegmentWriter`] for a durable engine, or
+    /// Build a per-topic [`segwriter::SegmentWriter`] for a durable engine, or
     /// `None` for a pure in-memory engine (no data dir). The HOT store is a
-    /// per-box dir `<data_dir>/boxes/<box_id-hex>`; the optional COLD store
-    /// mirrors that under `<cold_dir>/boxes/<box_id-hex>` (ARCHITECTURE §6). On
-    /// any store-open error we fall back to `None` (no writer) so a box stays
+    /// per-topic dir `<data_dir>/topics/<topic_id-hex>`; the optional COLD store
+    /// mirrors that under `<cold_dir>/topics/<topic_id-hex>` (ARCHITECTURE §6). On
+    /// any store-open error we fall back to `None` (no writer) so a topic stays
     /// fully functional via resident in-memory payloads — sealing/relocation is
     /// derivable, never load-bearing for correctness.
-    fn build_segment_writer(&self, box_id: u32) -> Option<segwriter::SegmentWriter> {
-        use crate::storage::{BoxTier, LocalSegmentStore};
+    fn build_segment_writer(&self, topic_id: u32) -> Option<segwriter::SegmentWriter> {
+        use crate::storage::{TopicTier, LocalSegmentStore};
         let data_dir = self.data_dir.as_ref()?;
-        let sub = format!("boxes/{box_id:08X}");
+        let sub = format!("topics/{topic_id:08X}");
         let hot = LocalSegmentStore::open(data_dir.join(&sub)).ok()?;
         let cold: Option<Box<dyn crate::storage::SegmentStore>> = match &self.config.cold_dir {
             Some(cd) => Some(Box::new(
@@ -640,7 +640,7 @@ impl Engine {
             )),
             None => None,
         };
-        let tier = Arc::new(BoxTier::new(Box::new(hot), cold));
+        let tier = Arc::new(TopicTier::new(Box::new(hot), cold));
         Some(segwriter::SegmentWriter::new(
             tier,
             self.config.segment.clone(),
@@ -648,10 +648,10 @@ impl Engine {
         ))
     }
 
-    /// Relocate a box's hot-retention-exceeding sealed segments HOT → COLD,
+    /// Relocate a topic's hot-retention-exceeding sealed segments HOT → COLD,
     /// running the (potentially slow) copy I/O **off every write/delivery-gating
     /// lock** (the Phase-6 HARD INVARIANT). Returns the number of segments
-    /// relocated. A no-op when the box has no writer or no cold tier, or nothing
+    /// relocated. A no-op when the topic has no writer or no cold tier, or nothing
     /// exceeds the hot-retention bound.
     ///
     /// State machine (crash-safe, idempotent — ARCHITECTURE §3.6):
@@ -662,11 +662,11 @@ impl Engine {
     /// 3. FLIP+DROP — under the writer lock, flip the in-memory tier pointer to COLD
     ///    and delete the hot copy (`confirm_relocated`).
     ///
-    /// An interruption between any steps recovers cleanly: `BoxTier::resolve`
+    /// An interruption between any steps recovers cleanly: `TopicTier::resolve`
     /// prefers the surviving HOT copy, so a half-relocated segment is still
     /// readable and the relocator re-runs the idempotent copy/drop.
-    pub fn relocate_box_cold(&self, name: &str) -> usize {
-        let Some(b) = self.get_box(name) else {
+    pub fn relocate_topic_cold(&self, name: &str) -> usize {
+        let Some(b) = self.get_topic(name) else {
             return 0;
         };
         let Some(sw) = b.segwriter.as_ref() else {
@@ -684,7 +684,7 @@ impl Engine {
             match segwriter::copy_segment_to_cold(&tier, id) {
                 Ok(()) => {}
                 Err(e) => {
-                    tracing::warn!(box_name = name, segment = id, error = %e,
+                    tracing::warn!(topic_name = name, segment = id, error = %e,
                         "relocate: cold copy failed; keeping hot copy");
                     continue;
                 }
@@ -692,7 +692,7 @@ impl Engine {
             // Named crash point: the cold copy is durably written (fsync'd) but the
             // tier pointer has NOT been flipped and the hot copy is still present
             // (F-COLD-CRASH-AFTER-COPY-BEFORE-FLIP). Both copies exist;
-            // `BoxTier::resolve` prefers HOT, the record stays readable, and the
+            // `TopicTier::resolve` prefers HOT, the record stays readable, and the
             // relocator re-runs the idempotent copy(no-op)+flip+drop — no loss.
             // No-op without `--features failpoints`.
             fail::fail_point!("cold::after_copy_before_flip");
@@ -704,7 +704,7 @@ impl Engine {
     }
 
     /// Post-recovery segment reclaim (the final recovery step, ARCHITECTURE §4).
-    /// After the snapshot + WAL replay rebuilt every box's index/floors/segment
+    /// After the snapshot + WAL replay rebuilt every topic's index/floors/segment
     /// registry, re-derive the droppable segments and reclaim them idempotently —
     /// both registered sealed segments now fully below the live floor and any
     /// **orphan** segment file left on disk by a pre-crash reclaim whose unlink
@@ -714,7 +714,7 @@ impl Engine {
     /// in-memory engine.
     pub(crate) fn reclaim_segments_on_recovery(&self) {
         let mut orphans = 0usize;
-        for entry in self.boxes.iter() {
+        for entry in self.topics.iter() {
             orphans += entry.value().reclaim_segments_on_recovery();
         }
         if orphans > 0 {
@@ -726,20 +726,20 @@ impl Engine {
     }
 
     /// Post-replay head-reservation reconciliation (R3). After every Append
-    /// replayed, advance each box's head to its durable `HeadWatermark`
+    /// replayed, advance each topic's head to its durable `HeadWatermark`
     /// reservation when that reservation sits BEYOND the replayed head — the
-    /// un-fsynced `disk` tail was lost to the crash, but the box durably promised
+    /// un-fsynced `disk` tail was lost to the crash, but the topic durably promised
     /// not to re-hand those seqs. `restore_head_watermark` pads the
     /// reserved-but-unwritten seqs as silent deleted gaps and advances head, so
     /// the seq counter never regresses and an already-acked `disk` seq is never
-    /// reused. A box whose reservation is `<=` its replayed head is a no-op.
+    /// reused. A topic whose reservation is `<=` its replayed head is a no-op.
     pub(crate) fn apply_head_watermarks(&self) {
-        for entry in self.boxes.iter() {
+        for entry in self.topics.iter() {
             let b = entry.value();
             let reserved = b.reserved_head();
             if reserved > b.head_seq() {
                 tracing::info!(
-                    box_name = %b.name,
+                    topic_name = %b.name,
                     reserved,
                     replayed_head = b.head_seq(),
                     "recovery: advancing head to durable reservation (lost un-fsynced disk tail)"
@@ -749,17 +749,17 @@ impl Engine {
         }
     }
 
-    /// Relocate hot-retention-exceeding sealed segments for **every** box (the
+    /// Relocate hot-retention-exceeding sealed segments for **every** topic (the
     /// background relocator pass). No-op when no cold tier is configured. Returns
-    /// the total number of segments relocated across all boxes.
+    /// the total number of segments relocated across all topics.
     pub fn relocate_all_due(&self) -> usize {
         if self.config.cold_dir.is_none() {
             return 0;
         }
-        let names: Vec<String> = self.boxes.iter().map(|e| e.key().clone()).collect();
+        let names: Vec<String> = self.topics.iter().map(|e| e.key().clone()).collect();
         let mut total = 0usize;
         for name in names {
-            total += self.relocate_box_cold(&name);
+            total += self.relocate_topic_cold(&name);
         }
         total
     }
@@ -797,7 +797,7 @@ impl Engine {
         Ok((wal_append_ms, 0.0))
     }
 
-    /// Log a control frame (box config/delete, routers, deletes) and **propagate**
+    /// Log a control frame (topic config/delete, routers, deletes) and **propagate**
     /// the WAL commit result. Control frames share the WAL's durability boundary
     /// (ARCHITECTURE §2.1) and are logged durably so a crash right after the HTTP
     /// response cannot lose the mutation. In pure in-memory mode this is a no-op
@@ -822,7 +822,7 @@ impl Engine {
     }
 
     /// Log a `Delete` control frame for a queue ack / dead-letter removal so the
-    /// permanent delete replays deterministically (durability == the box's
+    /// permanent delete replays deterministically (durability == the topic's
     /// `durable`: ack durability == jobs-log durability, DESIGN §10.1/§10.4).
     ///
     /// Best-effort by the queue's self-healing contract (DESIGN §10.6): if this
@@ -830,10 +830,10 @@ impl Engine {
     /// (at-least-once redelivery), not a silent data loss — so the swallow is the
     /// documented, correct choice for the leases projection, distinct from the
     /// (propagated) API §5 `delete`.
-    pub(crate) fn wal_log_delete_seqs(&self, box_id: u32, seqs: Vec<u64>, now: i64, durable: bool) {
+    pub(crate) fn wal_log_delete_seqs(&self, topic_id: u32, seqs: Vec<u64>, now: i64, durable: bool) {
         self.wal_log_best_effort(
             WalRecord::Delete {
-                box_id,
+                topic_id,
                 before_seq: None,
                 match_: None,
                 seqs,
@@ -846,7 +846,7 @@ impl Engine {
         );
     }
 
-    /// Durably log a monotone `EvictWatermark` for a box whose involuntary
+    /// Durably log a monotone `EvictWatermark` for a topic whose involuntary
     /// (cap/TTL) loss floor advanced, so the floor survives restart and a relaxed
     /// cap / backward clock can never resurrect an evicted record (codex P0 #2).
     /// `involuntary_floor` is `max(evict_floor, expiry_floor)` — the highest seq
@@ -860,18 +860,18 @@ impl Engine {
     /// reconstructible from the recovered head, so its watermark MUST be durable:
     /// a swallowed/lost frame there could let the evicted records replay from the
     /// un-absorbed WAL tail after a crash and silently resurrect past a floor the
-    /// box already enforced. The `evict_floor` (cap) and `expiry_floor` (TTL) are
+    /// topic already enforced. The `evict_floor` (cap) and `expiry_floor` (TTL) are
     /// carried SEPARATELY so the from-0 tombstone reason survives restart. The
     /// commit result is returned so the caller hardens the floor (fsync) before
     /// treating the eviction as durable.
-    fn log_evict_watermark(&self, box_id: u32, adv: &RetentionAdvance, now: i64) -> Result<()> {
+    fn log_evict_watermark(&self, topic_id: u32, adv: &RetentionAdvance, now: i64) -> Result<()> {
         let floor = adv.evict_floor.max(adv.expiry_floor);
         if self.wal.is_none() || floor == 0 {
             return Ok(());
         }
         self.wal_log(
             WalRecord::EvictWatermark {
-                box_id,
+                topic_id,
                 evict_floor: adv.evict_floor,
                 expiry_floor: adv.expiry_floor,
                 earliest_seq: floor.saturating_add(1),
@@ -882,7 +882,7 @@ impl Engine {
         .map(|_| ())
     }
 
-    /// Ensure box `b` has DURABLY (fsync) reserved a head seq ceiling at/above
+    /// Ensure topic `b` has DURABLY (fsync) reserved a head seq ceiling at/above
     /// `head` before a `disk`-class write that produced `head` is acked (R3). If
     /// the published head reached the current reservation, fsync a fresh
     /// `HeadWatermark` reserving [`config::DISK_HEAD_RESERVE_AHEAD`] seqs beyond it
@@ -896,8 +896,8 @@ impl Engine {
     /// in-memory engine (no WAL) has no reservation to make and returns `Ok`.
     fn ensure_disk_head_reserved(
         &self,
-        box_id: u32,
-        b: &BoxState,
+        topic_id: u32,
+        b: &TopicState,
         head: u64,
         now: i64,
     ) -> Result<()> {
@@ -918,7 +918,7 @@ impl Engine {
             .saturating_add(config::DISK_HEAD_RESERVE_AHEAD);
         self.wal_log(
             WalRecord::HeadWatermark {
-                box_id,
+                topic_id,
                 head_seq: target,
                 ts: now.max(0) as u64,
             },
@@ -937,12 +937,12 @@ impl Engine {
     /// the evicted records). On a hardening failure NOTHING is evicted and the
     /// error is RETURNED — the caller propagates it instead of silently serving a
     /// tombstone for an un-hardened floor. A re-derivable advance (records-cap)
-    /// needs no watermark and never fails here. A `memory` box takes the same path
+    /// needs no watermark and never fails here. A `memory` topic takes the same path
     /// (it shares the disk-like best-effort write path, §0.10): it logs the same
     /// best-effort watermark — its loss merely re-derives on the next pass.
-    fn enforce_retention_durable(&self, b: &BoxState, now: i64) -> Result<()> {
-        let box_id = b.box_id;
-        b.enforce_retention_hardened(now, |plan| self.log_evict_watermark(box_id, plan, now))?;
+    fn enforce_retention_durable(&self, b: &TopicState, now: i64) -> Result<()> {
+        let topic_id = b.topic_id;
+        b.enforce_retention_hardened(now, |plan| self.log_evict_watermark(topic_id, plan, now))?;
         Ok(())
     }
 
@@ -958,8 +958,8 @@ impl Engine {
     /// Enqueue a write batch's WAL `Append` frames to the single ordered writer
     /// as ONE ATOMIC submission (R5 / codex P0 #1), returning the batch's single
     /// commit token plus the enqueue time. Does **not** wait — the caller blocks
-    /// on the token *after* releasing the per-box append lock, so the fsync wait
-    /// never serializes other boxes' writes and durable group commit still
+    /// on the token *after* releasing the per-topic append lock, so the fsync wait
+    /// never serializes other topics' writes and durable group commit still
     /// coalesces.
     ///
     /// Atomicity matters: the prior implementation called `submit` once per record,
@@ -970,14 +970,14 @@ impl Engine {
     /// channel slot, so it is accepted all-or-none: a `Full` rejects the entire
     /// batch (nothing is written) and the caller's rollback is sound.
     ///
-    /// MUST be called while holding the box's `append_lock`, immediately after
-    /// `BoxState::append` assigned the seqs, so a box's WAL frames are enqueued
+    /// MUST be called while holding the topic's `append_lock`, immediately after
+    /// `TopicState::append` assigned the seqs, so a topic's WAL frames are enqueued
     /// in the same order their seqs were assigned (recovery applies frames in
     /// WAL order and skips `seq <= head`, so out-of-order enqueue would silently
-    /// drop the lower-seq frame — see `BoxState::append_lock`).
+    /// drop the lower-seq frame — see `TopicState::append_lock`).
     fn wal_enqueue_batch(
         &self,
-        box_id: u32,
+        topic_id: u32,
         seqs: &[u64],
         records: &[StoredRecord],
         now: i64,
@@ -996,7 +996,7 @@ impl Engine {
                 // JSON) so a replayed Append fully reconstructs the StoredRecord.
                 let data = encode_record_payload(&rec.data, &rec.meta);
                 WalRecord::Append {
-                    box_id,
+                    topic_id,
                     seq: *seq,
                     ts,
                     node: rec.node.clone(),
@@ -1006,7 +1006,7 @@ impl Engine {
             })
             .collect();
         let token = w
-            .submit_batch(box_id, frames, durable)
+            .submit_batch(topic_id, frames, durable)
             .map_err(|e| Error::internal(format!("WAL append failed: {e}")))?;
         Ok((elapsed_ms(t0), Some(token)))
     }
@@ -1014,8 +1014,8 @@ impl Engine {
     /// **WAL-first append** of `records` into `dest` (the shared durable-append
     /// path used by user writes' derived appends: router forwarding and queue
     /// dead-lettering). Stages the records, enqueues their WAL `Append` frame(s),
-    /// fsyncs if the box is durable, then publishes — exactly like a user write,
-    /// so a forwarded/dead-lettered copy into a durable box is durable BY
+    /// fsyncs if the topic is durable, then publishes — exactly like a user write,
+    /// so a forwarded/dead-lettered copy into a durable topic is durable BY
     /// CONSTRUCTION and recovers naturally via WAL replay (ARCHITECTURE §2.2;
     /// fixes the silent loss of routed copies on restart).
     ///
@@ -1030,7 +1030,7 @@ impl Engine {
     /// a failed durable forward is never acknowledged as forwarded.
     fn durable_append(
         &self,
-        dest: &BoxState,
+        dest: &TopicState,
         records: Vec<StoredRecord>,
         now: i64,
     ) -> Result<Vec<u64>> {
@@ -1039,7 +1039,7 @@ impl Engine {
         }
         let class = dest.config.read().durability_class();
         let durable = class == Durability::Fsync;
-        let box_id = dest.box_id;
+        let topic_id = dest.topic_id;
         let snapshot = records.clone();
         // Stage + enqueue + ticket UNDER the append lock (seq-order critical
         // section); fsync `wait()` then runs OFF the lock so concurrent durable
@@ -1054,7 +1054,7 @@ impl Engine {
             // path: forwarded / dead-lettered copies into it are group-committed to
             // the WAL (NOT fsync-gated) exactly like a direct memory write — they
             // MAY survive a restart or MAY be lost (no durability GUARANTEE, §0.10).
-            let token = match self.wal_enqueue_batch(box_id, &seqs, &snapshot, now, durable) {
+            let token = match self.wal_enqueue_batch(topic_id, &seqs, &snapshot, now, durable) {
                 Ok((_wal_ms, token)) => token,
                 Err(e) => {
                     // No ticket taken yet: tail truncation is still safe.
@@ -1097,7 +1097,7 @@ impl Engine {
         // dest is best-effort/lossy (§0.10) and forgoes the seq-ceiling fsync.
         if class == Durability::Disk {
             let publish_head = staged.publish_head();
-            if let Err(e) = self.ensure_disk_head_reserved(box_id, dest, publish_head, now) {
+            if let Err(e) = self.ensure_disk_head_reserved(topic_id, dest, publish_head, now) {
                 dest.rollback_staged_by_seqs(&staged);
                 ticket.done();
                 return Err(e);
@@ -1105,7 +1105,7 @@ impl Engine {
         }
         // R6: publish (advance head, wake readers) UNDER the gate, but seal/fsync
         // the segment AFTER releasing the gate so a slow seal `put` never serializes
-        // same-box writers (the gate now orders only head advances).
+        // same-topic writers (the gate now orders only head advances).
         let pub_range = dest.publish_staged_no_seal(staged, now);
         ticket.done();
         if let Some((start, end)) = pub_range {
@@ -1120,15 +1120,15 @@ impl Engine {
     /// source WAL + the per-router cursor, never separately logged). Used only by
     /// `advance_router` under the per-router advance lock, so there is no second
     /// DERIVED stager competing for the dest. But a dest can ALSO take DIRECT writes
-    /// (a mixed / `allow_cycle` box), so derived publishes MUST go through the SAME
+    /// (a mixed / `allow_cycle` topic), so derived publishes MUST go through the SAME
     /// publish-ticket gate as direct writes (codex P0 #2): otherwise a direct writer
     /// could stage a higher seq and publish (advancing `head_seq`) in the window
     /// between this derived batch's stage and its publish, after which an un-gated
     /// derived `head_seq.store` of the LOWER seq would regress the head and hide the
-    /// direct write. The ticket serializes all `head_seq` advances for the box into
+    /// direct write. The ticket serializes all `head_seq` advances for the topic into
     /// stage order, so the head is monotonic regardless of writer kind. The
     /// seal/fsync still runs off the gate. Returns the assigned dest seqs.
-    fn derived_append(&self, dest: &BoxState, records: Vec<StoredRecord>, now: i64) -> Vec<u64> {
+    fn derived_append(&self, dest: &TopicState, records: Vec<StoredRecord>, now: i64) -> Vec<u64> {
         if records.is_empty() {
             return Vec::new();
         }
@@ -1149,7 +1149,7 @@ impl Engine {
         };
         // Publish UNDER the gate (head advance ordered against direct writers), seal
         // the segment AFTER releasing the gate (R6: a slow seal never serializes
-        // same-box writers).
+        // same-topic writers).
         let mut ticket = ticket;
         ticket.wait_turn();
         let pub_range = dest.publish_staged_no_seal(staged, now);
@@ -1160,30 +1160,30 @@ impl Engine {
         seqs
     }
 
-    /// Compute the effective priority of a box right now (DESIGN §3.1).
-    fn effective_priority(&self, b: &BoxState) -> i64 {
+    /// Compute the effective priority of a topic right now (DESIGN §3.1).
+    fn effective_priority(&self, b: &TopicState) -> i64 {
         let cfg = b.config.read();
         let manual = cfg.priority;
         let auto = cfg.auto_priority;
         drop(cfg);
-        let last_consumed = BoxState::read_ts(&b.last_consumed_ms);
+        let last_consumed = TopicState::read_ts(&b.last_consumed_ms);
         // The age boost wants the wait time of the oldest unread record; phase 2
-        // uses the box's earliest retained write recency as a stand-in. With no
+        // uses the topic's earliest retained write recency as a stand-in. With no
         // queued work the term is 0, which is correct for the state read.
         self.scheduler
             .effective_priority(manual, auto, last_consumed, None)
     }
 
     // -----------------------------------------------------------------------
-    // Box lifecycle (API §1)
+    // Topic lifecycle (API §1)
     // -----------------------------------------------------------------------
 
-    /// `PUT /v0/boxes/:box` — create or update a box. Returns the config and
-    /// whether it was created on this call. Logs a `BoxConfig` (create/update)
+    /// `PUT /v0/topics/:topic` — create or update a topic. Returns the config and
+    /// whether it was created on this call. Logs a `TopicConfig` (create/update)
     /// WAL frame so config survives restart.
-    pub fn put_box(&self, name: &str, config: BoxConfig) -> Result<(bool, BoxConfig)> {
+    pub fn put_topic(&self, name: &str, config: TopicConfig) -> Result<(bool, TopicConfig)> {
         if !config::is_valid_name(name) {
-            return Err(Error::invalid_request(format!("invalid box name {name:?}")));
+            return Err(Error::invalid_request(format!("invalid topic name {name:?}")));
         }
         validate_config(&config)?;
         // Resolve + pin the durability class so the persisted config and every
@@ -1192,45 +1192,45 @@ impl Engine {
         let mut config = config;
         config.normalize_durability();
 
-        // A queue's dead-letter box must differ from itself (API §0.10).
+        // A queue's dead-letter topic must differ from itself (API §0.10).
         if config.is_queue() {
             if let Some(dl) = &config.dead_letter {
                 if dl == name {
                     return Err(Error::invalid_request(
-                        "dead_letter must name a different box",
+                        "dead_letter must name a different topic",
                     ));
                 }
             }
         }
 
-        // `type` is immutable once a box exists (API §0.10): a `PUT` that would
-        // change it is rejected with `409 box_exists_incompatible`. The durability
+        // `type` is immutable once a topic exists (API §0.10): a `PUT` that would
+        // change it is rejected with `409 topic_exists_incompatible`. The durability
         // class is freely mutable in place across ALL three classes: `memory` now
         // shares the disk-like write/snapshot/segment path (§0.10), so every class
         // has a segment writer and is treated identically by the snapshot/recovery
         // path — a `memory`↔`disk`↔`fsync` flip is just a config swap (no stale or
         // missing segment writer, no resurrected/dropped records). The common
         // "auto-create then set durability" flow works for any class.
-        if let Some(existing) = self.get_box(name) {
+        if let Some(existing) = self.get_topic(name) {
             let cur_cfg = existing.config.read();
             let cur_type = cur_cfg.r#type;
             if cur_type != config.r#type {
                 return Err(Error::new(
-                    ErrorCode::BoxExistsIncompatible,
-                    format!("box {name:?} already exists as type {cur_type:?}; type is immutable"),
+                    ErrorCode::TopicExistsIncompatible,
+                    format!("topic {name:?} already exists as type {cur_type:?}; type is immutable"),
                 )
                 .with_detail(serde_json::json!({
-                    "box": name,
+                    "topic": name,
                     "existing_type": cur_type,
                     "requested_type": config.r#type,
                 })));
             }
         }
 
-        // A control frame for a box config mutation, encoded once.
-        let frame = |box_id: u32| WalRecord::BoxConfig {
-            box_id,
-            op: crate::storage::BoxConfigOp {
+        // A control frame for a topic config mutation, encoded once.
+        let frame = |topic_id: u32| WalRecord::TopicConfig {
+            topic_id,
+            op: crate::storage::TopicConfigOp {
                 name: name.to_string(),
                 config: serde_json::to_vec(&config).unwrap_or_default(),
             },
@@ -1238,16 +1238,16 @@ impl Engine {
             ts: self.clock.now_ms().max(0) as u64,
         };
 
-        // --- In-place UPDATE of an existing box (bug #2). ------------------
+        // --- In-place UPDATE of an existing topic (bug #2). ------------------
         // The old path was APPLY-FIRST: it swapped the config in memory and only
-        // THEN logged the BoxConfig frame, so a WAL failure left the in-memory
+        // THEN logged the TopicConfig frame, so a WAL failure left the in-memory
         // config ahead of the durable log (a relaxed/tightened durability/cap/ttl
         // that a restart would silently revert — "applied but not committed").
         //
-        // The fix is WAL-FIRST and serialized against this box's appends/deletes:
+        // The fix is WAL-FIRST and serialized against this topic's appends/deletes:
         // under `append_lock` (so a durability/cap change orders correctly vs
         // concurrent writes and the WAL order matches the applied behavior) we LOG
-        // the BoxConfig frame FIRST, and only after it commits do we swap the
+        // the TopicConfig frame FIRST, and only after it commits do we swap the
         // config in memory + enforce the (possibly tighter) retention. On a WAL
         // failure we apply NOTHING and return an error, so memory never diverges
         // from the durable log. Crucially the tighter config is never even
@@ -1255,10 +1255,10 @@ impl Engine {
         // IRREVERSIBLE eviction (it can drop records past a tightened cap/ttl), so
         // exposing the new cap before the durable commit could silently evict a
         // record that the (failed) update was supposed to leave untouched.
-        if let Some(existing) = self.get_box(name) {
-            let box_id = existing.box_id;
+        if let Some(existing) = self.get_topic(name) {
+            let topic_id = existing.topic_id;
             let _guard = existing.append_lock.lock();
-            self.wal_log(frame(box_id), true)?;
+            self.wal_log(frame(topic_id), true)?;
             // Durably logged: NOW apply the config swap + enforce retention. A
             // tightened TTL/byte-cap that evicts on this swap durably persists its
             // new floor (R7) so the tighten can't be silently reverted by a crash.
@@ -1270,84 +1270,84 @@ impl Engine {
         // --- Fresh CREATE (WAL-FIRST, deferred review #3; serialized P1 #3). -----
         // Serialize the create critical section per engine (codex P1 #3): two
         // concurrent creates of the SAME new name must not BOTH log a create frame
-        // under their own distinct box id (replay would then materialize an orphan
-        // box for the loser's id, and the loser's in-memory config swap over the
-        // winner's box would diverge from the durable log). Holding `create_lock`
+        // under their own distinct topic id (replay would then materialize an orphan
+        // topic for the loser's id, and the loser's in-memory config swap over the
+        // winner's topic would diverge from the durable log). Holding `create_lock`
         // across re-check → reserve → WAL-first log → insert makes creates strictly
         // ordered; a duplicate observed under the lock is routed through the normal
-        // WAL-first UPDATE path (logging a BoxConfig frame for the WINNER's box id),
+        // WAL-first UPDATE path (logging a TopicConfig frame for the WINNER's topic id),
         // so the live config and the durable log always agree.
         let _create_guard = self.create_lock.lock();
 
         // Re-check under the create lock: a racer may have created `name` between
         // the fast-path check above and acquiring this lock. If so, this call is an
-        // UPDATE — log a BoxConfig frame for the EXISTING box's id under its
-        // `append_lock` (WAL-first), then swap the config. No second box, no orphan
+        // UPDATE — log a TopicConfig frame for the EXISTING topic's id under its
+        // `append_lock` (WAL-first), then swap the config. No second topic, no orphan
         // frame.
-        if let Some(existing) = self.get_box(name) {
-            let box_id = existing.box_id;
+        if let Some(existing) = self.get_topic(name) {
+            let topic_id = existing.topic_id;
             let _guard = existing.append_lock.lock();
-            self.wal_log(frame(box_id), true)?;
+            self.wal_log(frame(topic_id), true)?;
             *existing.config.write() = config.clone();
             self.enforce_retention_durable(&existing, self.clock.now_ms())?;
             return Ok((false, config));
         }
 
-        // Resource limit: cap the number of boxes (DoS hardening; [`crate::limits`]).
-        // Only a *new* box counts against the cap. `0` ⇒ unlimited.
+        // Resource limit: cap the number of topics (DoS hardening; [`crate::limits`]).
+        // Only a *new* topic counts against the cap. `0` ⇒ unlimited.
         //
-        // RESERVE the cap slot + box id, LOG + fsync the BoxConfig frame FIRST, and
-        // only after it durably commits INSERT the box into the live registry. A WAL
-        // failure leaves NO box (the reservation is released) and returns an error,
-        // so a create the client is told failed never leaves an orphan box behind.
-        let cap = self.config.limits.max_boxes;
-        let Some(box_id) = self.reserve_box_slot(cap) else {
+        // RESERVE the cap slot + topic id, LOG + fsync the TopicConfig frame FIRST, and
+        // only after it durably commits INSERT the topic into the live registry. A WAL
+        // failure leaves NO topic (the reservation is released) and returns an error,
+        // so a create the client is told failed never leaves an orphan topic behind.
+        let cap = self.config.limits.max_topics;
+        let Some(topic_id) = self.reserve_topic_slot(cap) else {
             return Err(Error::new(
                 ErrorCode::Throttled,
                 format!(
-                    "box limit reached ({} boxes); cannot create {name:?}",
-                    self.config.limits.max_boxes
+                    "topic limit reached ({} topics); cannot create {name:?}",
+                    self.config.limits.max_topics
                 ),
             )
             .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
             .with_detail(serde_json::json!({
-                "limit": "max_boxes",
-                "max": self.config.limits.max_boxes,
+                "limit": "max_topics",
+                "max": self.config.limits.max_topics,
             })));
         };
 
-        // WAL-FIRST: durably log the create before any in-memory box exists. On a
-        // WAL failure release the reserved cap slot and return — no orphan box.
-        if let Err(e) = self.wal_log(frame(box_id), true) {
-            self.box_count.fetch_sub(1, Ordering::AcqRel);
+        // WAL-FIRST: durably log the create before any in-memory topic exists. On a
+        // WAL failure release the reserved cap slot and return — no orphan topic.
+        if let Err(e) = self.wal_log(frame(topic_id), true) {
+            self.topic_count.fetch_sub(1, Ordering::AcqRel);
             return Err(e);
         }
 
-        // Durably committed AND serialized by `create_lock`: the box is guaranteed
+        // Durably committed AND serialized by `create_lock`: the topic is guaranteed
         // absent (we re-checked under the lock and no other create can interleave),
-        // so insert it into the registry. `insert_reserved_box` still defends
+        // so insert it into the registry. `insert_reserved_topic` still defends
         // against an Occupied entry (releasing the slot) but it can no longer be hit
         // by a same-name create race.
-        let created = self.insert_reserved_box(name, config.clone(), box_id);
+        let created = self.insert_reserved_topic(name, config.clone(), topic_id);
         Ok((created, config))
     }
 
-    /// Atomically reserve one box-count slot against `cap` (`0` ⇒ unlimited) and
-    /// allocate a fresh interned box id, WITHOUT inserting into the registry
+    /// Atomically reserve one topic-count slot against `cap` (`0` ⇒ unlimited) and
+    /// allocate a fresh interned topic id, WITHOUT inserting into the registry
     /// (WAL-first create, deferred review #3). The reserve CAS is the cap
     /// serialization point: only a reservation that observed a count strictly
-    /// below `cap` succeeds, so the surviving box count never exceeds `cap` under a
+    /// below `cap` succeeds, so the surviving topic count never exceeds `cap` under a
     /// concurrent create race. Returns `None` when the cap is full (the caller maps
     /// that to `429 throttled`); the returned slot must be released
-    /// (`box_count.fetch_sub`) if the create later fails or resolves as an update.
-    fn reserve_box_slot(&self, cap: u64) -> Option<u32> {
+    /// (`topic_count.fetch_sub`) if the create later fails or resolves as an update.
+    fn reserve_topic_slot(&self, cap: u64) -> Option<u32> {
         if cap != 0 {
-            let mut cur = self.box_count.load(Ordering::Relaxed);
+            let mut cur = self.topic_count.load(Ordering::Relaxed);
             loop {
                 if cur >= cap {
                     return None;
                 }
-                match self.box_count.compare_exchange_weak(
+                match self.topic_count.compare_exchange_weak(
                     cur,
                     cur + 1,
                     Ordering::AcqRel,
@@ -1358,39 +1358,39 @@ impl Engine {
                 }
             }
         } else {
-            self.box_count.fetch_add(1, Ordering::AcqRel);
+            self.topic_count.fetch_add(1, Ordering::AcqRel);
         }
-        Some(self.alloc_box_id())
+        Some(self.alloc_topic_id())
     }
 
-    /// Insert a box whose create frame is already durably logged (WAL-first
-    /// create). Returns `true` if THIS call created the box, or `false` if a
-    /// concurrent create won the name race first (the reserved `box_id`'s slot is
-    /// released and the existing box's config is updated in place — its own create
-    /// frame is already durable, so we don't re-log). The cap slot for `box_id`
-    /// was reserved by [`Self::reserve_box_slot`]; on the lost-race path it is
+    /// Insert a topic whose create frame is already durably logged (WAL-first
+    /// create). Returns `true` if THIS call created the topic, or `false` if a
+    /// concurrent create won the name race first (the reserved `topic_id`'s slot is
+    /// released and the existing topic's config is updated in place — its own create
+    /// frame is already durable, so we don't re-log). The cap slot for `topic_id`
+    /// was reserved by [`Self::reserve_topic_slot`]; on the lost-race path it is
     /// released here so the count gauge stays exact.
-    fn insert_reserved_box(&self, name: &str, config: BoxConfig, box_id: u32) -> bool {
+    fn insert_reserved_topic(&self, name: &str, config: TopicConfig, topic_id: u32) -> bool {
         use dashmap::mapref::entry::Entry;
-        match self.boxes.entry(name.to_string()) {
+        match self.topics.entry(name.to_string()) {
             Entry::Occupied(e) => {
                 // A racing create won this name first: resolve as an update of the
-                // existing box. Release our reserved slot (the existing box already
+                // existing topic. Release our reserved slot (the existing topic already
                 // counts against the cap) and drop the unused id.
                 let b = e.get();
                 *b.config.write() = config;
                 b.enforce_retention(self.clock.now_ms());
-                self.box_count.fetch_sub(1, Ordering::AcqRel);
+                self.topic_count.fetch_sub(1, Ordering::AcqRel);
                 false
             }
             Entry::Vacant(e) => {
-                let mut state = BoxState::new(name.to_string(), box_id, config, SEQ_BASE, 1);
+                let mut state = TopicState::new(name.to_string(), topic_id, config, SEQ_BASE, 1);
                 // Attach a HOT segment writer on a durable engine (Phase 6 Stage 2)
-                // — for EVERY class including `memory`: a memory box now takes the
+                // — for EVERY class including `memory`: a memory topic now takes the
                 // same disk-like write/recovery path (best-effort, §0.10), so its
                 // records materialize into segments and are fully queryable. A pure
                 // in-memory engine still attaches none (no segment store).
-                if let Some(writer) = self.build_segment_writer(box_id) {
+                if let Some(writer) = self.build_segment_writer(topic_id) {
                     state.attach_segwriter(writer);
                 }
                 e.insert(Arc::new(state));
@@ -1399,48 +1399,48 @@ impl Engine {
         }
     }
 
-    /// Apply a box create/update to the in-memory registry (no WAL logging).
-    /// Shared by the live `put_box` and WAL replay. `forced_id`/`forced_epoch`
+    /// Apply a topic create/update to the in-memory registry (no WAL logging).
+    /// Shared by the live `put_topic` and WAL replay. `forced_id`/`forced_epoch`
     /// let recovery restore the interned id + epoch from the log; live calls pass
     /// `None` and allocate fresh.
     ///
-    /// `cap` is the `max_boxes` limit (`0` ⇒ unlimited): on the vacant-create path
-    /// the live `box_count` gauge is **atomically reserved** against `cap` BEFORE the
+    /// `cap` is the `max_topics` limit (`0` ⇒ unlimited): on the vacant-create path
+    /// the live `topic_count` gauge is **atomically reserved** against `cap` BEFORE the
     /// registry insert (codex P2 #10), so a concurrent create race can never push the
-    /// surviving box count over the cap. Returns `Some((created, box_id))`, or `None`
+    /// surviving topic count over the cap. Returns `Some((created, topic_id))`, or `None`
     /// when a fresh create was refused because the cap is full (the caller maps that
-    /// to `429 throttled`). An update of an existing box never counts against the cap
+    /// to `429 throttled`). An update of an existing topic never counts against the cap
     /// and always returns `Some`.
-    fn apply_put_box(
+    fn apply_put_topic(
         &self,
         name: &str,
-        config: BoxConfig,
+        config: TopicConfig,
         forced_id: Option<u32>,
         forced_epoch: Option<u64>,
         cap: u64,
     ) -> Option<(bool, u32)> {
         use dashmap::mapref::entry::Entry;
-        match self.boxes.entry(name.to_string()) {
+        match self.topics.entry(name.to_string()) {
             Entry::Occupied(e) => {
-                // Existing box → replace config in place (no epoch bump, no
+                // Existing topic → replace config in place (no epoch bump, no
                 // record rewrite). Tightened caps/ttl take effect immediately.
                 let b = e.get();
                 *b.config.write() = config;
                 b.enforce_retention(self.clock.now_ms());
-                Some((false, b.box_id))
+                Some((false, b.topic_id))
             }
             Entry::Vacant(e) => {
-                // Atomic reserve-then-insert against the box cap. The CAS loop is the
+                // Atomic reserve-then-insert against the topic cap. The CAS loop is the
                 // serialization point for the cap: only a reservation that observed a
                 // count strictly below `cap` proceeds to insert, so the surviving
                 // count never exceeds `cap`. `cap == 0` ⇒ unlimited (just bump).
                 if cap != 0 {
-                    let mut cur = self.box_count.load(Ordering::Relaxed);
+                    let mut cur = self.topic_count.load(Ordering::Relaxed);
                     loop {
                         if cur >= cap {
                             return None; // cap full → caller returns 429 throttled.
                         }
-                        match self.box_count.compare_exchange_weak(
+                        match self.topic_count.compare_exchange_weak(
                             cur,
                             cur + 1,
                             Ordering::AcqRel,
@@ -1451,14 +1451,14 @@ impl Engine {
                         }
                     }
                 } else {
-                    self.box_count.fetch_add(1, Ordering::AcqRel);
+                    self.topic_count.fetch_add(1, Ordering::AcqRel);
                 }
-                let box_id = forced_id.unwrap_or_else(|| self.alloc_box_id());
+                let topic_id = forced_id.unwrap_or_else(|| self.alloc_topic_id());
                 if let Some(fid) = forced_id {
                     // Keep the allocator ahead of any replayed id.
-                    let mut cur = self.next_box_id.load(Ordering::Relaxed);
+                    let mut cur = self.next_topic_id.load(Ordering::Relaxed);
                     while (fid as u64) >= cur {
-                        match self.next_box_id.compare_exchange_weak(
+                        match self.next_topic_id.compare_exchange_weak(
                             cur,
                             fid as u64 + 1,
                             Ordering::Relaxed,
@@ -1469,9 +1469,9 @@ impl Engine {
                         }
                     }
                 }
-                let mut state = BoxState::new(
+                let mut state = TopicState::new(
                     name.to_string(),
-                    box_id,
+                    topic_id,
                     config,
                     SEQ_BASE,
                     forced_epoch.unwrap_or(1),
@@ -1479,15 +1479,15 @@ impl Engine {
                 // Attach a HOT segment writer for a durable engine so committed
                 // records are materialized into segments (Phase 6 Stage 2). A pure
                 // in-memory engine attaches none → payloads stay resident and the
-                // read path is unchanged by construction. A `memory`-class box gets
+                // read path is unchanged by construction. A `memory`-class topic gets
                 // a writer too: it shares the disk-like best-effort path (§0.10), so
                 // its records materialize + are fully queryable + may persist (its
                 // on-disk trace is allowed — recovery is best-effort, never forced).
-                if let Some(writer) = self.build_segment_writer(box_id) {
+                if let Some(writer) = self.build_segment_writer(topic_id) {
                     state.attach_segwriter(writer);
                 }
                 e.insert(Arc::new(state));
-                Some((true, box_id))
+                Some((true, topic_id))
             }
         }
     }
@@ -1496,44 +1496,44 @@ impl Engine {
     // WAL-replay apply paths (recovery only; never re-log to the WAL).
     // -----------------------------------------------------------------------
 
-    /// Find a box by its interned id (linear over the registry; used only by
+    /// Find a topic by its interned id (linear over the registry; used only by
     /// recovery, which is one-shot at startup).
-    pub(crate) fn get_box_by_id(&self, box_id: u32) -> Option<Arc<BoxState>> {
-        self.boxes
+    pub(crate) fn get_topic_by_id(&self, topic_id: u32) -> Option<Arc<TopicState>> {
+        self.topics
             .iter()
-            .find(|e| e.value().box_id == box_id)
+            .find(|e| e.value().topic_id == topic_id)
             .map(|e| e.value().clone())
     }
 
-    /// Create/update a box during replay (no WAL logging). Returns `(created,
-    /// box_id)`. Recovery is single-threaded and must restore every logged box, so
-    /// the cap is bypassed (`0` ⇒ unlimited); the live `box_count` gauge is still
+    /// Create/update a topic during replay (no WAL logging). Returns `(created,
+    /// topic_id)`. Recovery is single-threaded and must restore every logged topic, so
+    /// the cap is bypassed (`0` ⇒ unlimited); the live `topic_count` gauge is still
     /// bumped so it matches the rebuilt registry.
-    pub(crate) fn apply_put_box_for_recovery(
+    pub(crate) fn apply_put_topic_for_recovery(
         &self,
         name: &str,
-        config: BoxConfig,
+        config: TopicConfig,
         forced_id: Option<u32>,
     ) -> (bool, u32) {
-        self.apply_put_box(name, config, forced_id, None, 0)
-            .expect("recovery box create is never cap-refused (cap bypassed)")
+        self.apply_put_topic(name, config, forced_id, None, 0)
+            .expect("recovery topic create is never cap-refused (cap bypassed)")
     }
 
-    /// Remove a box during replay (box-delete tombstone). No cascade logging.
-    pub(crate) fn remove_box_for_recovery(&self, name: &str) {
-        if self.boxes.remove(name).is_some() {
-            self.box_count.fetch_sub(1, Ordering::AcqRel);
+    /// Remove a topic during replay (topic-delete tombstone). No cascade logging.
+    pub(crate) fn remove_topic_for_recovery(&self, name: &str) {
+        if self.topics.remove(name).is_some() {
+            self.topic_count.fetch_sub(1, Ordering::AcqRel);
         }
-        self.routers.lock().remove_touching_box(name);
+        self.routers.lock().remove_touching_topic(name);
         self.refresh_router_source_flags();
     }
 
     /// Re-insert a replayed record at its logged seq (no WAL logging). Appends in
-    /// the WAL are in per-box seq order with no gaps, so `BoxState::append`
+    /// the WAL are in per-topic seq order with no gaps, so `TopicState::append`
     /// reproduces the same seq; `expected_seq` is asserted in debug builds.
     pub(crate) fn apply_append_for_recovery(
         &self,
-        b: &BoxState,
+        b: &TopicState,
         expected_seq: u64,
         rec: ReplayRecord,
     ) {
@@ -1555,14 +1555,14 @@ impl Engine {
         debug_assert_eq!(
             assigned.first().copied(),
             Some(expected_seq),
-            "replay seq mismatch (box {})",
+            "replay seq mismatch (topic {})",
             b.name
         );
     }
 
     /// Re-create a router during replay (no WAL logging, no auto-create — the
-    /// boxes were already materialized by their own replayed config frames; if a
-    /// box is missing the router simply has no effect until one exists).
+    /// topics were already materialized by their own replayed config frames; if a
+    /// topic is missing the router simply has no effect until one exists).
     pub(crate) fn apply_router_create_for_recovery(&self, op: RouterOp) {
         let router = Router {
             name: op.name.clone(),
@@ -1601,16 +1601,16 @@ impl Engine {
                 // legacy frame (absent pair) recomputes from the live source head.
                 if created {
                     let cursor = op.initial_cursor.unwrap_or_else(|| {
-                        self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0)
+                        self.get_topic(&op.source).map(|b| b.head_seq()).unwrap_or(0)
                     });
                     let dest_base = op.initial_dest_base.unwrap_or_else(|| {
-                        self.get_box(&op.dest).map(|b| b.head_seq()).unwrap_or(0)
+                        self.get_topic(&op.dest).map(|b| b.head_seq()).unwrap_or(0)
                     });
                     graph.note_forwarded(&op.name, cursor, 0);
                     graph.seed_dest_base(&op.name, dest_base);
                 }
             } else {
-                let src_head = self.get_box(&op.source).map(|b| b.head_seq()).unwrap_or(0);
+                let src_head = self.get_topic(&op.source).map(|b| b.head_seq()).unwrap_or(0);
                 graph.note_forwarded(&op.name, src_head, 0);
             }
         }
@@ -1676,14 +1676,14 @@ impl Engine {
         }
     }
 
-    /// Recompute every box's `is_router_source` atomic from the current router
-    /// graph (codex P1). Called after ANY graph mutation (create / delete / box
+    /// Recompute every topic's `is_router_source` atomic from the current router
+    /// graph (codex P1). Called after ANY graph mutation (create / delete / topic
     /// delete / replay / restore) — all rare control-plane ops — so the write hot
-    /// path can read the per-box atomic instead of locking the global graph on
-    /// every append. O(boxes + routers); never on the write path.
+    /// path can read the per-topic atomic instead of locking the global graph on
+    /// every append. O(topics + routers); never on the write path.
     pub(crate) fn refresh_router_source_flags(&self) {
         let sources = self.routers.lock().source_names();
-        for entry in self.boxes.iter() {
+        for entry in self.topics.iter() {
             let b = entry.value();
             let is_src = sources.contains(&b.name);
             b.is_router_source
@@ -1691,12 +1691,12 @@ impl Engine {
         }
     }
 
-    /// `GET /v0/boxes/:box` — box state. Never auto-creates.
-    pub fn box_state(&self, name: &str, touch: bool) -> Result<BoxStateResponse> {
+    /// `GET /v0/topics/:topic` — topic state. Never auto-creates.
+    pub fn topic_state(&self, name: &str, touch: bool) -> Result<TopicStateResponse> {
         let start = Instant::now();
         let b = self
-            .get_box(name)
-            .ok_or_else(|| Error::box_not_found(name))?;
+            .get_topic(name)
+            .ok_or_else(|| Error::topic_not_found(name))?;
         // Read-path catch-up (forward_v2): drain routers feeding this dest so the
         // reported head_seq/count reflect forwarded records on an immediate state
         // read after a source write (read-your-writes). Inert under v2-off.
@@ -1711,7 +1711,7 @@ impl Engine {
         self.enforce_retention_durable(&b, now)?;
 
         if touch {
-            // A state read bumps the box's auto-priority recency clock and the
+            // A state read bumps the topic's auto-priority recency clock and the
             // read recency (DESIGN §3.1).
             b.last_read_ms.store(now, Ordering::Relaxed);
             b.last_consumed_ms.store(now, Ordering::Relaxed);
@@ -1722,7 +1722,7 @@ impl Engine {
         let config = b.config.read().clone();
         let effective_priority = self.effective_priority(&b);
 
-        // A queue box exposes its lease counters (§10.7) alongside the normal
+        // A queue topic exposes its lease counters (§10.7) alongside the normal
         // state; a plain log omits the `queue` sub-object.
         let queue = if b.is_queue() {
             Some(self.queue_counters(&b, now))
@@ -1730,8 +1730,8 @@ impl Engine {
             None
         };
 
-        Ok(BoxStateResponse {
-            box_name: name.to_string(),
+        Ok(TopicStateResponse {
+            topic_name: name.to_string(),
             r#type: config.r#type,
             head_seq: head,
             earliest_seq: earliest,
@@ -1740,34 +1740,34 @@ impl Engine {
             bytes: b.bytes(),
             config,
             effective_priority,
-            last_write_ts: BoxState::read_ts(&b.last_write_ms),
-            last_read_ts: BoxState::read_ts(&b.last_read_ms),
+            last_write_ts: TopicState::read_ts(&b.last_write_ms),
+            last_read_ts: TopicState::read_ts(&b.last_read_ms),
             queue,
             performance: Performance::with_total(elapsed_ms(start)),
         })
     }
 
-    /// `GET /v0/boxes` — list boxes (opaque-cursor paginated).
-    pub fn list_boxes(
+    /// `GET /v0/topics` — list topics (opaque-cursor paginated).
+    pub fn list_topics(
         &self,
         prefix: Option<&str>,
         page_size: usize,
         cursor: Option<&str>,
         touch: bool,
         allow_prefixes: &[String],
-    ) -> Result<BoxListResponse> {
+    ) -> Result<TopicListResponse> {
         let start = Instant::now();
         let page_size = page_size.clamp(1, config::MAX_PAGE_SIZE);
         let after = decode_cursor(cursor)?;
         let now = self.clock.now_ms();
 
         // Collect + sort names for stable opaque-cursor paging (API §0.7).
-        // `allow_prefixes` is the caller key's box-name allowlist (empty ⇒ no
-        // restriction): a prefix-limited key must not see cross-tenant box names
+        // `allow_prefixes` is the caller key's topic-name allowlist (empty ⇒ no
+        // restriction): a prefix-limited key must not see cross-tenant topic names
         // in the listing (codex MEDIUM #7), so names outside its allowlist are
         // filtered out here just as they are rejected on direct access.
         let mut names: Vec<String> = self
-            .boxes
+            .topics
             .iter()
             .map(|e| e.key().clone())
             .filter(|n| prefix.map(|p| n.starts_with(p)).unwrap_or(true))
@@ -1779,9 +1779,9 @@ impl Engine {
         let has_more = names.len() > page_size;
         names.truncate(page_size);
 
-        let mut boxes = Vec::with_capacity(names.len());
+        let mut topics = Vec::with_capacity(names.len());
         for n in &names {
-            if let Some(b) = self.get_box(n) {
+            if let Some(b) = self.get_topic(n) {
                 self.enforce_retention_durable(&b, now)?;
                 if touch {
                     b.last_consumed_ms.store(now, Ordering::Relaxed);
@@ -1789,8 +1789,8 @@ impl Engine {
                 let cfg = b.config.read();
                 let durable = cfg.durable;
                 drop(cfg);
-                boxes.push(BoxSummary {
-                    box_name: n.clone(),
+                topics.push(TopicSummary {
+                    topic_name: n.clone(),
                     head_seq: b.head_seq(),
                     earliest_seq: b.earliest_seq(),
                     count: b.count(),
@@ -1807,23 +1807,23 @@ impl Engine {
             None
         };
 
-        Ok(BoxListResponse {
-            boxes,
+        Ok(TopicListResponse {
+            topics,
             next_cursor,
             performance: Performance::with_total(elapsed_ms(start)),
         })
     }
 
-    /// `DELETE /v0/boxes/:box` — delete box + cascade routers.
-    pub fn delete_box(&self, name: &str, if_empty: bool) -> Result<BoxDeleteResponse> {
+    /// `DELETE /v0/topics/:topic` — delete topic + cascade routers.
+    pub fn delete_topic(&self, name: &str, if_empty: bool) -> Result<TopicDeleteResponse> {
         let start = Instant::now();
 
-        // Absent box → idempotent no-op (API §1.4): deleted:false, no cascade.
-        let b = match self.get_box(name) {
+        // Absent topic → idempotent no-op (API §1.4): deleted:false, no cascade.
+        let b = match self.get_topic(name) {
             Some(b) => b,
             None => {
-                return Ok(BoxDeleteResponse {
-                    box_name: name.to_string(),
+                return Ok(TopicDeleteResponse {
+                    topic_name: name.to_string(),
                     deleted: false,
                     routers_removed: Vec::new(),
                     performance: Performance::with_total(elapsed_ms(start)),
@@ -1835,27 +1835,27 @@ impl Engine {
             self.enforce_retention_durable(&b, self.clock.now_ms())?;
             if b.count() != 0 {
                 return Err(Error::new(
-                    ErrorCode::BoxNotEmpty,
-                    format!("box {name:?} is not empty"),
+                    ErrorCode::TopicNotEmpty,
+                    format!("topic {name:?} is not empty"),
                 )
-                .with_detail(serde_json::json!({ "box": name, "count": b.count() })));
+                .with_detail(serde_json::json!({ "topic": name, "count": b.count() })));
             }
         }
 
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
         // Pre-compute the cascade WITHOUT mutating, then durably log every
         // tombstone BEFORE touching memory (codex P0): if the WAL append/fsync
         // fails we return an error having removed NOTHING, so a retry still finds
-        // the box present and re-attempts the durable delete — it can never become
+        // the topic present and re-attempts the durable delete — it can never become
         // a false idempotent success that a crash then resurrects. The control
         // frames replay deterministically, so a crash after success cannot revive
-        // the box/routers and a crash before success leaves them fully intact.
-        let routers_removed = self.routers.lock().routers_touching_box(name);
+        // the topic/routers and a crash before success leaves them fully intact.
+        let routers_removed = self.routers.lock().routers_touching_topic(name);
         let now = self.clock.now_ms().max(0) as u64;
         self.wal_log(
-            WalRecord::BoxConfig {
-                box_id,
-                op: crate::storage::BoxConfigOp {
+            WalRecord::TopicConfig {
+                topic_id,
+                op: crate::storage::TopicConfigOp {
                     name: name.to_string(),
                     config: Vec::new(),
                 },
@@ -1875,21 +1875,21 @@ impl Engine {
         }
 
         // Durably logged: NOW apply the in-memory removal + cascade. Release this
-        // box's reservations from the live gauges (box-count + byte-total) so the
-        // `max_boxes` / `max_total_bytes` caps free the capacity it held.
+        // topic's reservations from the live gauges (topic-count + byte-total) so the
+        // `max_topics` / `max_total_bytes` caps free the capacity it held.
         let freed_bytes = b.bytes();
-        if self.boxes.remove(name).is_some() {
-            self.box_count.fetch_sub(1, Ordering::AcqRel);
+        if self.topics.remove(name).is_some() {
+            self.topic_count.fetch_sub(1, Ordering::AcqRel);
             self.total_bytes_live.fetch_sub(
                 freed_bytes.min(self.total_bytes_live.load(Ordering::Relaxed)),
                 Ordering::AcqRel,
             );
         }
-        self.routers.lock().remove_touching_box(name);
+        self.routers.lock().remove_touching_topic(name);
         self.refresh_router_source_flags();
 
-        Ok(BoxDeleteResponse {
-            box_name: name.to_string(),
+        Ok(TopicDeleteResponse {
+            topic_name: name.to_string(),
             deleted: true,
             routers_removed,
             performance: Performance::with_total(elapsed_ms(start)),
@@ -1900,7 +1900,7 @@ impl Engine {
     // Write (API §2)
     // -----------------------------------------------------------------------
 
-    /// `POST /v0/boxes/:box` — append records, assign seqs, forward to routers.
+    /// `POST /v0/topics/:topic` — append records, assign seqs, forward to routers.
     pub fn write(&self, name: &str, req: WriteRequest, return_seqs: bool) -> Result<WriteResponse> {
         let start = Instant::now();
         let now = self.clock.now_ms();
@@ -1936,11 +1936,11 @@ impl Engine {
             stored.push(sr);
         }
 
-        // --- Resolve the box, honoring create / auto_create. ----------------
-        let (b, created) = match self.get_box(name) {
+        // --- Resolve the topic, honoring create / auto_create. ----------------
+        let (b, created) = match self.get_topic(name) {
             Some(b) => (b, false),
             None => {
-                // Box absent: may we create it? `create:false` always refuses;
+                // Topic absent: may we create it? `create:false` always refuses;
                 // `create:true` always creates; an absent flag defers to the
                 // would-be config's `auto_create` (the inline `config`).
                 let create_cfg = req.config.clone().unwrap_or_default();
@@ -1949,16 +1949,16 @@ impl Engine {
                     None => create_cfg.auto_create,
                 };
                 if !may_create {
-                    return Err(Error::box_not_found(name));
+                    return Err(Error::topic_not_found(name));
                 }
                 if !config::is_valid_name(name) {
-                    return Err(Error::invalid_request(format!("invalid box name {name:?}")));
+                    return Err(Error::invalid_request(format!("invalid topic name {name:?}")));
                 }
                 validate_config(&create_cfg)?;
-                let (was_created, _cfg) = self.put_box(name, create_cfg)?;
+                let (was_created, _cfg) = self.put_topic(name, create_cfg)?;
                 let b = self
-                    .get_box(name)
-                    .ok_or_else(|| Error::internal("box vanished after create"))?;
+                    .get_topic(name)
+                    .ok_or_else(|| Error::internal("topic vanished after create"))?;
                 (b, was_created)
             }
         };
@@ -1995,7 +1995,7 @@ impl Engine {
                     b.release_dedupe_gate(key, &g);
                 }
                 return Ok(WriteResponse {
-                    box_name: name.to_string(),
+                    topic_name: name.to_string(),
                     first_seq: *seqs.first().unwrap_or(&0),
                     last_seq: *seqs.last().unwrap_or(&0),
                     seqs: if return_seqs {
@@ -2012,7 +2012,7 @@ impl Engine {
             }
         }
 
-        // --- Admission (discard:"reject" full-box check, DESIGN §5.3). ------
+        // --- Admission (discard:"reject" full-topic check, DESIGN §5.3). ------
         // Enforce retention first so current occupancy is the logical floor.
         b.enforce_retention(now);
         let cfg = b.config.read();
@@ -2022,20 +2022,20 @@ impl Engine {
         let class = cfg.durability_class();
         let durable = class == Durability::Fsync;
         drop(cfg);
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
 
         // A single write larger than the whole byte cap is a permanent
-        // `400 record_too_large`, distinct from a retryable `422 box_full`.
+        // `400 record_too_large`, distinct from a retryable `422 topic_full`.
         if cap_bytes > 0 && incoming_bytes > cap_bytes && discard == Discard::Reject {
             return Err(Error::new(
                 ErrorCode::RecordTooLarge,
-                "write exceeds the box's entire cap_bytes",
+                "write exceeds the topic's entire cap_bytes",
             ));
         }
         if cap_records > 0 && stored.len() as u64 > cap_records && discard == Discard::Reject {
             return Err(Error::new(
                 ErrorCode::RecordTooLarge,
-                "write exceeds the box's entire cap_records",
+                "write exceeds the topic's entire cap_records",
             ));
         }
 
@@ -2050,11 +2050,11 @@ impl Engine {
         );
         if decision == AdmitDecision::Reject {
             return Err(Error::new(
-                ErrorCode::BoxFull,
-                format!("box {name:?} is full (discard=reject)"),
+                ErrorCode::TopicFull,
+                format!("topic {name:?} is full (discard=reject)"),
             )
             .with_detail(serde_json::json!({
-                "box": name,
+                "topic": name,
                 "cap_records": cap_records,
                 "cap_bytes": cap_bytes,
                 "head_seq": b.head_seq(),
@@ -2063,7 +2063,7 @@ impl Engine {
         }
 
         // Global byte quota (DoS hardening; codex HIGH #5 / P2 #10): bound total
-        // disk/RAM growth across all boxes. Checked ONLY when the quota is enabled
+        // disk/RAM growth across all topics. Checked ONLY when the quota is enabled
         // (`max_total_bytes != 0`), so the default/unlimited path is unchanged and
         // pays nothing. The reservation is ATOMIC — `try_reserve_total_bytes` CASes
         // `incoming_bytes` onto the running `total_bytes_live` gauge and only admits
@@ -2088,10 +2088,10 @@ impl Engine {
         // --- WAL-FIRST append (ARCHITECTURE §2.2). -------------------------
         // The resolved records are needed in two places AFTER `stage_append`
         // consumes the input vec: (a) WAL frame encoding, which happens whenever a
-        // WAL actually exists, and (b) router forwarding when this box is a router
-        // source. A write that needs NEITHER (no WAL, no routers — e.g. any box on
+        // WAL actually exists, and (b) router forwarding when this topic is a router
+        // source. A write that needs NEITHER (no WAL, no routers — e.g. any topic on
         // an in-memory engine) skips the deep clone of every `serde_json::Value`
-        // entirely on that hot path (codex P0 #2). The router check reads the box's
+        // entirely on that hot path (codex P0 #2). The router check reads the topic's
         // lock-free `is_router_source` atomic (maintained by the rare graph-mutation
         // control path) instead of taking the GLOBAL router-graph mutex on every
         // append — that global lock capped WAL-shard write scaling (codex P1). The
@@ -2099,7 +2099,7 @@ impl Engine {
         // get the actual routes, so a momentarily-stale flag never drops/duplicates a
         // record; it only decides whether to snapshot the payloads for forwarding.
         //
-        // A `memory`-class box now takes the SAME disk-like write path (group-
+        // A `memory`-class topic now takes the SAME disk-like write path (group-
         // committed WAL, NO fsync gate) — it is `disk` with NO durability GUARANTEE:
         // its records MAY survive a restart or MAY be lost, recovery is best-effort
         // (§0.10). So `memory` writes to the WAL exactly like `disk`.
@@ -2111,10 +2111,10 @@ impl Engine {
             Vec::new()
         };
 
-        // The per-box append lock spans only the SEQ-ORDER critical section:
+        // The per-topic append lock spans only the SEQ-ORDER critical section:
         // stage seqs → enqueue the WAL frame → take a publish ticket. The fsync
         // `wait()` then happens OFF the lock (codex P0 #1), so many concurrent
-        // durable writers to THIS box coalesce into ONE group-commit fsync instead
+        // durable writers to THIS topic coalesce into ONE group-commit fsync instead
         // of serializing one-fsync-per-write. Staged records sit in the index
         // deque but are INVISIBLE (head_seq unchanged) until published; publish is
         // gated to strict seq order by the ticket, so the single ordered WAL
@@ -2127,12 +2127,12 @@ impl Engine {
             let staged = b.stage_append(stored);
             let seqs = staged.seqs();
             // Enqueue the WAL frame(s) for the staged seqs (still under the lock,
-            // so a box's frames are enqueued in exactly their seq order). A
-            // `memory`-class box takes this disk-like path too (group-committed,
+            // so a topic's frames are enqueued in exactly their seq order). A
+            // `memory`-class topic takes this disk-like path too (group-committed,
             // best-effort, NOT fsync-gated): its frames may persist or be lost, but
             // it shares the exact write path so it is fully queryable + recoverable.
             let (wal_append_ms, commit_token) =
-                match self.wal_enqueue_batch(box_id, &seqs, &stored_snapshot, now, durable) {
+                match self.wal_enqueue_batch(topic_id, &seqs, &stored_snapshot, now, durable) {
                     Ok(v) => v,
                     Err(e) => {
                         // WAL append failed before commit: publish nothing. No
@@ -2234,7 +2234,7 @@ impl Engine {
             if class == Durability::Disk {
                 // The head this batch is about to publish (its last staged seq).
                 let publish_head = staged.publish_head();
-                if let Err(e) = self.ensure_disk_head_reserved(box_id, &b, publish_head, now) {
+                if let Err(e) = self.ensure_disk_head_reserved(topic_id, &b, publish_head, now) {
                     b.rollback_staged_by_seqs(&staged);
                     ticket.done();
                     if bytes_reserved {
@@ -2246,7 +2246,7 @@ impl Engine {
             // Durably committed AND (for disk) durably reserved: NOW publish the
             // staged records, making them visible + notifying waiters. R6: seal the
             // segment AFTER releasing the publish gate (below) so a slow seal `put`
-            // fsync never serializes same-box writers behind the gate.
+            // fsync never serializes same-topic writers behind the gate.
             let pub_range = b.publish_staged_no_seal(staged, now);
             let head = b.head_seq();
             ticket.done();
@@ -2261,7 +2261,7 @@ impl Engine {
         // Post-append eviction for discard:"old" (may surface as a tombstone to
         // lagging consumers later). When this involuntary eviction advances the
         // loss floor via a NON-RE-DERIVABLE cause (TTL or byte-cap) on a non-`memory`
-        // box, the monotone `EvictWatermark` is fsynced BEFORE the floor advances and
+        // topic, the monotone `EvictWatermark` is fsynced BEFORE the floor advances and
         // the records are reclaimed (R7 / codex P0 #4), so a watermark fsync failure
         // can never leave the floor advanced-but-not-durable (a relaxed cap or
         // backward clock could otherwise resurrect an evicted record on restart). The
@@ -2289,12 +2289,12 @@ impl Engine {
         // --- Router forwarding (at-least-once, per-source FIFO). -----------
         // Forward off the freshly-stored records (carrying resolved $node/$tag),
         // recursing through chained routers with a bounded hop counter. Skipped
-        // entirely when this box is not a router source (the common case): the
+        // entirely when this topic is not a router source (the common case): the
         // snapshot was never even cloned above, so there is nothing to forward.
         // `forward_v2`: the write/ack path does NOT forward. Forwarded dest records
         // are DERIVED off the durable source log + the per-router cursor, never
         // separately WAL-logged, so a source append fanning to N dests is ONE WAL
-        // append (this box's) + the periodic cursor, not N (no amplification). The
+        // append (this topic's) + the periodic cursor, not N (no amplification). The
         // `mark_dirty_fast` below wakes the background router worker; an immediate
         // dest read also catches up via `catch_up_dest` (read-your-writes). The
         // legacy synchronous `forward_from` path runs only with v2 OFF.
@@ -2311,20 +2311,20 @@ impl Engine {
             self.forward_from(name, &forwarded, now, 0);
         }
 
-        // Mark the box dirty in the scheduler (advisory in phase 2). Lock-free once
-        // the box is already dirty, so this no longer takes a GLOBAL mutex on every
+        // Mark the topic dirty in the scheduler (advisory in phase 2). Lock-free once
+        // the topic is already dirty, so this no longer takes a GLOBAL mutex on every
         // append — that lock capped WAL-shard write scaling (codex P1).
         self.scheduler
             .mark_dirty_fast(name, self.effective_priority(&b), &b.sched_dirty);
 
-        // Populate WAL timings: real `fsync_ms` for a durable box (the response
+        // Populate WAL timings: real `fsync_ms` for a durable topic (the response
         // is fsync-gated), `0.0` for non-durable and for pure in-memory mode.
         let mut perf = Performance::with_total(elapsed_ms(start));
         perf.wal_append_ms = Some(wal_append_ms);
         perf.fsync_ms = Some(fsync_ms);
 
         Ok(WriteResponse {
-            box_name: name.to_string(),
+            topic_name: name.to_string(),
             first_seq: *seqs.first().unwrap_or(&0),
             last_seq: *seqs.last().unwrap_or(&0),
             seqs: if return_seqs {
@@ -2341,9 +2341,9 @@ impl Engine {
     }
 
     /// Forward freshly-committed records from `source` to every router whose
-    /// source is this box (at-least-once, per-source FIFO; DESIGN §8).
+    /// source is this topic (at-least-once, per-source FIFO; DESIGN §8).
     ///
-    /// Recurses through chained routers (A→B→C) so a forward into a box that is
+    /// Recurses through chained routers (A→B→C) so a forward into a topic that is
     /// itself a router source fans on. `hops` is the bounded loop-breaker: a
     /// record carrying `hops >= MAX_ROUTER_HOPS` is not forwarded again, so even
     /// `allow_cycle` topologies terminate (DESIGN §8.5).
@@ -2354,12 +2354,12 @@ impl Engine {
     fn forward_from(&self, source: &str, records: &[ForwardRecord], now: i64, hops: u8) {
         if hops >= config::MAX_ROUTER_HOPS {
             // Hop budget exhausted: stop forwarding (loop-breaking). The records
-            // already landed in this box; we just don't fan them out further.
+            // already landed in this topic; we just don't fan them out further.
             return;
         }
         let routes = self.routers.lock().routers_for_source(source);
         for r in routes {
-            let Some(dest) = self.get_box(&r.dest) else {
+            let Some(dest) = self.get_topic(&r.dest) else {
                 continue; // dest gone; cascade should have removed the router.
             };
 
@@ -2434,7 +2434,7 @@ impl Engine {
             let count = to_append.len() as u64;
             // Forwarded copies go through the SAME WAL-first durable append path
             // as user writes (ARCHITECTURE §2.2), so a routed copy into a durable
-            // destination box is durable by construction and recovers naturally via
+            // destination topic is durable by construction and recovers naturally via
             // WAL replay — it no longer lives only in memory and vanishes on restart
             // (the bug this fixes). A WAL/fsync failure publishes nothing and is
             // treated as backpressure: don't advance the router cursor, so the
@@ -2471,7 +2471,7 @@ impl Engine {
             );
 
             // Advance the per-router cursor + forwarded_total.
-            let src_head = self.get_box(source).map(|b| b.head_seq()).unwrap_or(0);
+            let src_head = self.get_topic(source).map(|b| b.head_seq()).unwrap_or(0);
             self.routers.lock().note_forwarded(&r.name, src_head, count);
 
             // Recurse: the dest may itself be a router source (chains / cycles).
@@ -2538,10 +2538,10 @@ impl Engine {
             }
         };
 
-        let Some(source) = self.get_box(&router.source) else {
+        let Some(source) = self.get_topic(&router.source) else {
             return 0;
         };
-        let Some(dest) = self.get_box(&router.dest) else {
+        let Some(dest) = self.get_topic(&router.dest) else {
             return 0; // dest gone; the cascade should have removed the router.
         };
 
@@ -2749,7 +2749,7 @@ impl Engine {
         consumed
     }
 
-    /// Read-path catch-up: before a dest box is read (`diff`/SSE/queue/GET
+    /// Read-path catch-up: before a dest topic is read (`diff`/SSE/queue/GET
     /// state), drain every router whose `dest == dest_name` up to the source
     /// head, so an immediate read after a source write is read-your-writes
     /// consistent (what keeps the no-sleep router tests green under async ack).
@@ -2790,24 +2790,24 @@ impl Engine {
         if !self.forward_v2 {
             return 0;
         }
-        // Drain the scheduler's dirty set, clearing each box's `sched_dirty` flag so
-        // a future write re-enqueues it. For every drained box that is a router
+        // Drain the scheduler's dirty set, clearing each topic's `sched_dirty` flag so
+        // a future write re-enqueues it. For every drained topic that is a router
         // source, advance each of its routers one bounded pass. A router still
         // behind re-marks its source dirty (in `advance_router`), so the next pass
-        // continues it — no box monopolizes a pass.
+        // continues it — no topic monopolizes a pass.
         let drained = self.scheduler.drain_order_clearing(|name| {
-            if let Some(b) = self.boxes.get(name) {
+            if let Some(b) = self.topics.get(name) {
                 b.value()
                     .sched_dirty
                     .store(false, std::sync::atomic::Ordering::Release);
             }
         });
         let mut total = 0u64;
-        for box_name in drained {
+        for topic_name in drained {
             let routers: Vec<String> = {
                 let graph = self.routers.lock();
                 graph
-                    .routers_for_source(&box_name)
+                    .routers_for_source(&topic_name)
                     .into_iter()
                     .map(|r| r.name)
                     .collect()
@@ -2823,13 +2823,13 @@ impl Engine {
     // Diff (API §3)
     // -----------------------------------------------------------------------
 
-    /// `POST /v0/boxes/:box/diff` — read difference from a cursor. Never
+    /// `POST /v0/topics/:topic/diff` — read difference from a cursor. Never
     /// auto-creates.
     pub fn diff(&self, name: &str, req: DiffRequest) -> Result<DiffResponse> {
         let start = Instant::now();
         let b = self
-            .get_box(name)
-            .ok_or_else(|| Error::box_not_found(name))?;
+            .get_topic(name)
+            .ok_or_else(|| Error::topic_not_found(name))?;
         // Read-path catch-up (forward_v2): drain routers feeding this dest so an
         // immediate read after a source write is read-your-writes consistent.
         // Inert under the default flag (Stage 1), so the live path is unchanged.
@@ -2843,7 +2843,7 @@ impl Engine {
         // tombstone the next restart could resurrect.
         self.enforce_retention_durable(&b, now)?;
 
-        // Bump auto-priority recency (a diff "consumes" the box; DESIGN §3.1).
+        // Bump auto-priority recency (a diff "consumes" the topic; DESIGN §3.1).
         b.last_read_ms.store(now, Ordering::Relaxed);
         b.last_consumed_ms.store(now, Ordering::Relaxed);
 
@@ -2886,7 +2886,7 @@ impl Engine {
         // evict_earliest`. Deletions never trigger a tombstone.
         let mut cursor = from_seq;
         if from_seq > head {
-            // From the future relative to this box instance ⇒ delete+recreate
+            // From the future relative to this topic instance ⇒ delete+recreate
             // (or a stale cursor). Emit a `recreated` tombstone and resume from
             // earliest (DESIGN §5.5).
             tombstone = Some(Tombstone {
@@ -3024,7 +3024,7 @@ impl Engine {
         }
 
         Ok(DiffResponse {
-            box_name: name.to_string(),
+            topic_name: name.to_string(),
             records,
             next_from_seq,
             head_seq: head,
@@ -3040,7 +3040,7 @@ impl Engine {
     // Deletion (permanent, point-in-time, silent — API §5, DESIGN §7)
     // -----------------------------------------------------------------------
 
-    /// `POST /v0/boxes/:box/delete` — permanently delete records by seq range
+    /// `POST /v0/topics/:topic/delete` — permanently delete records by seq range
     /// (`before_seq`) and/or tag `match`. At least one selector is required.
     pub fn delete(&self, name: &str, req: DeleteRequest) -> Result<DeleteResponse> {
         let start = Instant::now();
@@ -3051,10 +3051,10 @@ impl Engine {
             ));
         }
         let b = self
-            .get_box(name)
-            .ok_or_else(|| Error::box_not_found(name))?;
+            .get_topic(name)
+            .ok_or_else(|| Error::topic_not_found(name))?;
         let now = self.clock.now_ms();
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
         let class = b.config.read().durability_class();
         let durable = class == Durability::Fsync;
 
@@ -3070,12 +3070,12 @@ impl Engine {
         //
         // The fix pins the delete to its point-in-time head and orders its WAL
         // frame relative to appends, applying NOTHING until the frame is durable:
-        //   1. Under `append_lock` (the per-box append-order critical section),
+        //   1. Under `append_lock` (the per-topic append-order critical section),
         //      capture `bound_head = head + 1`. Any append that interleaves after
         //      this is assigned a seq >= bound_head, so the bound excludes it.
         //   2. ENQUEUE the Delete frame (carrying `bound_head`) to the single
         //      ordered WAL writer while still holding the lock, so it is ordered
-        //      relative to this box's appends, and take a PUBLISH TICKET in that
+        //      relative to this topic's appends, and take a PUBLISH TICKET in that
         //      same critical section (codex P0 #1 — snapshot interaction). The
         //      ticket threads the delete's in-memory apply through the SAME publish
         //      gate appends use, so a concurrent snapshot's `quiesce_publishes()`
@@ -3085,7 +3085,7 @@ impl Engine {
         //      restart (the frame is before the checkpoint offset, so replay skips
         //      it).
         //   3. Release the lock and WAIT on the commit token off-lock (for a
-        //      durable box this is the group fsync; for disk/memory it resolves at
+        //      durable topic this is the group fsync; for disk/memory it resolves at
         //      the buffered write / immediately) so concurrent durable ops still
         //      coalesce.
         //   4. ONLY on a durable commit, apply the delete in memory (under the
@@ -3106,7 +3106,7 @@ impl Engine {
                 Some(w) => {
                     match w.submit(
                         WalRecord::Delete {
-                            box_id,
+                            topic_id,
                             before_seq: req.before_seq,
                             match_: req.match_.as_ref().map(filter_to_matchsel),
                             seqs: Vec::new(),
@@ -3138,7 +3138,7 @@ impl Engine {
             None => None,
         };
 
-        // The delete's WAL `Delete` frame is now (for a durable box) committed but
+        // The delete's WAL `Delete` frame is now (for a durable topic) committed but
         // the in-memory apply has NOT run, and this writer still holds publish
         // `ticket`. Arm the guard to ABORT the process on an unexpected unwind here
         // (R14 / codex P0 #2): if a panic struck between the durable commit and the
@@ -3178,7 +3178,7 @@ impl Engine {
         ticket.done();
 
         Ok(DeleteResponse {
-            box_name: name.to_string(),
+            topic_name: name.to_string(),
             deleted,
             earliest_seq: b.earliest_seq(),
             head_seq: b.head_seq(),
@@ -3192,16 +3192,16 @@ impl Engine {
     // Routers (API §6)
     // -----------------------------------------------------------------------
 
-    /// Lazily auto-create a router's `source` and `dest` boxes with defaults (the
+    /// Lazily auto-create a router's `source` and `dest` topics with defaults (the
     /// dest only when it is missing — `create_dest:false` + missing dest is rejected
     /// by the caller before the router slot is reserved). Called AFTER the router
-    /// slot is secured so a refused router leaves no phantom box.
-    fn ensure_router_boxes(&self, req: &RouterCreateRequest, _created: bool) -> Result<()> {
-        if self.get_box(&req.source).is_none() {
-            self.put_box(&req.source, BoxConfig::default())?;
+    /// slot is secured so a refused router leaves no phantom topic.
+    fn ensure_router_topics(&self, req: &RouterCreateRequest, _created: bool) -> Result<()> {
+        if self.get_topic(&req.source).is_none() {
+            self.put_topic(&req.source, TopicConfig::default())?;
         }
-        if self.get_box(&req.dest).is_none() {
-            self.put_box(&req.dest, BoxConfig::default())?;
+        if self.get_topic(&req.dest).is_none() {
+            self.put_topic(&req.dest, TopicConfig::default())?;
         }
         Ok(())
     }
@@ -3226,12 +3226,12 @@ impl Engine {
         }
         router::validate_router(&req.source, &req.dest)?;
 
-        // `create_dest:false` + a missing dest is a `box_not_found` reject — check it
+        // `create_dest:false` + a missing dest is a `topic_not_found` reject — check it
         // (read-only) BEFORE reserving a router slot or auto-creating anything, so a
-        // request that cannot succeed leaves no phantom box and consumes no slot.
-        let dest_missing = self.get_box(&req.dest).is_none();
+        // request that cannot succeed leaves no phantom topic and consumes no slot.
+        let dest_missing = self.get_topic(&req.dest).is_none();
         if dest_missing && !req.create_dest {
-            return Err(Error::box_not_found(&req.dest));
+            return Err(Error::topic_not_found(&req.dest));
         }
 
         // No-fan-in rule for a derived dest (`forward_v2`; codex P0 #2/#4). A derived
@@ -3241,17 +3241,17 @@ impl Engine {
         // restart (the re-forward replay order is not pinned). So reject a SECOND
         // router whose dest is already fed by another router with a different source.
         // An idempotent re-PUT of the SAME router, or re-pointing this router, keeps
-        // single ownership and is allowed. This does NOT forbid a box that also takes
+        // single ownership and is allowed. This does NOT forbid a topic that also takes
         // direct writes or closes a cycle (the `/v0` `allow_cycle` contract permits a
-        // box to be both a router source with direct writes AND a router dest) — only
+        // topic to be both a router source with direct writes AND a router dest) — only
         // genuine multi-source fan-in is refused. The check is read-only + pre-slot,
-        // so a refused router leaves no phantom box. (Mixed direct-write + derived
-        // boxes — e.g. an `allow_cycle` loop — are supported but their derived tail is
+        // so a refused router leaves no phantom topic. (Mixed direct-write + derived
+        // topics — e.g. an `allow_cycle` loop — are supported but their derived tail is
         // re-materialized best-effort on recovery; see ASYNC_ROUTER_DESIGN.md §4.1.)
         if self.forward_v2 {
             let fan_in = {
                 let graph = self.routers.lock();
-                graph.routers_touching_box(&req.dest).into_iter().any(|rn| {
+                graph.routers_touching_topic(&req.dest).into_iter().any(|rn| {
                     rn != name
                         && graph
                             .get(&rn)
@@ -3260,16 +3260,16 @@ impl Engine {
             };
             if fan_in {
                 return Err(Error::new(
-                    ErrorCode::BoxExistsIncompatible,
+                    ErrorCode::TopicExistsIncompatible,
                     format!(
-                        "box {:?} is already the destination of another router with a \
+                        "topic {:?} is already the destination of another router with a \
                          different source; a derived dest is single-owner (no multi-source \
                          fan-in) while STREAMS_FORWARD_V2 is on",
                         req.dest
                     ),
                 )
                 .with_detail(
-                    serde_json::json!({ "box": req.dest, "reason": "router_dest_fan_in" }),
+                    serde_json::json!({ "topic": req.dest, "reason": "router_dest_fan_in" }),
                 ));
             }
         }
@@ -3280,11 +3280,11 @@ impl Engine {
         // records or assign colliding/non-deterministic dest seqs that recovery
         // cannot re-derive. Changing other knobs (filter, preserve_*, allow_cycle)
         // on an idempotent re-PUT is fine. Read-only + pre-slot, so a refused router
-        // leaves no phantom box. Delete + recreate to intentionally re-point.
+        // leaves no phantom topic. Delete + recreate to intentionally re-point.
         if let Some(existing) = self.routers.lock().get(name).cloned() {
             if existing.source != req.source || existing.dest != req.dest {
                 return Err(Error::new(
-                    ErrorCode::BoxExistsIncompatible,
+                    ErrorCode::TopicExistsIncompatible,
                     format!(
                         "router {name:?} already exists with source/dest \
                          {:?} -> {:?}; re-pointing to {:?} -> {:?} is not allowed \
@@ -3316,15 +3316,15 @@ impl Engine {
         // committed after this PUT are forwarded (per-source FIFO from "now"). A
         // not-yet-created source reads as head 0 (its auto-create below assigns the
         // same fresh base), which is correct — no historical backfill.
-        let src_head = self.get_box(&req.source).map(|b| b.head_seq()).unwrap_or(0);
+        let src_head = self.get_topic(&req.source).map(|b| b.head_seq()).unwrap_or(0);
 
         // Resource limit + cycle check + insert, ALL under the single graph lock
         // (codex P2 #10): `upsert_capped` refuses a NEW router with `429 throttled`
         // when the live count is already at `max_routers`, atomically with the
         // insert — so a concurrent create race can never push the router count over
         // the cap (the prior read-len-then-drop-lock-then-insert was a TOCTOU). The
-        // box auto-creates happen AFTER, only once the slot is secured, so a refused
-        // router never leaves a phantom dest/source box. `0` ⇒ unlimited.
+        // topic auto-creates happen AFTER, only once the slot is secured, so a refused
+        // router never leaves a phantom dest/source topic. `0` ⇒ unlimited.
         let created = {
             let mut graph = self.routers.lock();
             let created = graph.upsert_capped(router, self.config.limits.max_routers)?;
@@ -3341,18 +3341,18 @@ impl Engine {
             created
         };
 
-        // The router slot is now reserved. Auto-create `source`/`dest` boxes (the
-        // dest honoring `create_dest`, already validated above). If a box create
-        // fails (e.g. the box cap is full), roll the router back so a half-wired
+        // The router slot is now reserved. Auto-create `source`/`dest` topics (the
+        // dest honoring `create_dest`, already validated above). If a topic create
+        // fails (e.g. the topic cap is full), roll the router back so a half-wired
         // router never lingers.
-        if let Err(e) = self.ensure_router_boxes(&req, created) {
+        if let Err(e) = self.ensure_router_topics(&req, created) {
             if created {
                 self.routers.lock().remove(name);
             }
             self.refresh_router_source_flags();
             return Err(e);
         }
-        // The source box now (auto-)exists; refresh its lock-free router-source flag
+        // The source topic now (auto-)exists; refresh its lock-free router-source flag
         // so the write hot path forwards without taking the graph lock (codex P1).
         self.refresh_router_source_flags();
 
@@ -3362,7 +3362,7 @@ impl Engine {
         // never collide with existing records. Only on a fresh create (idempotent
         // re-PUT of a forwarding router keeps its running base).
         if created {
-            let dest_head = self.get_box(&req.dest).map(|b| b.head_seq()).unwrap_or(0);
+            let dest_head = self.get_topic(&req.dest).map(|b| b.head_seq()).unwrap_or(0);
             self.routers.lock().seed_dest_base(name, dest_head);
         }
 
@@ -3521,7 +3521,7 @@ impl Engine {
     }
 
     /// `DELETE /v0/routers/:router` — stops forwarding immediately. Idempotent.
-    /// The `(source, dest)` box names of router `name`, or `None` if it does not
+    /// The `(source, dest)` topic names of router `name`, or `None` if it does not
     /// exist. Used by the HTTP layer to authorize a prefix-limited key against a
     /// router's endpoints (not just its path name) on GET/DELETE (codex P1 #9).
     pub fn router_endpoints(&self, name: &str) -> Option<(String, String)> {
@@ -3566,20 +3566,20 @@ impl Engine {
 
     // -----------------------------------------------------------------------
     // Watch (API §7) — session bookkeeping lives in http::watch; the engine
-    // exposes the per-box read primitive used by both diff and SSE.
+    // exposes the per-topic read primitive used by both diff and SSE.
     // -----------------------------------------------------------------------
 
-    /// Resolve initial per-box watch state (head/earliest) for the create
-    /// response, validating that each named box exists (unless lenient).
-    pub fn watch_box_states(
+    /// Resolve initial per-topic watch state (head/earliest) for the create
+    /// response, validating that each named topic exists (unless lenient).
+    pub fn watch_topic_states(
         &self,
-        boxes: &std::collections::HashMap<String, WatchBoxOptions>,
+        topics: &std::collections::HashMap<String, WatchTopicOptions>,
         lenient: bool,
-    ) -> Result<std::collections::HashMap<String, WatchBoxState>> {
+    ) -> Result<std::collections::HashMap<String, WatchTopicState>> {
         let now = self.clock.now_ms();
-        let mut out = std::collections::HashMap::with_capacity(boxes.len());
-        for (name, opts) in boxes {
-            match self.get_box(name) {
+        let mut out = std::collections::HashMap::with_capacity(topics.len());
+        for (name, opts) in topics {
+            match self.get_topic(name) {
                 Some(b) => {
                     self.enforce_retention_durable(&b, now)?;
                     let head = b.head_seq();
@@ -3588,7 +3588,7 @@ impl Engine {
                     let from_seq = if opts.tail { head } else { opts.from_seq };
                     out.insert(
                         name.clone(),
-                        WatchBoxState {
+                        WatchTopicState {
                             from_seq,
                             head_seq: head,
                             earliest_seq: earliest,
@@ -3596,7 +3596,7 @@ impl Engine {
                     );
                 }
                 None if lenient => continue,
-                None => return Err(Error::box_not_found(name)),
+                None => return Err(Error::topic_not_found(name)),
             }
         }
         Ok(out)
@@ -3625,7 +3625,7 @@ struct ForwardRecord {
 /// slow) segment `read_range` runs with NO lock held — the Phase-6 HARD
 /// INVARIANT. Returns `(Null, None)` defensively if the writer cannot resolve it.
 pub(crate) fn resolve_sealed_off_lock(
-    b: &BoxState,
+    b: &TopicState,
     seq: u64,
     cold_reads: &mut u64,
 ) -> (serde_json::Value, Option<serde_json::Value>) {
@@ -3672,7 +3672,7 @@ fn map_wal_submit_err(e: crate::storage::WalError) -> Error {
     }
 }
 
-/// Whether a box/router `name` is permitted by an `allow_prefixes` allowlist: an
+/// Whether a topic/router `name` is permitted by an `allow_prefixes` allowlist: an
 /// **empty** allowlist permits any name (no restriction), otherwise `name` must
 /// start with one of the prefixes. Used to filter list results so a prefix-limited
 /// key never enumerates names outside its allowlist (codex MEDIUM #7). Mirrors
@@ -3681,11 +3681,11 @@ fn name_allowed(name: &str, allow_prefixes: &[String]) -> bool {
     allow_prefixes.is_empty() || allow_prefixes.iter().any(|p| name.starts_with(p.as_str()))
 }
 
-/// Validate a box config's value ranges (API §1.1). `priority` is clamped on
+/// Validate a topic config's value ranges (API §1.1). `priority` is clamped on
 /// read, but an out-of-range value supplied here is accepted and clamped by the
 /// scheduler; only structurally-impossible values are rejected. Phase 2 has no
 /// additional invalid combinations, so this currently always succeeds.
-fn validate_config(_config: &BoxConfig) -> Result<()> {
+fn validate_config(_config: &TopicConfig) -> Result<()> {
     Ok(())
 }
 
@@ -4025,21 +4025,21 @@ mod tests {
     }
 
     #[test]
-    fn diff_on_missing_box_is_404() {
+    fn diff_on_missing_topic_is_404() {
         let (engine, _clock) = engine_with_clock();
         let err = engine.diff("nope", diff_from(0)).unwrap_err();
-        assert_eq!(err.code, ErrorCode::BoxNotFound);
+        assert_eq!(err.code, ErrorCode::TopicNotFound);
     }
 
     #[test]
     fn cap_eviction_emits_cap_tombstone() {
         let (engine, _clock) = engine_with_clock();
         // cap_records=3, discard:"old".
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             cap_records: 3,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box("cap", cfg).unwrap();
+        engine.put_topic("cap", cfg).unwrap();
 
         // Write 5 records → seqs 1..=5; cap=3 evicts 1,2 → earliest_seq=3.
         for i in 1..=5 {
@@ -4051,7 +4051,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let st = engine.box_state("cap", false).unwrap();
+        let st = engine.topic_state("cap", false).unwrap();
         assert_eq!(st.head_seq, 5);
         assert_eq!(st.earliest_seq, 3);
         assert_eq!(st.count, 3);
@@ -4073,11 +4073,11 @@ mod tests {
     #[test]
     fn ttl_expiry_emits_ttl_tombstone() {
         let (engine, clock) = engine_with_clock();
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             ttl_ms: 1000,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box("ttl", cfg).unwrap();
+        engine.put_topic("ttl", cfg).unwrap();
 
         // Write 3 records at t0.
         for i in 1..=3 {
@@ -4100,7 +4100,7 @@ mod tests {
             )
             .unwrap();
 
-        let st = engine.box_state("ttl", false).unwrap();
+        let st = engine.topic_state("ttl", false).unwrap();
         assert_eq!(st.head_seq, 4);
         // Records 1..=3 expired; only seq 4 remains.
         assert_eq!(st.earliest_seq, 4);
@@ -4272,15 +4272,15 @@ mod tests {
     }
 
     // (e) DUAL WATERMARK: a deletion is silent while a cap eviction on the same
-    // box still yields reason=cap.
+    // topic still yields reason=cap.
     #[test]
     fn delete_silent_but_cap_still_tombstones() {
         let (engine, _clock) = engine_with_clock();
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             cap_records: 4,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box("dual", cfg).unwrap();
+        engine.put_topic("dual", cfg).unwrap();
         // Write 4 (seqs 1..=4), all within cap. Delete seq 2 (a middle hole).
         for i in 1..=4 {
             engine
@@ -4317,7 +4317,7 @@ mod tests {
     }
 
     // (f) tag index efficiency path: exact + prefix matching resolve via the
-    // per-box tag index (verified by correctness of the matched sets).
+    // per-topic tag index (verified by correctness of the matched sets).
     #[test]
     fn tag_index_exact_and_prefix_paths() {
         let (engine, _clock) = engine_with_clock();
@@ -4373,7 +4373,7 @@ mod tests {
         // All records written by node "self".
         engine
             .write(
-                "box",
+                "topic",
                 WriteRequest {
                     records: vec![
                         rec(json!({"i": 1}), None, Some("self")),
@@ -4394,7 +4394,7 @@ mod tests {
         // cursor advances past them to caught_up (no infinite empty loop).
         let d = engine
             .diff(
-                "box",
+                "topic",
                 DiffRequest {
                     from_seq: 0,
                     node: Some(NodeFilter::One("self".to_string())),
@@ -4408,7 +4408,7 @@ mod tests {
         assert_eq!(d.next_from_seq, 3);
         assert!(d.tombstone.is_none()); // node filtering is silent.
 
-        // A box of ONLY own-node records: zero delivered but caught_up reached.
+        // A topic of ONLY own-node records: zero delivered but caught_up reached.
         engine
             .write(
                 "selfbox",
@@ -4463,8 +4463,8 @@ mod tests {
         assert_eq!(second.seqs, Some(vec![1]));
         assert_eq!(second.head_seq, 1);
 
-        // Box still has exactly one record.
-        assert_eq!(engine.box_state("q", false).unwrap().head_seq, 1);
+        // Topic still has exactly one record.
+        assert_eq!(engine.topic_state("q", false).unwrap().head_seq, 1);
 
         // After the dedupe window elapses, the same key appends again.
         clock.advance(default_idempotency_window_ms_for_test() + 1);
@@ -4474,35 +4474,35 @@ mod tests {
     }
 
     fn default_idempotency_window_ms_for_test() -> i64 {
-        BoxConfig::default().idempotency_window_ms as i64
+        TopicConfig::default().idempotency_window_ms as i64
     }
 
     #[test]
-    fn discard_reject_full_box_is_422() {
+    fn discard_reject_full_topic_is_422() {
         let (engine, _clock) = engine_with_clock();
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             cap_records: 2,
             discard: Discard::Reject,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box("q", cfg).unwrap();
+        engine.put_topic("q", cfg).unwrap();
         engine
             .write("q", write_req(vec![rec(json!({}), None, None)]), true)
             .unwrap();
         engine
             .write("q", write_req(vec![rec(json!({}), None, None)]), true)
             .unwrap();
-        // Third write overflows cap=2 with discard:reject → 422 box_full.
+        // Third write overflows cap=2 with discard:reject → 422 topic_full.
         let err = engine
             .write("q", write_req(vec![rec(json!({}), None, None)]), true)
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::BoxFull);
+        assert_eq!(err.code, ErrorCode::TopicFull);
         // Nothing appended (all-or-nothing).
-        assert_eq!(engine.box_state("q", false).unwrap().head_seq, 2);
+        assert_eq!(engine.topic_state("q", false).unwrap().head_seq, 2);
     }
 
     #[test]
-    fn create_false_on_missing_box_is_404() {
+    fn create_false_on_missing_topic_is_404() {
         let (engine, _clock) = engine_with_clock();
         let req = WriteRequest {
             records: vec![rec(json!({}), None, None)],
@@ -4513,7 +4513,7 @@ mod tests {
             disable_backpressure: false,
         };
         let err = engine.write("typo", req, true).unwrap_err();
-        assert_eq!(err.code, ErrorCode::BoxNotFound);
+        assert_eq!(err.code, ErrorCode::TopicNotFound);
     }
 
     #[test]
@@ -4525,7 +4525,7 @@ mod tests {
                 .unwrap();
         }
         // A stale consumer is at from_seq=5 (== head).
-        engine.delete_box("b", false).unwrap();
+        engine.delete_topic("b", false).unwrap();
         // Recreate (lazy) — seq restarts at 1.
         engine
             .write("b", write_req(vec![rec(json!({}), None, None)]), true)
@@ -4686,7 +4686,7 @@ mod tests {
     #[test]
     fn router_allow_cycle_terminates_via_hop_cap() {
         let (engine, _clock) = engine_with_clock();
-        // A two-box mirror a<->b with allow_cycle on both edges.
+        // A two-topic mirror a<->b with allow_cycle on both edges.
         let edge = |s, d| RouterCreateRequest {
             allow_cycle: true,
             ..router_req(s, d)
@@ -4695,7 +4695,7 @@ mod tests {
         engine.put_router("b->a", edge("b", "a")).unwrap();
 
         // One write to `a` would loop forever without the hop cap; it must
-        // terminate. Just assert the call returns and both boxes have a bounded
+        // terminate. Just assert the call returns and both topics have a bounded
         // number of records (no hang / unbounded growth).
         engine
             .write(
@@ -4705,8 +4705,8 @@ mod tests {
             )
             .unwrap();
 
-        let a = engine.box_state("a", false).unwrap();
-        let b = engine.box_state("b", false).unwrap();
+        let a = engine.topic_state("a", false).unwrap();
+        let b = engine.topic_state("b", false).unwrap();
         // Bounded by the hop cap (MAX_ROUTER_HOPS=8): a handful of copies, never
         // unbounded. The exact count is implementation-defined but small.
         assert!(a.head_seq >= 1 && a.head_seq <= config::MAX_ROUTER_HOPS as u64 + 1);
@@ -4728,16 +4728,16 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::BoxNotFound);
+        assert_eq!(err.code, ErrorCode::TopicNotFound);
     }
 
     #[test]
-    fn delete_box_cascades_routers() {
+    fn delete_topic_cascades_routers() {
         let (engine, _clock) = engine_with_clock();
         engine.put_router("a->b", router_req("a", "b")).unwrap();
         engine.put_router("b->c", router_req("b", "c")).unwrap();
         // Deleting `b` removes both routers touching it.
-        let resp = engine.delete_box("b", false).unwrap();
+        let resp = engine.delete_topic("b", false).unwrap();
         assert!(resp.deleted);
         let mut removed = resp.routers_removed.clone();
         removed.sort();
@@ -4776,13 +4776,13 @@ mod tests {
     fn durability_class_resolves_and_normalizes() {
         let (engine, _clock) = engine_with_clock();
         // Explicit durability wins over a conflicting `durable` bool.
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             durable: true,
             durability: Some(Durability::Disk),
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box("a", cfg).unwrap();
-        let st = engine.box_state("a", false).unwrap();
+        engine.put_topic("a", cfg).unwrap();
+        let st = engine.topic_state("a", false).unwrap();
         assert_eq!(
             st.config.durability,
             Some(Durability::Disk),
@@ -4792,22 +4792,22 @@ mod tests {
 
         // Legacy durable:true with no class ⇒ fsync.
         engine
-            .put_box(
+            .put_topic(
                 "b",
-                BoxConfig {
+                TopicConfig {
                     durable: true,
-                    ..BoxConfig::default()
+                    ..TopicConfig::default()
                 },
             )
             .unwrap();
         assert_eq!(
-            engine.box_state("b", false).unwrap().config.durability,
+            engine.topic_state("b", false).unwrap().config.durability,
             Some(Durability::Fsync)
         );
         // Legacy default (durable:false) ⇒ disk.
-        engine.put_box("c", BoxConfig::default()).unwrap();
+        engine.put_topic("c", TopicConfig::default()).unwrap();
         assert_eq!(
-            engine.box_state("c", false).unwrap().config.durability,
+            engine.topic_state("c", false).unwrap().config.durability,
             Some(Durability::Disk)
         );
     }
@@ -4816,11 +4816,11 @@ mod tests {
     fn memory_class_write_serves_in_ram_and_is_queryable() {
         let (engine, _clock) = engine_with_clock();
         engine
-            .put_box(
+            .put_topic(
                 "mem",
-                BoxConfig {
+                TopicConfig {
                     durability: Some(Durability::Memory),
-                    ..BoxConfig::default()
+                    ..TopicConfig::default()
                 },
             )
             .unwrap();
@@ -4831,10 +4831,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        // A `memory` box takes the disk-like best-effort path (§0.10), but it is
+        // A `memory` topic takes the disk-like best-effort path (§0.10), but it is
         // never fsync-gated, so `fsync_ms` is 0. On a pure in-memory engine there is
         // no WAL, so timings are 0 here regardless; the record is served from RAM
-        // and is fully queryable via diff exactly like a disk box.
+        // and is fully queryable via diff exactly like a disk topic.
         assert_eq!(resp.performance.fsync_ms, Some(0.0));
         let d = engine.diff("mem", diff_from(0)).unwrap();
         assert_eq!(d.records.len(), 1);
@@ -4842,7 +4842,7 @@ mod tests {
     }
 
     #[test]
-    fn list_boxes_prefix_and_paging() {
+    fn list_topics_prefix_and_paging() {
         let (engine, _clock) = engine_with_clock();
         for n in ["a1", "a2", "a3", "b1"] {
             engine
@@ -4850,18 +4850,18 @@ mod tests {
                 .unwrap();
         }
         // Prefix filter.
-        let page = engine.list_boxes(Some("a"), 100, None, false, &[]).unwrap();
-        assert_eq!(page.boxes.len(), 3);
+        let page = engine.list_topics(Some("a"), 100, None, false, &[]).unwrap();
+        assert_eq!(page.topics.len(), 3);
         assert!(page.next_cursor.is_none());
 
         // Paging: page_size 2 → cursor → next page.
-        let p1 = engine.list_boxes(Some("a"), 2, None, false, &[]).unwrap();
-        assert_eq!(p1.boxes.len(), 2);
+        let p1 = engine.list_topics(Some("a"), 2, None, false, &[]).unwrap();
+        assert_eq!(p1.topics.len(), 2);
         let cursor = p1.next_cursor.expect("more pages");
         let p2 = engine
-            .list_boxes(Some("a"), 2, Some(&cursor), false, &[])
+            .list_topics(Some("a"), 2, Some(&cursor), false, &[])
             .unwrap();
-        assert_eq!(p2.boxes.len(), 1);
+        assert_eq!(p2.topics.len(), 1);
         assert!(p2.next_cursor.is_none());
     }
 }

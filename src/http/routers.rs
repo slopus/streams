@@ -27,16 +27,16 @@ pub async fn put_router(
     // source AND dest are within its allowlist (the router-path name was already
     // checked at the route level, but the body's source/dest are not — and the
     // engine auto-creates them; codex HIGH #2). Without this a scoped admin key
-    // could route forbidden data into an allowed box, or auto-create boxes
+    // could route forbidden data into an allowed topic, or auto-create topics
     // outside its allowlist. A full-access / unrestricted key passes transparently.
     if let Some(p) = extensions.get::<crate::auth::Principal>() {
         for name in [req.source.as_str(), req.dest.as_str()] {
             if !p.allows_name(name) {
                 return Err(crate::error::Error::new(
                     crate::types::ErrorCode::Forbidden,
-                    "api key is not allowed to route to/from this box",
+                    "api key is not allowed to route to/from this topic",
                 )
-                .with_detail(serde_json::json!({ "box": name })));
+                .with_detail(serde_json::json!({ "topic": name })));
             }
         }
     }
@@ -54,7 +54,7 @@ pub async fn put_router(
 /// Authorize a prefix-restricted principal against a router's NAME, SOURCE, and
 /// DEST (codex HIGH/P1 #9): the route-level check only saw the router path name, so
 /// a prefix-limited key could read/delete a router whose name is allowed but whose
-/// source/dest boxes are not. A full-access / unrestricted key (or dev mode) passes
+/// source/dest topics are not. A full-access / unrestricted key (or dev mode) passes
 /// transparently. A no-op when the router does not exist (the handler then returns
 /// the usual not-found / idempotent response).
 fn authorize_router_endpoints(
@@ -75,9 +75,9 @@ fn authorize_router_endpoints(
         if !p.allows_name(name) {
             return Err(crate::error::Error::new(
                 crate::types::ErrorCode::Forbidden,
-                "api key is not allowed to access this router's box(es)",
+                "api key is not allowed to access this router's topic(es)",
             )
-            .with_detail(serde_json::json!({ "box": name })));
+            .with_detail(serde_json::json!({ "topic": name })));
         }
     }
     Ok(())
@@ -107,9 +107,9 @@ pub async fn list_routers(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(config::DEFAULT_PAGE_SIZE);
     let cursor = params.get("cursor").map(String::as_str);
-    // Filter to the caller key's box-name allowlist (empty ⇒ no restriction) so a
+    // Filter to the caller key's topic-name allowlist (empty ⇒ no restriction) so a
     // prefix-limited key cannot enumerate cross-tenant routers (codex MEDIUM #7).
-    let allow = super::boxes::principal_prefixes(&extensions);
+    let allow = super::topics::principal_prefixes(&extensions);
     Ok(Json(state.engine.list_routers(
         prefix, source, dest, page_size, cursor, &allow,
     )?))

@@ -45,7 +45,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalError, WalReader, WalRecord};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_batch1.rs)
@@ -92,7 +92,7 @@ fn fast_cfg() -> WalConfig {
 
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -160,7 +160,7 @@ fn durable_wal_bytes(disk: &FakeDisk, path: &Path) -> Vec<u8> {
 }
 
 // WAL frame layout (src/storage/wal.rs): [frame_len:u32 @0..4][type:u8 @4]
-// [flags:u8 @5][box_id:u32 @6..10][seq:u64 @10..18][ts:u64 @18..26]
+// [flags:u8 @5][topic_id:u32 @6..10][seq:u64 @10..18][ts:u64 @18..26]
 // [node_len:u16][tag_len:u16][data_len:u32]...[body]...[crc:u64 last 8 bytes].
 const FRAME_LEN_PREFIX: usize = 4;
 const FRAME_HEADER_LEN: usize = 30;
@@ -645,10 +645,10 @@ fn f_nfs_estale_wal_fd() {
     {
         let engine = open_engine(&disk);
         engine
-            .put_box(
+            .put_topic(
                 "p",
-                BoxConfig {
-                    r#type: BoxType::Log,
+                TopicConfig {
+                    r#type: TopicType::Log,
                     durable: true,
                     cap_records: 0,
                     ..Default::default()

@@ -1,6 +1,6 @@
 ---
 title: vs NATS JetStream
-description: How streams compares to NATS JetStream — the closest single-binary peer — on subjects vs boxes, durability, consumers, dead-letter, gap detection, KV/Object store, RAFT replication, and isolation.
+description: How streams compares to NATS JetStream — the closest single-binary peer — on subjects vs topics, durability, consumers, dead-letter, gap detection, KV/Object store, RAFT replication, and isolation.
 ---
 
 import { Callout } from 'nextra/components'
@@ -23,8 +23,8 @@ leaves to advisories you wire up yourself.
 
 ## The shape of each system
 
-streams writes records to named **boxes** addressed directly by name (`jobs`,
-`audit`). A box has a per-box [durability class](/guarantees/durability) and is read by
+streams writes records to named **topics** addressed directly by name (`jobs`,
+`audit`). A topic has a per-topic [durability class](/guarantees/durability) and is read by
 its monotonic `seq` cursor over plain HTTP/JSON, with live delivery over
 [multiplexed SSE](/api/watch).
 
@@ -35,28 +35,28 @@ and a NATS client library; consumers are objects the server tracks on your behal
 
 That subject-binding model is genuinely powerful and has no equivalent in streams: a
 JetStream stream pulls in traffic by wildcard pattern without the producer naming the
-stream. In streams you write to a box by name, and [routers](/api/routers) handle
+stream. In streams you write to a topic by name, and [routers](/api/routers) handle
 fan-out after the fact.
 
-## Subjects vs boxes
+## Subjects vs topics
 
 | | streams | NATS JetStream |
 |---|---|---|
-| Addressing | Write to a **box** by name | Stream **binds subjects** (`orders.>`) and captures matching publishes |
-| Producer coupling | Producer names the box | Producer publishes to a subject; the stream captures it |
-| Fan-out | Server-side [routers](/api/routers) copy box→box | Multiple streams can bind overlapping subjects; consumers filter by subject |
-| Wildcards | Tag prefix match on reads/deletes; box names are literal | First-class subject wildcards (`*`, `>`) |
+| Addressing | Write to a **topic** by name | Stream **binds subjects** (`orders.>`) and captures matching publishes |
+| Producer coupling | Producer names the topic | Producer publishes to a subject; the stream captures it |
+| Fan-out | Server-side [routers](/api/routers) copy topic→topic | Multiple streams can bind overlapping subjects; consumers filter by subject |
+| Wildcards | Tag prefix match on reads/deletes; topic names are literal | First-class subject wildcards (`*`, `>`) |
 | Transport | Plain HTTP/JSON + SSE — `curl` is a client | NATS wire protocol + a NATS client library |
 
 Subject wildcard capture is a clear JetStream win. The streams win is reach: any HTTP
 client, no protocol or SDK, and SSE for live tailing.
 
-## Per-stream vs per-box durability
+## Per-stream vs per-topic durability
 
 JetStream sets storage **per stream** — `file` or `memory`. That is a binary choice for
 the whole stream.
 
-streams resolves a [durability class](/guarantees/durability) **per box**, with three
+streams resolves a [durability class](/guarantees/durability) **per topic**, with three
 levels rather than two:
 
 - `memory` — disk-like but best-effort: same group-committed WAL path as `disk`, no durability
@@ -66,9 +66,9 @@ levels rather than two:
 - `fsync` — ack is held until the group `fdatasync` completes, so an acknowledged write
   survives any crash.
 
-A RAM cache box, a group-committed feed, and an `fsync`-gated job queue coexist in one
+A RAM cache topic, a group-committed feed, and an `fsync`-gated job queue coexist in one
 process, each paying only for the guarantee it needs. JetStream's `file` storage is
-closer to streams' `disk`/`fsync` end; the per-box granularity and the explicit `disk`
+closer to streams' `disk`/`fsync` end; the per-topic granularity and the explicit `disk`
 middle tier are a streams distinction.
 
 ## Consumers + AckWait vs lease queues
@@ -95,7 +95,7 @@ streams splits this into two explicit models:
   is production-ready today.
 
 JetStream's win here is server-side consumer bookkeeping and `BackOff` scheduling out of
-the box. The streams win is that the cursor model needs no server-side consumer object at
+the topic. The streams win is that the cursor model needs no server-side consumer object at
 all, and the queue model gives you per-message leases with the same redelivery guarantee.
 
 ## MaxDeliver advisory vs built-in dead-letter MOVE
@@ -108,15 +108,15 @@ There is no built-in destination — you subscribe to the advisory and build you
 dead-letter handling.
 
 streams moves the message for you. When a queue job is about to be delivered for the
-`(max_deliveries + 1)`-th time and the box has a `dead_letter` target, the job is
-**moved** into the dead-letter box — stamped with `meta.$dead_letter_from`,
+`(max_deliveries + 1)`-th time and the topic has a `dead_letter` target, the job is
+**moved** into the dead-letter topic — stamped with `meta.$dead_letter_from`,
 `$dead_letter_deliveries`, and `$dead_letter_src_seq` — and deleted from the source
-queue. No advisory consumer to operate; the poison message lands in a box you can inspect
+queue. No advisory consumer to operate; the poison message lands in a topic you can inspect
 and replay.
 
 <Callout type="info">
-  The dead-letter copy honors the **destination** box's durability class. Point
-  `dead_letter` at an `fsync` box if you need poison messages to survive a crash.
+  The dead-letter copy honors the **destination** topic's durability class. Point
+  `dead_letter` at an `fsync` topic if you need poison messages to survive a crash.
 </Callout>
 
 ## Gap detection
@@ -133,8 +133,8 @@ carries the surviving records. A purely **deleted** gap reads silently (you aske
 removal); only **involuntary** loss tombstones. That distinction is the
 [load-bearing invariant](/getting-started) of the whole data model.
 
-streams also lets a box **reject** instead of evicting: with `discard:"reject"`, a full
-box fails the producer with `422 box_full` **before** a seq is assigned, rather than
+streams also lets a topic **reject** instead of evicting: with `discard:"reject"`, a full
+topic fails the producer with `422 topic_full` **before** a seq is assigned, rather than
 dropping the oldest record. JetStream's `DiscardNew` similarly refuses new messages on a
 full stream; the difference is that streams pairs rejection-on-write with a tombstone
 on the read side when eviction *does* happen.
@@ -145,7 +145,7 @@ JetStream ships **KV** and **Object** stores built on top of streams-as-subjects
 genuine convenience for config, sessions, and large blobs without bolting on another
 system.
 
-streams has **no** KV or Object abstraction. A box is an append-only log; the closest
+streams has **no** KV or Object abstraction. A topic is an append-only log; the closest
 thing to "latest value for a key" is a tag plus a [point-in-time delete](/api/deletion),
 which is not the same as a KV bucket. If you want a key/value or object API in the same
 binary, JetStream wins outright.
@@ -159,7 +159,7 @@ stream survives the loss of a node, with automatic leader election and failover 
 high availability.
 
 streams has **no replication, no failover, no HA**. A single machine is the entire
-durability and failure domain. An `fsync` box survives any crash of *that* machine and
+durability and failure domain. An `fsync` topic survives any crash of *that* machine and
 replays its WAL on restart, but if the machine or its disk is gone, the data is gone
 until you restore a backup. There is no quorum, no follower, no automatic failover.
 
@@ -179,13 +179,13 @@ terminates **TLS** natively (plus WebSocket and MQTT gateways). For scale, NATS 
 streams is more modest on all three axes, and says so:
 
 - **Isolation** is a [prefix allowlist](/deployment/security) per API key — a *filter*,
-  not a partition. Two keys can be scoped to non-overlapping box-name prefixes, but this
+  not a partition. Two keys can be scoped to non-overlapping topic-name prefixes, but this
   is not hard tenant isolation, and a hard namespace partition is **out of scope** (not a
   planned feature).
 - **TLS** is **not** terminated by streams. Run it behind a TLS-terminating reverse proxy
   for any non-loopback exposure. Auth is bearer keys, hashed SHA-256 at rest and compared
   in constant time, with [per-key scopes](/deployment/security) (`read`/`write`/`delete`/`admin`).
-- **Scale** is **vertical only** — one NVMe box. The engine core sustains
+- **Scale** is **vertical only** — one NVMe-backed machine. The engine core sustains
   millions of records/sec in-process and a single HTTP origin tops out around
   0.5 M rec/sec disk-class, but you scale up, not out. See [Performance](/how-it-works/performance).
 
@@ -202,10 +202,10 @@ streams is more modest on all three axes, and says so:
         a <code>MaxDeliver</code> advisory you have to consume and route yourself.</li>
       <li>You want <strong>plain HTTP/JSON + SSE</strong> — <code>curl</code> is the
         client — with no NATS protocol or client library.</li>
-      <li>You want <strong>per-box durability classes</strong> (memory / disk / fsync)
+      <li>You want <strong>per-topic durability classes</strong> (memory / disk / fsync)
         rather than one per-stream file/memory switch.</li>
       <li>You want a producer to <strong>fail fast</strong> (<code>discard:"reject"</code>,
-        <code>422 box_full</code>) before a seq is assigned on a full box.</li>
+        <code>422 topic_full</code>) before a seq is assigned on a full topic.</li>
       <li>You want one small binary and one disk, with no cluster to operate.</li>
     </ul>
   </div>

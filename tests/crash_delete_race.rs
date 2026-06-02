@@ -4,7 +4,7 @@
 //! crashes, recovers a fresh engine through the same image, and asserts the
 //! point-in-time guarantee survived the crash:
 //!
-//!   a `match`-tag delete is bounded by the box head AT THE MOMENT IT WAS LOGGED,
+//!   a `match`-tag delete is bounded by the topic head AT THE MOMENT IT WAS LOGGED,
 //!   so a record that arrived AFTER the delete frame (carrying a higher seq) is
 //!   NEVER swept on replay.
 //!
@@ -30,9 +30,9 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
-use streams::storage::{BoxConfigOp, MatchSel, Wal, WalConfig, WalRecord};
+use streams::storage::{TopicConfigOp, MatchSel, Wal, WalConfig, WalRecord};
 use streams::types::{
-    BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
 };
 
 const DATA_DIR: &str = "/data";
@@ -52,21 +52,21 @@ fn open_engine(disk: &FakeDisk) -> Arc<Engine> {
     Engine::with_data_dir_fs(cfg(), clock(), disk.arc()).expect("engine opens through FakeDisk")
 }
 
-/// A durable log box.
+/// A durable log topic.
 fn put_durable_log(engine: &Engine, name: &str) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 ..Default::default()
             },
         )
-        .expect("create durable box");
+        .expect("create durable topic");
 }
 
-/// Append one record `(data, tag)` to a durable box, returning the assigned seq.
+/// Append one record `(data, tag)` to a durable topic, returning the assigned seq.
 fn append(engine: &Engine, name: &str, data: &str, tag: &str) -> u64 {
     let req = WriteRequest {
         records: vec![RecordIn {
@@ -145,7 +145,7 @@ fn delete_race_newer_same_tag_append_survives_crash() {
         assert_eq!(s1, 1);
 
         // Point-in-time delete of every current tag=x (just seq 1). WAL-first:
-        // the Delete frame is fsynced (durable box) with bound_head = 2 BEFORE the
+        // the Delete frame is fsynced (durable topic) with bound_head = 2 BEFORE the
         // in-memory delete applies.
         let r = engine
             .delete(
@@ -180,7 +180,7 @@ fn delete_race_newer_same_tag_append_survives_crash() {
     );
     assert_eq!(live[&2], "new");
     // Head recovered to the newer append.
-    let st = engine.box_state("msgs", false).unwrap();
+    let st = engine.topic_state("msgs", false).unwrap();
     assert_eq!(st.head_seq, 2, "head recovered to the newer append");
 }
 
@@ -239,10 +239,10 @@ fn delete_race_concurrent_appends_no_overdelete_on_crash() {
                 },
             )
             .expect("delete acked");
-        // The delete has returned. The box head right now is the point-in-time
+        // The delete has returned. The topic head right now is the point-in-time
         // upper bound on what the delete could have swept; every append acked from
         // here on carries a strictly higher seq.
-        let head_after_delete = engine.box_state("race", false).unwrap().head_seq;
+        let head_after_delete = engine.topic_state("race", false).unwrap().head_seq;
         post_delete_min.store(head_after_delete + 1, Ordering::SeqCst);
 
         // Append a few MORE NEW tag=x records that are guaranteed post-delete.
@@ -287,7 +287,7 @@ fn delete_race_concurrent_appends_no_overdelete_on_crash() {
     //     floor, and <= the recovered head) is present. These records provably
     //     arrived after the delete frame was logged, so the point-in-time bound
     //     must never have reached them — losing one would be the over-delete bug.
-    let head = engine.box_state("race", false).unwrap().head_seq;
+    let head = engine.topic_state("race", false).unwrap().head_seq;
     for seq in floor..=head {
         assert!(
             live.contains_key(&seq),
@@ -320,9 +320,9 @@ fn delete_race_concurrent_appends_no_overdelete_on_crash() {
 fn replay_honors_logged_delete_bound_against_later_append_frame() {
     let disk = FakeDisk::new();
     let data_dir = std::path::PathBuf::from(DATA_DIR);
-    let box_id = 1u32;
-    let cfg_blob = serde_json::to_vec(&BoxConfig {
-        r#type: BoxType::Log,
+    let topic_id = 1u32;
+    let cfg_blob = serde_json::to_vec(&TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         ..Default::default()
     })
@@ -333,11 +333,11 @@ fn replay_honors_logged_delete_bound_against_later_append_frame() {
         let wal = Wal::open_at_with(disk.arc(), WalConfig::new(&data_dir), 1, 0)
             .expect("open wal through fakedisk");
         let w = wal.writer();
-        // BoxConfig create so recovery materializes box_id=1 as a durable log.
+        // TopicConfig create so recovery materializes topic_id=1 as a durable log.
         w.append(
-            WalRecord::BoxConfig {
-                box_id,
-                op: BoxConfigOp {
+            WalRecord::TopicConfig {
+                topic_id,
+                op: TopicConfigOp {
                     name: "msgs".into(),
                     config: cfg_blob,
                 },
@@ -351,7 +351,7 @@ fn replay_honors_logged_delete_bound_against_later_append_frame() {
         // optional meta), exactly what `encode_record_payload` writes; recovery's
         // `decode_record_payload` reads `d` back out.
         let ap = |seq: u64| WalRecord::Append {
-            box_id,
+            topic_id,
             seq,
             ts: 10 + seq,
             node: None,
@@ -365,7 +365,7 @@ fn replay_honors_logged_delete_bound_against_later_append_frame() {
         // logged (so it only ever sweeps seq < 2).
         w.append(
             WalRecord::Delete {
-                box_id,
+                topic_id,
                 before_seq: None,
                 match_: Some(MatchSel::Eq("x".into())),
                 seqs: Vec::new(),

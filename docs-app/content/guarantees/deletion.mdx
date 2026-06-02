@@ -7,15 +7,15 @@ import { Callout, Tabs } from 'nextra/components'
 
 # Permanent Deletion
 
-A **delete** removes records that exist in a box **right now**, by `seq` range and/or by
+A **delete** removes records that exist in a topic **right now**, by `seq` range and/or by
 tag match. It is permanent, effective immediately on every reader, asynchronous (with **no
 compaction / no reclaim** — deleted records stay on disk, just marked),
 **silent** (never a tombstone), and **point-in-time** (a future record with the same tag is
 never touched). This page specifies all five properties, the request grammar, the three
-patterns it enables, the per-box tag index that makes it cheap, and the one watermark
+patterns it enables, the per-topic tag index that makes it cheap, and the one watermark
 interaction that keeps deletion from ever tripping the gap alarm.
 
-The endpoint is `POST /v0/boxes/:box/delete`; the field-by-field reference lives in
+The endpoint is `POST /v0/topics/:topic/delete`; the field-by-field reference lives in
 [Deletion API](/api/deletion). This page is the *why* and the *contract*.
 
 ## The five properties
@@ -25,8 +25,8 @@ standing filter that keeps matching future writes. Five properties define it:
 
 - **Permanent.** Deleted records are gone for good. There is no un-delete in `/v0`. To
   bring data back, write a new record. A delete is committed and WAL-logged, so it survives
-  restart — a recovered box does not resurrect deleted records.
-- **Effective immediately.** The delete is invisible to **all** reads at once: `diff`, box
+  restart — a recovered topic does not resurrect deleted records.
+- **Effective immediately.** The delete is invisible to **all** reads at once: `diff`, topic
   state (`count` / `bytes`), and live SSE. A reader's cursor simply advances past the
   deleted seqs. A lagging consumer cannot "miss a deletion," because the record is gone for
   every reader simultaneously.
@@ -102,19 +102,19 @@ These three shapes cover the practical uses of point-in-time deletion.
   <Tabs.Tab>
 
 **Snapshot / drop-prefix by seq.** You have read and persisted everything below some seq
-elsewhere; drop it from the box. `before_seq` only is an O(1) marker delete — it never touches
+elsewhere; drop it from the topic. `before_seq` only is an O(1) marker delete — it never touches
 the tag index. (This is logical removal, not physical compaction — see the no-reclaim note
 above; disk space is only released when a whole segment is cleared.)
 
 ```bash
 # Drop everything the durable consumer has already checkpointed past.
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "before_seq": 480001 }'
 ```
 
 ```json
-{ "box": "jobs", "deleted": 14, "earliest_seq": 480001, "head_seq": 480234,
+{ "topic": "jobs", "deleted": 14, "earliest_seq": 480001, "head_seq": 480234,
   "count": 234, "bytes": 478820, "performance": { "server_total_ms": 0.12 } }
 ```
 
@@ -127,7 +127,7 @@ match with a `before_seq` set to the new version's seq.
 
 ```bash
 # v2 was just appended at seq 480300; remove only the earlier versions of this tag.
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Eq", "msg-123"], "before_seq": 480300 }'
 ```
@@ -144,7 +144,7 @@ a kicked user, revoke their chat.
 
 ```bash
 # Cancel every job that exists right now under this tenant's chat room.
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Glob", "chat-42:*"] }'
 ```
@@ -156,9 +156,9 @@ at the instant of the call, not a subscription.
   </Tabs.Tab>
 </Tabs>
 
-## The per-box tag index
+## The per-topic tag index
 
-A `match` delete **must not** scan the whole log. Each box keeps a **tag index** mapping
+A `match` delete **must not** scan the whole log. Each topic keeps a **tag index** mapping
 each live tag to its live seqs in ascending order — conceptually a
 `BTreeMap<String, Vec<u64>>`:
 
@@ -178,7 +178,7 @@ slots as they go.
 
 ## How a delete moves the watermarks
 
-This is the load-bearing interaction. A box has a [dual watermark](/guarantees/tombstones):
+This is the load-bearing interaction. A topic has a [dual watermark](/guarantees/tombstones):
 
 - **`earliest_seq`** — the seq of the first **currently-live** record (not evicted, not
   TTL-expired, **not deleted**). A delete that removes a prefix **advances** `earliest_seq`.
@@ -207,11 +207,11 @@ advancing the cursor, and the tombstone is computed **solely** from `from_seq` v
 
 ## Response
 
-The response reports the count removed plus the post-delete box state. `count` and `bytes`
+The response reports the count removed plus the post-delete topic state. `count` and `bytes`
 already exclude the deleted records.
 
 ```json
-{ "box": "jobs",
+{ "topic": "jobs",
   "deleted": 14,
   "earliest_seq": 480001,
   "head_seq": 480234,
@@ -224,7 +224,7 @@ already exclude the deleted records.
 |---|---|
 | `deleted` | Count of records removed by this call. |
 | `earliest_seq` | New first live seq (advanced past any deleted prefix). |
-| `head_seq` / `count` / `bytes` | Box state after the delete. |
+| `head_seq` / `count` / `bytes` | Topic state after the delete. |
 
 ## See also
 

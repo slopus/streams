@@ -1,5 +1,5 @@
 //! The [`SegmentStore`] trait and its [`LocalSegmentStore`] implementation, plus
-//! the per-box [`BoxTier`] (a HOT store + an optional COLD store).
+//! the per-topic [`TopicTier`] (a HOT store + an optional COLD store).
 //!
 //! # Why a trait
 //!
@@ -15,7 +15,7 @@
 //! The methods are **synchronous and self-contained** (each does its own file
 //! I/O and returns owned bytes). That is deliberate: cold reads and the
 //! relocator run on a separate blocking/IO pool (`spawn_blocking`), so a slow
-//! cold fetch never holds a box write lock or blocks an SSE push (the Phase-6
+//! cold fetch never holds a topic write lock or blocks an SSE push (the Phase-6
 //! HARD INVARIANT). A future async/S3 impl can wrap these same signatures.
 //!
 //! # Segment identity
@@ -59,8 +59,8 @@ pub enum StoreError {
 }
 
 /// A pluggable place to keep segment objects. One physical tier (a local folder
-/// now; an object store later). A box's storage is a HOT store plus an optional
-/// COLD store (see [`BoxTier`]).
+/// now; an object store later). A topic's storage is a HOT store plus an optional
+/// COLD store (see [`TopicTier`]).
 ///
 /// All methods are synchronous so the relocator + cold reads run on a blocking
 /// pool off the hot path (module docs). Implementations MUST be `Send + Sync` so
@@ -136,7 +136,7 @@ pub trait SegmentStore: Send + Sync {
 
 /// A [`SegmentStore`] backed by a local directory: each segment is the file pair
 /// `seg-<start_seq>.data` + `seg-<start_seq>.idx` under `root`. This is both the
-/// HOT store (a per-box dir under the data dir) and v1's COLD store (a per-box
+/// HOT store (a per-topic dir under the data dir) and v1's COLD store (a per-topic
 /// dir under `STREAMS_COLD_DIR`).
 pub struct LocalSegmentStore {
     root: PathBuf,
@@ -372,7 +372,7 @@ fn read_exact_at(f: &dyn super::fs::File, offset: u64, buf: &mut [u8]) -> io::Re
     Ok(())
 }
 
-/// A box's two-tier segment storage: a required HOT store (fast NVMe, under the
+/// A topic's two-tier segment storage: a required HOT store (fast NVMe, under the
 /// data dir) and an optional COLD store (`STREAMS_COLD_DIR`; `None` ⇒ tiering is
 /// disabled and everything stays hot — the default in every existing test, so
 /// behavior is unchanged by construction).
@@ -380,22 +380,22 @@ fn read_exact_at(f: &dyn super::fs::File, offset: u64, buf: &mut [u8]) -> io::Re
 /// [`Self::resolve`] reports which tier holds a segment, with HOT preferred when
 /// a copy exists in both (the transient state during a relocation: copy to cold,
 /// then drop hot — prefer the surviving copy, never lose a segment).
-pub struct BoxTier {
+pub struct TopicTier {
     hot: Box<dyn SegmentStore>,
     cold: Option<Box<dyn SegmentStore>>,
 }
 
-/// Which tier a segment currently lives in (per [`BoxTier::resolve`]).
+/// Which tier a segment currently lives in (per [`TopicTier::resolve`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Hot,
     Cold,
 }
 
-impl BoxTier {
+impl TopicTier {
     /// Build a tier from a hot store and an optional cold store.
     pub fn new(hot: Box<dyn SegmentStore>, cold: Option<Box<dyn SegmentStore>>) -> Self {
-        BoxTier { hot, cold }
+        TopicTier { hot, cold }
     }
 
     /// The hot store (active + recent sealed segments live here).
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn box_tier_resolves_hot_then_cold_prefers_hot() {
+    fn topic_tier_resolves_hot_then_cold_prefers_hot() {
         let hot_dir = tempfile::tempdir().unwrap();
         let cold_dir = tempfile::tempdir().unwrap();
         let hot = Box::new(LocalSegmentStore::open(hot_dir.path()).unwrap());
@@ -540,7 +540,7 @@ mod tests {
         hot.put(2, &d2, &i2).unwrap();
         cold.put(2, &d2, &i2).unwrap();
 
-        let tier = BoxTier::new(hot, Some(cold));
+        let tier = TopicTier::new(hot, Some(cold));
         assert!(tier.has_cold());
         assert_eq!(tier.resolve(1), Some(Tier::Cold));
         assert_eq!(tier.resolve(2), Some(Tier::Hot)); // prefer the hot copy.
@@ -597,12 +597,12 @@ mod tests {
     }
 
     #[test]
-    fn box_tier_without_cold_keeps_everything_hot() {
+    fn topic_tier_without_cold_keeps_everything_hot() {
         let hot_dir = tempfile::tempdir().unwrap();
         let hot = Box::new(LocalSegmentStore::open(hot_dir.path()).unwrap());
         let (data, idx) = build_segment(1, 1);
         hot.put(1, &data, &idx).unwrap();
-        let tier = BoxTier::new(hot, None);
+        let tier = TopicTier::new(hot, None);
         assert!(!tier.has_cold());
         assert!(tier.cold().is_none());
         assert_eq!(tier.resolve(1), Some(Tier::Hot));

@@ -1,6 +1,6 @@
 //! Phase-3 §2 — in-process integration tests for routers (fan-out) over real HTTP.
 //!
-//! Black-box coverage of the documented `/v0/routers` contract (API §6) plus the
+//! Black-topic coverage of the documented `/v0/routers` contract (API §6) plus the
 //! end-to-end forwarding semantics, exercised against a live bound server via the
 //! shared [`common::Harness`]:
 //!
@@ -16,7 +16,7 @@
 //!   * `allow_cycle` mirror terminates via the hop cap (no infinite forwarding).
 //!   * deleting a router stops further forwarding while already-forwarded records
 //!     remain in `dest`.
-//!   * `create_dest` behavior (auto-create on; `404 box_not_found` when off + missing).
+//!   * `create_dest` behavior (auto-create on; `404 topic_not_found` when off + missing).
 //!
 //! All assertions are timing-independent (the harness runs a `SystemClock`, so no
 //! TTL/priority correctness is asserted here — see the engine unit/property tests).
@@ -30,20 +30,20 @@ use serde_json::{json, Value};
 // Small helpers
 // --------------------------------------------------------------------------
 
-/// Diff `box` from the earliest seq as an unrelated node `consumer` (so node
+/// Diff `topic` from the earliest seq as an unrelated node `consumer` (so node
 /// loop-prevention never hides forwarded records), with `$tag` included.
 /// Returns the parsed `records` array.
-fn diff_all(h: &Harness, box_name: &str) -> Vec<Value> {
+fn diff_all(h: &Harness, topic_name: &str) -> Vec<Value> {
     let (status, body) = h.post(
-        &format!("/v0/boxes/{box_name}/diff"),
+        &format!("/v0/topics/{topic_name}/diff"),
         json!({ "from_seq": 0, "limit": 1000, "node": "consumer", "include_tags": true }),
     );
-    assert_eq!(status, StatusCode::OK, "diff {box_name}: {body}");
+    assert_eq!(status, StatusCode::OK, "diff {topic_name}: {body}");
     body["records"].as_array().cloned().unwrap_or_default()
 }
 
-/// Write one record to `box` (origin node + optional tag); assert 2xx.
-fn write_one(h: &Harness, box_name: &str, data: Value, node: Option<&str>, tag: Option<&str>) {
+/// Write one record to `topic` (origin node + optional tag); assert 2xx.
+fn write_one(h: &Harness, topic_name: &str, data: Value, node: Option<&str>, tag: Option<&str>) {
     let mut rec = json!({ "data": data });
     if let Some(t) = tag {
         rec["tag"] = json!(t);
@@ -52,10 +52,10 @@ fn write_one(h: &Harness, box_name: &str, data: Value, node: Option<&str>, tag: 
     if let Some(n) = node {
         body["node"] = json!(n);
     }
-    let (status, resp) = h.post(&format!("/v0/boxes/{box_name}"), body);
+    let (status, resp) = h.post(&format!("/v0/topics/{topic_name}"), body);
     assert!(
         status == StatusCode::OK || status == StatusCode::CREATED,
-        "write to {box_name} expected 2xx, got {status}: {resp}"
+        "write to {topic_name} expected 2xx, got {status}: {resp}"
     );
 }
 
@@ -211,7 +211,7 @@ fn list_routers_filters_by_source_and_dest() {
         StatusCode::CONFLICT,
         "multi-source fan-in into dest c is refused under v2: {body}"
     );
-    assert_eq!(body["error"]["code"], "box_exists_incompatible");
+    assert_eq!(body["error"]["code"], "topic_exists_incompatible");
     assert_eq!(body["error"]["detail"]["reason"], "router_dest_fan_in");
 }
 
@@ -369,7 +369,7 @@ fn cycle_creation_rejected_409_with_detail() {
         .expect("detail.cycle path present");
     assert!(
         cycle.len() >= 2,
-        "cycle path lists the box names: {cycle:?}"
+        "cycle path lists the topic names: {cycle:?}"
     );
     let path: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
     // Path starts at the new source and ends back at it (a -> ... -> a).
@@ -388,7 +388,7 @@ fn cycle_creation_rejected_409_with_detail() {
 #[test]
 fn allow_cycle_mirror_terminates_via_hop_cap() {
     let h = Harness::start();
-    // Two-box mirror a<->b, both edges allow_cycle.
+    // Two-topic mirror a<->b, both edges allow_cycle.
     h.put(
         "/v0/routers/a->b",
         json!({ "source": "a", "dest": "b", "allow_cycle": true }),
@@ -403,9 +403,9 @@ fn allow_cycle_mirror_terminates_via_hop_cap() {
     // unbounded growth). The harness request timeout (30s) would surface a hang.
     write_one(&h, "a", json!({ "x": 1 }), Some("A"), None);
 
-    let (status, a_state) = h.get("/v0/boxes/a");
+    let (status, a_state) = h.get("/v0/topics/a");
     assert_eq!(status, StatusCode::OK);
-    let (_s, b_state) = h.get("/v0/boxes/b");
+    let (_s, b_state) = h.get("/v0/topics/b");
 
     let a_head = a_state["head_seq"].as_u64().unwrap();
     let b_head = b_state["head_seq"].as_u64().unwrap();
@@ -445,7 +445,7 @@ fn allow_cycle_re_put_of_self_edge_is_not_a_cycle() {
 fn create_dest_true_auto_creates_destination() {
     let h = Harness::start();
     // dest "freshdst" does not exist yet.
-    let (status, _b) = h.get("/v0/boxes/freshdst");
+    let (status, _b) = h.get("/v0/topics/freshdst");
     assert_eq!(status, StatusCode::NOT_FOUND, "dest absent before router");
 
     // create_dest defaults true -> PUT succeeds and materializes the dest.
@@ -456,14 +456,14 @@ fn create_dest_true_auto_creates_destination() {
     assert_eq!(status, StatusCode::CREATED);
 
     // dest now exists (state read, which never auto-creates, returns 200).
-    let (status, body) = h.get("/v0/boxes/freshdst");
+    let (status, body) = h.get("/v0/topics/freshdst");
     assert_eq!(
         status,
         StatusCode::OK,
         "create_dest auto-created the dest: {body}"
     );
     // source auto-created too.
-    let (status, _b) = h.get("/v0/boxes/srcx");
+    let (status, _b) = h.get("/v0/topics/srcx");
     assert_eq!(status, StatusCode::OK, "source auto-created as well");
 }
 
@@ -479,7 +479,7 @@ fn create_dest_false_on_missing_dest_is_404() {
         StatusCode::NOT_FOUND,
         "create_dest:false + missing -> 404: {body}"
     );
-    assert_eq!(body["error"]["code"], "box_not_found");
+    assert_eq!(body["error"]["code"], "topic_not_found");
 
     // The router was not created.
     let (status, _b) = h.get("/v0/routers/srcy->missingdst");
@@ -490,7 +490,7 @@ fn create_dest_false_on_missing_dest_is_404() {
 fn create_dest_false_with_existing_dest_succeeds() {
     let h = Harness::start();
     // Pre-create the dest, then a create_dest:false router must attach fine.
-    let (status, _b) = h.put("/v0/boxes/predst", json!({}));
+    let (status, _b) = h.put("/v0/topics/predst", json!({}));
     assert_eq!(status, StatusCode::CREATED);
 
     let (status, body) = h.put(

@@ -13,9 +13,9 @@
 //!     the reclaim freelist and is claimable again (codex HIGH #4). At-least-once:
 //!     a job is never lost, never silently double-acked-then-lost.
 //!   * **dead-letter on `max_deliveries` with crashes**: the poison job is moved
-//!     to a durable DL box exactly once and removed from the source; a power loss
+//!     to a durable DL topic exactly once and removed from the source; a power loss
 //!     around the move never loses the job (it is in the source claimable OR in
-//!     the DL box, never neither) and never duplicates it into the DL box on a
+//!     the DL topic, never neither) and never duplicates it into the DL topic on a
 //!     re-run after recovery beyond at-least-once.
 //!   * **`leases_durable` true vs false recovery**: a durable leases log replays
 //!     the projection (an in-flight lease survives restart, NOT re-claimable until
@@ -51,7 +51,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
-use streams::types::{BoxConfig, BoxType, Durability, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, Durability, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Engine build / clock / data-dir plumbing through a FakeDisk (mirrors
@@ -100,9 +100,9 @@ fn sync_wal_dir(disk: &FakeDisk) {
 
 /// A durable (fsync-class) queue config; `leases_durable` controls the leases
 /// log durability. `max_deliveries`/`dead_letter` optional.
-fn queue_cfg(leases_durable: bool, max_deliveries: u64, dead_letter: Option<&str>) -> BoxConfig {
-    BoxConfig {
-        r#type: BoxType::Queue,
+fn queue_cfg(leases_durable: bool, max_deliveries: u64, dead_letter: Option<&str>) -> TopicConfig {
+    TopicConfig {
+        r#type: TopicType::Queue,
         durability: Some(Durability::Fsync),
         durable: true,
         lease_ms: 1000,
@@ -171,17 +171,17 @@ fn live_seqs(engine: &Engine, name: &str) -> BTreeSet<u64> {
     out
 }
 
-/// Like [`live_seqs`] but returns `None` if the box does not exist post-recovery
-/// (used by the sweep: an early crash can drop the box-config frame entirely,
+/// Like [`live_seqs`] but returns `None` if the topic does not exist post-recovery
+/// (used by the sweep: an early crash can drop the topic-config frame entirely,
 /// which is a legitimate dense-prefix outcome — nothing was durably acked then).
 fn live_seqs_opt(engine: &Engine, name: &str) -> Option<BTreeSet<u64>> {
-    engine.box_state(name, false).ok()?;
+    engine.topic_state(name, false).ok()?;
     Some(live_seqs(engine, name))
 }
 
-/// `(ready, in_flight, dead_lettered)` for a queue box at the engine's clock now.
+/// `(ready, in_flight, dead_lettered)` for a queue topic at the engine's clock now.
 fn counters(engine: &Engine, name: &str) -> (u64, u64, u64) {
-    let st = engine.box_state(name, false).expect("box_state ok");
+    let st = engine.topic_state(name, false).expect("topic_state ok");
     let q = st.queue.expect("queue counters present");
     (q.ready, q.in_flight, q.dead_lettered)
 }
@@ -337,7 +337,7 @@ fn durable_ack_delete_fsync_fail_requeues_not_stranded() {
     let (shared, _tc) = test_clock();
     let engine = open_engine_fs(gate.arc(), shared);
     engine
-        .put_box("jobs", queue_cfg(false, 0, None))
+        .put_topic("jobs", queue_cfg(false, 0, None))
         .expect("create durable queue");
     let seqs = produce(&engine, "jobs", 3);
     assert_eq!(seqs, vec![1, 2, 3]);
@@ -388,7 +388,7 @@ fn durable_ack_fail_then_recovery_preserves_job() {
         let (shared, _tc) = test_clock();
         let engine = open_engine_fs(gate.arc(), shared);
         engine
-            .put_box("jobs", queue_cfg(false, 0, None))
+            .put_topic("jobs", queue_cfg(false, 0, None))
             .expect("create durable queue");
         produce(&engine, "jobs", 2);
         let c = claim_seqs(&engine, "jobs", "w1", 2);
@@ -433,11 +433,11 @@ fn durable_ack_fail_then_recovery_preserves_job() {
 }
 
 // ===========================================================================
-// 2) Dead-letter on max_deliveries with crashes (durable DL box)
+// 2) Dead-letter on max_deliveries with crashes (durable DL topic)
 // ===========================================================================
 
 /// A poison job dead-lettered after `max_deliveries`, then a power loss, then
-/// recovery: the job is never LOST — it lands in the durable DL box (which
+/// recovery: the job is never LOST — it lands in the durable DL topic (which
 /// recovers via WAL replay) AND is removed from the source, OR (if the crash
 /// pre-empted the durable move) remains claimable in the source. Never neither.
 #[test]
@@ -445,11 +445,11 @@ fn dead_letter_then_crash_preserves_job_in_dl_or_source() {
     let disk = FakeDisk::new();
     {
         let (engine, tc) = open_engine(&disk);
-        // Durable DL box so the dead-letter copy survives restart by construction.
+        // Durable DL topic so the dead-letter copy survives restart by construction.
         engine
-            .put_box(
+            .put_topic(
                 "dlq",
-                BoxConfig {
+                TopicConfig {
                     durability: Some(Durability::Fsync),
                     durable: true,
                     ..Default::default()
@@ -457,7 +457,7 @@ fn dead_letter_then_crash_preserves_job_in_dl_or_source() {
             )
             .expect("create durable dlq");
         engine
-            .put_box("jobs", queue_cfg(false, 2, Some("dlq")))
+            .put_topic("jobs", queue_cfg(false, 2, Some("dlq")))
             .expect("create durable queue w/ DL");
         produce(&engine, "jobs", 1);
         sync_wal_dir(&disk);
@@ -474,7 +474,7 @@ fn dead_letter_then_crash_preserves_job_in_dl_or_source() {
         let c3 = claim_seqs(&engine, "jobs", "w", 1);
         assert!(c3.is_empty(), "poison job dead-lettered, not redelivered");
 
-        // The source is empty; the DL box has it exactly once.
+        // The source is empty; the DL topic has it exactly once.
         let (_r, _inf, dl) = counters(&engine, "jobs");
         assert_eq!(dl, 1, "one dead-letter recorded");
         assert!(
@@ -482,7 +482,7 @@ fn dead_letter_then_crash_preserves_job_in_dl_or_source() {
             "job removed from source"
         );
         let dl_live = live_seqs(&engine, "dlq");
-        assert_eq!(dl_live.len(), 1, "the poison job is in the DL box");
+        assert_eq!(dl_live.len(), 1, "the poison job is in the DL topic");
 
         sync_wal_dir(&disk);
         disk.crash(TornDamage::None);
@@ -491,14 +491,14 @@ fn dead_letter_then_crash_preserves_job_in_dl_or_source() {
     disk.reset_power();
 
     // Recover: the durable DL append + the durable source delete both fsynced
-    // before the crash, so the job is in the DL box and gone from the source.
+    // before the crash, so the job is in the DL topic and gone from the source.
     let (engine, _tc) = open_engine(&disk);
     let src_live = live_seqs(&engine, "jobs");
     let dl_live = live_seqs(&engine, "dlq");
     // The invariant: the job exists in exactly one place (never neither).
     assert!(
         src_live.contains(&1) || dl_live.len() == 1,
-        "dead-lettered job must survive in DL box OR source after crash \
+        "dead-lettered job must survive in DL topic OR source after crash \
          (src={src_live:?}, dl={dl_live:?})"
     );
     // It was durably dead-lettered before the crash ⇒ in DL, not source.
@@ -541,9 +541,9 @@ fn dead_letter_source_delete_fail_requeues_not_lost() {
     let (shared, tc) = test_clock();
     let engine = open_engine_fs(gate.arc(), shared);
     engine
-        .put_box(
+        .put_topic(
             "dlq",
-            BoxConfig {
+            TopicConfig {
                 durability: Some(Durability::Fsync),
                 durable: true,
                 ..Default::default()
@@ -551,7 +551,7 @@ fn dead_letter_source_delete_fail_requeues_not_lost() {
         )
         .expect("durable dlq");
     engine
-        .put_box("jobs", queue_cfg(false, 1, Some("dlq")))
+        .put_topic("jobs", queue_cfg(false, 1, Some("dlq")))
         .expect("durable queue, max_deliveries=1");
     produce(&engine, "jobs", 1);
 
@@ -567,13 +567,13 @@ fn dead_letter_source_delete_fail_requeues_not_lost() {
     assert!(c2.is_empty(), "poison job diverted to DL, not leased");
 
     // Sanity: the skip(1) landed exactly as intended — the DL append fsync SUCCEEDED
-    // (the poison copy is in the DL box) while the source delete fsync FAILED (the
+    // (the poison copy is in the DL topic) while the source delete fsync FAILED (the
     // job is still present in the source). This pins the test on the codex HIGH #4
     // path (source delete fails AFTER a successful DL append).
     assert_eq!(
         live_seqs(&engine, "dlq").len(),
         1,
-        "DL append fsync succeeded ⇒ poison copy is in the DL box"
+        "DL append fsync succeeded ⇒ poison copy is in the DL topic"
     );
 
     // The job is NOT lost: the source delete failed ⇒ the seq is still present in
@@ -608,7 +608,7 @@ fn leases_durable_true_replays_inflight_lease() {
     {
         let (engine, _tc) = open_engine(&disk);
         engine
-            .put_box("jobs", queue_cfg(true, 0, None))
+            .put_topic("jobs", queue_cfg(true, 0, None))
             .expect("durable queue + durable leases");
         produce(&engine, "jobs", 3);
         sync_wal_dir(&disk);
@@ -658,7 +658,7 @@ fn leases_durable_true_replayed_leases_expire_then_reclaimable() {
     {
         let (engine, _tc) = open_engine(&disk);
         engine
-            .put_box("jobs", queue_cfg(true, 0, None))
+            .put_topic("jobs", queue_cfg(true, 0, None))
             .expect("durable queue + durable leases");
         produce(&engine, "jobs", 2);
         sync_wal_dir(&disk);
@@ -695,7 +695,7 @@ fn leases_durable_false_self_heals_all_claimable() {
     {
         let (engine, _tc) = open_engine(&disk);
         engine
-            .put_box("jobs", queue_cfg(false, 0, None))
+            .put_topic("jobs", queue_cfg(false, 0, None))
             .expect("durable queue, non-durable leases");
         produce(&engine, "jobs", 3);
         sync_wal_dir(&disk);
@@ -859,7 +859,7 @@ fn sweep_durable_claim_ack_crash_points_no_loss() {
         let (shared, _tc) = test_clock();
         let engine = open_engine_fs(probe.arc(), shared);
         engine
-            .put_box("s", queue_cfg(false, 0, None))
+            .put_topic("s", queue_cfg(false, 0, None))
             .expect("queue");
         produce(&engine, "s", N);
         let c = claim_seqs(&engine, "s", "w1", N as u32);
@@ -872,7 +872,7 @@ fn sweep_durable_claim_ack_crash_points_no_loss() {
         "workload issues several write_at calls (M={total_writes})"
     );
     // Cap the sweep so it stays fast but still covers every interesting boundary of
-    // this tiny workload (box-config frame, each durable produce frame, the claim
+    // this tiny workload (topic-config frame, each durable produce frame, the claim
     // lease frames, the ack-delete frame). Each crash point pays one recovery
     // reopen (~1 s on the FakeDisk), so the cap bounds total wall time well under
     // the suite budget.
@@ -888,7 +888,7 @@ fn sweep_durable_claim_ack_crash_points_no_loss() {
             let (shared, _tc) = test_clock();
             let engine = open_engine_fs(trip.arc(), shared);
             // Each op may fail once the device freezes mid-stream; tolerate errors.
-            if engine.put_box("s", queue_cfg(false, 0, None)).is_err() {
+            if engine.put_topic("s", queue_cfg(false, 0, None)).is_err() {
                 disk.reset_power();
                 continue;
             }
@@ -933,14 +933,14 @@ fn sweep_durable_claim_ack_crash_points_no_loss() {
 
         // Recover on the healthy image and assert the at-least-once invariant.
         let (engine, _tc) = open_engine(&disk);
-        // An early crash can drop the box-config frame ⇒ the box is gone. That is
+        // An early crash can drop the topic-config frame ⇒ the topic is gone. That is
         // a legitimate dense-prefix outcome (nothing was durably acked yet), so the
         // invariant holds trivially; skip this crash point.
         let Some(live) = live_seqs_opt(&engine, "s") else {
             continue;
         };
         let head = engine
-            .box_state("s", false)
+            .topic_state("s", false)
             .map(|st| st.head_seq)
             .unwrap_or(0);
 
@@ -1015,7 +1015,7 @@ fn concurrent_claim_ack_drains_each_job_once() {
     let disk = FakeDisk::new();
     let (engine, _tc) = open_engine(&disk);
     engine
-        .put_box("jobs", queue_cfg(false, 0, None))
+        .put_topic("jobs", queue_cfg(false, 0, None))
         .expect("durable queue");
     produce(&engine, "jobs", JOBS);
     sync_wal_dir(&disk);

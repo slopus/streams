@@ -15,7 +15,7 @@ and `i64` are the literal Rust types.
 
 ## 1. Record
 
-A record is one immutable event in a box. Once assigned a `seq`, a record's fields never change.
+A record is one immutable event in a topic. Once assigned a `seq`, a record's fields never change.
 Deletion (§7) and eviction (§5) never mutate a record's fields; a record is either present (and
 unchanged) or removed (gone). Deletion is permanent removal, not a mutation.
 
@@ -23,7 +23,7 @@ unchanged) or removed (gone). Deletion is permanent removal, not a mutation.
 
 | Field | Wire key (in → out) | Type | Origin | Required | Notes |
 |---|---|---|---|---|---|
-| Sequence | — / `$seq` | u64 | server | n/a | Per-box monotonic id, assigned at commit (§4). |
+| Sequence | — / `$seq` | u64 | server | n/a | Per-topic monotonic id, assigned at commit (§4). |
 | Timestamp | — / `$ts` | u64 ms | server | n/a | Server wall-clock at commit; used for TTL (§5.2). |
 | Origin node | `node` / `$node` | string | client | optional | Loop-prevention key (§6). |
 | Tag | `tag` / `$tag` | string | client | optional | Deletion match key (§7). |
@@ -56,25 +56,25 @@ not `null`); `data` is always present (may be JSON `null`). A read-returned reco
 
 ---
 
-## 2. Box
+## 2. Topic
 
-A box is an append-only log of records ordered by `seq`, plus a small config and derived
+A topic is an append-only log of records ordered by `seq`, plus a small config and derived
 watermarks.
 
 ### 2.1 Identity & naming
 
-- Addressed by **name** in the path: `/v0/boxes/:box`. The name *is* the identity.
+- Addressed by **name** in the path: `/v0/topics/:topic`. The name *is* the identity.
 - Naming rule: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts alphanumeric, allows
   `. _ : -`; `:` enables namespacing like `jobs:tenantA`). Case-sensitive, byte-exact, no Unicode
   normalization.
 - **Creation policy** is per-request, defaulting to lazy-create (turbopuffer ergonomics) with an
-  opt-out (Redis `NOMKSTREAM` lesson against typo-boxes):
-  - Write with `create: true` (or the box's `auto_create: true`) auto-creates using inline
+  opt-out (Redis `NOMKSTREAM` lesson against typo-topics):
+  - Write with `create: true` (or the topic's `auto_create: true`) auto-creates using inline
     `config` or defaults.
-  - Write with `create: false` to a missing box → `404 box_not_found`.
-  - Explicit `PUT /v0/boxes/:box` creates-or-updates per the upsert rules (API §1.1).
-- **Deleting** a box tears down all records, the tag index, dedupe state, and any routers
-  with it as `source` or `dest`. Irreversible. A later lazy-create makes a **new, empty** box
+  - Write with `create: false` to a missing topic → `404 topic_not_found`.
+  - Explicit `PUT /v0/topics/:topic` creates-or-updates per the upsert rules (API §1.1).
+- **Deleting** a topic tears down all records, the tag index, dedupe state, and any routers
+  with it as `source` or `dest`. Irreversible. A later lazy-create makes a **new, empty** topic
   whose `seq` restarts at the base; stale consumers detect this exactly like full eviction
   (§5.5).
 
@@ -86,9 +86,9 @@ auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Defaults: `tt
 `durability` resolved from `durable`, `priority=null` + `auto_priority=true`, `auto_create=true`,
 `dedupe_node=true`.
 
-**Durability commit class (`durability`).** A box has one of three commit classes — the
+**Durability commit class (`durability`).** A topic has one of three commit classes — the
 durability/performance tradeoff — resolved from its current config as `durability_class()`
-(the box `type` is immutable, but durability/config can be updated in place, and the resolved
+(the topic `type` is immutable, but durability/config can be updated in place, and the resolved
 class always reflects the current config):
 
 - **`memory`** — _"disk-like but best-effort"_. Takes the **same** group-committed WAL write
@@ -96,14 +96,14 @@ class always reflects the current config):
   fully queryable (getState / getDifference / SSE; its records may persist), but carries **NO
   durability GUARANTEE**: after a restart its records **MAY survive OR be lost**, and recovery
   is **gradual / best-effort** — it does **not** block readiness and does **not** guarantee
-  completeness or emptiness. Never `fsync`-gated, so `fsync_ms` is `0`. The box CONFIG always
+  completeness or emptiness. Never `fsync`-gated, so `fsync_ms` is `0`. The topic CONFIG always
   survives (a control frame). It forgoes the disk-class seq-ceiling fsync (`HeadWatermark`), so
   on a lost tail its `head_seq` may legitimately regress; it never fabricates a record or hands
-  out a future seq. A router / dead-letter copy whose **destination** is a memory box takes the
+  out a future seq. A router / dead-letter copy whose **destination** is a memory topic takes the
   same best-effort path (the copy may survive or be lost). Effectively `disk` minus the
   durability promise — for caches / scratch where occasional loss is acceptable.
 - **`disk`** — written to the WAL and **group-committed** (no per-write `fsync`); `fsync_ms` is
-  `0` (the fast path). The write is acked as soon as its frame is enqueued to its box's WAL-shard
+  `0` (the fast path). The write is acked as soon as its frame is enqueued to its topic's WAL-shard
   writer (the WAL is sharded — see ARCHITECTURE §2; the ack is **not** fsync-gated — the engine
   drops the commit token); the shard writer group-commits and `fdatasync`s the batch shortly
   after. Survives a crash **minus the un-fsynced tail** (the frames enqueued but not yet
@@ -114,12 +114,12 @@ class always reflects the current config):
 **Resolution & back-compat.** An explicit `durability` always wins; absent it, the class is
 derived from the legacy `durable` bool (`true ⇒ fsync`, `false ⇒ disk`) — so `memory` is
 reachable only by setting `durability:"memory"`. The resolved class is reported on every
-box-state / box-create response, and `durable` is normalized to `durable == (class == fsync)`
+topic-state / topic-create response, and `durable` is normalized to `durable == (class == fsync)`
 so a legacy client reading `durable` still sees the right boolean. `is_durable()` is
 `class == fsync`.
 
 **Defaults rationale.**
-- All caps/TTL off ⇒ an out-of-the-box box loses nothing. The safe default for a persistence
+- All caps/TTL off ⇒ an out-of-the-topic topic loses nothing. The safe default for a persistence
   product is "keep everything"; pub/sub users *opt into* small cap+TTL. Silent loss must be a
   deliberate choice.
 - `discard="old"` matches the "append log" mental model and the pub/sub/recent-state cases;
@@ -127,7 +127,7 @@ so a legacy client reading `durable` still sees the right boolean. `is_durable()
 - `durable=false` (class `disk`): the 1–5 ms target on NVMe means fsync-by-default would make
   the common pub/sub case pay for a guarantee it doesn't want. One bool (or `durability`) away
   from `fsync`. The third class, `memory`, is `disk` with **no durability guarantee** —
-  best-effort/lossy caches/scratch boxes that take the same write+recovery path but where data
+  best-effort/lossy caches/scratch topics that take the same write+recovery path but where data
   MAY survive OR be lost on restart (recovery is gradual, never blocks readiness).
 - `priority=null` + `auto_priority=true`: most users never think about priority; recency-based
   auto does the right thing. Power users pin an integer.
@@ -136,7 +136,7 @@ When both `cap_records` and `cap_bytes` are set, **whichever is hit first** trig
 (Kafka dual-retention). TTL and cap are independent and both apply; a record leaves the retained
 set when *any* of (ttl expired) OR (beyond `cap_records`) OR (beyond `cap_bytes`) holds.
 
-### 2.3 State (read via `GET /v0/boxes/:box`)
+### 2.3 State (read via `GET /v0/topics/:topic`)
 
 `head_seq` (highest assigned seq, log end; `0` if never written), `earliest_seq` (lowest
 retained non-expired deliverable seq, log start; `head_seq + 1` when empty), `next_seq`,
@@ -147,17 +147,17 @@ the exact definition of `earliest_seq` and API §1.2 for the response shape.
 
 ## 3. Priority & effective priority
 
-Every box has an **effective priority** combining a manual component and an automatic
+Every topic has an **effective priority** combining a manual component and an automatic
 recency component. It affects **delivery scheduling only** — never `seq` order, retention, or
 which records are visible.
 
 ### 3.1 Formula & defaults
 
 ```
-P_eff(box, now) =
+P_eff(topic, now) =
       W_manual * clamp(priority, -1000, 1000)
-    + W_auto   * auto_recency(box, now)
-    + W_age    * age_boost(box, now)
+    + W_auto   * auto_recency(topic, now)
+    + W_age    * age_boost(topic, now)
 
 auto_recency = AUTO_MAX * 2^( -(now - last_consumed_at) / HALF_LIFE_MS )
 age_boost    = AGE_RATE * min(now - enqueued_at, AGE_CAP_MS)
@@ -167,21 +167,21 @@ age_boost    = AGE_RATE * min(now - enqueued_at, AGE_CAP_MS)
 |---|---|---|
 | `W_manual`, `W_auto`, `W_age` | `1.0` each | Component weights. |
 | `priority` | `0` (config `null` ⇒ auto-only) | Operator-set base, clamped `[-1000, 1000]`. |
-| `AUTO_MAX` | `500` | A freshly-consumed box ≈ a +500 manual box. |
+| `AUTO_MAX` | `500` | A freshly-consumed topic ≈ a +500 manual topic. |
 | `HALF_LIFE_MS` | `30000` | Auto bonus halves every 30 s of inactivity. |
 | `AUTO_FLOOR_MS` | `300000` | After 5 min untouched, auto term forced to 0 (skip the math). |
 | `AGE_RATE` | `+100 / s waited` | Anti-starvation climb. |
 | `AGE_CAP_MS` | `10000` | Aging capped at +1000 after 10 s. |
 
-A box is "consumed" by any `GET /v0/boxes/:box` (untouched if `touch=false`),
-`POST /v0/boxes/:box/diff`, or SSE attach/delivery; each sets `last_consumed_at = now`.
+A topic is "consumed" by any `GET /v0/topics/:topic` (untouched if `touch=false`),
+`POST /v0/topics/:topic/diff`, or SSE attach/delivery; each sets `last_consumed_at = now`.
 
 Decay (AUTO_MAX 500, half-life 30 s): 0 s → 500, 15 s → 354, 30 s → 250, 60 s → 125, 120 s →
-31, ≥300 s → 0. Half-life 30 s means an actively-polling consumer keeps its box "hot" with
-negligible upkeep, while a quiet box sheds priority within a couple of minutes — matching
-"recently consumed boxes get higher effective priority" without letting a once-busy box hog the
+31, ≥300 s → 0. Half-life 30 s means an actively-polling consumer keeps its topic "hot" with
+negligible upkeep, while a quiet topic sheds priority within a couple of minutes — matching
+"recently consumed topics get higher effective priority" without letting a once-busy topic hog the
 scheduler. `AUTO_MAX=500` keeps recency worth roughly half the manual range, so an operator can
-still force a box above all auto traffic with `priority=1000` (or below with `-1000`).
+still force a topic above all auto traffic with `priority=1000` (or below with `-1000`).
 
 `P_eff` is never stored as ground truth; it is computed on demand at enqueue time and on a 50 ms
 aging tick, using integer/fixed-point math (a 64-entry LUT for `2^-x`, no `powf` on the hot
@@ -195,7 +195,7 @@ ARCHITECTURE §4–5.
 
 ### 4.1 Exact contract
 
-- Each box has its own `u64` counter `next_seq`, starting at `seq_base` (default `1`; `0` is
+- Each topic has its own `u64` counter `next_seq`, starting at `seq_base` (default `1`; `0` is
   reserved to mean "no records").
 - On commit of a write of N records, the server atomically assigns `next_seq, …, next_seq+N-1`,
   sets `next_seq += N`, and returns the seqs in write order. Assignment is at **commit**
@@ -214,10 +214,10 @@ ARCHITECTURE §4–5.
 ### 4.2 Restart / recreate
 
 - After restart, `next_seq` is recovered as `max(committed seq) + 1`. Records buffered in the WAL
-  but not yet durably committed (for non-durable boxes) are lost; their seqs are never reused, so
+  but not yet durably committed (for non-durable topics) are lost; their seqs are never reused, so
   seq is monotonic across restarts. Gaps from lost-but-acked non-durable writes are treated
   exactly like eviction by consumers.
-- A deleted-and-recreated box restarts `next_seq` at `seq_base`; because the new `head_seq` can
+- A deleted-and-recreated topic restarts `next_seq` at `seq_base`; because the new `head_seq` can
   be *below* a stale consumer's cursor, this is made non-silent via §5.5.
 
 ### 4.3 Cursors
@@ -235,12 +235,12 @@ ARCHITECTURE §4–5.
 
 ### 5.1 The dual watermark — `evict_floor` and `earliest_seq`
 
-Each box distinguishes **two floors** so the tombstone (involuntary loss) is decoupled from
+Each topic distinguishes **two floors** so the tombstone (involuntary loss) is decoupled from
 voluntary deletion:
 
 - **`earliest_seq`** — the seq of the **first currently-live record**: not eviction-reclaimed,
-  not TTL-expired, and **not deleted**. Reported in box state and `diff`. If no live record
-  exists it is `head_seq + 1`. It is **monotonically non-decreasing** over a box instance's
+  not TTL-expired, and **not deleted**. Reported in topic state and `diff`. If no live record
+  exists it is `head_seq + 1`. It is **monotonically non-decreasing** over a topic instance's
   life (eviction, TTL, and **deletion** all advance it); it resets only on delete+recreate
   (§5.5).
 - **`evict_floor`** — advanced **only** by **involuntary** loss of live records: cap eviction
@@ -277,21 +277,21 @@ popping **already-deleted** slots (voluntary) does **not** advance `evict_floor`
   logically expired (invisible) before physically reclaimed — never observable as anything but
   "expired."
 - Because `$ts` is commit-assigned and `seq` is commit-ordered, `$ts` is **non-decreasing in
-  `seq`** within a box. So "all seqs ≤ X are expired" is a binary-searchable predicate (Redis
+  `seq`** within a topic. So "all seqs ≤ X are expired" is a binary-searchable predicate (Redis
   time-id lesson) — finding the TTL sub-floor of `evict_floor` is O(log n) over segments, not
   O(n).
 
 ### 5.3 Eviction by cap & full policy
 
-When a write would push the box beyond `cap_records` or `cap_bytes`:
+When a write would push the topic beyond `cap_records` or `cap_bytes`:
 - `discard = "old"` (default): commit the write, then advance `evict_floor` by removing oldest
-  records until back within cap — segment-granular and lazy (§5.6), so the box may transiently
+  records until back within cap — segment-granular and lazy (§5.6), so the topic may transiently
   exceed cap by up to one segment; `earliest_seq`/`count` reflect the logical floor.
 - `discard = "reject"`: the write is **rejected synchronously before assigning any seq**, with
-  `422 box_full` and `error.detail` carrying `cap_records`/`cap_bytes` and current
+  `422 topic_full` and `error.detail` carrying `cap_records`/`cap_bytes` and current
   `head_seq`/`earliest_seq`. No record is acked-then-dropped (the NATS DiscardNew foot-gun is
   avoided). A single write larger than the entire cap is a permanent `400 record_too_large` (not
-  retryable), distinguished from `422 box_full` (retryable after consumers drain).
+  retryable), distinguished from `422 topic_full` (retryable after consumers drain).
 
 ### 5.4 Tombstone / gap — the exact consumer contract
 
@@ -322,7 +322,7 @@ cursor simply advances past the deleted seqs.
 - `$seq` of the tombstone equals `earliest_seq` (first live seq after the gap), so it slots into
   the monotonic id stream as a valid resume point.
 - `reason` ∈ `"cap"` (evicted for capacity), `"ttl"` (TTL-expired), `"mixed"` (both contributed),
-  `"recreated"` (box deleted+recreated, §5.5). In SSE the connect-time variant `"from_seq_too_old"`
+  `"recreated"` (topic deleted+recreated, §5.5). In SSE the connect-time variant `"from_seq_too_old"`
   is also used (same meaning as cap/ttl discovered at connect). The reason is informational; the
   **gap range is authoritative**.
 
@@ -352,10 +352,10 @@ mixing the two signals is structurally impossible.
 
 ### 5.5 Delete+recreate / seq rewind
 
-If a box is deleted and a new box of the same name is created, a stale consumer presenting
-`from_seq >= new head_seq` (from the future relative to the new box) MUST receive a tombstone with
+If a topic is deleted and a new topic of the same name is created, a stale consumer presenting
+`from_seq >= new head_seq` (from the future relative to the new topic) MUST receive a tombstone with
 `reason:"recreated"`, `gap_from = seq_base`, `gap_to = new head_seq` (possibly empty), then the
-read proceeds from the new `earliest_seq`. The server detects this via a per-box-instance
+read proceeds from the new `earliest_seq`. The server detects this via a per-topic-instance
 **epoch** (monotonic counter bumped on create); cursors MAY encode the epoch so the rewind is
 detected exactly. Absent an epoch, the server treats `from_seq > head_seq` as a recreate signal.
 
@@ -399,7 +399,7 @@ back events it produced.
   window is selected, a batch may return fewer than `limit` records (even zero) while still
   advancing the cursor. The consumer relies on `next_from_seq`/`head_seq`/`caught_up`, not on
   batch fullness, to know whether it is caught up (avoids unbounded scanning to "fill" a batch).
-- Disable per-box with `dedupe_node: false` if you genuinely want echoes.
+- Disable per-topic with `dedupe_node: false` if you genuinely want echoes.
 
 ---
 
@@ -407,13 +407,13 @@ back events it produced.
 
 ### 7.1 Model — permanent, async, immediate, silent, point-in-time
 
-`POST /v0/boxes/:box/delete` removes records by **seq range** (`before_seq`) and/or by **tag**
+`POST /v0/topics/:topic/delete` removes records by **seq range** (`before_seq`) and/or by **tag**
 `match`. It is a one-shot operation against the records present at call time, **not** a standing
 filter. Five properties define it:
 
 - **PERMANENT.** Deleted records are gone for good; there is no un-delete in `/v0` (this resolves
   the old open question — see ROADMAP). To "resurrect," write a new record.
-- **EFFECTIVE IMMEDIATELY.** The delete is invisible to **all** reads at once — `diff`, box state
+- **EFFECTIVE IMMEDIATELY.** The delete is invisible to **all** reads at once — `diff`, topic state
   `count`/`bytes`, and SSE. A reader's cursor simply advances past the deleted seqs.
 - **ASYNCHRONOUS, NO COMPACTION / NO RECLAIM.** Records are *logically* gone instantly (the work
   runs off the call path), but a deleted record **stays on disk, just marked** — there is no
@@ -451,9 +451,9 @@ Records with **no tag** are never matched by a `match`. A delete is committed an
 (survives restart). The response returns `deleted` (count removed) plus the post-delete
 `earliest_seq`/`head_seq`/`count`/`bytes` (API §5).
 
-### 7.2 The per-box tag index (efficient match-deletes)
+### 7.2 The per-topic tag index (efficient match-deletes)
 
-A `match` delete MUST NOT scan the whole log. Each box keeps a **tag index** mapping tag → its
+A `match` delete MUST NOT scan the whole log. Each topic keeps a **tag index** mapping tag → its
 live seqs in ascending order — conceptually a `BTreeMap<String, Vec<u64>>`:
 - **Exact** `Eq "X"` → point lookup of `index["X"]`.
 - **Prefix** `Glob "X*"` → range scan over keys in `["X", next-key)`.
@@ -507,7 +507,7 @@ after a checkpoint trims the WAL. Three witnesses are kept in agreement:
   the next checkpoint re-flips.
 
 This makes a sealed-record deletion survive a **WAL trim / checkpoint** that drops the `Delete`
-frame: on recovery the engine **reads the on-disk flags back** (it lists each box's segment files
+frame: on recovery the engine **reads the on-disk flags back** (it lists each topic's segment files
 and scans their `.data` frames) and re-marks the corresponding seqs deleted in the rebuilt index —
 the deletion no longer depends on a retained WAL frame. Reads (`diff`/SSE) skip the flagged
 records, and the recovery scan is idempotent and crash-safe to re-run.
@@ -575,8 +575,8 @@ recommended (one WAL write per source append, off the ack path, no silent loss).
   `preserve_node`; this is what makes loop-prevention work across the route), `$tag` (when
   `preserve_tag`), `meta`, and `data` verbatim.
 - `$seq` and `$ts` are reassigned by `dst`. Original src seq/ts are optionally preserved in
-  reserved meta `$src_box` / `$src_seq` for traceability (off by default to keep payloads lean).
-- Deletes and node filters are **per-box** and do not propagate through routers. A delete on
+  reserved meta `$src_topic` / `$src_seq` for traceability (off by default to keep payloads lean).
+- Deletes and node filters are **per-topic** and do not propagate through routers. A delete on
   `src` removes records from `src`, but a copy may already have been forwarded to `dst`; to remove
   it in `dst` too, issue a delete on `dst`. Honest and predictable.
 
@@ -598,9 +598,9 @@ A forward into `dst` is an ordinary append obeying `dst`'s config:
 
 1. **Node loop-prevention (content-level, primary).** Because `$node` is preserved verbatim
    through every forward, a symmetric topology works: node A writes `$node=A`; routers fan it to
-   B's and C's boxes; B and C read with their own `node` filters, so they receive A's record but
+   B's and C's topics; B and C read with their own `node` filters, so they receive A's record but
    never re-emit it as their own. Routers forwarding a record do not change `$node`, so a record
-   that loops back to a box read by its origin node is filtered at read. This makes N-way
+   that loops back to a topic read by its origin node is filtered at read. This makes N-way
    multi-master safe even with cyclic router graphs, *as long as nodes set and filter their node
    ids* — the documented contract for the multi-master use case.
 
@@ -626,7 +626,7 @@ A forward into `dst` is an ordinary append obeying `dst`'s config:
   if missing unless `create_dest: false`.
 - `DELETE /v0/routers/:router` stops forwarding immediately; already-forwarded records in `dst`
   remain.
-- Deleting a box deletes the routers touching it (a router referencing a missing endpoint cannot
+- Deleting a topic deletes the routers touching it (a router referencing a missing endpoint cannot
   exist).
 
 ---
@@ -656,21 +656,21 @@ A forward into `dst` is an ordinary append obeying `dst`'s config:
    DAG-by-default** (with an explicit hop-capped `allow_cycle` escape hatch): forwarding runs off
    the write/ack path, derived copies are not WAL-logged (one WAL write per source append
    regardless of fan-out), a durable per-router cursor drives replay-from-cursor recovery, and a
-   second router with a different source into one dest is rejected `409 box_exists_incompatible`
+   second router with a different source into one dest is rejected `409 topic_exists_incompatible`
    (`error.detail.reason: "router_dest_fan_in"`). `dst`
    enforces its own retention and `discard:"reject"` applies backpressure rather than silently
    dropping.
-7. **Durability is per-box and explicit**; only data not yet in the (fsynced, for durable boxes)
+7. **Durability is per-topic and explicit**; only data not yet in the (fsynced, for durable topics)
    WAL is lost on crash, and such loss appears to consumers as ordinary eviction-style gaps.
 
 ---
 
 ## 10. Queues (lease-based job delivery)
 
-A **queue** is a *type* of box (`type:"queue"`, API §0.10). It is purely **additive**: a
-queue is an ordinary box (everything in §1–§9 still holds — seq assignment, the dual
+A **queue** is a *type* of topic (`type:"queue"`, API §0.10). It is purely **additive**: a
+queue is an ordinary topic (everything in §1–§9 still holds — seq assignment, the dual
 watermark, tombstones, node filtering, routers, durability) with a lease lifecycle layered
-on top. A `"log"` box (the default) behaves exactly as before and rejects the queue
+on top. A `"log"` topic (the default) behaves exactly as before and rejects the queue
 endpoints with `409 not_a_queue` (API §10). This section is normative for the queue layer
 only; it changes **no** existing semantics.
 
@@ -678,8 +678,8 @@ only; it changes **no** existing semantics.
 
 A queue is **two logs**:
 
-1. **The jobs log** — the box itself. You `POST` records into it (API §2); each record is a
-   job, identified by its `$seq`. Durability follows the box's `durable` config. This is the
+1. **The jobs log** — the topic itself. You `POST` records into it (API §2); each record is a
+   job, identified by its `$seq`. Durability follows the topic's `durable` config. This is the
    queue's source of truth for *what work exists*.
 2. **The leases log** — an append-only log of **lifecycle events** describing *who holds
    what*: `claimed`, `released`, `extended`, `acked` (one event per lifecycle transition,
@@ -688,12 +688,12 @@ A queue is **two logs**:
    event-sourced, not a separately-mutated table. Rebuilding the projection by replaying the
    leases log yields the exact current who-holds-what.
 
-The leases log is built on the **same box machinery** (it is an internal companion log of
-the queue box), so it inherits WAL framing, group commit, and crash recovery for free. Its
+The leases log is built on the **same topic machinery** (it is an internal companion log of
+the queue topic), so it inherits WAL framing, group commit, and crash recovery for free. Its
 **materialized projection** (the live lease table + reclaim freelist + claim cursor) is held
 in memory and rebuilt on restart (ARCHITECTURE §12).
 
-**Durability nuance (a deliberate perf win).** The **jobs log** is durable per the box's
+**Durability nuance (a deliberate perf win).** The **jobs log** is durable per the topic's
 `durable` config — *we must not lose jobs*. The **leases log defaults non-durable**
 (`leases_durable:false`) because **losing leases on a crash is self-healing**: on restart, a
 job with no replayed active lease is simply claimable again, which is exactly correct
@@ -723,7 +723,7 @@ use the Clock, never wall-clock sleeps):
               │                                                   ▼
               │                                              ┌─────────┐
               └──── (delivery > max_deliveries) ───────────► │  DONE   │
-                    dead-letter: move to dead_letter box     │(deleted)│
+                    dead-letter: move to dead_letter topic     │(deleted)│
                     + permanent delete                       └─────────┘
 ```
 
@@ -744,7 +744,7 @@ use the Clock, never wall-clock sleeps):
 - **IN_FLIGHT → IN_FLIGHT** — an `extend` (§10.6 heartbeat) appends an `extended` event
   setting a new `deadline = now + lease_ms`; the delivery counter is **not** touched.
 - **READY → DONE (dead-letter)** — when a job would be delivered past `max_deliveries`, it is
-  moved to the `dead_letter` box and permanently deleted instead of re-delivered (§10.7).
+  moved to the `dead_letter` topic and permanently deleted instead of re-delivered (§10.7).
 
 ### 10.3 The coalescing-window claim + even distribution
 
@@ -788,10 +788,10 @@ The queue is **at-least-once**, matching routers (§8.2) and the BullMQ lesson:
 
 ### 10.5 Reads, watch, and routers still work
 
-A queue box is still a box. `GET /v0/boxes/:q` returns the normal state **plus** a `queue`
+A queue topic is still a topic. `GET /v0/topics/:q` returns the normal state **plus** a `queue`
 sub-object (`ready`/`in_flight`/`dead_lettered`). `diff` (§3) and SSE `watch` (§7) read the
 **jobs log** read-only — useful for monitoring/auditing the backlog — and never claim, ack,
-or touch leases. Routers (§8) may forward into or out of a queue's jobs log like any box
+or touch leases. Routers (§8) may forward into or out of a queue's jobs log like any topic
 (a router into a queue is a producer; the dead-letter move is an internal append, not a
 router). Node loop-prevention, tombstones, TTL, and caps apply to the jobs log unchanged
 (e.g. `discard:"reject"` makes a full durable queue refuse new jobs rather than drop them).
@@ -814,11 +814,11 @@ at-least-once already permits.
 ### 10.7 Dead-lettering
 
 Each job carries a **delivery counter** (incremented on every claim, including reclaims). When
-a job is about to be delivered for the `(max_deliveries + 1)`-th time and the box has a
-non-null `dead_letter`, the server instead **moves** the job to the `dead_letter` box —
+a job is about to be delivered for the `(max_deliveries + 1)`-th time and the topic has a
+non-null `dead_letter`, the server instead **moves** the job to the `dead_letter` topic —
 appending its record there (preserving `$tag`/`meta`/`data`, stamping `meta.$dead_letter_*`
 provenance) and permanently deleting it from the jobs log (the §7 delete path). With
 `max_deliveries = 0` or `dead_letter = null`, jobs are reclaimed indefinitely. Dead-lettering
-increments the `dead_lettered` observability counter. The dead-letter box is an ordinary box
+increments the `dead_lettered` observability counter. The dead-letter topic is an ordinary topic
 (log or queue), so a poison job can be inspected via `diff`/`watch` or re-driven by reading it
 and re-producing into the source queue.

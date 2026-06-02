@@ -25,7 +25,7 @@
 //!   (`torn_tail_on_subprocess_wal_recovers_clean`).
 //!
 //! The in-process engine-level durability tests live in
-//! `tests/integration_durability.rs`; these are the black-box, real-process
+//! `tests/integration_durability.rs`; these are the black-topic, real-process
 //! proofs.
 
 #![cfg(unix)]
@@ -150,7 +150,7 @@ fn get_json(c: &reqwest::blocking::Client, url: String) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Build a non-trivial durable state (writes with tags/nodes, a delete, a cap
-/// box that evicts, and a router), confirm every write is acked (durable ⇒ the
+/// topic that evicts, and a router), confirm every write is acked (durable ⇒ the
 /// 2xx returns only after fsync), SIGKILL, restart on the same dir, and assert
 /// the FULL state matches pre-crash: head/earliest/count/config, the deleted
 /// record stays gone (silent), the cap floor still tombstones, and the router +
@@ -167,9 +167,9 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     let base = server.base;
     wait_healthy(&c, &base, Duration::from_secs(10));
 
-    // A durable "jobs" box: 5 tagged/noded writes, then delete seq < 2.
+    // A durable "jobs" topic: 5 tagged/noded writes, then delete seq < 2.
     assert!(c
-        .put(format!("{base}/v0/boxes/jobs"))
+        .put(format!("{base}/v0/topics/jobs"))
         .json(&json!({ "durable": true, "ttl_ms": 0 }))
         .send()
         .unwrap()
@@ -177,7 +177,7 @@ fn sigkill_durable_writes_survive_with_identical_state() {
         .is_success());
     for i in 1..=5 {
         let r = c
-            .post(format!("{base}/v0/boxes/jobs"))
+            .post(format!("{base}/v0/topics/jobs"))
             .json(&json!({ "records": [{
                 "data": { "i": i }, "tag": format!("t{i}"), "node": "writerA"
             }] }))
@@ -191,16 +191,16 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     }
     // Delete the prefix < seq 2 (voluntary ⇒ silent, advances earliest only).
     assert!(c
-        .post(format!("{base}/v0/boxes/jobs/delete"))
+        .post(format!("{base}/v0/topics/jobs/delete"))
         .json(&json!({ "before_seq": 2 }))
         .send()
         .unwrap()
         .status()
         .is_success());
 
-    // A durable cap box (cap=3): write 6 ⇒ evict_floor advances (involuntary).
+    // A durable cap topic (cap=3): write 6 ⇒ evict_floor advances (involuntary).
     assert!(c
-        .put(format!("{base}/v0/boxes/capped"))
+        .put(format!("{base}/v0/topics/capped"))
         .json(&json!({ "durable": true, "cap_records": 3 }))
         .send()
         .unwrap()
@@ -208,7 +208,7 @@ fn sigkill_durable_writes_survive_with_identical_state() {
         .is_success());
     for i in 1..=6 {
         let r = c
-            .post(format!("{base}/v0/boxes/capped"))
+            .post(format!("{base}/v0/topics/capped"))
             .json(&json!({ "records": [{ "data": { "i": i } }] }))
             .send()
             .unwrap();
@@ -231,21 +231,21 @@ fn sigkill_durable_writes_survive_with_identical_state() {
         .status()
         .is_success());
     assert!(c
-        .put(format!("{base}/v0/boxes/src"))
+        .put(format!("{base}/v0/topics/src"))
         .json(&json!({ "durable": true }))
         .send()
         .unwrap()
         .status()
         .is_success());
     assert!(c
-        .put(format!("{base}/v0/boxes/dst"))
+        .put(format!("{base}/v0/topics/dst"))
         .json(&json!({ "durable": true }))
         .send()
         .unwrap()
         .status()
         .is_success());
     assert!(c
-        .post(format!("{base}/v0/boxes/src"))
+        .post(format!("{base}/v0/topics/src"))
         .json(&json!({ "records": [{ "data": { "fwd": 1 }, "tag": "ftag", "node": "writerA" }] }))
         .send()
         .unwrap()
@@ -253,9 +253,9 @@ fn sigkill_durable_writes_survive_with_identical_state() {
         .is_success());
 
     // Snapshot the pre-crash committed state for an exact comparison.
-    let pre_jobs = get_json(&c, format!("{base}/v0/boxes/jobs"));
-    let pre_capped = get_json(&c, format!("{base}/v0/boxes/capped"));
-    let pre_src = get_json(&c, format!("{base}/v0/boxes/src"));
+    let pre_jobs = get_json(&c, format!("{base}/v0/topics/jobs"));
+    let pre_capped = get_json(&c, format!("{base}/v0/topics/capped"));
+    let pre_src = get_json(&c, format!("{base}/v0/topics/src"));
     let pre_router = get_json(&c, format!("{base}/v0/routers/r1"));
 
     // --- Hard kill: SIGKILL, no graceful path. ---
@@ -270,12 +270,12 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     let base = server2.base;
     wait_ready(&c, &base, Duration::from_secs(10));
 
-    let post_jobs = get_json(&c, format!("{base}/v0/boxes/jobs"));
-    let post_capped = get_json(&c, format!("{base}/v0/boxes/capped"));
-    let post_src = get_json(&c, format!("{base}/v0/boxes/src"));
+    let post_jobs = get_json(&c, format!("{base}/v0/topics/jobs"));
+    let post_capped = get_json(&c, format!("{base}/v0/topics/capped"));
+    let post_src = get_json(&c, format!("{base}/v0/topics/src"));
     let post_router = get_json(&c, format!("{base}/v0/routers/r1"));
 
-    // head/earliest/count/config all identical to pre-crash for the boxes whose
+    // head/earliest/count/config all identical to pre-crash for the topics whose
     // records are durably WAL-logged (direct writes): jobs, capped, src.
     for field in ["head_seq", "earliest_seq", "count", "config"] {
         assert_eq!(post_jobs[field], pre_jobs[field], "jobs.{field} matches");
@@ -292,7 +292,7 @@ fn sigkill_durable_writes_survive_with_identical_state() {
 
     // The deleted record stays gone and the delete is still SILENT (no tombstone).
     let jobs_diff: Value = c
-        .post(format!("{base}/v0/boxes/jobs/diff"))
+        .post(format!("{base}/v0/topics/jobs/diff"))
         .json(&json!({ "from_seq": 0, "include_tags": true }))
         .send()
         .unwrap()
@@ -315,13 +315,13 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     assert_eq!(jobs_diff["records"][0]["$tag"], json!("t2"));
     assert_eq!(jobs_diff["records"][0]["$node"], json!("writerA"));
 
-    // Cap box: floor recovered ⇒ a cursor below it STILL tombstones (no silent
+    // Cap topic: floor recovered ⇒ a cursor below it STILL tombstones (no silent
     // involuntary loss across restart).
     assert_eq!(post_capped["head_seq"], 6);
     assert_eq!(post_capped["earliest_seq"], 4, "cap floor recovered");
     assert_eq!(post_capped["count"], 3);
     let cap_diff: Value = c
-        .post(format!("{base}/v0/boxes/capped/diff"))
+        .post(format!("{base}/v0/topics/capped/diff"))
         .json(&json!({ "from_seq": 0 }))
         .send()
         .unwrap()
@@ -351,7 +351,7 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     // beat for the recovery re-forward / background worker.
     std::thread::sleep(Duration::from_millis(50));
     let dst_diff1: Value = c
-        .post(format!("{base}/v0/boxes/dst/diff"))
+        .post(format!("{base}/v0/topics/dst/diff"))
         .json(&json!({ "from_seq": 0, "include_tags": true }))
         .send()
         .unwrap()
@@ -377,7 +377,7 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     // Forwarding still works after restart: a NEW durable write to src is
     // forwarded to dst with $node/$tag preserved.
     assert!(c
-        .post(format!("{base}/v0/boxes/src"))
+        .post(format!("{base}/v0/topics/src"))
         .json(&json!({ "records": [{ "data": { "fwd": 2 }, "tag": "ftag2", "node": "writerB" }] }))
         .send()
         .unwrap()
@@ -387,7 +387,7 @@ fn sigkill_durable_writes_survive_with_identical_state() {
     // read-path router catch-up, but give the background worker a beat too.
     std::thread::sleep(Duration::from_millis(50));
     let dst_diff2: Value = c
-        .post(format!("{base}/v0/boxes/dst/diff"))
+        .post(format!("{base}/v0/topics/dst/diff"))
         .json(&json!({ "from_seq": 0, "include_tags": true }))
         .send()
         .unwrap()
@@ -427,10 +427,10 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
     let base = server.base;
     wait_healthy(&c, &base, Duration::from_secs(10));
 
-    // A NON-durable box (durable:false default) ⇒ writes are acked after the
+    // A NON-durable topic (durable:false default) ⇒ writes are acked after the
     // buffered write; durability follows a later group fsync.
     assert!(c
-        .put(format!("{base}/v0/boxes/burst"))
+        .put(format!("{base}/v0/topics/burst"))
         .json(&json!({ "durable": false }))
         .send()
         .unwrap()
@@ -448,7 +448,7 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
             let c = client();
             for i in 0..per_writer {
                 let _ = c
-                    .post(format!("{base}/v0/boxes/burst"))
+                    .post(format!("{base}/v0/topics/burst"))
                     .json(&json!({ "records": [{ "data": { "w": w, "i": i } }],
                                    "return_seqs": false }))
                     .send();
@@ -476,12 +476,12 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
     // under load).
     wait_ready(&c, &base, Duration::from_secs(60));
 
-    let st = get_json(&c, format!("{base}/v0/boxes/burst"));
+    let st = get_json(&c, format!("{base}/v0/topics/burst"));
     let head = st["head_seq"].as_u64().unwrap();
     let count = st["count"].as_u64().unwrap();
     assert_eq!(st["earliest_seq"], 1, "no eviction; earliest stays 1");
     // The recovered LIVE set is a dense contiguous prefix [1..=count] (no deletes/
-    // eviction, no middle gap). For a `disk` box, `head` may sit ABOVE `count` by
+    // eviction, no middle gap). For a `disk` topic, `head` may sit ABOVE `count` by
     // the durable head reservation (R3): the SIGKILL dropped the un-fsynced disk
     // tail, so recovery resumes at the reservation ceiling and the unwritten
     // reserved seqs are silent deleted gaps — but head NEVER regresses below an
@@ -501,7 +501,7 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
     let mut from = 0u64;
     loop {
         let d: Value = c
-            .post(format!("{base}/v0/boxes/burst/diff"))
+            .post(format!("{base}/v0/topics/burst/diff"))
             .json(&json!({ "from_seq": from, "limit": 1000 }))
             .send()
             .unwrap()
@@ -528,7 +528,7 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
     // The WAL is writable again post-recovery: a fresh durable write appends
     // cleanly after the truncated tail and survives a second restart.
     let r = c
-        .post(format!("{base}/v0/boxes/burst"))
+        .post(format!("{base}/v0/topics/burst"))
         .json(&json!({ "records": [{ "data": { "after": "crash" } }] }))
         .send()
         .unwrap();
@@ -536,7 +536,7 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
     let body = r.text().unwrap_or_default();
     assert!(status.is_success(), "fresh write failed: {status} {body}");
     let new_head: u64 = c
-        .get(format!("{base}/v0/boxes/burst"))
+        .get(format!("{base}/v0/topics/burst"))
         .send()
         .unwrap()
         .json::<Value>()
@@ -574,7 +574,7 @@ fn torn_tail_on_subprocess_wal_recovers_clean() {
     wait_healthy(&c, &base, Duration::from_secs(10));
 
     assert!(c
-        .put(format!("{base}/v0/boxes/t"))
+        .put(format!("{base}/v0/topics/t"))
         .json(&json!({ "durable": true }))
         .send()
         .unwrap()
@@ -582,7 +582,7 @@ fn torn_tail_on_subprocess_wal_recovers_clean() {
         .is_success());
     for i in 1..=3 {
         let r = c
-            .post(format!("{base}/v0/boxes/t"))
+            .post(format!("{base}/v0/topics/t"))
             .json(&json!({ "records": [{ "data": { "i": i } }] }))
             .send()
             .unwrap();
@@ -636,14 +636,14 @@ fn torn_tail_on_subprocess_wal_recovers_clean() {
     let base = server2.base;
     wait_ready(&c, &base, Duration::from_secs(10));
 
-    let st = get_json(&c, format!("{base}/v0/boxes/t"));
+    let st = get_json(&c, format!("{base}/v0/topics/t"));
     assert_eq!(
         st["head_seq"], 3,
         "good frames recovered, torn tail discarded"
     );
     assert_eq!(st["count"], 3);
     let d: Value = c
-        .post(format!("{base}/v0/boxes/t/diff"))
+        .post(format!("{base}/v0/topics/t/diff"))
         .json(&json!({ "from_seq": 0 }))
         .send()
         .unwrap()
@@ -660,14 +660,14 @@ fn torn_tail_on_subprocess_wal_recovers_clean() {
     // WAL writable again: a new durable write appends after the truncation and
     // survives a clean restart (proves truncation, not append-after-garbage).
     assert!(c
-        .post(format!("{base}/v0/boxes/t"))
+        .post(format!("{base}/v0/topics/t"))
         .json(&json!({ "records": [{ "data": { "i": 4 } }] }))
         .send()
         .unwrap()
         .status()
         .is_success());
     assert_eq!(
-        get_json(&c, format!("{base}/v0/boxes/t"))["head_seq"],
+        get_json(&c, format!("{base}/v0/topics/t"))["head_seq"],
         4,
         "append continues cleanly after torn-tail truncation"
     );

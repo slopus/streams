@@ -17,7 +17,7 @@
 //!   every CommitToken resolves exactly once to Ok or Failed (never Pending forever)
 //!   no lost wakeup; wait() never blocks forever
 //!   multiple submitters + one writer drain: every submission is written, in
-//!     per-box submit order; no submission dropped
+//!     per-topic submit order; no submission dropped
 //!   writer gone ⇒ pending waiters observe Failed (WriterGone), never deadlock;
 //!     a submit after writer-gone returns Err
 //!   an fsync that fails fails ALL tokens in the batch (durable AND non-durable)
@@ -27,10 +27,10 @@
 //! | id | what it pins |
 //! |----|--------------|
 //! | `F-CT-COMMIT-TOKEN-HANDOFF`  | the `Mutex<CommitOutcome>+Condvar` handoff: every token resolves exactly once; no lost wakeup; wait never hangs. |
-//! | `F-CT-MPSC-SINGLE-CONSUMER`  | N submitters + one writer drain: every submission is written, per-box order preserved, none dropped. |
+//! | `F-CT-MPSC-SINGLE-CONSUMER`  | N submitters + one writer drain: every submission is written, per-topic order preserved, none dropped. |
 //! | `F-CT-WRITER-GONE`           | the writer exits with tokens still pending: waiters observe Failed (WriterGone), never deadlock; a later submit returns Err. |
 //! | `F-CT-BATCH-PARTIAL-FAIL`    | an fsync EIO on a batch with durable + non-durable submissions fails ALL its tokens (no per-frame partial ack). |
-//! | `F-PUB-ROLLBACK-INVISIBLE`   | a writer stages, the fsync fails, it rolls back; a concurrent reader polling head_seq sees nothing — box byte-identical to pre-stage. |
+//! | `F-PUB-ROLLBACK-INVISIBLE`   | a writer stages, the fsync fails, it rolls back; a concurrent reader polling head_seq sees nothing — topic byte-identical to pre-stage. |
 //!
 //! ## Running
 //!
@@ -77,7 +77,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalError, WalReader, WalRecord};
 use streams::storage::Fs;
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/fault_wal_*.rs — reused, not reinvented).
@@ -108,20 +108,20 @@ fn fast_cfg(dir: &std::path::Path) -> WalConfig {
     c
 }
 
-/// An Append frame for `box_id` at `seq`.
-fn ap(box_id: u32, seq: u64) -> WalRecord {
+/// An Append frame for `topic_id` at `seq`.
+fn ap(topic_id: u32, seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id,
+        topic_id,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
         tag: Some("t".into()),
-        data: format!("p-{box_id}-{seq}").into_bytes(),
+        data: format!("p-{topic_id}-{seq}").into_bytes(),
     }
 }
 
 /// Replay every `wal-*.log` on a disk image, stopping each file at its torn
-/// tail. Returns the decoded (box_id, seq) pairs in file order.
+/// tail. Returns the decoded (topic_id, seq) pairs in file order.
 fn replay_wal(disk: &FakeDisk, data_dir: &std::path::Path) -> Vec<(u32, u64)> {
     let fs = disk.arc();
     let wal_dir = data_dir.join("wal");
@@ -141,8 +141,8 @@ fn replay_wal(disk: &FakeDisk, data_dir: &std::path::Path) -> Vec<(u32, u64)> {
     for f in files {
         let r = WalReader::open_with(&fs, &f).expect("open wal file");
         for frame in r {
-            if let WalRecord::Append { box_id, seq, .. } = &frame.record {
-                out.push((*box_id, *seq));
+            if let WalRecord::Append { topic_id, seq, .. } = &frame.record {
+                out.push((*topic_id, *seq));
             }
         }
     }
@@ -241,34 +241,34 @@ fn f_ct_commit_token_handoff() {
 // ---------------------------------------------------------------------------
 // Multiple submitters feed the single writer's mpsc; the one writer drains
 // (drain_ready/try_recv) and group-commits. Every submission must be written
-// exactly once; frames from one box must be written in submit order (the writer
+// exactly once; frames from one topic must be written in submit order (the writer
 // drains FIFO); group-commit batches are well-formed; no submission dropped.
 //
-// N submitter threads, each owning a distinct box_id, each submitting a
+// N submitter threads, each owning a distinct topic_id, each submitting a
 // contiguous run of durable frames in seq order. After all join + a clean
-// shutdown drain, the recovered WAL must contain EVERY (box,seq) exactly once,
-// and each box's seqs must appear in ascending (submit) order.
+// shutdown drain, the recovered WAL must contain EVERY (topic,seq) exactly once,
+// and each topic's seqs must appear in ascending (submit) order.
 // ===========================================================================
 
 #[test]
 fn f_ct_mpsc_single_consumer() {
-    const BOXES: u32 = 8;
-    const PER_BOX: u64 = 60;
+    const TOPICS: u32 = 8;
+    const PER_TOPIC: u64 = 60;
 
     let disk = FakeDisk::new();
     let data_dir = PathBuf::from(DATA_DIR);
     let wal = Wal::open_at_with(disk.arc(), fast_cfg(&data_dir), 1, 0).unwrap();
 
-    let start = Arc::new(Barrier::new(BOXES as usize));
+    let start = Arc::new(Barrier::new(TOPICS as usize));
     let mut handles = Vec::new();
-    for b in 1..=BOXES {
+    for b in 1..=TOPICS {
         let w = wal.writer();
         let start = start.clone();
         handles.push(std::thread::spawn(move || {
             start.wait();
-            for seq in 1..=PER_BOX {
-                // Block on each so this box's frames are submitted strictly in seq
-                // order (the per-box FIFO the single consumer must preserve).
+            for seq in 1..=PER_TOPIC {
+                // Block on each so this topic's frames are submitted strictly in seq
+                // order (the per-topic FIFO the single consumer must preserve).
                 w.append(ap(b, seq), true).expect("append ok");
             }
         }));
@@ -282,37 +282,37 @@ fn f_ct_mpsc_single_consumer() {
 
     let frames = replay_wal(&disk, &data_dir);
 
-    // (1) NO SUBMISSION DROPPED + NO DUPLICATE: exactly BOXES*PER_BOX frames, each
-    //     (box,seq) present exactly once.
+    // (1) NO SUBMISSION DROPPED + NO DUPLICATE: exactly TOPICS*PER_TOPIC frames, each
+    //     (topic,seq) present exactly once.
     let mut seen: BTreeMap<(u32, u64), u32> = BTreeMap::new();
     for f in &frames {
         *seen.entry(*f).or_insert(0) += 1;
     }
     assert_eq!(
         frames.len() as u64,
-        BOXES as u64 * PER_BOX,
+        TOPICS as u64 * PER_TOPIC,
         "every submission written exactly once (none dropped / duplicated): {} frames",
         frames.len()
     );
-    for b in 1..=BOXES {
-        for seq in 1..=PER_BOX {
+    for b in 1..=TOPICS {
+        for seq in 1..=PER_TOPIC {
             assert_eq!(
                 seen.get(&(b, seq)).copied().unwrap_or(0),
                 1,
-                "frame (box {b}, seq {seq}) must appear exactly once"
+                "frame (topic {b}, seq {seq}) must appear exactly once"
             );
         }
     }
 
-    // (2) PER-BOX SUBMIT ORDER: within each box the seqs appear ascending in the
-    //     write stream (the single consumer drains the mpsc FIFO; per-box frames
+    // (2) PER-TOPIC SUBMIT ORDER: within each topic the seqs appear ascending in the
+    //     write stream (the single consumer drains the mpsc FIFO; per-topic frames
     //     were submitted in seq order, so they must land in seq order).
-    let mut last_per_box: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut last_per_topic: BTreeMap<u32, u64> = BTreeMap::new();
     for (b, seq) in &frames {
-        let last = last_per_box.entry(*b).or_insert(0);
+        let last = last_per_topic.entry(*b).or_insert(0);
         assert!(
             *seq > *last,
-            "box {b} seq {seq} landed out of submit order (prev {last}) — \
+            "topic {b} seq {seq} landed out of submit order (prev {last}) — \
              single-consumer FIFO violated"
         );
         *last = *seq;
@@ -464,11 +464,11 @@ fn f_ct_batch_partial_fail() {
 // A durable write stages records (into the index, head NOT advanced ⇒ invisible)
 // then its WAL fsync FAILS, so the engine rolls the staged batch back. A
 // concurrent reader polling head_seq must see NOTHING for the rolled-back batch;
-// head_seq never advances; the box is byte-identical to pre-stage. No
+// head_seq never advances; the topic is byte-identical to pre-stage. No
 // visible-but-not-durable record.
 //
-// We drive the fully-wired engine: a durable box, a reader thread polling
-// box_state head_seq + diff while a writer issues durable writes whose fsync is
+// We drive the fully-wired engine: a durable topic, a reader thread polling
+// topic_state head_seq + diff while a writer issues durable writes whose fsync is
 // forced to EIO. Every failed write must leave head unchanged and surface no new
 // record to the reader.
 // ===========================================================================
@@ -482,15 +482,15 @@ fn f_pub_rollback_invisible() {
     {
         let engine = open_engine(&disk);
         engine
-            .put_box(
+            .put_topic(
                 "roll",
-                BoxConfig {
-                    r#type: BoxType::Log,
+                TopicConfig {
+                    r#type: TopicType::Log,
                     durable: true,
                     ..Default::default()
                 },
             )
-            .expect("put_box");
+            .expect("put_topic");
         for i in 1..=3u64 {
             let req = WriteRequest {
                 records: vec![RecordIn {
@@ -517,7 +517,7 @@ fn f_pub_rollback_invisible() {
         FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, false).arc();
     let engine = Engine::with_data_dir_fs(cfg(), clock(), faulty).expect("reopen through faultfs");
 
-    let head_before = engine.box_state("roll", false).unwrap().head_seq;
+    let head_before = engine.topic_state("roll", false).unwrap().head_seq;
     assert_eq!(
         head_before, 3,
         "the 3 acked durable writes are the visible prefix"
@@ -535,7 +535,7 @@ fn f_pub_rollback_invisible() {
         let violated = violated.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let st = engine.box_state("roll", false).unwrap();
+                let st = engine.topic_state("roll", false).unwrap();
                 if st.head_seq > 3 {
                     violated.fetch_add(1, Ordering::Relaxed);
                 }
@@ -583,7 +583,7 @@ fn f_pub_rollback_invisible() {
         );
         // After each failed write, head is unchanged (the staged batch rolled back).
         assert_eq!(
-            engine.box_state("roll", false).unwrap().head_seq,
+            engine.topic_state("roll", false).unwrap().head_seq,
             3,
             "head_seq advanced for a rolled-back batch (visible-but-not-durable!) at seq {i}"
         );
@@ -597,10 +597,10 @@ fn f_pub_rollback_invisible() {
         "a reader observed a staged-but-rolled-back record (publish/rollback not invisible)"
     );
 
-    // The box is byte-identical to pre-stage: still exactly the 3 acked records,
+    // The topic is byte-identical to pre-stage: still exactly the 3 acked records,
     // head still 3.
-    let st = engine.box_state("roll", false).unwrap();
+    let st = engine.topic_state("roll", false).unwrap();
     assert_eq!(st.head_seq, 3, "head_seq unchanged after every rollback");
-    assert_eq!(st.count, 3, "no rolled-back record left a trace in the box");
+    assert_eq!(st.count, 3, "no rolled-back record left a trace in the topic");
     drop(engine);
 }

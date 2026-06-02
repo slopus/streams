@@ -1,7 +1,7 @@
 //! Crash/race test: a SNAPSHOT taken WHILE many concurrent durable writers are
-//! in-flight on the SAME box, then a power loss + recovery FROM THE SNAPSHOT
+//! in-flight on the SAME topic, then a power loss + recovery FROM THE SNAPSHOT
 //! CHECKPOINT. Asserts the snapshot/checkpoint discipline (ARCHITECTURE §3): the
-//! checkpoint position is recorded BEFORE state is materialized and each box is
+//! checkpoint position is recorded BEFORE state is materialized and each topic is
 //! captured under its `append_lock` after draining ticketed-but-unpublished
 //! writes, so:
 //!
@@ -30,7 +30,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 
@@ -87,7 +87,7 @@ fn live_records(engine: &Engine, name: &str) -> BTreeMap<u64, String> {
 }
 
 #[test]
-fn snapshot_with_inflight_same_box_writers_loses_no_acked_write() {
+fn snapshot_with_inflight_same_topic_writers_loses_no_acked_write() {
     let disk = FakeDisk::new();
 
     // The set of (seq -> value) the engine ACKED (its durable fsync returned). This
@@ -97,22 +97,22 @@ fn snapshot_with_inflight_same_box_writers_loses_no_acked_write() {
     {
         let engine = open_engine(&disk);
         engine
-            .put_box(
+            .put_topic(
                 "hot",
-                BoxConfig {
-                    r#type: BoxType::Log,
+                TopicConfig {
+                    r#type: TopicType::Log,
                     durable: true,
                     ..Default::default()
                 },
             )
-            .expect("create durable box");
+            .expect("create durable topic");
 
         let stop = Arc::new(AtomicBool::new(false));
         const N_WRITERS: usize = 6;
         const PER_WRITER: usize = 40;
 
-        // Spawn many concurrent durable writers to the SAME box. Each blocks on its
-        // group-commit fsync (durable box ⇒ `write` returns only after the fsync),
+        // Spawn many concurrent durable writers to the SAME topic. Each blocks on its
+        // group-commit fsync (durable topic ⇒ `write` returns only after the fsync),
         // so an Ok response means the write is acked & durable.
         let mut handles = Vec::new();
         for wid in 0..N_WRITERS {
@@ -148,7 +148,7 @@ fn snapshot_with_inflight_same_box_writers_loses_no_acked_write() {
         // Take snapshots WHILE the writers are in-flight — repeatedly, so a
         // snapshot's checkpoint-record / state-materialize window overlaps the
         // writers' fsync waits and ticketed-but-unpublished stages. Each snapshot
-        // captures every box under its append_lock after draining in-flight writes.
+        // captures every topic under its append_lock after draining in-flight writes.
         for _ in 0..8 {
             let _ = engine.write_snapshot();
             thread::yield_now();
@@ -207,7 +207,7 @@ fn snapshot_with_inflight_same_box_writers_loses_no_acked_write() {
         });
         assert_eq!(a, value, "recovered seq {seq} value mismatch vs acked");
     }
-    let st = engine.box_state("hot", false).unwrap();
+    let st = engine.topic_state("hot", false).unwrap();
     assert!(
         st.head_seq <= max_acked,
         "recovered head {} exceeds the highest acked seq {max_acked} (future/unacked seq)",

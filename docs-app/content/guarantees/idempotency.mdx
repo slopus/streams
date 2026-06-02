@@ -10,7 +10,7 @@ import { Callout } from 'nextra/components'
 streams offers two complementary idempotency mechanisms and **no** global idempotency-token
 service. The **control plane is idempotent by construction** (create/configure is an
 upsertable `PUT`, `DELETE` of an absent resource is a benign `200`). **Writes** carry an
-optional `idempotency_key` with a per-box time window: a retried write with the same key
+optional `idempotency_key` with a per-topic time window: a retried write with the same key
 in-window returns the original seqs and appends nothing. This page covers both, the
 `Idempotency-Key` header, and why a dedup key — not a compare-and-set condition — is the
 right primitive for a log.
@@ -19,43 +19,43 @@ right primitive for a log.
 
 The control plane (create, configure, delete) is idempotent without you doing anything.
 
-- **Create / configure is an upsertable `PUT`.** `PUT /v0/boxes/:box` and
+- **Create / configure is an upsertable `PUT`.** `PUT /v0/topics/:topic` and
   `PUT /v0/routers/:router` are create-or-update. An identical `PUT` is a no-op `200`; a
   changed `PUT` applies the diff and returns `200`; a `PUT` that brings the resource into
   existence returns `201`. The `created` field tells you which happened. Retrying a `PUT`
   is always safe.
-- **`DELETE` of an absent resource is a benign `200`.** Deleting a box or router that does
+- **`DELETE` of an absent resource is a benign `200`.** Deleting a topic or router that does
   not exist returns `200` with `"deleted": false` rather than a `404` — so a retried delete,
   or a delete of something already gone, never errors.
 
 ```bash
 # Identical PUTs are no-ops; safe to retry.
-curl -X PUT localhost:4000/v0/boxes/jobs \
+curl -X PUT localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "durable": true, "cap_records": 1000000 }'
 ```
 
 ```json
-{ "box": "jobs", "created": false,
+{ "topic": "jobs", "created": false,
   "config": { "...": "..." },
   "performance": { "server_total_ms": 0.08 } }
 ```
 
 <Callout type="info">
   One control-plane field is **not** mutable: `type` (`log` ⇄ `queue`). A `PUT` that changes
-  it on an existing box returns `409 box_exists_incompatible`. Every other config field is
+  it on an existing topic returns `409 topic_exists_incompatible`. Every other config field is
   mutable going forward.
 </Callout>
 
 ## Write idempotency — `idempotency_key`
 
 A write may carry an optional `idempotency_key`. When supplied, the server remembers the
-mapping `(box, idempotency_key) → assigned seqs` for a window. A retried write with the same
-key, to the same box, **within the window** returns the **original** seqs with
+mapping `(topic, idempotency_key) → assigned seqs` for a window. A retried write with the same
+key, to the same topic, **within the window** returns the **original** seqs with
 `"deduped": true` and does **not** append again.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs \
+curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "node": "worker-eu-1",
         "idempotency_key": "client-batch-7f3a",
@@ -67,7 +67,7 @@ curl -X POST localhost:4000/v0/boxes/jobs \
 The first call appends and returns the assigned seqs:
 
 ```json
-{ "box": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
+{ "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
   "head_seq": 1, "count": 1, "created": false, "deduped": false,
   "performance": { "server_total_ms": 0.62, "fsync_ms": 0.39 } }
 ```
@@ -75,7 +75,7 @@ The first call appends and returns the assigned seqs:
 A retry with the same key, in-window, returns the **same** seqs and appends nothing:
 
 ```json
-{ "box": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
+{ "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
   "head_seq": 1, "count": 1, "created": false, "deduped": true,
   "performance": { "server_total_ms": 0.05 } }
 ```
@@ -84,8 +84,8 @@ The only observable difference is `"deduped": true` (and that no new seqs were a
 
 ### The window — `idempotency_window_ms`
 
-Dedup state is retained per box for `idempotency_window_ms`, **default 120000 ms** (two
-minutes). It is a config field on the box, so you can lengthen it for slow retry loops or
+Dedup state is retained per topic for `idempotency_window_ms`, **default 120000 ms** (two
+minutes). It is a config field on the topic, so you can lengthen it for slow retry loops or
 shorten it to bound memory. After the window elapses for a key, a write with that key is
 treated as new and appends again.
 
@@ -103,13 +103,13 @@ The key may be supplied either as the body field `idempotency_key` or as the HTT
 convenient for clients that attach an idempotency key uniformly across requests.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs \
+curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: client-batch-7f3a' \
   -d '{ "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
 ```
 
-The key is scoped to the box and bounded to 256 characters.
+The key is scoped to the topic and bounded to 256 characters.
 
 ## Why a dedup key, not CAS
 
@@ -136,6 +136,6 @@ the shape of the problem an append-only log presents.
 ## See also
 
 - [Writing API](/api/writing) — the write endpoint, `idempotency_key`, and the `deduped` field.
-- [Boxes API](/api/boxes) — `idempotency_window_ms` and the upsertable `PUT`.
+- [Topics API](/api/topics) — `idempotency_window_ms` and the upsertable `PUT`.
 - [Conventions](/api/conventions) — the §0.8 idempotency model and error shape.
 - [Ordering & Cursors](/guarantees/ordering-and-cursors) — why consumers must be idempotent under at-least-once delivery.

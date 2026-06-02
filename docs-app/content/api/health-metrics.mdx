@@ -64,14 +64,14 @@ curl localhost:4000/v0/ready
 ```
 
 ```json
-{ "status": "ready", "wal_replay_complete": true, "boxes": 42 }
+{ "status": "ready", "wal_replay_complete": true, "topics": 42 }
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
 | `status` | string | `"ready"` when serving. |
 | `wal_replay_complete` | bool | `true` once boot-time WAL replay has finished. |
-| `boxes` | `u64` | Number of boxes currently registered. |
+| `topics` | `u64` | Number of topics currently registered. |
 
 **Not ready — during WAL replay** (`503`)
 
@@ -106,17 +106,17 @@ process.
 
 <Callout type="info">
   **The metric surface is a full catalog**, not a stub. `/v0/metrics` emits process/aggregate
-  gauges (`streams_boxes`, `streams_boxes_by_class{class=…}`, `streams_routers`,
-  `streams_records_live`, `streams_bytes_live`, `streams_queue_boxes`,
+  gauges (`streams_topics`, `streams_topics_by_class{class=…}`, `streams_routers`,
+  `streams_records_live`, `streams_bytes_live`, `streams_queue_topics`,
   `streams_queue_leases_in_flight`, `streams_sse_connections`, `streams_watch_sessions`,
-  `streams_ready`, `streams_recovery_progress`, `streams_uptime_ms`), **per-box gauges**
-  (`streams_box_head_seq` / `_earliest_seq` / `_records_live` / `_bytes_live` /
-  `_queue_ready` / `_queue_in_flight`, labelled `{box=…}`, bounded — `streams_box_metrics_truncated`
+  `streams_ready`, `streams_recovery_progress`, `streams_uptime_ms`), **per-topic gauges**
+  (`streams_topic_head_seq` / `_earliest_seq` / `_records_live` / `_bytes_live` /
+  `_queue_ready` / `_queue_in_flight`, labelled `{topic=…}`, bounded — `streams_topic_metrics_truncated`
   flags a cap), the real **WAL metrics** (`streams_wal_frames_total`, `_batches_total`,
   `_fsyncs_total`, `_bytes_written_total`, `_rotations_total`, `_queue_depth`, `_queue_depth_peak`,
   `_submit_full_total`, `_read_only`), and a **fsync-latency histogram**
   `streams_wal_fsync_latency_us` (with `_bucket{le=…}` / `_sum` / `_count`). There are **no**
-  per-box append/read/eviction/tombstone counters and no scheduler-throttle metric. The
+  per-topic append/read/eviction/tombstone counters and no scheduler-throttle metric. The
   [`performance` block](/api/errors#the-performance-block) on every response remains the most
   detailed per-request view.
 </Callout>
@@ -128,13 +128,13 @@ curl localhost:4000/v0/metrics
 ```
 
 ```text
-# HELP streams_boxes Number of boxes.
-# TYPE streams_boxes gauge
-streams_boxes 42
-# HELP streams_box_head_seq Highest assigned seq per box.
-# TYPE streams_box_head_seq gauge
-streams_box_head_seq{box="jobs"} 480231
-streams_box_earliest_seq{box="jobs"} 468188
+# HELP streams_topics Number of topics.
+# TYPE streams_topics gauge
+streams_topics 42
+# HELP streams_topic_head_seq Highest assigned seq per topic.
+# TYPE streams_topic_head_seq gauge
+streams_topic_head_seq{topic="jobs"} 480231
+streams_topic_earliest_seq{topic="jobs"} 468188
 # HELP streams_wal_fsyncs_total WAL fsyncs.
 # TYPE streams_wal_fsyncs_total counter
 streams_wal_fsyncs_total 88241
@@ -149,9 +149,9 @@ curl localhost:4000/v0/metrics -H 'accept: application/json'
 ```
 
 ```json
-{ "boxes": 42, "boxes_memory": 3, "boxes_disk": 30, "boxes_fsync": 9,
+{ "topics": 42, "topics_memory": 3, "topics_disk": 30, "topics_fsync": 9,
   "routers": 5, "records_live": 1843201, "bytes_live": 734003200,
-  "queue_boxes": 2, "queue_leases_in_flight": 286,
+  "queue_topics": 2, "queue_leases_in_flight": 286,
   "sse_connections": 41, "watch_sessions": 44, "ready": true,
   "replay_progress": 1.0, "uptime_ms": 360123,
   "wal": { "fsyncs": 88241, "frames": 1843290, "batches": 90011,

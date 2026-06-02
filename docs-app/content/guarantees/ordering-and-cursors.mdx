@@ -7,15 +7,15 @@ import { Callout } from 'nextra/components'
 
 # Ordering & Cursors
 
-Every record gets a per-box `seq`: a `u64` that is **strictly increasing and gap-free at
+Every record gets a per-topic `seq`: a `u64` that is **strictly increasing and gap-free at
 assignment**, assigned at durable commit. The `seq` **is** the cursor — there is no opaque
 token. Advancing your stored cursor past a record acks it. This page covers exactly what the
 seq contract guarantees (and what it does not), the cursor model, the `next_from_seq` /
-`caught_up` semantics, and how seqs behave across restart and box recreate.
+`caught_up` semantics, and how seqs behave across restart and topic recreate.
 
 ## Seq assignment
 
-Each box has its own `u64` counter, `next_seq`, starting at `seq_base` (default `1`; `0` is
+Each topic has its own `u64` counter, `next_seq`, starting at `seq_base` (default `1`; `0` is
 reserved to mean "no records"). On commit of a write of N records, the server atomically
 assigns `next_seq … next_seq + N − 1`, advances `next_seq` by N, and returns the seqs in
 write order.
@@ -35,7 +35,7 @@ assigned.
 
 <Callout type="info">
   Seq is rendered as a JSON number. It fits in an IEEE-754 double until ~9 quadrillion, well
-  beyond any single-machine box lifetime, so no string encoding is needed. Clients should
+  beyond any single topic's lifetime, so no string encoding is needed. Clients should
   still parse it as a 64-bit integer.
 </Callout>
 
@@ -69,9 +69,9 @@ records with `$seq > from_seq`.
 
 - `from_seq = 0` means "from the beginning of what is currently retained" (`earliest_seq`).
 - A tail / only-new cursor is `from_seq = head_seq` at subscription — like Redis `$`. You
-  can read this off box state as `next_seq - 1`.
+  can read this off topic state as `next_seq - 1`.
 
-There is no opaque continuation token on box reads. The client **owns** its cursor; on the
+There is no opaque continuation token on topic reads. The client **owns** its cursor; on the
 diff path the server keeps **no** per-consumer state at all. You store the cursor, you pass
 it back, you advance it.
 
@@ -82,7 +82,7 @@ model): advancing your stored `from_seq` past seq N acks records `1..N`. There i
 per-message ack on this path — moving the cursor *is* the acknowledgment.
 
 This is why a delete or a node-filter must still advance the cursor past the records it
-skips: otherwise a consumer reading a box full of its own (filtered) events would loop
+skips: otherwise a consumer reading a topic full of its own (filtered) events would loop
 forever, never able to ack past them.
 
 <Callout type="info">
@@ -114,13 +114,13 @@ The critical rule:
   empty" can spin or stall. Loop until `caught_up` is `true`.
 </Callout>
 
-A worked example: you read a box where every record was written by your own node and you
+A worked example: you read a topic where every record was written by your own node and you
 pass your node id as the filter. Every record is dropped, `records` is `[]`, but
 `next_from_seq` jumps to `head_seq` and `caught_up` is `true` in one call. You are caught up
 — the empty batch was correct, not a stall.
 
 ```json
-{ "box": "jobs",
+{ "topic": "jobs",
   "records": [],
   "next_from_seq": 480234, "head_seq": 480234, "earliest_seq": 479101,
   "caught_up": true, "tombstone": null, "lag": 0,
@@ -135,27 +135,27 @@ Seqs are stable across the events that reset state, in well-defined ways.
 
 After a restart, `next_seq` is recovered as `max(committed seq) + 1`. Records that were
 buffered in the WAL but **not yet durably committed** — possible only on non-durable
-(`disk`/`memory`) boxes — are lost on a crash; **their seqs are never reused**, so seq stays
+(`disk`/`memory`) topics — are lost on a crash; **their seqs are never reused**, so seq stays
 monotonic across restarts. A gap left by a lost-but-acked non-durable write looks to a
 consumer exactly like eviction: a hole that, if it crosses the cursor below `evict_floor`,
 tombstones. See [Durability Classes](/guarantees/durability).
 
-A `memory` box is best-effort: it takes the same group-committed WAL + recovery path as
+A `memory` topic is best-effort: it takes the same group-committed WAL + recovery path as
 `disk`, so on restart its records **may survive or be lost** (no guarantee either way). It
 never resets to empty by contract and **`head_seq` never regresses above the acked head** — at
 worst a lost tail leaves `head_seq` at a lower (but still monotonic, never-rewound-below-acked)
-value; the box config always persists. See [Durability Classes](/guarantees/durability).
+value; the topic config always persists. See [Durability Classes](/guarantees/durability).
 
 ### Delete + recreate (seq rewind)
 
-If a box is deleted and a new box of the same name is created, the new box restarts
+If a topic is deleted and a new topic of the same name is created, the new topic restarts
 `next_seq` at `seq_base`. A stale consumer presenting a `from_seq` from the **future**
-relative to the new box (i.e. `from_seq >= new head_seq`) receives a tombstone with
+relative to the new topic (i.e. `from_seq >= new head_seq`) receives a tombstone with
 `reason: "recreated"` — never silent corruption. The server detects the rewind via a
-per-box-instance epoch (bumped on create); absent the epoch it treats `from_seq > head_seq`
+per-topic-instance epoch (bumped on create); absent the epoch it treats `from_seq > head_seq`
 as the recreate signal. The read then proceeds from the new `earliest_seq`.
 
-This is the one case where `earliest_seq` resets downward; over a single box instance's life
+This is the one case where `earliest_seq` resets downward; over a single topic instance's life
 it is otherwise [monotonically non-decreasing](/guarantees/tombstones).
 
 ## See also

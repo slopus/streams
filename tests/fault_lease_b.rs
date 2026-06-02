@@ -39,7 +39,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 
@@ -79,9 +79,9 @@ fn sync_dirs(disk: &FakeDisk) {
 
 /// A durable queue with a durable leases log (so claim frames are fsynced and
 /// replay rebuilds the who-holds-what projection — DESIGN §10.1, invariant 12).
-fn durable_queue_cfg() -> BoxConfig {
-    BoxConfig {
-        r#type: BoxType::Queue,
+fn durable_queue_cfg() -> TopicConfig {
+    TopicConfig {
+        r#type: TopicType::Queue,
         durable: true,
         leases_durable: true,
         lease_ms: LEASE_MS,
@@ -89,7 +89,7 @@ fn durable_queue_cfg() -> BoxConfig {
     }
 }
 
-/// Append one durable job; returns its assigned seq. The durable box fsyncs, so
+/// Append one durable job; returns its assigned seq. The durable topic fsyncs, so
 /// the returned seq is acked ⇒ must survive any later crash.
 fn append_job(engine: &Engine, name: &str, data: &str) -> u64 {
     let req = WriteRequest {
@@ -152,7 +152,7 @@ fn f_clock_backward_lease() {
     let (claimed_seq, deadline, head_before) = {
         let (engine, _tc) = open_engine_at(&disk, T0);
         let (_created, _cfg) = engine
-            .put_box("q", durable_queue_cfg())
+            .put_topic("q", durable_queue_cfg())
             .expect("create durable queue");
 
         let s1 = append_job(&engine, "q", "j1");
@@ -160,7 +160,7 @@ fn f_clock_backward_lease() {
         let s3 = append_job(&engine, "q", "j3");
         assert_eq!((s1, s2, s3), (1, 2, 3), "seqs are the logical 1..=3");
 
-        // Claim exactly one job for node "w1" with the box lease. The Claimed
+        // Claim exactly one job for node "w1" with the topic lease. The Claimed
         // lease frame is fsynced (leases_durable) ⇒ acked ⇒ must replay.
         let resp = engine.claim("q", "w1", 1, None).expect("claim succeeds");
         assert_eq!(resp.count, 1, "exactly one job leased");
@@ -173,7 +173,7 @@ fn f_clock_backward_lease() {
         );
         assert_eq!(resp.ready, 2, "2 jobs remain claimable");
 
-        let head = engine.box_state("q", false).unwrap().head_seq;
+        let head = engine.topic_state("q", false).unwrap().head_seq;
         assert_eq!(head, 3);
 
         // Persist directory entries, then a clean power loss with no torn damage:
@@ -189,7 +189,7 @@ fn f_clock_backward_lease() {
     let (engine, tc2) = open_engine_at(&disk, t_back);
 
     // (1) SEQ MONOTONIC: head is the logical counter, untouched by the clock jump.
-    let st = engine.box_state("q", false).expect("queue recovered");
+    let st = engine.topic_state("q", false).expect("queue recovered");
     assert_eq!(
         st.head_seq, head_before,
         "head_seq monotonic across a backward clock jump"
@@ -219,7 +219,7 @@ fn f_clock_backward_lease() {
     //      boot time would still show it held here. Then rewind so the rest of the
     //      checks run at `t_back` as before.
     tc2.set(deadline + 1);
-    let q_expired = engine.box_state("q", false).unwrap().queue.expect("queue");
+    let q_expired = engine.topic_state("q", false).unwrap().queue.expect("queue");
     assert_eq!(
         q_expired.in_flight, 0,
         "past the durable absolute deadline {deadline} the lease expires — proving \
@@ -276,7 +276,7 @@ fn f_clock_backward_lease() {
     // ---- Boot 3 (recover again, clock still earlier): convergent + no revival.
     let (engine2, _tc3) = open_engine_at(&disk, t_back);
     let st2 = engine2
-        .box_state("q", false)
+        .topic_state("q", false)
         .expect("queue recovered again");
     assert_eq!(
         st2.head_seq, 4,

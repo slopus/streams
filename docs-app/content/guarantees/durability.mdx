@@ -7,13 +7,13 @@ import { Callout } from 'nextra/components'
 
 # Durability Classes
 
-Durability in streams is a **per-box** decision, not a server-wide mode. Each box is one of
+Durability in streams is a **per-topic** decision, not a server-wide mode. Each topic is one of
 three **commit classes** — `memory`, `disk`, or `fsync` — that trade write latency against
-crash survival. A best-effort `memory` cache box, a group-committed pub/sub feed, and an
+crash survival. A best-effort `memory` cache topic, a group-committed pub/sub feed, and an
 `fsync`-gated job queue coexist in one process, and each pays for exactly the guarantee it uses.
 
-The class is resolved from the box's **current config** (`durability_class()`) and reported on
-every box-state and box-create response. The box `type` is immutable, but durability/config can
+The class is resolved from the topic's **current config** (`durability_class()`) and reported on
+every topic-state and topic-create response. The topic `type` is immutable, but durability/config can
 be **updated in place** — the resolved class always reflects the current config.
 
 ## The three classes
@@ -27,13 +27,13 @@ be **updated in place** — the resolved class always reflects the current confi
 
 ### `memory`
 
-_"disk-like but best-effort."_ A `memory` box takes the **same** group-committed WAL write
+_"disk-like but best-effort."_ A `memory` topic takes the **same** group-committed WAL write
 **and** recovery path as `disk` and is **fully queryable** (getState / getDifference / SSE) —
 but it carries **NO durability guarantee**. The ack is never `fsync`-gated, so `fsync_ms` is
 `0` (the fastest path).
 
 After a restart its records **MAY survive OR be lost** — recovery is **gradual / best-effort**:
-it does **not** block readiness and does **not** guarantee completeness or emptiness. The box
+it does **not** block readiness and does **not** guarantee completeness or emptiness. The topic
 **config always persists** (it is a control frame in the WAL). The one hard bound is
 no-fabrication / no-future-seq: a recovered record is always one that was actually written, and
 the head never hands out a seq past what was acked (a best-effort restart may legitimately
@@ -46,7 +46,7 @@ reachable **only** by setting `durability:"memory"` explicitly — no legacy boo
 ### `disk`
 
 Records are written to the WAL and **group-committed** — no per-write `fsync` — so `fsync_ms`
-is `0` (the fast path). The write is acked **as soon as its frame is enqueued** to its box's
+is `0` (the fast path). The write is acked **as soon as its frame is enqueued** to its topic's
 WAL-shard writer (the WAL is [sharded](/how-it-works/wal-and-group-commit)); the ack is **not**
 fsync-gated. The shard writer then group-commits and `fdatasync`s the batch shortly after.
 
@@ -89,13 +89,13 @@ Set the class with the `durability` field at create time:
 
 ```bash
 # An fsync-gated, unbounded job queue: every ack is a durable promise.
-curl -X PUT localhost:4000/v0/boxes/jobs \
+curl -X PUT localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "durability": "fsync", "cap_records": 0, "ttl_ms": 0 }'
 ```
 
 ```json
-{ "box": "jobs", "created": true,
+{ "topic": "jobs", "created": true,
   "config": { "ttl_ms": 0, "cap_records": 0, "cap_bytes": 0, "discard": "old",
               "durable": true, "durability": "fsync", "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true },
@@ -103,7 +103,7 @@ curl -X PUT localhost:4000/v0/boxes/jobs \
 ```
 
 The class defaults to `disk` when neither `durability` nor `durable` is set, so an
-auto-created box (one materialized lazily on first write) is `disk`. To get `memory`, you
+auto-created topic (one materialized lazily on first write) is `disk`. To get `memory`, you
 must say so explicitly.
 
 ### The legacy `durable` bool
@@ -116,14 +116,14 @@ must say so explicitly.
 
 An explicit `durability` always wins over `durable`. On the way out, `durable` is normalized
 to `durable == (durability == "fsync")`, so a legacy client reading the `durable` boolean on a
-box-state response still sees the right value regardless of how the box was configured.
+topic-state response still sees the right value regardless of how the topic was configured.
 Internally, `is_durable()` is simply `class == "fsync"`.
 
 <Callout type="info">
   Durability only governs **persistence across a crash or restart**. It is independent of
   retention: `ttl_ms` and the `cap_records`/`cap_bytes` caps still apply to every class, and
   involuntary eviction or expiry of live records always surfaces as a
-  [tombstone](/guarantees/tombstones) — even on a `memory` box, for as long as that box lives.
+  [tombstone](/guarantees/tombstones) — even on a `memory` topic, for as long as that topic lives.
 </Callout>
 
 ## Routers and dead-letter honor the destination class
@@ -131,13 +131,13 @@ Internally, `is_durable()` is simply `class == "fsync"`.
 Router forwarding is **async** (off the source write/ack path) and **derived** — the forwarded
 copy is **not separately WAL-logged**, so one source append is one WAL write regardless of
 fan-out, and copies are re-derived on recovery by replaying from a durable per-router cursor.
-The **destination box's** commit class governs how/whether that re-derived copy (and a
+The **destination topic's** commit class governs how/whether that re-derived copy (and a
 dead-lettered job) is retained and recovered — not the source's:
 
 - A `fsync` destination retains/recovers the copy under fsync semantics.
 - A `disk` destination retains it group-committed, recovered minus the un-fsynced tail.
 - A `memory` destination keeps a **best-effort** copy — **may survive or be lost** on a restart
-  (the dest config always persists), exactly like a direct write to that box.
+  (the dest config always persists), exactly like a direct write to that topic.
 
 So if you route an `fsync` source into a `memory` destination, the forwarded copies are
 best-effort while the durable source recovers in full. The durability of the copy follows where
@@ -159,8 +159,8 @@ On restart the engine loads the latest snapshot, replays the WAL forward from th
 checkpoint, truncates a torn tail (any frame whose length runs past EOF or whose XXH3-64
 checksum fails to verify), and reclaims orphaned segments. An acked durable write is, by
 construction, a **complete, checksum-valid WAL frame** — so it is never lost. The only data a
-crash can cost is what a class explicitly does not promise: a `memory` box's records, or a
-`disk` box's un-fsynced tail. Both surface to consumers as ordinary eviction-style gaps. See
+crash can cost is what a class explicitly does not promise: a `memory` topic's records, or a
+`disk` topic's un-fsynced tail. Both surface to consumers as ordinary eviction-style gaps. See
 [Recovery](/how-it-works/recovery).
 
 ## See also
@@ -170,4 +170,4 @@ crash can cost is what a class explicitly does not promise: a `memory` box's rec
 - [WAL & group commit](/how-it-works/wal-and-group-commit) — how `disk` and `fsync` writes
   are committed off-lock.
 - [Recovery](/how-it-works/recovery) — snapshot load, WAL replay, and torn-tail truncation.
-- [Configure a box](/api/boxes) — the full config field table including `durability`.
+- [Configure a topic](/api/topics) — the full config field table including `durability`.

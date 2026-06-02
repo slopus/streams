@@ -6,18 +6,18 @@
 //! The Phase-8A harness ([`streams::storage::testfs::FakeDisk`] +
 //! [`streams::engine::Engine::with_data_dir_fs`]) drives the *real, fully-wired*
 //! engine; one test adds a crash + recovery on top to prove the durable byte
-//! quota (and the per-box commit sequencer it shares the write path with) stays
+//! quota (and the per-topic commit sequencer it shares the write path with) stays
 //! consistent across a power loss.
 //!
 //! | id | what it pins |
 //! |----|--------------|
-//! | `L-MAX-BOXES-RACE`        | N threads racing `put_box` (distinct names) against `max_boxes=N`: the surviving box count never exceeds the cap; refusals are `429 throttled`. |
-//! | `L-MAX-BOXES-AUTOCREATE-RACE` | N threads racing auto-create-on-write against `max_boxes`: the auto-create path honors the same cap (no write smuggles a box past it). |
-//! | `L-MAX-ROUTERS-RACE`      | N threads racing `put_router` against `max_routers=N`: router count never exceeds the cap; a refused router leaves no phantom dest box. |
+//! | `L-MAX-TOPICS-RACE`        | N threads racing `put_topic` (distinct names) against `max_topics=N`: the surviving topic count never exceeds the cap; refusals are `429 throttled`. |
+//! | `L-MAX-TOPICS-AUTOCREATE-RACE` | N threads racing auto-create-on-write against `max_topics`: the auto-create path honors the same cap (no write smuggles a topic past it). |
+//! | `L-MAX-ROUTERS-RACE`      | N threads racing `put_router` against `max_routers=N`: router count never exceeds the cap; a refused router leaves no phantom dest topic. |
 //! | `L-MAX-WATCH-SESSIONS-RACE` | N HTTP threads racing `POST /v0/watch` against `max_watch_sessions=N`: live session count never exceeds the cap (HTTP harness). |
 //! | `L-SESSION-GC-RACE-OPEN`  | the idle-session GC reaping a session racing a stream open on a sibling session: no use-after-GC (the open either succeeds on a live session or cleanly 404s; the GC never frees a session with an open stream). |
 //! | `L-TOTAL-BYTES-QUOTA-RACE`| many concurrent writers against `max_total_bytes`: the committed live total never exceeds the cap (TOCTOU on the admission read); refusals are `429 throttled`. |
-//! | `L-TOTAL-BYTES-QUOTA-CRASH` | the durable byte quota + per-box commit sequencer across a crash: every acked write survives, the recovered total stays at/under the cap, survivors are a dense prefix. |
+//! | `L-TOTAL-BYTES-QUOTA-CRASH` | the durable byte quota + per-topic commit sequencer across a crash: every acked write survives, the recovered total stays at/under the cap, survivors are a dense prefix. |
 //! | `L-SCOPE-CONSISTENT-RACE` | concurrent scoped-key requests through the HTTP auth layer: a write-scoped key can never read and a read-scoped key can never write, regardless of interleaving (scope check is per-request, stateless). |
 //!
 //! Reuses the harness exactly (per `tests/crash_oracle.rs` + `src/storage/testfs.rs`
@@ -58,7 +58,7 @@ use streams::engine::Engine;
 use streams::limits::Limits;
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::types::{
-    BoxConfig, BoxType, DiffRequest, Durability, RecordIn, RouterCreateRequest, WriteRequest,
+    TopicConfig, TopicType, DiffRequest, Durability, RecordIn, RouterCreateRequest, WriteRequest,
 };
 
 // ===========================================================================
@@ -86,7 +86,7 @@ fn open_engine_limits(disk: &FakeDisk, limits: Limits) -> Arc<Engine> {
         .expect("engine opens through FakeDisk")
 }
 
-/// A one-record write request (auto-creating the box) with `data` bytes.
+/// A one-record write request (auto-creating the topic) with `data` bytes.
 fn write_req(data: serde_json::Value) -> WriteRequest {
     WriteRequest {
         records: vec![RecordIn {
@@ -103,22 +103,22 @@ fn write_req(data: serde_json::Value) -> WriteRequest {
     }
 }
 
-/// A durable (fsync) log box config (the strongest class — the WAL-first commit
+/// A durable (fsync) log topic config (the strongest class — the WAL-first commit
 /// sequencer path).
-fn durable_box() -> BoxConfig {
-    BoxConfig {
-        r#type: BoxType::Log,
+fn durable_topic() -> TopicConfig {
+    TopicConfig {
+        r#type: TopicType::Log,
         durability: Some(Durability::Fsync),
         ..Default::default()
     }
 }
 
 // ===========================================================================
-// L-MAX-BOXES-RACE
+// L-MAX-TOPICS-RACE
 // ---------------------------------------------------------------------------
-// N threads each try to create a DISTINCT box name against `max_boxes = CAP`.
-// The cap is a check-then-create guard (read box_count, then insert). The
-// INVARIANT the limit promises: the surviving box count never exceeds CAP, and
+// N threads each try to create a DISTINCT topic name against `max_topics = CAP`.
+// The cap is a check-then-create guard (read topic_count, then insert). The
+// INVARIANT the limit promises: the surviving topic count never exceeds CAP, and
 // every refusal is a `429 throttled`. We assert the strong contract; if the
 // non-atomic read-then-create overshoots the cap under the race, that is a real
 // divergence from "never exceed N" and the test fails loudly (then would be
@@ -126,7 +126,7 @@ fn durable_box() -> BoxConfig {
 // ===========================================================================
 
 #[test]
-fn l_max_boxes_race_never_exceeds_cap() {
+fn l_max_topics_race_never_exceeds_cap() {
     const CAP: u64 = 16;
     const RACERS: usize = 48; // 3x the cap ⇒ most creates must be refused.
 
@@ -134,7 +134,7 @@ fn l_max_boxes_race_never_exceeds_cap() {
     let engine = open_engine_limits(
         &disk,
         Limits {
-            max_boxes: CAP,
+            max_topics: CAP,
             ..Default::default()
         },
     );
@@ -149,9 +149,9 @@ fn l_max_boxes_race_never_exceeds_cap() {
         let created = created.clone();
         let throttled = throttled.clone();
         handles.push(std::thread::spawn(move || {
-            let name = format!("box-{i}");
+            let name = format!("topic-{i}");
             start.wait();
-            match engine.put_box(&name, durable_box()) {
+            match engine.put_topic(&name, durable_topic()) {
                 Ok(_) => {
                     created.fetch_add(1, Ordering::Relaxed);
                 }
@@ -159,7 +159,7 @@ fn l_max_boxes_race_never_exceeds_cap() {
                     assert_eq!(
                         e.code,
                         streams::types::ErrorCode::Throttled,
-                        "box create over cap must be throttled, got {e:?}"
+                        "topic create over cap must be throttled, got {e:?}"
                     );
                     throttled.fetch_add(1, Ordering::Relaxed);
                 }
@@ -174,32 +174,32 @@ fn l_max_boxes_race_never_exceeds_cap() {
     let refused = throttled.load(Ordering::Relaxed);
     // Every racer either created or was throttled (no silent drop).
     assert_eq!(ok + refused, RACERS as u64, "every create accounted for");
-    // INVARIANT: the surviving box count never exceeds the cap.
+    // INVARIANT: the surviving topic count never exceeds the cap.
     assert!(
-        engine.box_count() <= CAP,
-        "box_count {} exceeded the cap {CAP} under the create race",
-        engine.box_count()
+        engine.topic_count() <= CAP,
+        "topic_count {} exceeded the cap {CAP} under the create race",
+        engine.topic_count()
     );
-    // The number of Ok creates equals the surviving boxes (each Ok was a distinct
+    // The number of Ok creates equals the surviving topics (each Ok was a distinct
     // name, each refusal created nothing).
     assert_eq!(
         ok,
-        engine.box_count(),
-        "every Ok create is a surviving box, every refusal left none"
+        engine.topic_count(),
+        "every Ok create is a surviving topic, every refusal left none"
     );
     drop(engine);
 }
 
 // ===========================================================================
-// L-MAX-BOXES-AUTOCREATE-RACE
+// L-MAX-TOPICS-AUTOCREATE-RACE
 // ---------------------------------------------------------------------------
-// The auto-create-on-write path is a SECOND door onto the box registry and must
-// honor the SAME `max_boxes` cap. N threads each write to a distinct (new) box;
-// the surviving box count never exceeds the cap and an over-cap write is `429`.
+// The auto-create-on-write path is a SECOND door onto the topic registry and must
+// honor the SAME `max_topics` cap. N threads each write to a distinct (new) topic;
+// the surviving topic count never exceeds the cap and an over-cap write is `429`.
 // ===========================================================================
 
 #[test]
-fn l_max_boxes_autocreate_race_never_exceeds_cap() {
+fn l_max_topics_autocreate_race_never_exceeds_cap() {
     const CAP: u64 = 12;
     const RACERS: usize = 40;
 
@@ -207,7 +207,7 @@ fn l_max_boxes_autocreate_race_never_exceeds_cap() {
     let engine = open_engine_limits(
         &disk,
         Limits {
-            max_boxes: CAP,
+            max_topics: CAP,
             ..Default::default()
         },
     );
@@ -239,14 +239,14 @@ fn l_max_boxes_autocreate_race_never_exceeds_cap() {
     }
 
     assert!(
-        engine.box_count() <= CAP,
-        "auto-create smuggled boxes past the cap: box_count {} > {CAP}",
-        engine.box_count()
+        engine.topic_count() <= CAP,
+        "auto-create smuggled topics past the cap: topic_count {} > {CAP}",
+        engine.topic_count()
     );
     assert_eq!(
         created.load(Ordering::Relaxed),
-        engine.box_count(),
-        "each successful write created exactly one surviving box"
+        engine.topic_count(),
+        "each successful write created exactly one surviving topic"
     );
     drop(engine);
 }
@@ -255,9 +255,9 @@ fn l_max_boxes_autocreate_race_never_exceeds_cap() {
 // L-MAX-ROUTERS-RACE
 // ---------------------------------------------------------------------------
 // N threads racing `put_router` (distinct router names, shared source so the
-// source-box auto-create does not itself trip a box cap) against
+// source-topic auto-create does not itself trip a topic cap) against
 // `max_routers = CAP`. Router count never exceeds the cap; a refused router is
-// `429` and (checked before any dest auto-create) leaves no phantom dest box.
+// `429` and (checked before any dest auto-create) leaves no phantom dest topic.
 // ===========================================================================
 
 #[test]
@@ -270,12 +270,12 @@ fn l_max_routers_race_never_exceeds_cap() {
         &disk,
         Limits {
             max_routers: CAP,
-            max_boxes: 0, // unlimited boxes so router dest auto-create is unconstrained.
+            max_topics: 0, // unlimited topics so router dest auto-create is unconstrained.
             ..Default::default()
         },
     );
-    // A shared source box so every router's source already exists.
-    engine.put_box("src", durable_box()).expect("src box");
+    // A shared source topic so every router's source already exists.
+    engine.put_topic("src", durable_topic()).expect("src topic");
 
     let start = Arc::new(Barrier::new(RACERS));
     let created = Arc::new(AtomicU64::new(0));
@@ -328,12 +328,12 @@ fn l_max_routers_race_never_exceeds_cap() {
         engine.router_count(),
         "each Ok put_router is a surviving router"
     );
-    // A refused router must NOT have auto-created its dest box (the cap check is
-    // before any box auto-create).
+    // A refused router must NOT have auto-created its dest topic (the cap check is
+    // before any topic auto-create).
     for dest in refused_dests.lock().unwrap().iter() {
         assert!(
-            engine.get_box(dest).is_none(),
-            "refused router left a phantom dest box {dest:?}"
+            engine.get_topic(dest).is_none(),
+            "refused router left a phantom dest topic {dest:?}"
         );
     }
     drop(engine);
@@ -345,7 +345,7 @@ fn l_max_routers_race_never_exceeds_cap() {
 // N HTTP threads racing `POST /v0/watch` against `max_watch_sessions = CAP`.
 // The session registry is a DashMap; the cap is checked against its `len()`
 // (check-then-insert). The live session count never exceeds the cap and every
-// over-cap create is `429 throttled`. (Black-box over the real bound server.)
+// over-cap create is `429 throttled`. (Black-topic over the real bound server.)
 // ===========================================================================
 
 #[test]
@@ -360,7 +360,7 @@ fn l_max_watch_sessions_race_never_exceeds_cap() {
         },
         ..Default::default()
     }));
-    let (s, _) = h.put("/v0/boxes/events", json!({}));
+    let (s, _) = h.put("/v0/topics/events", json!({}));
     assert_eq!(s, StatusCode::CREATED);
 
     let start = Arc::new(Barrier::new(RACERS));
@@ -372,7 +372,7 @@ fn l_max_watch_sessions_race_never_exceeds_cap() {
         let ok = ok.clone();
         handles.push(std::thread::spawn(move || {
             start.wait();
-            let (status, body) = h.post("/v0/watch", json!({ "boxes": { "events": {} } }));
+            let (status, body) = h.post("/v0/watch", json!({ "topics": { "events": {} } }));
             if status == StatusCode::OK {
                 ok.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -400,7 +400,7 @@ fn l_max_watch_sessions_race_never_exceeds_cap() {
     // Re-confirm: a fresh create after the storm is refused (the cap is full) iff we
     // actually filled it.
     if admitted == CAP {
-        let (status, body) = h.post("/v0/watch", json!({ "boxes": { "events": {} } }));
+        let (status, body) = h.post("/v0/watch", json!({ "topics": { "events": {} } }));
         assert_eq!(
             status,
             StatusCode::TOO_MANY_REQUESTS,
@@ -442,13 +442,13 @@ fn l_session_gc_race_open_no_use_after_gc() {
         },
         ..Default::default()
     }));
-    let (s, _) = h.put("/v0/boxes/events", json!({}));
+    let (s, _) = h.put("/v0/topics/events", json!({}));
     assert_eq!(s, StatusCode::CREATED);
 
     // Mint a pool of wids to open concurrently.
     let mut wids = Vec::new();
     for _ in 0..SESSIONS {
-        let (status, body) = h.post("/v0/watch", json!({ "boxes": { "events": {} } }));
+        let (status, body) = h.post("/v0/watch", json!({ "topics": { "events": {} } }));
         assert_eq!(status, StatusCode::OK);
         wids.push(body["wid"].as_str().expect("wid").to_string());
     }
@@ -464,7 +464,7 @@ fn l_session_gc_race_open_no_use_after_gc() {
         handles.push(std::thread::spawn(move || {
             start.wait();
             for _ in 0..8 {
-                let (status, _) = h.post("/v0/watch", json!({ "boxes": { "events": {} } }));
+                let (status, _) = h.post("/v0/watch", json!({ "topics": { "events": {} } }));
                 assert_eq!(status, StatusCode::OK, "create during GC race must be 200");
             }
         }));
@@ -554,7 +554,7 @@ fn l_total_bytes_quota_race_stays_under_cap() {
 
     // Measure one record's accounted byte cost by doing a single write on a fresh
     // engine with an unlimited quota (so the cap does not interfere), then read the
-    // box's bytes(). This makes the cap self-calibrating regardless of the exact
+    // topic's bytes(). This makes the cap self-calibrating regardless of the exact
     // per-record overhead.
     let per_record_bytes = {
         let probe_disk = FakeDisk::new();
@@ -565,11 +565,11 @@ fn l_total_bytes_quota_race_stays_under_cap() {
                 ..Default::default()
             },
         );
-        probe.put_box("p", durable_box()).unwrap();
+        probe.put_topic("p", durable_topic()).unwrap();
         probe
             .write("p", write_req(json!({ "v": "payload" })), true)
             .unwrap();
-        let b = probe.box_state("p", false).unwrap().bytes;
+        let b = probe.topic_state("p", false).unwrap().bytes;
         drop(probe);
         b.max(1)
     };
@@ -592,9 +592,9 @@ fn l_total_bytes_quota_race_stays_under_cap() {
             ..Default::default()
         },
     );
-    // One durable box; every writer appends to it (the total is summed across all
-    // boxes, but a single box keeps the accounting crisp).
-    engine.put_box("quota", durable_box()).expect("quota box");
+    // One durable topic; every writer appends to it (the total is summed across all
+    // topics, but a single topic keeps the accounting crisp).
+    engine.put_topic("quota", durable_topic()).expect("quota topic");
 
     let start = Arc::new(Barrier::new(RACERS));
     let committed = Arc::new(AtomicU64::new(0));
@@ -621,7 +621,7 @@ fn l_total_bytes_quota_race_stays_under_cap() {
         hd.join().expect("no quota writer panicked");
     }
 
-    let total = engine.box_state("quota", false).unwrap().bytes;
+    let total = engine.topic_state("quota", false).unwrap().bytes;
     let admitted = committed.load(Ordering::Relaxed);
     // INVARIANT (the byte quota, codex HIGH #5 / P2 #10): the ATOMIC reserve never
     // admits a write that would push the live total over the cap, so the committed
@@ -671,7 +671,7 @@ fn l_total_bytes_quota_crash_recovers_acked_dense_prefix() {
                 ..Default::default()
             },
         );
-        engine.put_box("dq", durable_box()).expect("dq box");
+        engine.put_topic("dq", durable_topic()).expect("dq topic");
 
         let start = Arc::new(Barrier::new(WRITERS));
         let mut handles = Vec::new();
@@ -714,7 +714,7 @@ fn l_total_bytes_quota_crash_recovers_acked_dense_prefix() {
             ..Default::default()
         },
     );
-    let st = engine.box_state("dq", false).unwrap();
+    let st = engine.topic_state("dq", false).unwrap();
     let mut survivors = Vec::new();
     let mut from = 0u64;
     loop {
@@ -787,7 +787,7 @@ fn l_total_bytes_quota_crash_recovers_acked_dense_prefix() {
 // (route_requirement -> principal.allows_scope). Under concurrency it must stay
 // consistent: a WRITE-only key can never read, and a READ-only key can never
 // write, regardless of interleaving. We race both key kinds against both verbs on
-// a shared box and assert every outcome matches the key's scope exactly (no
+// a shared topic and assert every outcome matches the key's scope exactly (no
 // request ever escalates scope under load, no 5xx).
 //
 // Key syntax (from integration_auth_scopes): `<secret>:<scopes>` where scopes is a
@@ -807,9 +807,9 @@ fn l_scope_consistent_under_concurrency() {
         ],
         ..Default::default()
     }));
-    // Admin creates the shared box (write/read keys lack admin scope).
-    let (s, _) = h.put_auth("/v0/boxes/shared", json!({}), "admin");
-    assert_eq!(s, StatusCode::CREATED, "admin creates the box");
+    // Admin creates the shared topic (write/read keys lack admin scope).
+    let (s, _) = h.put_auth("/v0/topics/shared", json!({}), "admin");
+    assert_eq!(s, StatusCode::CREATED, "admin creates the topic");
 
     let start = Arc::new(Barrier::new(RACERS * 2));
     let mut handles = Vec::new();
@@ -823,7 +823,7 @@ fn l_scope_consistent_under_concurrency() {
             start.wait();
             for _ in 0..ITERS {
                 let (sw, _) = h.post_auth(
-                    "/v0/boxes/shared",
+                    "/v0/topics/shared",
                     json!({ "records": [{ "data": 1 }] }),
                     "wonly",
                 );
@@ -831,7 +831,7 @@ fn l_scope_consistent_under_concurrency() {
                     sw == StatusCode::OK || sw == StatusCode::CREATED,
                     "write-scoped key write must succeed, got {sw}"
                 );
-                let (sr, _) = h.get_auth("/v0/boxes/shared", "wonly");
+                let (sr, _) = h.get_auth("/v0/topics/shared", "wonly");
                 assert_eq!(
                     sr,
                     StatusCode::FORBIDDEN,
@@ -848,14 +848,14 @@ fn l_scope_consistent_under_concurrency() {
         handles.push(std::thread::spawn(move || {
             start.wait();
             for _ in 0..ITERS {
-                let (sr, _) = h.get_auth("/v0/boxes/shared", "ronly");
+                let (sr, _) = h.get_auth("/v0/topics/shared", "ronly");
                 assert_eq!(
                     sr,
                     StatusCode::OK,
                     "read-scoped key read must succeed, got {sr}"
                 );
                 let (sw, _) = h.post_auth(
-                    "/v0/boxes/shared",
+                    "/v0/topics/shared",
                     json!({ "records": [{ "data": 1 }] }),
                     "ronly",
                 );

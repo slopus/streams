@@ -4,14 +4,14 @@
 //! (`copy_segment_to_cold` → `confirm_relocated` = flip the tier pointer + drop
 //! the hot copy) against a hostile, crash-modelling filesystem ([`FakeDisk`] /
 //! [`FaultFs`] from the Phase-8A harness). The relocation is driven through the
-//! *real* [`BoxTier`] + [`LocalSegmentStore`] wired onto a [`FakeDisk`] (via
+//! *real* [`TopicTier`] + [`LocalSegmentStore`] wired onto a [`FakeDisk`] (via
 //! `LocalSegmentStore::open_with`), so a `crash()` exercises the genuine
 //! copy→fsync→flip→drop ordering the engine relies on — exactly the layer every
 //! strategy's `inject_how` targets.
 //!
 //! The invariant under test (DESIGN oracle §9, COLD RELOCATION ALL-OR-NOTHING):
 //! after a crash at *any* point in copy→fsync→flip→delete, **exactly one** (never
-//! zero) readable copy of every segment exists; `BoxTier::resolve` prefers HOT in
+//! zero) readable copy of every segment exists; `TopicTier::resolve` prefers HOT in
 //! the both-exist window; the hot copy is dropped only after the cold copy is
 //! durable; and the relocator re-runs the idempotent copy(no-op)+flip+drop and
 //! loses nothing.
@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::{
-    decode_data_frame, lookup, BoxTier, LocalSegmentStore, SegmentBuilder, SegmentPart,
+    decode_data_frame, lookup, TopicTier, LocalSegmentStore, SegmentBuilder, SegmentPart,
     SegmentRecord, Tier,
 };
 
@@ -55,8 +55,8 @@ use streams::storage::{
 // re-derive a tier from the post-crash durable image (the recovery view).
 // ===========================================================================
 
-const HOT_DIR: &str = "/data/boxes/00000001";
-const COLD_DIR: &str = "/cold/boxes/00000001";
+const HOT_DIR: &str = "/data/topics/00000001";
+const COLD_DIR: &str = "/cold/topics/00000001";
 
 /// Build a real segment (`.data` + `.idx`) of `n` records starting at `start`.
 fn build_segment(start: u64, n: u64) -> (Vec<u8>, Vec<u8>) {
@@ -73,14 +73,14 @@ fn build_segment(start: u64, n: u64) -> (Vec<u8>, Vec<u8>) {
     b.finish()
 }
 
-/// Open a HOT+COLD [`BoxTier`] whose every byte of segment I/O routes through
+/// Open a HOT+COLD [`TopicTier`] whose every byte of segment I/O routes through
 /// `disk` (so a `crash()` decides what survives). The two stores live at distinct
-/// roots, exactly as the engine wires `<data_dir>/boxes/<id>` (hot) and
-/// `<cold_dir>/boxes/<id>` (cold).
-fn open_tier(disk: &FakeDisk) -> Arc<BoxTier> {
+/// roots, exactly as the engine wires `<data_dir>/topics/<id>` (hot) and
+/// `<cold_dir>/topics/<id>` (cold).
+fn open_tier(disk: &FakeDisk) -> Arc<TopicTier> {
     let hot = LocalSegmentStore::open_with(PathBuf::from(HOT_DIR), disk.arc()).unwrap();
     let cold = LocalSegmentStore::open_with(PathBuf::from(COLD_DIR), disk.arc()).unwrap();
-    Arc::new(BoxTier::new(Box::new(hot), Some(Box::new(cold))))
+    Arc::new(TopicTier::new(Box::new(hot), Some(Box::new(cold))))
 }
 
 /// Make every directory entry written so far durable (the dir-fsync production
@@ -89,10 +89,10 @@ fn open_tier(disk: &FakeDisk) -> Arc<BoxTier> {
 fn sync_all_dirs(disk: &FakeDisk) {
     let fs = disk.arc();
     for d in [
-        "/data/boxes/00000001",
-        "/cold/boxes/00000001",
-        "/data/boxes",
-        "/cold/boxes",
+        "/data/topics/00000001",
+        "/cold/topics/00000001",
+        "/data/topics",
+        "/cold/topics",
         "/data",
         "/cold",
     ] {
@@ -103,7 +103,7 @@ fn sync_all_dirs(disk: &FakeDisk) {
 /// Seal a segment into the HOT store and make it durable (its bytes are fsync'd
 /// by `put`; we fsync the dir so the name survives a crash). This is the
 /// pre-relocation steady state: one sealed segment, hot only.
-fn seal_hot(tier: &BoxTier, disk: &FakeDisk, id: u64, n: u64) -> (Vec<u8>, Vec<u8>) {
+fn seal_hot(tier: &TopicTier, disk: &FakeDisk, id: u64, n: u64) -> (Vec<u8>, Vec<u8>) {
     let (data, idx) = build_segment(id, n);
     tier.hot().put(id, &data, &idx).unwrap();
     sync_all_dirs(disk);
@@ -114,7 +114,7 @@ fn seal_hot(tier: &BoxTier, disk: &FakeDisk, id: u64, n: u64) -> (Vec<u8>, Vec<u
 /// way a consumer read does (resolve → bulk-read `.idx` → locate → read the frame
 /// → decode). Returns the decoded payload bytes. Panics if the segment resolves
 /// to no tier (a lost segment) — the thing the oracle forbids.
-fn read_record(tier: &BoxTier, id: u64, seq: u64) -> Vec<u8> {
+fn read_record(tier: &TopicTier, id: u64, seq: u64) -> Vec<u8> {
     let store = tier
         .store_for(id)
         .unwrap_or_else(|| panic!("segment {id} resolved to NO tier (lost!)"));
@@ -126,11 +126,11 @@ fn read_record(tier: &BoxTier, id: u64, seq: u64) -> Vec<u8> {
     decode_data_frame(&frame).expect("frame decodes").data
 }
 
-/// The in-engine relocation order, driven the way `Engine::relocate_box_cold`
+/// The in-engine relocation order, driven the way `Engine::relocate_topic_cold`
 /// does it: copy hot→cold (fsync'd by `put`), then flip the durable tier pointer
 /// + drop the hot copy. The "durable pointer" IS the cold copy's existence, so a
 /// crash between the two steps is what every strategy probes.
-fn copy_to_cold(tier: &Arc<BoxTier>, id: u64) {
+fn copy_to_cold(tier: &Arc<TopicTier>, id: u64) {
     streams::engine::segwriter::copy_segment_to_cold(tier, id).expect("cold copy");
 }
 
@@ -138,7 +138,7 @@ fn copy_to_cold(tier: &Arc<BoxTier>, id: u64) {
 /// engine's `confirm_relocated` does. Mirrored here at the tier level (the
 /// in-memory sealed-registry flip is re-derived from `resolve` on restart, so the
 /// only durable action is the hot delete).
-fn flip_drop_hot(tier: &Arc<BoxTier>, id: u64) {
+fn flip_drop_hot(tier: &Arc<TopicTier>, id: u64) {
     tier.hot().delete(id).expect("drop hot copy");
 }
 
@@ -147,7 +147,7 @@ fn flip_drop_hot(tier: &Arc<BoxTier>, id: u64) {
 //
 //   fault:  crash after cold.put fsync but before confirm_relocated flips the
 //           tier pointer.
-//   oracle: both hot and cold copies exist; BoxTier::resolve prefers HOT; record
+//   oracle: both hot and cold copies exist; TopicTier::resolve prefers HOT; record
 //           fully readable; relocator re-runs idempotent copy(no-op)+flip+drop
 //           (matches interrupted_relocation_recovers_without_loss).
 // ===========================================================================
@@ -307,10 +307,10 @@ fn f_cold_resolve_prefers_hot() {
 }
 
 /// Re-derive a fresh tier from the current durable disk image (a "recovery" open).
-fn rederive(disk: &FakeDisk) -> BoxTier {
+fn rederive(disk: &FakeDisk) -> TopicTier {
     let hot = LocalSegmentStore::open_with(PathBuf::from(HOT_DIR), disk.arc()).unwrap();
     let cold = LocalSegmentStore::open_with(PathBuf::from(COLD_DIR), disk.arc()).unwrap();
-    BoxTier::new(Box::new(hot), Some(Box::new(cold)))
+    TopicTier::new(Box::new(hot), Some(Box::new(cold)))
 }
 
 // ===========================================================================
@@ -426,7 +426,7 @@ fn f_compound_relocate_during_recovery() {
 /// throwaway `SegmentWriter` around the tier (its sealed registry is empty, so the
 /// sweep's "not registered" test is governed purely by the `live_floor` argument —
 /// exactly what recovery passes after rebuilding the registry).
-fn run_orphan_sweep(tier: &Arc<BoxTier>, live_floor: u64) -> usize {
+fn run_orphan_sweep(tier: &Arc<TopicTier>, live_floor: u64) -> usize {
     use streams::clock::{SharedClock, TestClock};
     use streams::config::SegmentConfig;
     use streams::engine::segwriter::SegmentWriter;
@@ -470,7 +470,7 @@ fn f_sweep_cold_relocation() {
         let counter = MutCounter::wrap(disk.arc());
         let hot = LocalSegmentStore::open_with(PathBuf::from(HOT_DIR), counter.arc()).unwrap();
         let cold = LocalSegmentStore::open_with(PathBuf::from(COLD_DIR), counter.arc()).unwrap();
-        let tier = Arc::new(BoxTier::new(Box::new(hot), Some(Box::new(cold))));
+        let tier = Arc::new(TopicTier::new(Box::new(hot), Some(Box::new(cold))));
         copy_to_cold(&tier, id);
         flip_drop_hot(&tier, id);
         counter.count()
@@ -501,7 +501,7 @@ fn f_sweep_cold_relocation() {
             let trip = CrashAfter::new(disk.clone(), crash_point);
             let hot = LocalSegmentStore::open_with(PathBuf::from(HOT_DIR), trip.arc()).unwrap();
             let cold = LocalSegmentStore::open_with(PathBuf::from(COLD_DIR), trip.arc()).unwrap();
-            let tier = Arc::new(BoxTier::new(Box::new(hot), Some(Box::new(cold))));
+            let tier = Arc::new(TopicTier::new(Box::new(hot), Some(Box::new(cold))));
             // copy (may crash partway), dir fsync, flip+drop (may crash partway).
             // All FS calls past the trip point land on a frozen device and are lost.
             let _ = streams::engine::segwriter::copy_segment_to_cold(&tier, id);

@@ -9,19 +9,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
-// Box config (API §0.10)
+// Topic config (API §0.10)
 // ---------------------------------------------------------------------------
 
-/// The Box config object. Appears in box-create requests and box-state
+/// The Topic config object. Appears in topic-create requests and topic-state
 /// responses. All fields are optional on create; omitted fields take the
 /// documented default (via `#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BoxConfig {
-    /// Box kind: `"log"` (default, plain append-only log) or `"queue"` (enables
+pub struct TopicConfig {
+    /// Topic kind: `"log"` (default, plain append-only log) or `"queue"` (enables
     /// the lease-based claim/ack/nack/extend/work endpoints, API §10). Immutable
-    /// after create (a `PUT` changing it ⇒ `409 box_exists_incompatible`).
-    #[serde(default = "default_box_type")]
-    pub r#type: BoxType,
+    /// after create (a `PUT` changing it ⇒ `409 topic_exists_incompatible`).
+    #[serde(default = "default_topic_type")]
+    pub r#type: TopicType,
     #[serde(default = "default_ttl_ms")]
     pub ttl_ms: u64,
     #[serde(default = "default_cap_records")]
@@ -34,8 +34,8 @@ pub struct BoxConfig {
     pub durable: bool,
     /// Durability commit class (additive, back-compat). When present this is the
     /// authoritative durability selector; when absent it is resolved from
-    /// `durable` (`true ⇒ fsync`, `false ⇒ disk`). See [`BoxConfig::durability_class`].
-    /// Reported (resolved) in box-state/box-create responses; omitted on the wire
+    /// `durable` (`true ⇒ fsync`, `false ⇒ disk`). See [`TopicConfig::durability_class`].
+    /// Reported (resolved) in topic-state/topic-create responses; omitted on the wire
     /// only when never set *and* on a create request (absence = "resolve from
     /// `durable`"). On a response it is always the resolved class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,7 +52,7 @@ pub struct BoxConfig {
     pub dedupe_node: bool,
 
     // --- Queue-only config (meaningful only when `type:"queue"`; accepted but
-    // inert on a "log" box). DESIGN §10, API §0.10/§10. ---
+    // inert on a "log" topic). DESIGN §10, API §0.10/§10. ---
     /// Default lease (visibility-timeout) duration for a claim, ms. Clamped
     /// `[100, 86400000]`.
     #[serde(default = "default_lease_ms")]
@@ -66,8 +66,8 @@ pub struct BoxConfig {
     /// `0` = unlimited redelivery (never dead-letter on delivery count).
     #[serde(default = "default_max_deliveries")]
     pub max_deliveries: u64,
-    /// Box to move a job to after it exceeds `max_deliveries` (§10.6). `null` =
-    /// no dead-letter box (the job keeps being reclaimed).
+    /// Topic to move a job to after it exceeds `max_deliveries` (§10.6). `null` =
+    /// no dead-letter topic (the job keeps being reclaimed).
     #[serde(default = "default_dead_letter")]
     pub dead_letter: Option<String>,
     /// Durability of the *leases* log (§10.1). Defaults `false` (self-healing:
@@ -76,8 +76,8 @@ pub struct BoxConfig {
     pub leases_durable: bool,
 }
 
-fn default_box_type() -> BoxType {
-    BoxType::Log
+fn default_topic_type() -> TopicType {
+    TopicType::Log
 }
 fn default_lease_ms() -> u64 {
     30_000
@@ -126,10 +126,10 @@ fn default_dedupe_node() -> bool {
     true
 }
 
-impl Default for BoxConfig {
+impl Default for TopicConfig {
     fn default() -> Self {
-        BoxConfig {
-            r#type: default_box_type(),
+        TopicConfig {
+            r#type: default_topic_type(),
             ttl_ms: default_ttl_ms(),
             cap_records: default_cap_records(),
             cap_bytes: default_cap_bytes(),
@@ -150,13 +150,13 @@ impl Default for BoxConfig {
     }
 }
 
-impl BoxConfig {
-    /// Whether this box is a queue (enables the §10 lease lifecycle).
+impl TopicConfig {
+    /// Whether this topic is a queue (enables the §10 lease lifecycle).
     pub fn is_queue(&self) -> bool {
-        self.r#type == BoxType::Queue
+        self.r#type == TopicType::Queue
     }
 
-    /// Resolve the single authoritative durability commit class for this box
+    /// Resolve the single authoritative durability commit class for this topic
     /// (API §0.10). An explicit `durability` always wins; otherwise it is derived
     /// from the legacy `durable` bool: `durable:true ⇒ fsync`, `durable:false ⇒
     /// disk`. (`memory` is reachable only via an explicit `durability:"memory"`.)
@@ -173,7 +173,7 @@ impl BoxConfig {
         }
     }
 
-    /// Whether an acknowledged write to this box is fsync-gated (the strongest
+    /// Whether an acknowledged write to this topic is fsync-gated (the strongest
     /// class). `true` iff the resolved class is `fsync`; kept as the back-compat
     /// meaning of the old `durable` bool.
     pub fn is_durable(&self) -> bool {
@@ -191,7 +191,7 @@ impl BoxConfig {
     }
 }
 
-/// The durability commit class of a box (API §0.10). Selects where a write lands
+/// The durability commit class of a topic (API §0.10). Selects where a write lands
 /// and when it is acknowledged — the durability/performance tradeoff:
 ///
 /// - `memory` — "disk-like but best-effort". Takes the SAME group-committed WAL
@@ -217,23 +217,23 @@ pub enum Durability {
     Fsync,
 }
 
-/// The kind of a box: a plain append-only log, or a lease-based job queue.
+/// The kind of a topic: a plain append-only log, or a lease-based job queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum BoxType {
+pub enum TopicType {
     /// Plain append-only log (default). Rejects the §10 queue endpoints.
     Log,
     /// Lease-based job queue (enables claim/ack/nack/extend/work, §10).
     Queue,
 }
 
-/// Full-box overflow policy.
+/// Full-topic overflow policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Discard {
     /// Evict oldest records to make room (pub/sub friendly). Default.
     Old,
-    /// Refuse the write with `422 box_full`.
+    /// Refuse the write with `422 topic_full`.
     Reject,
 }
 
@@ -241,7 +241,7 @@ pub enum Discard {
 // Records (DESIGN §1, API §0.4)
 // ---------------------------------------------------------------------------
 
-/// An input record as supplied by a writer on `POST /v0/boxes/:box`.
+/// An input record as supplied by a writer on `POST /v0/topics/:topic`.
 /// `node`/`tag` are plain top-level keys (no sigil on write).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecordIn {
@@ -276,47 +276,47 @@ pub struct RecordOut {
 }
 
 // ---------------------------------------------------------------------------
-// Box lifecycle: PUT / GET / list / DELETE (API §1)
+// Topic lifecycle: PUT / GET / list / DELETE (API §1)
 // ---------------------------------------------------------------------------
 
-/// Response for `PUT /v0/boxes/:box`.
+/// Response for `PUT /v0/topics/:topic`.
 #[derive(Debug, Clone, Serialize)]
-pub struct BoxCreateResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+pub struct TopicCreateResponse {
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub created: bool,
-    pub config: BoxConfig,
+    pub config: TopicConfig,
     pub performance: Performance,
 }
 
-/// Response for `GET /v0/boxes/:box` (box state).
+/// Response for `GET /v0/topics/:topic` (topic state).
 #[derive(Debug, Clone, Serialize)]
-pub struct BoxStateResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
-    /// Box kind (`"queue"` for a queue, `"log"` otherwise) — API §10.7.
-    pub r#type: BoxType,
+pub struct TopicStateResponse {
+    #[serde(rename = "topic")]
+    pub topic_name: String,
+    /// Topic kind (`"queue"` for a queue, `"log"` otherwise) — API §10.7.
+    pub r#type: TopicType,
     pub head_seq: u64,
     pub earliest_seq: u64,
     pub next_seq: u64,
     pub count: u64,
     pub bytes: u64,
-    pub config: BoxConfig,
+    pub config: TopicConfig,
     pub effective_priority: i64,
     pub last_write_ts: Option<i64>,
     pub last_read_ts: Option<i64>,
     /// Queue counters (`ready`/`in_flight`/`dead_lettered`) — present only for a
-    /// queue box (API §10.7); omitted on a plain log.
+    /// queue topic (API §10.7); omitted on a plain log.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueState>,
     pub performance: Performance,
 }
 
-/// One entry in the `GET /v0/boxes` listing.
+/// One entry in the `GET /v0/topics` listing.
 #[derive(Debug, Clone, Serialize)]
-pub struct BoxSummary {
-    #[serde(rename = "box")]
-    pub box_name: String,
+pub struct TopicSummary {
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub head_seq: u64,
     pub earliest_seq: u64,
     pub count: u64,
@@ -325,20 +325,20 @@ pub struct BoxSummary {
     pub effective_priority: i64,
 }
 
-/// Response for `GET /v0/boxes`.
+/// Response for `GET /v0/topics`.
 #[derive(Debug, Clone, Serialize)]
-pub struct BoxListResponse {
-    pub boxes: Vec<BoxSummary>,
+pub struct TopicListResponse {
+    pub topics: Vec<TopicSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub performance: Performance,
 }
 
-/// Response for `DELETE /v0/boxes/:box`.
+/// Response for `DELETE /v0/topics/:topic`.
 #[derive(Debug, Clone, Serialize)]
-pub struct BoxDeleteResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+pub struct TopicDeleteResponse {
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub deleted: bool,
     pub routers_removed: Vec<String>,
     pub performance: Performance,
@@ -348,7 +348,7 @@ pub struct BoxDeleteResponse {
 // Write (API §2)
 // ---------------------------------------------------------------------------
 
-/// Request body for `POST /v0/boxes/:box`.
+/// Request body for `POST /v0/topics/:topic`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WriteRequest {
     pub records: Vec<RecordIn>,
@@ -356,21 +356,21 @@ pub struct WriteRequest {
     pub node: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// Overrides the box's `auto_create` for this write only.
+    /// Overrides the topic's `auto_create` for this write only.
     #[serde(default)]
     pub create: Option<bool>,
-    /// Applied only if this write creates the box.
+    /// Applied only if this write creates the topic.
     #[serde(default)]
-    pub config: Option<BoxConfig>,
+    pub config: Option<TopicConfig>,
     #[serde(default)]
     pub disable_backpressure: bool,
 }
 
-/// Response for `POST /v0/boxes/:box`.
+/// Response for `POST /v0/topics/:topic`.
 #[derive(Debug, Clone, Serialize)]
 pub struct WriteResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub first_seq: u64,
     pub last_seq: u64,
     /// Suppressed with `?return_seqs=false`.
@@ -405,7 +405,7 @@ impl NodeFilter {
     }
 }
 
-/// Request body for `POST /v0/boxes/:box/diff`.
+/// Request body for `POST /v0/topics/:topic/diff`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiffRequest {
     #[serde(default)]
@@ -469,7 +469,7 @@ pub enum TombstoneReason {
     Mixed,
     Recreated,
     /// A derived router dest could not re-materialize a forwarded record because
-    /// the SOURCE box had already evicted/trimmed it (TTL / byte-cap involuntary
+    /// the SOURCE topic had already evicted/trimmed it (TTL / byte-cap involuntary
     /// loss) below the router's forward cursor before it was forwarded. The dest
     /// faithfully reflects the source's retention — the gap is surfaced, never a
     /// silent skip (async/derived router model, design §4 source-retention bound).
@@ -479,11 +479,11 @@ pub enum TombstoneReason {
     FromSeqTooOld,
 }
 
-/// Response for `POST /v0/boxes/:box/diff`.
+/// Response for `POST /v0/topics/:topic/diff`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub records: Vec<RecordOut>,
     pub next_from_seq: u64,
     pub head_seq: u64,
@@ -617,7 +617,7 @@ impl Filter {
     }
 }
 
-/// Request body for `POST /v0/boxes/:box/delete` (API §5). Permanent,
+/// Request body for `POST /v0/topics/:topic/delete` (API §5). Permanent,
 /// point-in-time deletion by seq range and/or tag match. At least one of
 /// `before_seq` / `match` is required (else `400 invalid_request`); supplying
 /// both ANDs them.
@@ -632,11 +632,11 @@ pub struct DeleteRequest {
     pub match_: Option<Filter>,
 }
 
-/// Response for `POST /v0/boxes/:box/delete` (API §5).
+/// Response for `POST /v0/topics/:topic/delete` (API §5).
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     /// Count of records removed by this call.
     pub deleted: u64,
     /// New first live seq (advanced past any deleted prefix).
@@ -651,7 +651,7 @@ pub struct DeleteResponse {
 // Queues (API §10)
 // ---------------------------------------------------------------------------
 
-/// The `queue` sub-object on `GET /v0/boxes/:q` for a queue box (API §10.7).
+/// The `queue` sub-object on `GET /v0/topics/:q` for a queue topic (API §10.7).
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueState {
     /// Claimable jobs right now (not acked, no active lease; includes
@@ -659,19 +659,19 @@ pub struct QueueState {
     pub ready: u64,
     /// Jobs with an active (un-expired) lease — currently held by some worker.
     pub in_flight: u64,
-    /// Cumulative jobs moved to the `dead_letter` box over this box instance's
+    /// Cumulative jobs moved to the `dead_letter` topic over this topic instance's
     /// life (resets on delete+recreate).
     pub dead_lettered: u64,
 }
 
-/// Request body for `POST /v0/boxes/:q/claim` (API §10.2).
+/// Request body for `POST /v0/topics/:q/claim` (API §10.2).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClaimRequest {
     pub node: String,
     /// Max jobs to lease this call (default 1, clamped to `MAX_CLAIM`).
     #[serde(default)]
     pub max: u32,
-    /// Lease duration override for this call (default = box `lease_ms`).
+    /// Lease duration override for this call (default = topic `lease_ms`).
     #[serde(default)]
     pub lease_ms: Option<u64>,
 }
@@ -693,18 +693,18 @@ pub struct ClaimedJob {
     pub meta: Option<Value>,
 }
 
-/// Response for `POST /v0/boxes/:q/claim`.
+/// Response for `POST /v0/topics/:q/claim`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaimResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub claimed: Vec<ClaimedJob>,
     pub count: u64,
     pub ready: u64,
     pub performance: Performance,
 }
 
-/// Request body for `POST /v0/boxes/:q/ack` (API §10.4).
+/// Request body for `POST /v0/topics/:q/ack` (API §10.4).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AckRequest {
     pub node: String,
@@ -718,11 +718,11 @@ pub struct AckRequest {
     pub lease_ids: Vec<String>,
 }
 
-/// Response for `POST /v0/boxes/:q/ack`.
+/// Response for `POST /v0/topics/:q/ack`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AckResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub acked: u64,
     pub skipped: Vec<u64>,
     pub ready: u64,
@@ -730,7 +730,7 @@ pub struct AckResponse {
     pub performance: Performance,
 }
 
-/// Request body for `POST /v0/boxes/:q/nack` (API §10.5).
+/// Request body for `POST /v0/topics/:q/nack` (API §10.5).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct NackRequest {
     pub node: String,
@@ -743,11 +743,11 @@ pub struct NackRequest {
     pub lease_ids: Vec<String>,
 }
 
-/// Response for `POST /v0/boxes/:q/nack`.
+/// Response for `POST /v0/topics/:q/nack`.
 #[derive(Debug, Clone, Serialize)]
 pub struct NackResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub nacked: u64,
     pub skipped: Vec<u64>,
     pub ready: u64,
@@ -755,7 +755,7 @@ pub struct NackResponse {
     pub performance: Performance,
 }
 
-/// Request body for `POST /v0/boxes/:q/extend` (API §10.6).
+/// Request body for `POST /v0/topics/:q/extend` (API §10.6).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExtendRequest {
     pub node: String,
@@ -767,11 +767,11 @@ pub struct ExtendRequest {
     pub lease_ids: Vec<String>,
 }
 
-/// Response for `POST /v0/boxes/:q/extend`.
+/// Response for `POST /v0/topics/:q/extend`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtendResponse {
-    #[serde(rename = "box")]
-    pub box_name: String,
+    #[serde(rename = "topic")]
+    pub topic_name: String,
     pub extended: u64,
     pub skipped: Vec<u64>,
     /// New absolute deadline (ms) per extended seq, keyed by seq as a string.
@@ -875,9 +875,9 @@ pub struct RouterDeleteResponse {
 // Watch / SSE (API §7)
 // ---------------------------------------------------------------------------
 
-/// Per-box options inside a watch subscription.
+/// Per-topic options inside a watch subscription.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct WatchBoxOptions {
+pub struct WatchTopicOptions {
     #[serde(default)]
     pub from_seq: u64,
     #[serde(default)]
@@ -889,7 +889,7 @@ pub struct WatchBoxOptions {
 pub struct WatchCreateRequest {
     #[serde(default)]
     pub node: Option<NodeFilter>,
-    pub boxes: std::collections::HashMap<String, WatchBoxOptions>,
+    pub topics: std::collections::HashMap<String, WatchTopicOptions>,
     #[serde(default = "default_watch_limit")]
     pub limit: u32,
     #[serde(default = "default_max_batch_bytes")]
@@ -926,9 +926,9 @@ pub enum Consistency {
     Strong,
 }
 
-/// Per-box watermark info echoed in the watch-create response.
+/// Per-topic watermark info echoed in the watch-create response.
 #[derive(Debug, Clone, Serialize)]
-pub struct WatchBoxState {
+pub struct WatchTopicState {
     pub from_seq: u64,
     pub head_seq: u64,
     pub earliest_seq: u64,
@@ -940,7 +940,7 @@ pub struct WatchCreateResponse {
     pub wid: String,
     pub stream_url: String,
     pub session_ttl_ms: u64,
-    pub boxes: std::collections::HashMap<String, WatchBoxState>,
+    pub topics: std::collections::HashMap<String, WatchTopicState>,
     pub performance: Performance,
 }
 
@@ -959,7 +959,7 @@ pub struct HealthResponse {
 pub struct ReadyResponse {
     pub status: String,
     pub wal_replay_complete: bool,
-    pub boxes: u64,
+    pub topics: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,18 +1023,18 @@ pub enum ErrorCode {
     RecordTooLarge,
     Unauthorized,
     Forbidden,
-    BoxNotFound,
+    TopicNotFound,
     RouterNotFound,
     NotFound,
     MethodNotAllowed,
     NotAcceptable,
     RouterCycle,
-    BoxExistsIncompatible,
-    BoxNotEmpty,
+    TopicExistsIncompatible,
+    TopicNotEmpty,
     NotAQueue,
     PayloadTooLarge,
     UnsupportedMediaType,
-    BoxFull,
+    TopicFull,
     Throttled,
     Internal,
     NotReady,
@@ -1049,13 +1049,13 @@ impl ErrorCode {
             InvalidRequest | BatchTooLarge | RecordTooLarge => 400,
             Unauthorized => 401,
             Forbidden => 403,
-            BoxNotFound | RouterNotFound | NotFound => 404,
+            TopicNotFound | RouterNotFound | NotFound => 404,
             MethodNotAllowed => 405,
             NotAcceptable => 406,
-            RouterCycle | BoxExistsIncompatible | BoxNotEmpty | NotAQueue => 409,
+            RouterCycle | TopicExistsIncompatible | TopicNotEmpty | NotAQueue => 409,
             PayloadTooLarge => 413,
             UnsupportedMediaType => 415,
-            BoxFull => 422,
+            TopicFull => 422,
             Throttled => 429,
             Internal => 500,
             NotReady | ShuttingDown => 503,
@@ -1071,18 +1071,18 @@ impl ErrorCode {
             RecordTooLarge => "record_too_large",
             Unauthorized => "unauthorized",
             Forbidden => "forbidden",
-            BoxNotFound => "box_not_found",
+            TopicNotFound => "topic_not_found",
             RouterNotFound => "router_not_found",
             NotFound => "not_found",
             MethodNotAllowed => "method_not_allowed",
             NotAcceptable => "not_acceptable",
             RouterCycle => "router_cycle",
-            BoxExistsIncompatible => "box_exists_incompatible",
-            BoxNotEmpty => "box_not_empty",
+            TopicExistsIncompatible => "topic_exists_incompatible",
+            TopicNotEmpty => "topic_not_empty",
             NotAQueue => "not_a_queue",
             PayloadTooLarge => "payload_too_large",
             UnsupportedMediaType => "unsupported_media_type",
-            BoxFull => "box_full",
+            TopicFull => "topic_full",
             Throttled => "throttled",
             Internal => "internal",
             NotReady => "not_ready",

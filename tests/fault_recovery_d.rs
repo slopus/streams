@@ -12,7 +12,7 @@
 //! | `F-REC-REBUILD-MATCHES-SCRATCH`  | snapshot+replay state == full from-frame-zero replay |
 //! | `F-REC-NO-SNAPSHOT-FULL-REPLAY`  | snapshots gone/corrupt ⇒ rebuild equivalent state from WAL |
 //! | `F-REC-PARTIAL-CHECKPOINT-OVERLAP` | checkpoint offset mid-snapshot-materialized frames ⇒ idempotent |
-//! | `F-REC-BOX-MISSING-FOR-APPEND`   | Append whose BoxConfig was lost ⇒ lazily materialized, record kept, no panic |
+//! | `F-REC-TOPIC-MISSING-FOR-APPEND`   | Append whose TopicConfig was lost ⇒ lazily materialized, record kept, no panic |
 //!
 //! All five drive the *real, fully-wired* [`Engine`] through an in-memory
 //! [`FakeDisk`] (the Phase-8A harness), then recover a fresh engine through the
@@ -43,7 +43,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
 use streams::storage::wal::{encode_frame, WalRecord};
 use streams::storage::OpenOpts;
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Plumbing shared by every test (adapted from tests/crash_oracle.rs — the
@@ -76,11 +76,11 @@ struct Rec {
     node: Option<String>,
 }
 
-/// A flat, comparable dump of one recovered box: head / earliest / count and the
+/// A flat, comparable dump of one recovered topic: head / earliest / count and the
 /// live records read back through the real diff path (the same bytes a consumer
 /// sees). This is the "byte-identical recovery" comparison key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -89,8 +89,8 @@ struct BoxDump {
 }
 
 /// Read the full recovered state of `name` through the engine's public API.
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone_reason = None;
     let mut from = 0u64;
@@ -133,7 +133,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -142,12 +142,12 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
     })
 }
 
-/// Dump every box the engine currently knows about, keyed by name, into one
+/// Dump every topic the engine currently knows about, keyed by name, into one
 /// comparable map (the whole-engine recovery fingerprint).
-fn dump_all(engine: &Engine, names: &[&str]) -> BTreeMap<String, BoxDump> {
+fn dump_all(engine: &Engine, names: &[&str]) -> BTreeMap<String, TopicDump> {
     let mut out = BTreeMap::new();
     for n in names {
-        if let Some(d) = dump_box(engine, n) {
+        if let Some(d) = dump_topic(engine, n) {
             out.insert((*n).to_string(), d);
         }
     }
@@ -162,15 +162,15 @@ fn sync_dirs(disk: &FakeDisk) {
     let _ = fs.sync_dir(&PathBuf::from(DATA_DIR).join("meta"));
 }
 
-/// Create a durable Log box.
-fn put_durable_box(engine: &Engine, name: &str) {
-    let cfg = BoxConfig {
-        r#type: BoxType::Log,
+/// Create a durable Log topic.
+fn put_durable_topic(engine: &Engine, name: &str) {
+    let cfg = TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         cap_records: 0,
         ..Default::default()
     };
-    engine.put_box(name, cfg).expect("put_box");
+    engine.put_topic(name, cfg).expect("put_topic");
 }
 
 /// Append one durable record `(data, tag, node)`, blocking on its group fsync
@@ -285,7 +285,7 @@ fn write_wal_file(disk: &FakeDisk, path: &PathBuf, records: &[WalRecord]) {
 // F-REC-RUN-TWICE-IDENTICAL — replay(replay(x)) == replay(x), byte-for-byte.
 // ===========================================================================
 
-/// Drive a durable multi-box workload (appends + a tag-delete + a cap eviction),
+/// Drive a durable multi-topic workload (appends + a tag-delete + a cap eviction),
 /// then recover THREE times in a row, each time snapshotting the full engine
 /// state. All three fingerprints must be byte-identical: head / earliest / count
 /// / per-seq data·tag·node / tombstone reason. This is the PG idempotent-replay
@@ -297,16 +297,16 @@ fn f_rec_run_twice_identical() {
 
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "jobs");
-        put_durable_box(&engine, "events");
-        // A durable cap box: writing past the cap advances the involuntary floor.
-        let capcfg = BoxConfig {
-            r#type: BoxType::Log,
+        put_durable_topic(&engine, "jobs");
+        put_durable_topic(&engine, "events");
+        // A durable cap topic: writing past the cap advances the involuntary floor.
+        let capcfg = TopicConfig {
+            r#type: TopicType::Log,
             durable: true,
             cap_records: 3,
             ..Default::default()
         };
-        engine.put_box("capped", capcfg).unwrap();
+        engine.put_topic("capped", capcfg).unwrap();
 
         append(&engine, "jobs", "j1", Some("a"), Some("nA"));
         append(&engine, "jobs", "j2", Some("drop"), None);
@@ -391,8 +391,8 @@ fn f_rec_rebuild_matches_scratch() {
 
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "a");
-        put_durable_box(&engine, "b");
+        put_durable_topic(&engine, "a");
+        put_durable_topic(&engine, "b");
         // Pre-snapshot writes (these get materialized INTO the snapshot).
         append(&engine, "a", "a1", Some("t"), None);
         append(&engine, "a", "a2", None, Some("nA"));
@@ -479,7 +479,7 @@ fn f_rec_no_snapshot_full_replay() {
 
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "log");
+        put_durable_topic(&engine, "log");
         for i in 1..=4 {
             append(&engine, "log", &format!("v{i}"), Some("t"), None);
         }
@@ -556,8 +556,8 @@ fn f_rec_partial_checkpoint_overlap() {
     use streams::storage::{next_snapshot_id_with, write_snapshot_with};
 
     let disk = FakeDisk::new();
-    let bcfg = BoxConfig {
-        r#type: BoxType::Log,
+    let bcfg = TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         cap_records: 0,
         ..Default::default()
@@ -565,7 +565,7 @@ fn f_rec_partial_checkpoint_overlap() {
 
     {
         let engine = open_engine(&disk);
-        engine.put_box("ov", bcfg.clone()).unwrap();
+        engine.put_topic("ov", bcfg.clone()).unwrap();
         for i in 1..=5u64 {
             append(&engine, "ov", &format!("o{i}"), Some("t"), None);
         }
@@ -583,7 +583,7 @@ fn f_rec_partial_checkpoint_overlap() {
         append(&engine, "ov", "o7", None, None);
 
         // Rewind the checkpoint OFFSET to 0 (the partial-overlap injection): replay
-        // will re-read the whole WAL (the BoxConfig create + Appends 1..=5 that the
+        // will re-read the whole WAL (the TopicConfig create + Appends 1..=5 that the
         // snapshot already materialized, plus 6,7) against a head-5 snapshot.
         snap.checkpoint.wal_offset = 0;
         snap.checkpoint.wal_idx = 1;
@@ -594,10 +594,10 @@ fn f_rec_partial_checkpoint_overlap() {
     }
 
     // Recover: restore snapshot (head 5, seqs 1..=5) then replay the WHOLE WAL from
-    // offset 0. The overlapping BoxConfig is idempotent; Appends 1..=5 are
+    // offset 0. The overlapping TopicConfig is idempotent; Appends 1..=5 are
     // seq-skipped (<= head); 6,7 append at head+1. No double-insert, no gap.
     let e = open_engine(&disk);
-    let ov = dump_box(&e, "ov").expect("ov present after overlap recovery");
+    let ov = dump_topic(&e, "ov").expect("ov present after overlap recovery");
     drop(e);
 
     assert_eq!(
@@ -618,37 +618,37 @@ fn f_rec_partial_checkpoint_overlap() {
 
     // Idempotent on a second recovery too.
     let e2 = open_engine(&disk);
-    let ov2 = dump_box(&e2, "ov").expect("ov present #2");
+    let ov2 = dump_topic(&e2, "ov").expect("ov present #2");
     drop(e2);
     assert_eq!(ov, ov2, "partial-overlap recovery is convergent");
 }
 
 // ===========================================================================
-// F-REC-BOX-MISSING-FOR-APPEND — Append whose BoxConfig create frame was lost.
+// F-REC-TOPIC-MISSING-FOR-APPEND — Append whose TopicConfig create frame was lost.
 // ===========================================================================
 
-/// A WAL where the box's `BoxConfig` create frame is ABSENT (torn before it / lost
-/// to a power loss) but a later `Append` for that `box_id` survives. Recovery must
+/// A WAL where the topic's `TopicConfig` create frame is ABSENT (torn before it / lost
+/// to a power loss) but a later `Append` for that `topic_id` survives. Recovery must
 /// NOT panic and must NOT drop the record: `replay_frame` lazily materializes the
-/// box with default config under the synthetic name `box-<box_id>`
-/// (`apply_put_box_for_recovery`). The record is therefore preserved (no silent
+/// topic with default config under the synthetic name `topic-<topic_id>`
+/// (`apply_put_topic_for_recovery`). The record is therefore preserved (no silent
 /// loss) — but the contract note is that this never *silently changes a durable
-/// box's config*: the recovered box carries DEFAULT (non-durable Log) config, not
+/// topic's config*: the recovered topic carries DEFAULT (non-durable Log) config, not
 /// the original durable config, which a from-scratch read surfaces under the
 /// synthetic name. We assert the record survives, no panic, and the synthetic
 /// materialization is observable (so the loss-of-config is explicit, not silent).
 #[test]
-fn f_rec_box_missing_for_append() {
+fn f_rec_topic_missing_for_append() {
     let disk = FakeDisk::new();
     let fs = disk.arc();
     fs.create_dir_all(&PathBuf::from(DATA_DIR).join("wal"))
         .unwrap();
 
-    // A box_id that NO BoxConfig frame creates — only Appends reference it.
-    let orphan_box_id: u32 = 7;
+    // A topic_id that NO TopicConfig frame creates — only Appends reference it.
+    let orphan_topic_id: u32 = 7;
     let frames = vec![
         WalRecord::Append {
-            box_id: orphan_box_id,
+            topic_id: orphan_topic_id,
             seq: 1,
             ts: 1_700_000_000_001,
             node: Some("nA".into()),
@@ -656,7 +656,7 @@ fn f_rec_box_missing_for_append() {
             data: payload("rec1"),
         },
         WalRecord::Append {
-            box_id: orphan_box_id,
+            topic_id: orphan_topic_id,
             seq: 2,
             ts: 1_700_000_000_002,
             node: None,
@@ -669,17 +669,17 @@ fn f_rec_box_missing_for_append() {
         .join("wal-0000000000000001.log");
     write_wal_file(&disk, &wal_path, &frames);
 
-    // Recovery must lazily materialize the box and keep the records — no panic.
+    // Recovery must lazily materialize the topic and keep the records — no panic.
     let engine = open_engine(&disk);
 
-    // The box surfaces under the synthetic name `box-<box_id>` (default config).
-    let synthetic = format!("box-{orphan_box_id}");
-    let dump = dump_box(&engine, &synthetic)
-        .expect("Append with a missing BoxConfig is lazily materialized, record kept");
+    // The topic surfaces under the synthetic name `topic-<topic_id>` (default config).
+    let synthetic = format!("topic-{orphan_topic_id}");
+    let dump = dump_topic(&engine, &synthetic)
+        .expect("Append with a missing TopicConfig is lazily materialized, record kept");
     assert_eq!(
         dump.records.keys().copied().collect::<Vec<_>>(),
         vec![1, 2],
-        "both orphan-box Appends are preserved (no silent loss)"
+        "both orphan-topic Appends are preserved (no silent loss)"
     );
     assert_eq!(dump.records[&1].data, "rec1");
     assert_eq!(dump.records[&1].tag.as_deref(), Some("t1"));
@@ -687,10 +687,10 @@ fn f_rec_box_missing_for_append() {
     assert_eq!(dump.records[&2].data, "rec2");
     assert_eq!(dump.head, 2, "head reflects the recovered appends");
 
-    // Recovery is idempotent here too (the lazily-materialized box is stable).
+    // Recovery is idempotent here too (the lazily-materialized topic is stable).
     drop(engine);
     let e2 = open_engine(&disk);
-    let dump2 = dump_box(&e2, &synthetic).expect("synthetic box present #2");
+    let dump2 = dump_topic(&e2, &synthetic).expect("synthetic topic present #2");
     drop(e2);
     assert_eq!(dump, dump2, "lazy-materialization recovery is convergent");
 }

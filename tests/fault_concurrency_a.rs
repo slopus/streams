@@ -10,7 +10,7 @@
 //! strategy is therefore implemented as a **robust high-thread STRESS test**
 //! (many concurrent actors, fixed iteration budgets) asserting the SAME
 //! invariants the catalog oracle names, driving the *real* primitives
-//! ([`BoxState::stage_append`]/`publish_staged`/`rollback_staged`, the real
+//! ([`TopicState::stage_append`]/`publish_staged`/`rollback_staged`, the real
 //! [`SegmentWriter`] mutex, the fully-wired [`Engine`] dedupe path, a real
 //! [`Wal`] over a [`FakeDisk`]). Loom/shuttle remain a documented follow-up
 //! (see the module note below).
@@ -70,13 +70,13 @@ use serde_json::json;
 
 use streams::clock::{SharedClock, TestClock};
 use streams::config::{SegmentConfig, ServerConfig};
-use streams::engine::box_state::{BoxState, StoredRecord};
+use streams::engine::topic_state::{TopicState, StoredRecord};
 use streams::engine::segwriter::SegmentWriter;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
-use streams::storage::{BoxTier, LocalSegmentStore};
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::storage::{TopicTier, LocalSegmentStore};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_wal_*.rs).
@@ -107,10 +107,10 @@ fn fast_cfg(dir: &std::path::Path) -> WalConfig {
     c
 }
 
-/// An Append frame for `box_id` at `seq`.
-fn ap(box_id: u32, seq: u64) -> WalRecord {
+/// An Append frame for `topic_id` at `seq`.
+fn ap(topic_id: u32, seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id,
+        topic_id,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -135,14 +135,14 @@ fn rec(data: &str, tag: Option<&str>) -> StoredRecord {
     }
 }
 
-/// Build a fresh standalone `BoxState` (durable=false; only the publish/stage
+/// Build a fresh standalone `TopicState` (durable=false; only the publish/stage
 /// visibility primitive matters here, not the WAL).
-fn fresh_box(name: &str) -> Arc<BoxState> {
-    Arc::new(BoxState::new(
+fn fresh_topic(name: &str) -> Arc<TopicState> {
+    Arc::new(TopicState::new(
         name.to_string(),
         1,
-        BoxConfig {
-            r#type: BoxType::Log,
+        TopicConfig {
+            r#type: TopicType::Log,
             durable: false,
             ..Default::default()
         },
@@ -157,7 +157,7 @@ fn fresh_box(name: &str) -> Arc<BoxState> {
 fn seg_writer(max_events: u64) -> (SegmentWriter, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let hot = Box::new(LocalSegmentStore::open(dir.path()).unwrap());
-    let tier = Arc::new(BoxTier::new(hot, None));
+    let tier = Arc::new(TopicTier::new(hot, None));
     let cfg = SegmentConfig {
         max_events,
         max_bytes: 0,
@@ -186,7 +186,7 @@ fn f_pub_reader_observes_partial() {
     const BATCHES: u64 = 400;
     const BATCH_SZ: u64 = 4;
 
-    let b = fresh_box("pub");
+    let b = fresh_topic("pub");
     let done = Arc::new(AtomicBool::new(false));
     let start = Arc::new(Barrier::new(2));
 
@@ -279,13 +279,13 @@ fn f_pub_reader_observes_partial() {
 // ===========================================================================
 // F-IDEMP-CONCURRENT-RETRY
 // ---------------------------------------------------------------------------
-// Two concurrent durable writes carrying the SAME idempotency_key race the box
+// Two concurrent durable writes carrying the SAME idempotency_key race the topic
 // dedupe write lock. At most one set of seqs is assigned-and-published for the
 // key in-window; the loser returns the SAME seqs (deduped:true). Never two
 // distinct live batches for one key.
 //
 // Many concurrent threads per key, many keys, asserting per key: all winners +
-// dedupers share one seq set, and the box's head reflects exactly one append
+// dedupers share one seq set, and the topic's head reflects exactly one append
 // per key (no double-publish).
 //
 // BUG (real, repro below): the dedupe map is consulted under `b.dedupe.write()`
@@ -308,17 +308,17 @@ fn f_idemp_concurrent_retry() {
 
     let disk = FakeDisk::new();
     let engine = open_engine(&disk);
-    // A durable box so the write path takes the WAL-first reservation + dedupe.
+    // A durable topic so the write path takes the WAL-first reservation + dedupe.
     engine
-        .put_box(
+        .put_topic(
             "idem",
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 ..Default::default()
             },
         )
-        .expect("put_box");
+        .expect("put_topic");
 
     let start = Arc::new(Barrier::new(KEYS * RACERS));
     let mut handles = Vec::new();
@@ -382,8 +382,8 @@ fn f_idemp_concurrent_retry() {
         }
     }
 
-    // The box published exactly KEYS records (one per key), head == KEYS.
-    let st = engine.box_state("idem", false).unwrap();
+    // The topic published exactly KEYS records (one per key), head == KEYS.
+    let st = engine.topic_state("idem", false).unwrap();
     assert_eq!(
         st.head_seq, KEYS as u64,
         "exactly one append published per key (no double-publish under the race)"
@@ -396,12 +396,12 @@ fn f_idemp_concurrent_retry() {
 // F-SEG-SEAL-RACE-APPEND
 // ---------------------------------------------------------------------------
 // Concurrent appends race seal_active under the SegmentWriter mutex (the real
-// `Mutex<SegmentWriter>` the engine wraps each box's writer in). Sealed segments
+// `Mutex<SegmentWriter>` the engine wraps each topic's writer in). Sealed segments
 // must be dense/gapless/contiguous (the SegmentBuilder debug_assert holds in a
 // debug test build); no record sealed twice or skipped; the sealed_seqs returned
 // across all appends cover exactly the seqs the seal boundary crossed.
 //
-// The writer assigns no seqs itself (the box does, in order, under append_lock),
+// The writer assigns no seqs itself (the topic does, in order, under append_lock),
 // so we mirror production: a single monotonic seq source feeds N appender threads
 // that each lock the writer to append. Interleaving seal + append under the lock
 // must never break the contiguity invariant.
@@ -415,7 +415,7 @@ fn f_seg_seal_race_append() {
 
     let (writer, _dir) = seg_writer(MAX_EVENTS);
     let writer = Arc::new(Mutex::new(writer));
-    // The single ordered seq source (production: assigned under the box append
+    // The single ordered seq source (production: assigned under the topic append
     // lock; here a fetch_add hands each append its contiguous seq).
     let next_seq = Arc::new(AtomicU64::new(1));
     // Every seq reported sealed by any thread, collected to prove no double/skip.
@@ -431,9 +431,9 @@ fn f_seg_seal_race_append() {
         handles.push(std::thread::spawn(move || {
             start.wait();
             loop {
-                // Production mirrors this exactly: the box assigns the next
+                // Production mirrors this exactly: the topic assigns the next
                 // contiguous seq AND enqueues/materializes it under one critical
-                // section (the `append_lock`), so a box's segment appends arrive in
+                // section (the `append_lock`), so a topic's segment appends arrive in
                 // seq order. Here the writer lock IS that critical section: take it,
                 // claim the next seq, append — so seq order == append order even
                 // though many threads contend for the lock. A `debug_assert_eq!` in
@@ -513,7 +513,7 @@ fn f_seg_seal_race_append() {
 // ===========================================================================
 // F-SNAP-RACE-WRITE-DURING-CAPTURE
 // ---------------------------------------------------------------------------
-// A durable write commits BETWEEN a snapshot capture's position read and the box
+// A durable write commits BETWEEN a snapshot capture's position read and the topic
 // materialization. The racing write has a WAL offset >= the recorded checkpoint
 // ⇒ it is replayed on recovery; if it was also in the materialized snapshot set
 // it is seq-skipped on replay (Append seq<=head). No acked write falls into the
@@ -535,15 +535,15 @@ fn f_snap_race_write_during_capture() {
     {
         let engine = open_engine(&disk);
         engine
-            .put_box(
+            .put_topic(
                 "snaprace",
-                BoxConfig {
-                    r#type: BoxType::Log,
+                TopicConfig {
+                    r#type: TopicType::Log,
                     durable: true,
                     ..Default::default()
                 },
             )
-            .expect("put_box");
+            .expect("put_topic");
 
         let start = Arc::new(Barrier::new(WRITERS + 1));
         let stop_cap = Arc::new(AtomicBool::new(false));
@@ -615,7 +615,7 @@ fn f_snap_race_write_during_capture() {
     // Recover and assert: every acked durable write survives (capture racing live
     // writes never dropped one), the survivor set is a dense prefix, no fabrication.
     let engine = open_engine(&disk);
-    let st = engine.box_state("snaprace", false).unwrap();
+    let st = engine.topic_state("snaprace", false).unwrap();
     let mut survivors = Vec::new();
     let mut from = 0u64;
     loop {
@@ -732,7 +732,7 @@ fn f_wal_double_writer_fencing() {
     // Recovery reads frames until the first torn/inconsistent one. The KNOWN GAP:
     // two writers can clobber each other so some frames are lost — that's allowed
     // and documented. The HARD invariant: every frame the reader DOES decode is a
-    // genuine, CRC-valid Append frame for one of the two boxes (no cross-writer
+    // genuine, CRC-valid Append frame for one of the two topics (no cross-writer
     // garble materializes a fabricated record), and the reader stops cleanly.
     let wal_dir = data_dir.join("wal");
     let mut files: Vec<PathBuf> = fs
@@ -752,17 +752,17 @@ fn f_wal_double_writer_fencing() {
         let r = WalReader::open_with(&fs, &f).expect("open wal file");
         for frame in r {
             decoded += 1;
-            // Every decoded frame is a real Append for box 1 or box 2 with a seq in
+            // Every decoded frame is a real Append for topic 1 or topic 2 with a seq in
             // the attempted range — never a fabricated/garbled record. (The reader
             // itself already validated the CRC; we assert the decoded fields are
             // ones a writer actually attempted.)
             if let WalRecord::Append {
-                box_id, seq, data, ..
+                topic_id, seq, data, ..
             } = &frame.record
             {
                 assert!(
-                    *box_id == 1 || *box_id == 2,
-                    "decoded a frame for an unattempted box {box_id} (cross-writer garble)"
+                    *topic_id == 1 || *topic_id == 2,
+                    "decoded a frame for an unattempted topic {topic_id} (cross-writer garble)"
                 );
                 assert!((1..=20).contains(seq), "decoded an out-of-range seq {seq}");
                 assert_eq!(

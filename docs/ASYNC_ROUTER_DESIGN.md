@@ -11,7 +11,7 @@ What Stage 4 fixed (codex findings):
 - **P0 #1 — snapshot ⇄ cursor/dest atomicity.** A new engine `router_snapshot_lock`
   (`RwLock`): `advance_router` holds it SHARED for its whole pass (dest publish +
   cursor advance are one unit); snapshot `capture` holds it EXCLUSIVE across BOTH
-  box capture and router-cursor capture, so the captured (derived dest, cursor) pair
+  topic capture and router-cursor capture, so the captured (derived dest, cursor) pair
   is one consistent checkpoint unit (no duplicate re-forward, no silent loss across a
   snapshot). Verified by `snapshot_cursor_and_dest_stay_consistent_under_concurrency`.
 - **P0 #3 — durable cursor under WAL sharding.** The `RouterCreate` WAL frame now
@@ -22,15 +22,15 @@ What Stage 4 fixed (codex findings):
 - **P0 #2 / #4 — single-OWNER derived dest.** `put_router` rejects multi-source
   fan-in into one derived dest (`409 router_dest_fan_in`); see §4.1 (the over-strict
   "no direct writes / no cycle" variant was dropped — it broke the `/v0`
-  `allow_cycle` contract — and the residual mixed-box recovery limitation is
+  `allow_cycle` contract — and the residual mixed-topic recovery limitation is
   documented there).
-- **P1 #5 — durable source-trim floor.** `SnapshotBox.source_trim_floor` is captured
+- **P1 #5 — durable source-trim floor.** `SnapshotTopic.source_trim_floor` is captured
   + restored so a previously-surfaced `source_trim` tombstone never degrades into a
   silent gap after restart.
 - **P1 #6 — retention before forward.** `advance_router` now runs
   `enforce_retention_durable(source)` BEFORE reading the source head / evict floor,
   so a TTL-expired record is never forwarded past an un-hardened floor.
-- **P1 #7 — ordered materialization (R6).** A per-box `MaterializeSeam` feeds
+- **P1 #7 — ordered materialization (R6).** A per-topic `MaterializeSeam` feeds
   published ranges to the `SegmentWriter` strictly by seq, so the off-gate seal
   (R6) can never materialize `N+1` before `N` (which would trip the writer's
   contiguity assert / seal a phantom gap).
@@ -54,9 +54,9 @@ What landed in Stage 2 (vs. the Stage-1 skeleton below):
   a `TombstoneReason::SourceTrim` (never a silent gap).
 - Cycle/hop termination: each derived record carries `StoredRecord.hops`
   (source.hops + 1); a record at `MAX_ROUTER_HOPS` is consumed but not re-forwarded.
-- R6: `BoxState::publish_staged_no_seal` advances head + releases the publish gate;
+- R6: `TopicState::publish_staged_no_seal` advances head + releases the publish gate;
   the segment seal/fsync (`materialize_published`) runs OFF the gate. Verified by
-  `tests/integration_seal_offgate.rs` (a blocked seal does not stall same-box
+  `tests/integration_seal_offgate.rs` (a blocked seal does not stall same-topic
   visibility).
 - A background router worker runs in `main.rs` (elastic tick) so forwarding
   progresses with no dest reader; a final drain runs before the shutdown snapshot.
@@ -79,7 +79,7 @@ which is a full WAL-first append. So:
   fan-out is 50k WAL writes blocking one ack.
 - **Seal serialization (R6):** `publish_staged` → `materialize_segment` →
   `SegmentWriter::seal_active` → `SegmentStore::put` (fsync) runs **under the
-  per-box publish-gate turn**, so a slow seal fsync serializes same-box writers.
+  per-topic publish-gate turn**, so a slow seal fsync serializes same-topic writers.
 - **Silent loss (R2):** `forward_from` advances the per-router cursor to the
   *current source head* (`note_forwarded(&r.name, src_head, count)`, line ~2317)
   **regardless** of records that were filtered out, back-pressured
@@ -89,7 +89,7 @@ which is a full WAL-first append. So:
 ## 1. Target model
 
 ```
-write(src) ──► src box + ONE WAL append ──► return (no inline forwarding)
+write(src) ──► src topic + ONE WAL append ──► return (no inline forwarding)
                     │
                     └─ mark src dirty (sched_dirty)  ┐
                                                      ├─► router worker (async, elastic)
@@ -100,7 +100,7 @@ write(src) ──► src box + ONE WAL append ──► return (no inline forwar
                                                               ▸ advance cursor by #committed
 ```
 
-Two truths only are durable: **(a) the source WAL** (source boxes + their
+Two truths only are durable: **(a) the source WAL** (source topics + their
 records) and **(b) the router definitions + a durable per-router cursor**
 (persisted via snapshot/checkpoint). Forwarded dest records are **derived** —
 NOT separately WAL-logged — so one source append fanning to N dests is **one**
@@ -115,13 +115,13 @@ worker would make that racy. So forwarding is **cursor-driven** and runnable fro
 **two drivers** over the same idempotent step (`advance_router(name)`):
 
 1. **Read-path (synchronous, read-your-writes):** a `diff`/SSE/`GET state`/queue
-   read of box `D` first drains every router whose `dest == D` up to the source
+   read of topic `D` first drains every router whose `dest == D` up to the source
    head. This is what keeps the existing no-sleep tests green: by the time the
    dest read serves, its feeding routers are caught up.
 2. **Background worker (async, elastic):** a maintenance task (mirrors the
    existing snapshotter in src/main.rs) drains dirty router sources off the
    write path, so progress happens even with no dest reader and so a write ack
-   never pays for forwarding. Woken by the per-box `sched_dirty` hook.
+   never pays for forwarding. Woken by the per-topic `sched_dirty` hook.
 
 Both call the same `advance_router` under a per-router mutex, so they never
 double-forward and the cursor is the single source of truth for progress. (The
@@ -131,11 +131,11 @@ while the *ack path* becomes async — the ack no longer forwards.)
 ## 2. The router worker (wake / throttle / ordering / backpressure)
 
 ### Wake / throttle
-- Reuse `BoxState::sched_dirty` + `Scheduler::mark_dirty_fast`. A source write
-  marks its box dirty (already done, line ~2160). The worker loop calls
+- Reuse `TopicState::sched_dirty` + `Scheduler::mark_dirty_fast`. A source write
+  marks its topic dirty (already done, line ~2160). The worker loop calls
   `scheduler.drain_order_clearing(...)` (already exists, currently unused) to get
-  dirty box names in priority-band order, clearing each flag, and runs
-  `advance_router` for every router whose `source` is a drained box.
+  dirty topic names in priority-band order, clearing each flag, and runs
+  `advance_router` for every router whose `source` is a drained topic.
 - Elastic: an interval tick (`ROUTER_TICK_INTERVAL_MS`, new const) bounds the
   worst-case latency; a Notify/condvar woken on `mark_dirty` gives low-latency
   wake. Each pass forwards at most `ROUTER_BATCH` source records per router, then
@@ -201,7 +201,7 @@ exactly as today (the per-record transform in `forward_from` moves verbatim into
 
 ## 4. Deterministic dest-seq re-materialization
 
-The recovery contract: a consumer holding a cursor into a **dest** box must stay
+The recovery contract: a consumer holding a cursor into a **dest** topic must stay
 valid across a restart. So a re-derived dest record MUST get the **same seq** it
 had pre-crash, independent of replay timing/order.
 
@@ -228,38 +228,38 @@ is a pure function of `(source records, router definition, dest_base, cursor)`.
 
 ### Constraint: single derived OWNER per dest (enforced + documented)
 Determinism holds iff a derived dest's seq stream is owned by **one** producer.
-We therefore **enforce** (validation in `put_router`): a box may not be the dest of
+We therefore **enforce** (validation in `put_router`): a topic may not be the dest of
 a **second router with a different source** (multi-source fan-in) while `forward_v2`
 is on — two independent derived seq streams cannot share a dest, because the
 re-forward replay order across a restart is not pinned, so their interleaving (and
 hence the assigned dest seqs) would differ. A violation is a `409
-box_exists_incompatible {reason:"router_dest_fan_in"}` at definition time, never a
+topic_exists_incompatible {reason:"router_dest_fan_in"}` at definition time, never a
 silent seq collision. (An idempotent re-PUT of the SAME router, or re-pointing it,
 keeps single ownership and is allowed.)
 
-**What is NOT forbidden (a deliberate scope decision — codex Stage 4):** a box may
-be BOTH a router dest AND a direct-write box, and may close a cycle (`A→B→A` with
+**What is NOT forbidden (a deliberate scope decision — codex Stage 4):** a topic may
+be BOTH a router dest AND a direct-write topic, and may close a cycle (`A→B→A` with
 `allow_cycle:true`). The `/v0` contract REQUIRES this (the `allow_cycle` conformance
-case writes directly into a box that is also a router dest), so it cannot be
+case writes directly into a topic that is also a router dest), so it cannot be
 rejected. The original "a derived dest may not also take direct writes" rule was too
 strict and broke the contract; only genuine multi-source fan-in is refused.
 
-#### Known limitation: a MIXED direct-write + derived box is best-effort on recovery
-A box that receives BOTH direct writes (each a WAL `Append` frame) AND derived
-forwards (no WAL frame) — e.g. an `allow_cycle` loop, or a box used as both a
+#### Known limitation: a MIXED direct-write + derived topic is best-effort on recovery
+A topic that receives BOTH direct writes (each a WAL `Append` frame) AND derived
+forwards (no WAL frame) — e.g. an `allow_cycle` loop, or a topic used as both a
 direct-write target and a router dest — has an **interleaved** seq stream where some
 seqs are WAL-logged and some are not. Recovery replays the WAL `Append` frames in
-strict per-box seq contiguity (`seq == head + 1`), so a direct-write frame whose seq
+strict per-topic seq contiguity (`seq == head + 1`), so a direct-write frame whose seq
 sits ABOVE a derived (un-logged) seq is dropped by the contiguity guard (its seq is
 not `head + 1`). The derived tail is then re-materialized by
 `reforward_routers_on_recovery`, but the **interleaving order is not guaranteed
-identical** to the pre-crash assignment. Consequence: for a mixed box, a consumer
+identical** to the pre-crash assignment. Consequence: for a mixed topic, a consumer
 cursor may not stay byte-exact across a crash. This is acceptable because: (a) the
 amplification + no-silent-loss + async-ack goals do NOT depend on it; (b) the
-*normal* derived-router shape — a **dedicated** dest box fed by exactly one router,
+*normal* derived-router shape — a **dedicated** dest topic fed by exactly one router,
 with NO direct writes — re-materializes deterministically (verified:
 `integration_forward_v2::dest_rematerializes_deterministically_across_restart` and
-the kill-9 live test); (c) a mixed box is an advanced topology, and the alternative
+the kill-9 live test); (c) a mixed topic is an advanced topology, and the alternative
 (forbidding it) would break the `/v0` `allow_cycle` contract. A user wanting a
 crash-exact dest should use a dedicated single-router dest (the common case).
 
@@ -280,7 +280,7 @@ derived-router property.
 
 Today: `publish_staged` (under the publish-gate turn) → `materialize_segment` →
 `seal_active` → `SegmentStore::put` (fsync). A slow seal fsync serializes
-same-box writers behind the gate.
+same-topic writers behind the gate.
 
 Plan:
 - `publish_staged` advances `head_seq` (makes records visible), releases the
@@ -289,7 +289,7 @@ Plan:
   builder (cheap, still synchronous so reads of just-published records resolve
   from the writer cache), and (b) the **seal+fsync (`seal_active` → `put`)**,
   which moves to a **background seal task** (or is deferred to the maintenance
-  worker / a per-box seal queue). The gate is released before (b).
+  worker / a per-topic seal queue). The gate is released before (b).
 - **Crash-safety preserved:** the WAL already made the records durable; a segment
   is a derivable materialization (the existing `seal_active` comment confirms a
   `put` failure is *not* data loss — payloads stay resident and the range
@@ -308,9 +308,9 @@ order), with no fsync on it.
 |---|---|
 | `src/config.rs` | Add `ROUTER_TICK_INTERVAL_MS`, `ROUTER_BATCH` consts; a `forward_v2` runtime flag (env `STREAMS_FORWARD_V2`). Was default off in Stage 1; the cutover flipped it to **default ON** (`STREAMS_FORWARD_V2=0` is now the legacy opt-out). |
 | `src/engine/router.rs` | `RouterGraph`: add `dest_base: HashMap<String,u64>` and per-router `Mutex` (or move per-router advance state into a small `RouterRuntime`). Add `dest_base(name)`, `set_dest_base`, `pending_deferred` bookkeeping. `note_forwarded` keeps advancing cursor+total; add `cursor(name)`. |
-| `src/engine/mod.rs` | New `advance_router(&self, name)` (the idempotent forward step, per-router-mutex-guarded) carrying the per-record transform + filter + backpressure-prefix logic extracted from `forward_from`. New `catch_up_dest(&self, dest)` called at the top of `diff`/SSE/queue/`box_state` GET read paths. New `drain_router_sources(&self)` for the worker. `write()`: when `forward_v2`, **drop** the inline `forward_from` call (lines ~2143-2154) — just `mark_dirty` the source. Keep `forward_from` as the v1 path under the flag so all tests stay green until cutover. |
-| `src/engine/box_state.rs` | `publish_staged`: advance head + notify, then materialize **after** the caller releases the gate; split out `seal_pending()` to run the seal/fsync off-gate. Add a per-box `pending_seal` marker the maintenance worker / read path drains. |
-| `src/engine/recovery.rs` | After boxes + routers are rebuilt (step ~7, before opening writers), for each router replay `source[cursor..head]` through its filter and re-forward (derived re-materialization) instead of relying on replayed dest Append frames. Clamp cursor to `source.evict_earliest-1` and stamp the dest `source_trim` tombstone boundary when the source trimmed below the cursor. `apply_router_create_for_recovery`: seed `dest_base` deterministically. |
+| `src/engine/mod.rs` | New `advance_router(&self, name)` (the idempotent forward step, per-router-mutex-guarded) carrying the per-record transform + filter + backpressure-prefix logic extracted from `forward_from`. New `catch_up_dest(&self, dest)` called at the top of `diff`/SSE/queue/`topic_state` GET read paths. New `drain_router_sources(&self)` for the worker. `write()`: when `forward_v2`, **drop** the inline `forward_from` call (lines ~2143-2154) — just `mark_dirty` the source. Keep `forward_from` as the v1 path under the flag so all tests stay green until cutover. |
+| `src/engine/topic_state.rs` | `publish_staged`: advance head + notify, then materialize **after** the caller releases the gate; split out `seal_pending()` to run the seal/fsync off-gate. Add a per-topic `pending_seal` marker the maintenance worker / read path drains. |
+| `src/engine/recovery.rs` | After topics + routers are rebuilt (step ~7, before opening writers), for each router replay `source[cursor..head]` through its filter and re-forward (derived re-materialization) instead of relying on replayed dest Append frames. Clamp cursor to `source.evict_earliest-1` and stamp the dest `source_trim` tombstone boundary when the source trimmed below the cursor. `apply_router_create_for_recovery`: seed `dest_base` deterministically. |
 | `src/engine/snapshot.rs` / `src/storage/snapshot.rs` | `SnapshotRouter`: add `dest_base: u64` (defaulted for back-compat). `router_to_snapshot` / `restore` carry it. |
 | `src/types.rs` | Add `TombstoneReason::SourceTrim` (+ wire string `"source_trim"`). |
 | `src/main.rs` | Add a **router worker** task (mirrors the snapshotter): interval tick + `drain_router_sources`, on the blocking pool; `abort()` on shutdown after a final drain. |

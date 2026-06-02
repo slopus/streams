@@ -35,16 +35,16 @@ leading bytes — matched via a timing side-channel.
 If the server starts with **no** keys configured, auth is disabled (single-tenant dev mode)
 and the header is ignored — logged loudly at boot.
 
-#### Optional scopes & box-name prefix allowlist
+#### Optional scopes & topic-name prefix allowlist
 
-A key **may** carry a scope set and a box-name prefix allowlist. **This is fully additive and
+A key **may** carry a scope set and a topic-name prefix allowlist. **This is fully additive and
 back-compatible**: a bare `key` (no scopes, no prefixes) is a **full-access** key, exactly as
 before. The `STREAMS_API_KEYS` entry syntax is extended:
 
 ```
-key                       # full access (back-compat): all scopes, all boxes
-key:scopes                # scopes only, all boxes
-key:scopes:prefixes       # scopes + a box-name PREFIX allowlist
+key                       # full access (back-compat): all scopes, all topics
+key:scopes                # scopes only, all topics
+key:scopes:prefixes       # scopes + a topic-name PREFIX allowlist
 key::prefixes             # empty scopes field = ALL scopes, prefix-restricted
 ```
 
@@ -53,22 +53,22 @@ key::prefixes             # empty scopes field = ALL scopes, prefix-restricted
   scopes. Per-route requirements:
   | Scope | Routes |
   |---|---|
-  | `read` | `GET /v0/boxes`, `GET /v0/boxes/:box`, `POST /v0/boxes/:box/diff`, `GET /v0/routers`, `GET /v0/routers/:r`, `POST /v0/watch` (+ the SSE GET, capability-gated) |
-  | `write` | `POST /v0/boxes/:box` (records), queue `ack`/`nack`/`extend` |
-  | `read`+`write` | queue `claim` and the `GET /v0/boxes/:q/work` stream (a lease *mutates* then returns jobs) |
-  | `delete` | `DELETE /v0/boxes/:box`, `DELETE /v0/routers/:r`, `POST /v0/boxes/:box/delete` |
-  | `admin` | `PUT /v0/boxes/:box`, `PUT /v0/routers/:r` (control-plane create/configure) |
+  | `read` | `GET /v0/topics`, `GET /v0/topics/:topic`, `POST /v0/topics/:topic/diff`, `GET /v0/routers`, `GET /v0/routers/:r`, `POST /v0/watch` (+ the SSE GET, capability-gated) |
+  | `write` | `POST /v0/topics/:topic` (records), queue `ack`/`nack`/`extend` |
+  | `read`+`write` | queue `claim` and the `GET /v0/topics/:q/work` stream (a lease *mutates* then returns jobs) |
+  | `delete` | `DELETE /v0/topics/:topic`, `DELETE /v0/routers/:r`, `POST /v0/topics/:topic/delete` |
+  | `admin` | `PUT /v0/topics/:topic`, `PUT /v0/routers/:r` (control-plane create/configure) |
   The `read` scope additionally gates `GET /v0/metrics` (§8.3).
-- **`prefixes`** — a `|`-separated list of box/router-name prefixes the key may touch
+- **`prefixes`** — a `|`-separated list of topic/router-name prefixes the key may touch
   (e.g. `tenant42:|shared.`). An **empty** prefixes field means **any** name. The match is a
   byte prefix against the raw name, so the `tenant:` convention (§3) becomes a real boundary.
   The key secret may not contain `:` (the field delimiter); everything before the first `:` is
   the secret. The allowlist is enforced against **both** the path name and the relevant
-  **request-body** names: the boxes a `POST /v0/watch` names, and a router's `source`/`dest`
-  (auto-created on its behalf). The **list** endpoints (`GET /v0/boxes`, `GET /v0/routers`) are
+  **request-body** names: the topics a `POST /v0/watch` names, and a router's `source`/`dest`
+  (auto-created on its behalf). The **list** endpoints (`GET /v0/topics`, `GET /v0/routers`) are
   filtered to the allowlist, so a prefix-limited key cannot enumerate cross-tenant names.
 
-A request that authenticates but lacks the required scope, or addresses a box/router name
+A request that authenticates but lacks the required scope, or addresses a topic/router name
 outside its prefix allowlist (path or relevant body name), returns **`403 forbidden`**. A
 **malformed scope token** in `STREAMS_API_KEYS` makes the server **refuse to start**
 (fail-closed — it will not silently grant the wrong scope). The plaintext keys are parsed into
@@ -101,12 +101,12 @@ deployment rather than built in:
 - **TLS — out of scope.** streams speaks plain HTTP; terminate TLS at a reverse proxy (or bind
   loopback). This is a transport concern handled outside the binary, not a planned feature.
 - **Scopes / prefix allowlist — *implemented* (§0.2).** A key may carry a scope set
-  (`read`/`write`/`delete`/`admin`) and a box-name prefix allowlist; keys are hashed at rest.
+  (`read`/`write`/`delete`/`admin`) and a topic-name prefix allowlist; keys are hashed at rest.
   A bare key is still full-access for back-compat. The `tenant:` prefix convention (§3) becomes
   a real boundary when a key is prefix-restricted. **Multi-tenancy beyond these per-key scopes +
   prefix allowlists is out of scope** — there is no hard per-tenant namespace partition (and the
   prefix allowlist is a filter, not an isolated namespace).
-- **Resource / rate limits — *implemented* (§11).** Configurable caps on boxes, routers, watch
+- **Resource / rate limits — *implemented* (§11).** Configurable caps on topics, routers, watch
   sessions, concurrent SSE connections (global + per-key), per-key in-flight requests, and a
   global **total-bytes** quota (`STREAMS_MAX_TOTAL_BYTES`), enforced on every creation/write path
   with a `429 throttled`; plus a per-response **byte budget**, a length bound on queue `seqs`
@@ -127,7 +127,7 @@ deployment rather than built in:
 - **Timestamps** are integer **milliseconds since Unix epoch** (`ts`, `*_ms`). Durations
   are integer milliseconds. There are no string dates anywhere.
 - **`seq`** is a `u64` rendered as a JSON number. Seqs fit in IEEE-754 doubles until
-  ~9 quadrillion, well beyond any single-machine box lifetime, so no string encoding is
+  ~9 quadrillion, well beyond any single topic's lifetime, so no string encoding is
   needed. Clients SHOULD parse as 64-bit integers regardless.
 
 ### 0.4 The `$`-prefixed metadata convention
@@ -156,9 +156,9 @@ Every non-2xx response (except in-stream SSE errors, §7) carries this exact sha
 ```json
 {
   "error": {
-    "code": "box_not_found",
-    "message": "box \"jobs\" does not exist",
-    "detail": { "box": "jobs" }
+    "code": "topic_not_found",
+    "message": "topic \"jobs\" does not exist",
+    "detail": { "topic": "jobs" }
   }
 }
 ```
@@ -179,17 +179,17 @@ top-level `error` key is the only success/failure discriminator.
 | Code | Meaning | `error.code` examples |
 |---|---|---|
 | `200` | OK (read, idempotent write/create/delete) | — |
-| `201` | Created (box/router created on this call) | — |
+| `201` | Created (topic/router created on this call) | — |
 | `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large` |
 | `401` | Missing/invalid bearer token | `unauthorized` |
-| `403` | Authenticated but the key lacks the required scope, or the box/router name is outside its prefix allowlist (§0.2) | `forbidden` |
-| `404` | Box/router does not exist (and was not auto-created) | `box_not_found`, `router_not_found` |
+| `403` | Authenticated but the key lacks the required scope, or the topic/router name is outside its prefix allowlist (§0.2) | `forbidden` |
+| `404` | Topic/router does not exist (and was not auto-created) | `topic_not_found`, `router_not_found` |
 | `405` | Wrong method for path | `method_not_allowed` |
 | `406` | `Accept` not `text/event-stream` (SSE GET) | `not_acceptable` |
-| `409` | Conflict: router cycle, config conflict, queue op on non-queue box | `router_cycle`, `box_exists_incompatible`, `box_not_empty`, `not_a_queue` |
+| `409` | Conflict: router cycle, config conflict, queue op on non-queue topic | `router_cycle`, `topic_exists_incompatible`, `topic_not_empty`, `not_a_queue` |
 | `413` | Body exceeds server hard limit (pre-parse) | `payload_too_large` |
 | `415` | Wrong/missing `Content-Type` | `unsupported_media_type` |
-| `422` | Semantically invalid (write to a full `discard:"reject"` box) | `box_full` |
+| `422` | Semantically invalid (write to a full `discard:"reject"` topic) | `topic_full` |
 | `429` | Elastic throttle / backpressure under CPU pressure, **or** a resource cap reached (§11) | `throttled` — carries `Retry-After`; a CPU-pressure throttle adds `error.detail.retry_after_ms`, a resource cap adds `error.detail.limit` |
 | `500` | Internal error (bug) | `internal` |
 | `503` | Not ready (WAL replay on boot) / shutting down | `not_ready`, `shutting_down` — carries `Retry-After` |
@@ -202,14 +202,14 @@ admits the write but may queue it, trading latency for not failing.
 
 Three cursor styles for three read shapes:
 
-1. **Box reads are seq-cursored, not opaque.** The cursor *is* `from_seq`. `POST .../diff`
+1. **Topic reads are seq-cursored, not opaque.** The cursor *is* `from_seq`. `POST .../diff`
    returns `next_from_seq`; pass it back. When fully caught up, `next_from_seq == head_seq`
    and `"caught_up": true`. We always return `next_from_seq`; `caught_up` is the "done for
    now" flag (for a live log "done for now" is not "done forever").
-2. **List endpoints use opaque cursors.** `GET /v0/boxes` and `GET /v0/routers` return
+2. **List endpoints use opaque cursors.** `GET /v0/topics` and `GET /v0/routers` return
    `next_cursor` (opaque base64), **present only when more pages exist** — its absence means
    the last page. Pass it back as `?cursor=`. `page_size` default `100`, max `1000`.
-3. **SSE uses a composite cursor.** The multiplex watch encodes per-box `(box → seq)`
+3. **SSE uses a composite cursor.** The multiplex watch encodes per-topic `(topic → seq)`
    positions as a base64url-encoded JSON map, usable as both `Last-Event-ID` and the
    `cursor` request field. See §7.
 
@@ -221,8 +221,8 @@ Two complementary mechanisms; no global idempotency-token service.
    upsertable: an identical `PUT` is a no-op `200`; a changed `PUT` applies the diff.
    `DELETE` of an absent resource returns `200` with `"deleted": false`.
 2. **Writes use an optional `idempotency_key`.** If supplied, the server remembers
-   `(box, idempotency_key) → assigned seqs` for `idempotency_window_ms` (default 120000,
-   per box). A retried write with the same key in-window returns the **original** seqs with
+   `(topic, idempotency_key) → assigned seqs` for `idempotency_window_ms` (default 120000,
+   per topic). A retried write with the same key in-window returns the **original** seqs with
    `"deduped": true` and does **not** append again. The key may also be sent as header
    `Idempotency-Key:` (body field wins). A log has no "old value," so a dedup key — not a
    CAS condition — is the right primitive for safe append retries.
@@ -243,11 +243,11 @@ lives in the response, not a side channel:
 ```
 
 Fields are best-effort and additive; clients must tolerate any subset. `fsync_ms` is `0.0`
-for non-durable boxes. `throttle_wait_ms` is time parked behind the elastic scheduler.
+for non-durable topics. `throttle_wait_ms` is time parked behind the elastic scheduler.
 
-### 0.10 The Box config object
+### 0.10 The Topic config object
 
-This object appears in box-create requests and box-state responses. All fields are
+This object appears in topic-create requests and topic-state responses. All fields are
 optional on create; omitted fields take the documented default.
 
 ```json
@@ -274,47 +274,47 @@ optional on create; omitted fields take the documented default.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `type` | `"log" \| "queue"` | `"log"` | Box kind. `"log"` is the plain append-only log (every endpoint in §1–§7). `"queue"` additionally enables the claim/ack/nack/extend/work endpoints (§10) — lease-based at-least-once job delivery layered on the same log. The five `lease_ms`/`claim_jitter_ms`/`max_deliveries`/`dead_letter`/`leases_durable` fields below are **only meaningful when `type:"queue"`** (ignored, but accepted, on a `"log"` box). `type` is **not** mutable via `PUT` once set (a `PUT` changing it returns `409 box_exists_incompatible`). |
+| `type` | `"log" \| "queue"` | `"log"` | Topic kind. `"log"` is the plain append-only log (every endpoint in §1–§7). `"queue"` additionally enables the claim/ack/nack/extend/work endpoints (§10) — lease-based at-least-once job delivery layered on the same log. The five `lease_ms`/`claim_jitter_ms`/`max_deliveries`/`dead_letter`/`leases_durable` fields below are **only meaningful when `type:"queue"`** (ignored, but accepted, on a `"log"` topic). `type` is **not** mutable via `PUT` once set (a `PUT` changing it returns `409 topic_exists_incompatible`). |
 | `ttl_ms` | `u64` | `0` (off) | Records older than this (by `$ts`) are not delivered (expired). `0` = no TTL. Expiry is a read-time filter plus lazy segment reclamation; crossing a consumer's cursor yields a tombstone (§4.4). |
-| `cap_records` | `u64` | `0` (off) | Max retained record count. On overflow the box evicts per `discard`. `0` = unbounded. |
+| `cap_records` | `u64` | `0` (off) | Max retained record count. On overflow the topic evicts per `discard`. `0` = unbounded. |
 | `cap_bytes` | `u64` | `0` (off) | Max retained payload bytes (`data` + `meta` + framing). `0` = unbounded. Whichever of `cap_records`/`cap_bytes` is hit first triggers eviction. |
-| `discard` | `"old" \| "reject"` | `"old"` | Full-box policy. `old` = evict oldest (pub/sub friendly). `reject` = refuse the write with `422 box_full` so durable queues fail loudly rather than dropping unconsumed work. |
+| `discard` | `"old" \| "reject"` | `"old"` | Full-topic policy. `old` = evict oldest (pub/sub friendly). `reject` = refuse the write with `422 topic_full` so durable queues fail loudly rather than dropping unconsumed work. |
 | `durable` | `bool` | `false` | **Back-compat alias** for `durability` (below). On create: `durable:true` ⇒ class `fsync`, `durable:false` ⇒ class `disk` (only consulted when `durability` is absent). On every response it is reported as `durable == (durability == "fsync")`, so a legacy client reading `durable` still sees the right boolean. Prefer `durability` for new clients. |
-| `durability` | `"memory" \| "disk" \| "fsync"` | _(resolved from `durable`)_ | The **durability commit class** — where a write lands and when it is acked (the durability/perf tradeoff). **`memory`** — _"disk-like but best-effort"_: takes the **same** group-committed WAL write **and** recovery path as `disk` and is fully queryable (getState / getDifference / SSE), but carries **NO durability GUARANTEE**. After a restart its records **MAY survive OR be lost** (recovery is gradual / best-effort: it does **not** block readiness and does **not** guarantee completeness or emptiness). The box CONFIG always survives. Never `fsync`-gated, so `fsync_ms` is `0`. Effectively `disk` minus the durability promise — for caches / scratch where occasional loss is fine. **`disk`**: written to the WAL and **group-committed** (no per-write `fsync`); acked on frame enqueue (the ack is **not** `fsync`-gated — group-committed shortly after by its box's WAL-shard writer; the WAL is sharded — see ARCHITECTURE §2); survives a crash **minus the un-fsynced tail**; reports `fsync_ms` as `0` (the fast path). **`fsync`**: the ack is **`fsync`-gated** (held until the WAL frame is durably synced, real `fsync_ms`); survives any crash. **Resolution:** an explicit `durability` always wins; otherwise it is derived from `durable` (`true`⇒`fsync`, `false`⇒`disk`) — so `memory` is reachable only by setting `durability:"memory"` explicitly. The resolved class is always reported in box-state/box-create responses, and the class is freely mutable in place. Router-forwarded / dead-lettered copies honor the **destination** box's class (a `memory` dest persists a best-effort copy — it may survive or be lost). |
+| `durability` | `"memory" \| "disk" \| "fsync"` | _(resolved from `durable`)_ | The **durability commit class** — where a write lands and when it is acked (the durability/perf tradeoff). **`memory`** — _"disk-like but best-effort"_: takes the **same** group-committed WAL write **and** recovery path as `disk` and is fully queryable (getState / getDifference / SSE), but carries **NO durability GUARANTEE**. After a restart its records **MAY survive OR be lost** (recovery is gradual / best-effort: it does **not** block readiness and does **not** guarantee completeness or emptiness). The topic CONFIG always survives. Never `fsync`-gated, so `fsync_ms` is `0`. Effectively `disk` minus the durability promise — for caches / scratch where occasional loss is fine. **`disk`**: written to the WAL and **group-committed** (no per-write `fsync`); acked on frame enqueue (the ack is **not** `fsync`-gated — group-committed shortly after by its topic's WAL-shard writer; the WAL is sharded — see ARCHITECTURE §2); survives a crash **minus the un-fsynced tail**; reports `fsync_ms` as `0` (the fast path). **`fsync`**: the ack is **`fsync`-gated** (held until the WAL frame is durably synced, real `fsync_ms`); survives any crash. **Resolution:** an explicit `durability` always wins; otherwise it is derived from `durable` (`true`⇒`fsync`, `false`⇒`disk`) — so `memory` is reachable only by setting `durability:"memory"` explicitly. The resolved class is always reported in topic-state/topic-create responses, and the class is freely mutable in place. Router-forwarded / dead-lettered copies honor the **destination** topic's class (a `memory` dest persists a best-effort copy — it may survive or be lost). |
 | `priority` | `i32 \| null` | `null` | Manual delivery priority (higher served first under pressure), clamped `[-1000, 1000]`. `null` ⇒ use auto-priority. |
-| `auto_priority` | `bool` | `true` | If `priority` is `null`, derive effective priority from recency of the last read/SSE/state call on this box. A manual `priority` always overrides. |
-| `auto_create` | `bool` | `true` | Whether a write to this box name may lazily create it. The per-write `create` flag can override downward. |
-| `idempotency_window_ms` | `u64` | `120000` | How long `(box, idempotency_key)` dedupe state is retained (§0.8). |
-| `dedupe_node` | `bool` | `true` | Whether node loop-prevention filtering is enabled on reads of this box (§4.5/§7.1). Essentially always `true`; exposed so a box can opt out of node filtering entirely. |
+| `auto_priority` | `bool` | `true` | If `priority` is `null`, derive effective priority from recency of the last read/SSE/state call on this topic. A manual `priority` always overrides. |
+| `auto_create` | `bool` | `true` | Whether a write to this topic name may lazily create it. The per-write `create` flag can override downward. |
+| `idempotency_window_ms` | `u64` | `120000` | How long `(topic, idempotency_key)` dedupe state is retained (§0.8). |
+| `dedupe_node` | `bool` | `true` | Whether node loop-prevention filtering is enabled on reads of this topic (§4.5/§7.1). Essentially always `true`; exposed so a topic can opt out of node filtering entirely. |
 | `lease_ms` | `u64` | `30000` | **Queue only.** Default lease (visibility-timeout) duration for a claim. After `lease_ms` with no ack/extend, the job becomes claimable again (§10.3). Per-claim `lease_ms` overrides this. Clamped `[100, 86400000]`. |
 | `claim_jitter_ms` | `u64` | `0` (greedy) | **Queue only.** Coalescing-window width. `0` = serve each claim immediately, lowest latency, first-arrival drains the head. `>0` = a claim waits up to this window, the server gathers the whole cohort of claimers that arrived in it, then divides the available jobs **evenly** across the cohort (§10.2). Clamped `[0, 5000]`. |
 | `max_deliveries` | `u64` | `0` (off) | **Queue only.** After a job has been delivered (claimed) this many times without an ack, it is dead-lettered (§10.6) instead of reclaimed. `0` = unlimited redelivery (never dead-letter on delivery count). |
-| `dead_letter` | `string \| null` | `null` | **Queue only.** Name of the box to move a job to when it exceeds `max_deliveries` (§10.6). `null` = no dead-letter box (the job keeps being reclaimed). May name any box (log or queue); auto-created on first dead-letter if absent and `auto_create` allows. Must differ from this box. |
+| `dead_letter` | `string \| null` | `null` | **Queue only.** Name of the topic to move a job to when it exceeds `max_deliveries` (§10.6). `null` = no dead-letter topic (the job keeps being reclaimed). May name any topic (log or queue); auto-created on first dead-letter if absent and `auto_create` allows. Must differ from this topic. |
 | `leases_durable` | `bool` | `false` | **Queue only.** Durability of the *leases* log (the lifecycle-events log, §10.1). Defaults `false` because losing leases on a crash is **self-healing** — all in-flight jobs simply become claimable again on restart (correct visibility-timeout semantics), a deliberate perf win. The *jobs* log durability is governed by the normal `durable` field; **ack durability == `durable`** (an acked+deleted job stays gone iff its delete was durable). |
 
 **Caps, deletes, and `earliest_seq`:** `earliest_seq` is the seq of the **first
 currently-live record** (not evicted, not TTL-expired, not deleted; `head_seq + 1` when
-the box is empty). Eviction is *segment-granular and lazy* (whole segments dropped, may
+the topic is empty). Eviction is *segment-granular and lazy* (whole segments dropped, may
 transiently exceed cap) and deletes advance `earliest_seq` past removed records, so the
 true retained floor **must be read from the server** — never computed by the client from
-`head_seq - cap_records`. A separate `evict_floor` (not in box state) tracks only
+`head_seq - cap_records`. A separate `evict_floor` (not in topic state) tracks only
 **involuntary** cap/TTL loss and is the sole tombstone trigger (§3.3): `evict_floor <=
 earliest_seq` always, and a purely-deleted gap (below `earliest_seq` but at/above
 `evict_floor`) reads silently with `tombstone: null`.
 
 ---
 
-## 1. Box lifecycle
+## 1. Topic lifecycle
 
-### 1.1 Create / configure a box — `PUT /v0/boxes/:box`
+### 1.1 Create / configure a topic — `PUT /v0/topics/:topic`
 
-Create a box, or update its config. Idempotent and upsertable.
+Create a topic, or update its config. Idempotent and upsertable.
 
-**Path** — `:box`, name `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts
+**Path** — `:topic`, name `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts
 alphanumeric, allows `. _ : -`; `:` enables namespacing like `jobs:tenantA`). Case-sensitive,
 byte-exact.
 
-**Request body** — the Box config object (§0.10). All fields optional; empty `{}` creates
+**Request body** — the Topic config object (§0.10). All fields optional; empty `{}` creates
 all-default. Set `"type":"queue"` to make this a queue (enables §10); the queue tuning
 fields (`lease_ms`, `claim_jitter_ms`, `max_deliveries`, `dead_letter`, `leases_durable`)
 go here too.
@@ -331,12 +331,12 @@ A queue (with `discard:"reject"` so unconsumed work fails loudly rather than dro
 ```
 
 **Behavior**
-- Box absent → created with given config merged over defaults → `201`.
-- Box exists, identical config → no-op → `200`.
-- Box exists, different config → updated → `200`. Changes apply going forward; they never
+- Topic absent → created with given config merged over defaults → `201`.
+- Topic exists, identical config → no-op → `200`.
+- Topic exists, different config → updated → `200`. Changes apply going forward; they never
   rewrite stored records, but a tightened `cap`/`ttl` makes existing records eligible for
   lazy eviction/expiry. **`type` is the one immutable field**: a `PUT` that changes `type`
-  on an existing box (`log`→`queue` or `queue`→`log`) returns `409 box_exists_incompatible`.
+  on an existing topic (`log`→`queue` or `queue`→`log`) returns `409 topic_exists_incompatible`.
   Every other field is mutable in `/v0` (including the queue tuning fields, applied going
   forward).
 
@@ -344,7 +344,7 @@ A queue (with `discard:"reject"` so unconsumed work fails loudly rather than dro
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "created": true,
   "config": { "type": "log", "ttl_ms": 60000, "cap_records": 1000000, "cap_bytes": 0,
               "discard": "old", "durable": true, "durability": "fsync", "priority": 10,
@@ -356,26 +356,26 @@ A queue (with `discard:"reject"` so unconsumed work fails loudly rather than dro
 }
 ```
 
-`created` is `true` only when this call brought the box into existence. `config` always
-echoes the full object including the queue fields (inert on a `"log"` box).
+`created` is `true` only when this call brought the topic into existence. `config` always
+echoes the full object including the queue fields (inert on a `"log"` topic).
 
-**Errors** — `400 invalid_request` (bad name/field/value; e.g. `dead_letter` == this box);
-`409 box_exists_incompatible` (changed `type`, or other incompatible change).
+**Errors** — `400 invalid_request` (bad name/field/value; e.g. `dead_letter` == this topic);
+`409 topic_exists_incompatible` (changed `type`, or other incompatible change).
 
-### 1.2 Get box state — `GET /v0/boxes/:box`
+### 1.2 Get topic state — `GET /v0/topics/:topic`
 
 Read current state: head seq, earliest retained seq, count, byte size, config. The cheap
-"where am I / how much lag" call. By default it **bumps the box's auto-priority recency
+"where am I / how much lag" call. By default it **bumps the topic's auto-priority recency
 clock**.
 
 **Query** — `touch` (bool, default `true`): if `false`, do not update auto-priority recency
-(for monitoring scrapes that shouldn't make a box look "hot").
+(for monitoring scrapes that shouldn't make a topic look "hot").
 
 **Response** (`200`)
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "type": "log",
   "head_seq": 480231,
   "earliest_seq": 479101,
@@ -390,11 +390,11 @@ clock**.
 }
 ```
 
-A **queue** box additionally returns a `queue` sub-object (§10.7) and `type:"queue"`:
+A **queue** topic additionally returns a `queue` sub-object (§10.7) and `type:"queue"`:
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "type": "queue",
   "head_seq": 480231, "earliest_seq": 479101, "next_seq": 480232,
   "count": 1130, "bytes": 2310912,
@@ -409,19 +409,19 @@ A **queue** box additionally returns a `queue` sub-object (§10.7) and `type:"qu
 | Field | Meaning |
 |---|---|
 | `type` | `"log"` (default, may be omitted) or `"queue"`. |
-| `head_seq` | Highest assigned seq (log end). `0` for a fresh empty box. |
-| `earliest_seq` | Seq of the first currently-live record — not evicted, not TTL-expired, **not deleted** (log start). If the box is empty, `earliest_seq = head_seq + 1`. A consumer whose `from_seq + 1 < earliest_seq` has fallen below the floor; it receives a tombstone only if `from_seq + 1 < evict_floor` (involuntary cap/TTL loss), otherwise the cursor advances silently past deleted seqs. |
+| `head_seq` | Highest assigned seq (log end). `0` for a fresh empty topic. |
+| `earliest_seq` | Seq of the first currently-live record — not evicted, not TTL-expired, **not deleted** (log start). If the topic is empty, `earliest_seq = head_seq + 1`. A consumer whose `from_seq + 1 < earliest_seq` has fallen below the floor; it receives a tombstone only if `from_seq + 1 < evict_floor` (involuntary cap/TTL loss), otherwise the cursor advances silently past deleted seqs. |
 | `next_seq` | Seq the next append will receive (`head_seq + 1`). A handy "tail" cursor: read from `next_seq - 1` to get only new records. |
 | `count`, `bytes` | Currently retained records and payload bytes (approximate under lazy eviction). |
 | `effective_priority` | The priority the scheduler is using right now (manual, or auto-derived). |
 | `last_write_ts` / `last_read_ts` | Recency clocks (ms); `null` if never. |
-| `queue` | **Queue only.** `{ ready, in_flight, dead_lettered }` counters (§10.7). Absent on a `"log"` box. |
+| `queue` | **Queue only.** `{ ready, in_flight, dead_lettered }` counters (§10.7). Absent on a `"log"` topic. |
 
-**Errors** — `404 box_not_found` (state read never auto-creates).
+**Errors** — `404 topic_not_found` (state read never auto-creates).
 
-### 1.3 List boxes — `GET /v0/boxes`
+### 1.3 List topics — `GET /v0/topics`
 
-Enumerate boxes with summary state. Opaque-cursor paginated.
+Enumerate topics with summary state. Opaque-cursor paginated.
 
 **Query** — `prefix` (string), `page_size` (default 100, max 1000), `cursor` (opaque),
 `touch` (bool, default `false` — listing does not bump auto-priority).
@@ -430,9 +430,9 @@ Enumerate boxes with summary state. Opaque-cursor paginated.
 
 ```json
 {
-  "boxes": [
-    { "box": "jobs",   "head_seq": 480231, "earliest_seq": 479101, "count": 1130, "bytes": 2310912, "durable": true,  "effective_priority": 500 },
-    { "box": "events", "head_seq": 99,     "earliest_seq": 1,      "count": 99,   "bytes": 8112,    "durable": false, "effective_priority": 3 }
+  "topics": [
+    { "topic": "jobs",   "head_seq": 480231, "earliest_seq": 479101, "count": 1130, "bytes": 2310912, "durable": true,  "effective_priority": 500 },
+    { "topic": "events", "head_seq": 99,     "earliest_seq": 1,      "count": 99,   "bytes": 8112,    "durable": false, "effective_priority": 3 }
   ],
   "next_cursor": "eyJhZnRlciI6ImpvYnMifQ==",
   "performance": { "server_total_ms": 0.18 }
@@ -443,31 +443,31 @@ Enumerate boxes with summary state. Opaque-cursor paginated.
 
 **Errors** — `400 invalid_request` (malformed/corrupt cursor).
 
-### 1.4 Delete a box — `DELETE /v0/boxes/:box`
+### 1.4 Delete a topic — `DELETE /v0/topics/:topic`
 
-Permanently remove a box and all its records, dedupe state, the per-box tag index, and
+Permanently remove a topic and all its records, dedupe state, the per-topic tag index, and
 routers referencing it. Idempotent. Irreversible.
 
 **Query** — `if_empty` (bool, default `false`): if `true`, delete only when `count == 0`,
-else `409 box_not_empty`.
+else `409 topic_not_empty`.
 
 **Response** (`200`)
 
 ```json
-{ "box": "jobs", "deleted": true,
+{ "topic": "jobs", "deleted": true,
   "routers_removed": ["jobs->audit", "jobs->mirror"],
   "performance": { "server_total_ms": 0.31 } }
 ```
 
-Deleting an absent box returns `200` with `"deleted": false` and empty `routers_removed`. A
-later lazy-create makes a **new, empty** box (seq restarts); stale consumers detect this via
+Deleting an absent topic returns `200` with `"deleted": false` and empty `routers_removed`. A
+later lazy-create makes a **new, empty** topic (seq restarts); stale consumers detect this via
 the `recreated` tombstone (§4.4 / DESIGN §5.5).
 
-**Errors** — `409 box_not_empty`.
+**Errors** — `409 topic_not_empty`.
 
 ---
 
-## 2. Write — `POST /v0/boxes/:box`
+## 2. Write — `POST /v0/topics/:topic`
 
 Append one or many records. The server assigns `seq`s and returns them. The single write
 endpoint also carries inline config (applied only on lazy create) so the common case needs
@@ -498,9 +498,9 @@ no separate configure call.
 | `records[].node` | string | no | Per-record origin node; overrides batch-level `node`. ≤ `MAX_NODE_BYTES`. |
 | `records[].meta` | object | no | Small headers, returned verbatim. ≤ `MAX_META_BYTES`, ≤ 64 keys. |
 | `node` | string | no | Batch-level default origin node (the common one-writer case). |
-| `idempotency_key` | string | no | Dedupe key (§0.8), scoped to this box. ≤ 256 chars. |
-| `create` | bool | no | Overrides the box's `auto_create` for this write only. `true` ⇒ auto-create if absent; `false` ⇒ `404 box_not_found` if absent (Redis `NOMKSTREAM`, prevents typo-boxes). Default = box's `auto_create`. |
-| `config` | Box config | no | Applied **only if this write creates the box**. Ignored if the box exists (config changes on an existing box go through `PUT`). |
+| `idempotency_key` | string | no | Dedupe key (§0.8), scoped to this topic. ≤ 256 chars. |
+| `create` | bool | no | Overrides the topic's `auto_create` for this write only. `true` ⇒ auto-create if absent; `false` ⇒ `404 topic_not_found` if absent (Redis `NOMKSTREAM`, prevents typo-topics). Default = topic's `auto_create`. |
+| `config` | Topic config | no | Applied **only if this write creates the topic**. Ignored if the topic exists (config changes on an existing topic go through `PUT`). |
 | `disable_backpressure` | bool | no | If `true`, opt out of `429` for this write; server may queue instead. Default `false`. |
 
 **Behavior**
@@ -508,17 +508,17 @@ no separate configure call.
   append.
 - `node` is recorded as `$node`; on later reads/SSE by that same node these records are
   filtered out (§4.5).
-- Durable boxes: response held until `fsync` completes. Non-durable: acked on buffered
+- Durable topics: response held until `fsync` completes. Non-durable: acked on buffered
   append.
-- **Full box:** `discard:"old"` evicts oldest and the write succeeds (eviction may later
-  surface as a tombstone to lagging consumers). `discard:"reject"` ⇒ `422 box_full`,
+- **Full topic:** `discard:"old"` evicts oldest and the write succeeds (eviction may later
+  surface as a tombstone to lagging consumers). `discard:"reject"` ⇒ `422 topic_full`,
   **nothing appended** (all-or-nothing), writer learns synchronously (never ack-then-drop).
 
-**Response** (`200`, or `201` if this write created the box)
+**Response** (`200`, or `201` if this write created the topic)
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "first_seq": 480232, "last_seq": 480234,
   "seqs": [480232, 480233, 480234],
   "head_seq": 480234, "count": 3,
@@ -543,12 +543,12 @@ prior in-window write; `seqs` are the original ones and no new append happened.
 | Max `node` length | `128` bytes | `STREAMS_MAX_NODE_BYTES` |
 
 **Errors** — `400 invalid_request` / `batch_too_large` / `record_too_large`;
-`404 box_not_found` (`create:false` and absent); `413 payload_too_large`;
-`415 unsupported_media_type`; `422 box_full`; `429 throttled`.
+`404 topic_not_found` (`create:false` and absent); `413 payload_too_large`;
+`415 unsupported_media_type`; `422 topic_full`; `429 throttled`.
 
 ---
 
-## 3. Read difference (getDifference) — `POST /v0/boxes/:box/diff`
+## 3. Read difference (getDifference) — `POST /v0/topics/:topic/diff`
 
 The core consume operation. Given a cursor `from_seq`, return the records after it, bounded
 to a batch, with a continuation cursor and any tombstone. Skips TTL-expired, deleted, and
@@ -581,7 +581,7 @@ because the operation is described by the JSON body; it is read-only and safe to
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "records": [
     { "$seq": 479101, "$ts": 1748450001000, "$node": "worker-us-2", "$tag": "tenant42:job-8800",
       "data": { "type": "resize", "url": "s3://b/x.png" }, "meta": { "trace": "z9" } },
@@ -613,13 +613,13 @@ The default consume model is **cursor-advance = ack-all** (Kafka offset, NATS Ac
 advancing your stored `from_seq` past seq N acks 1..N. The client owns its cursor; the
 server keeps **no** per-consumer state on this path. Per-message explicit-ack / lease /
 heartbeat (the BullMQ stalled-job model) is not in `/v0`; it is a planned higher-level mode
-(ROADMAP) layered on tags + a side in-flight box, kept out of the core to preserve the
+(ROADMAP) layered on tags + a side in-flight topic, kept out of the core to preserve the
 stateless-log primitive.
 
 ### 3.2 Skipped records still advance the cursor
 
 Node-filtered and deleted records (and TTL-expired ones) are **omitted from `records`**
-but `next_from_seq` advances **past** them. Otherwise a consumer reading a box full of its
+but `next_from_seq` advances **past** them. Otherwise a consumer reading a topic full of its
 own (node-filtered) events would loop forever. So `records.length` may be less than the
 number of seqs traversed, and may be `0` while `next_from_seq` advanced. **`caught_up` is
 the reliable "no more" signal — never `records.length == 0`.**
@@ -634,7 +634,7 @@ past the deleted seqs. `evict_floor <= earliest_seq` always.)
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "records": [ { "$seq": 479101, "...": "..." } ],
   "tombstone": {
     "gap_from": 478501,
@@ -655,7 +655,7 @@ past the deleted seqs. `evict_floor <= earliest_seq` always.)
 |---|---|
 | `gap_from` | First missing seq (= stale `from_seq + 1`). |
 | `gap_to` | Last missing seq (= `earliest_seq - 1`). The lost range `[gap_from, gap_to]` is inclusive both ends. |
-| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), `"recreated"` (box was deleted+recreated), or `"source_trim"` (a router dest could not re-materialize a forwarded record because the **source** had already evicted/trimmed it below the router's cursor — the derived dest faithfully reflects source retention rather than silently skipping; default async/derived router model). Best-effort/informational; the range is authoritative. |
+| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), `"recreated"` (topic was deleted+recreated), or `"source_trim"` (a router dest could not re-materialize a forwarded record because the **source** had already evicted/trimmed it below the router's cursor — the derived dest faithfully reflects source retention rather than silently skipping; default async/derived router model). Best-effort/informational; the range is authoritative. |
 | `missed_estimate` | Approximate count of dropped records (approximate because eviction is segment-granular). |
 | `earliest_seq` / `head_seq` | Current watermarks, echoed for convenience. |
 
@@ -672,7 +672,7 @@ as `event: tombstone` (§7).
 > cap/TTL loss (`reason ∈ cap|ttl|mixed`), tracked by `evict_floor`, never by deletes.
 
 **Errors** — `400 invalid_request` (type errors only; `wait_ms`/`limit` over max are
-clamped, not errored); `404 box_not_found` (diff never auto-creates); `429 throttled`.
+clamped, not errored); `404 topic_not_found` (diff never auto-creates); `429 throttled`.
 
 ---
 
@@ -690,17 +690,17 @@ shared topology, each sees only the *others'* records, with no echo and no infin
 - Filtering happens **after** retention/TTL but is **content-based and intentional**, so it
   is **silent** (no tombstone — see DESIGN §5.4). Dropped seqs are simply absent; the cursor
   advances past them (§3.2).
-- Disable per-box with `dedupe_node: false` (§0.10) if you genuinely want echoes.
+- Disable per-topic with `dedupe_node: false` (§0.10) if you genuinely want echoes.
 
 ---
 
-## 5. Deletion (permanent, point-in-time) — `POST /v0/boxes/:box/delete`
+## 5. Deletion (permanent, point-in-time) — `POST /v0/topics/:topic/delete`
 
 Permanently remove records by **seq range** (`before_seq`) and/or by **tag** match
 (`match`). Deletion is:
 
 - **Permanent** — deleted records are gone for good; there is no un-delete in `/v0`.
-- **Effective immediately** — invisible to all reads at once (diff, box state `count`/
+- **Effective immediately** — invisible to all reads at once (diff, topic state `count`/
   `bytes`, and SSE); the reader's cursor simply advances past the deleted seqs.
 - **Asynchronous, no compaction / no reclaim** — records are logically gone instantly (the
   work runs off the call path), but a deleted record **stays on disk, just marked**: there is
@@ -714,7 +714,7 @@ Permanently remove records by **seq range** (`before_seq`) and/or by **tag** mat
 - **Point-in-time** — it is **not** a standing filter. It only removes records present at
   call time; future records (even with a matching tag) are never affected.
 
-A delete advances the box's `earliest_seq` (first live seq) but **not** its `evict_floor`,
+A delete advances the topic's `earliest_seq` (first live seq) but **not** its `evict_floor`,
 so reading across a purely-deleted gap is silent (§3.3).
 
 **Durable for already-sealed records.** A delete of a record that has already been sealed into an
@@ -737,7 +737,7 @@ invalid_request`); supply both to AND them. A snapshot/compaction by seq:
 | Field | Type | Meaning |
 |---|---|---|
 | `before_seq` | `u64` | Delete every record with `$seq < before_seq` (snapshot / compaction by seq). |
-| `match` | predicate | `["tag","Eq","X"]` exact match, or `["tag","Glob","X*"]` **trailing-prefix only** (a literal prefix followed by a single `*`; full glob/regex is deliberately excluded so a delete is a point lookup or a bounded range scan over the per-box tag index). A bare string is shorthand for `Eq`: `"match": "tenant42:job-9001"` == `["tag","Eq","tenant42:job-9001"]`. |
+| `match` | predicate | `["tag","Eq","X"]` exact match, or `["tag","Glob","X*"]` **trailing-prefix only** (a literal prefix followed by a single `*`; full glob/regex is deliberately excluded so a delete is a point lookup or a bounded range scan over the per-topic tag index). A bare string is shorthand for `Eq`: `"match": "tenant42:job-9001"` == `["tag","Eq","tenant42:job-9001"]`. |
 
 **Semantics by combination**
 
@@ -747,13 +747,13 @@ invalid_request`); supply both to AND them. A snapshot/compaction by seq:
 | `match` only | Delete every **existing** record whose tag matches, bounded by the current head at call time (bound = `head_seq + 1`). Point-in-time: future records with that tag are **not** deleted (e.g. revoke a kicked user's chat: `match ["tag","Glob","chat-42:*"]`). |
 | `match` + `before_seq` | Delete records with `$seq < before_seq` **AND** tag matches (e.g. publish v2 of a message then delete its prior versions, keeping the new one: `match ["tag","Eq","msg-123"]`, `before_seq = <seq of v2>`). |
 
-Records with **no tag** are never matched by `match`. A tag delete uses the per-box tag
+Records with **no tag** are never matched by `match`. A tag delete uses the per-topic tag
 index (exact = point lookup, prefix = range scan); it never scans the whole log.
 
 **Response** (`200`)
 
 ```json
-{ "box": "jobs",
+{ "topic": "jobs",
   "deleted": 14,
   "earliest_seq": 480001,
   "head_seq": 480234,
@@ -766,10 +766,10 @@ index (exact = point lookup, prefix = range scan); it never scans the whole log.
 |---|---|
 | `deleted` | Count of records removed by this call. |
 | `earliest_seq` | New first live seq (advanced past any deleted prefix). |
-| `head_seq` / `count` / `bytes` | Box state after the delete (`count`/`bytes` already exclude the deleted records). |
+| `head_seq` / `count` / `bytes` | Topic state after the delete (`count`/`bytes` already exclude the deleted records). |
 
 **Errors** — `400 invalid_request` (neither `before_seq` nor `match` supplied; bad tuple;
-`match` op not in `{Eq, Glob}`; `Glob` without a trailing `*`); `404 box_not_found`.
+`match` op not in `{Eq, Glob}`; `Glob` without a trailing `*`); `404 topic_not_found`.
 
 ---
 
@@ -786,7 +786,7 @@ copies are re-derived on recovery by replaying from a **durable per-router curso
 **at-least-once, per-source FIFO** (a crash between "appended to dest" and "advanced router
 cursor" can re-forward; consumers must be idempotent — see DESIGN §6). A derived `dest` is
 **single-source**: a second router with a *different* `source` into the same `dest` is rejected
-`409 box_exists_incompatible` with `error.detail.reason: "router_dest_fan_in"`.
+`409 topic_exists_incompatible` with `error.detail.reason: "router_dest_fan_in"`.
 
 > **Legacy opt-out (`STREAMS_FORWARD_V2=0`).** The async + derived model above is the shipped
 > default. Setting `STREAMS_FORWARD_V2=0` (`false`/`no`/`off`) reverts to the legacy
@@ -798,7 +798,7 @@ cursor" can re-forward; consumers must be idempotent — see DESIGN §6). A deri
 
 ### 6.1 Create / configure — `PUT /v0/routers/:router`
 
-**Path** — `:router`, same charset as box names. Convention default name `"<source>-><dest>"`.
+**Path** — `:router`, same charset as topic names. Convention default name `"<source>-><dest>"`.
 
 **Request body**
 
@@ -810,8 +810,8 @@ cursor" can re-forward; consumers must be idempotent — see DESIGN §6). A deri
 
 | Field | Type | Req? | Default | Meaning |
 |---|---|---|---|---|
-| `source` | string | yes | — | Source box; records here are forwarded. |
-| `dest` | string | yes | — | Destination box; must differ from `source`. |
+| `source` | string | yes | — | Source topic; records here are forwarded. |
+| `dest` | string | yes | — | Destination topic; must differ from `source`. |
 | `preserve_node` | bool | no | `true` | Keep original `$node` on forwarded records (required for loop prevention across the fan-out). `false` clears it. |
 | `preserve_tag` | bool | no | `true` | Keep `$tag` (so a tag delete can be applied at the dest too). |
 | `create_dest` | bool | no | `true` | Auto-create `dest` if absent. `false` ⇒ `404` if missing. |
@@ -822,7 +822,7 @@ cursor" can re-forward; consumers must be idempotent — see DESIGN §6). A deri
 - Forwarding runs **asynchronously** off the `source` write/ack path (driven by the durable
   per-router cursor), not inline at append. The forwarded copy gets its own fresh `$seq` and
   `$ts` in `dest` (an independent log); `$node`/`$tag`/`data`/`meta` carry through verbatim
-  (subject to `preserve_*`). Optional reserved meta `$src_box`/`$src_seq` aid traceability (off
+  (subject to `preserve_*`). Optional reserved meta `$src_topic`/`$src_seq` aid traceability (off
   by default).
 - `dest`'s own config governs the forward: `discard:"old"` evicts to make room; `discard:"reject"`
   rejects the forward, the router **does not advance** its cursor and retries with backoff
@@ -839,8 +839,8 @@ cursor" can re-forward; consumers must be idempotent — see DESIGN §6). A deri
 ```
 
 **Errors** — `400 invalid_request` (missing `source`/`dest`, `source == dest`, bad filter);
-`404 box_not_found`; `409 router_cycle` (`error.detail.cycle: ["A","B","A"]`);
-`409 box_exists_incompatible` with `error.detail.reason: "router_dest_fan_in"` (a second router
+`404 topic_not_found`; `409 router_cycle` (`error.detail.cycle: ["A","B","A"]`);
+`409 topic_exists_incompatible` with `error.detail.reason: "router_dest_fan_in"` (a second router
 with a different `source` into a `dest` that is already a derived destination — single-source).
 
 ### 6.2 Get a router — `GET /v0/routers/:router`
@@ -874,14 +874,14 @@ Idempotent. Stops forwarding immediately; already-forwarded records in `dest` ar
 ```json
 { "router": "jobs->audit", "deleted": true, "performance": { "server_total_ms": 0.06 } }
 ```
-`"deleted": false` if absent. Deleting a **box** (§1.4) cascades to every router with that
-box as `source` or `dest`.
+`"deleted": false` if absent. Deleting a **topic** (§1.4) cascades to every router with that
+topic as `source` or `dest`.
 
 ---
 
 ## 7. Multiplexed SSE watch
 
-Watch **many boxes** over a single long-lived connection. The server pushes new records,
+Watch **many topics** over a single long-lived connection. The server pushes new records,
 tombstone/gap events, and periodic heartbeats, all resumable via a composite cursor.
 
 ### 7.1 Two-step shape — POST to create, GET to stream
@@ -891,20 +891,20 @@ POST /v0/watch          -> creates a watch session, returns a wid + stream_url
 GET  /v0/watch/:wid     -> opens the SSE stream (text/event-stream)
 ```
 
-A multiplexed watch can name dozens of boxes with per-box cursors and options — too much
+A multiplexed watch can name dozens of topics with per-topic cursors and options — too much
 for a query string, and browser `EventSource` is GET-only with no body/headers. So the
 **POST** carries the full JSON subscription (and returns `400`/`404` *before* any stream is
 open, while the client can still read the error body), and the **GET** is a tiny,
 `EventSource`-compatible URL. A session holds the subscription definition plus the
-last-delivered cursor per box (so GET reconnects resume exactly) and is **reclaimed** after
+last-delivered cursor per topic (so GET reconnects resume exactly) and is **reclaimed** after
 `session_ttl_ms` (default 300000) of no active GET. The idle-session GC runs opportunistically
 on every `POST /v0/watch` and stream-open: a session with no live stream whose last access is
 older than the TTL is removed, so an abandoned session cannot pin a `STREAMS_MAX_WATCH_SESSIONS`
 slot until restart. A session with an open stream is never reclaimed (its cursor map is in use).
 
 **Auth & the `wid` capability.** The **POST** is authenticated normally
-(`Authorization: Bearer`) and additionally enforces the key's **box-name prefix allowlist**
-against every box named in the body — a prefix-limited key cannot watch a box outside its
+(`Authorization: Bearer`) and additionally enforces the key's **topic-name prefix allowlist**
+against every topic named in the body — a prefix-limited key cannot watch a topic outside its
 allowlist (`403 forbidden`). The returned `wid` is an **unguessable random bearer capability**
 (≥128 bits of entropy, base64url, e.g. `wid_BuRguGorNdVFWNQULz-rrw`) — it is not a guessable
 counter, and the GET stream is found by the `wid` alone (a browser `EventSource`-compatible URL).
@@ -916,7 +916,7 @@ also have the key. In dev mode (no auth) the `wid` alone opens the stream. The s
 to the creating key's scope so the stream can never exceed it.
 
 > **`?token=<key>` is a documented dev-only fallback** for browser `EventSource` (which cannot
-> send custom headers) on the **SSE stream GETs only** (`/v0/watch/:wid`, `/v0/boxes/:q/work`);
+> send custom headers) on the **SSE stream GETs only** (`/v0/watch/:wid`, `/v0/topics/:q/work`);
 > it is **never** accepted on ordinary data/control-plane routes (use the header there). A query
 > string leaks via server logs, browser history, and proxies, so **prefer the
 > `Authorization: Bearer` header**, and never put a long-lived api key in a URL in production.
@@ -928,7 +928,7 @@ to the creating key's scope so the stream can never exceed it.
 ```json
 {
   "node": "worker-eu-1",
-  "boxes": {
+  "topics": {
     "jobs":   { "from_seq": 4096 },
     "events": { "tail": true },
     "audit":  { "from_seq": 1 }
@@ -945,12 +945,12 @@ to the creating key's scope so the stream can never exceed it.
 
 | Field | Meaning | Default |
 |---|---|---|
-| `node` | Loop-prevention filter applied to all watched boxes (this node never receives its own records). Omit for none. | none |
-| `boxes` | Map of `box → per-box options`. The key is the box (keeps cursors unambiguous and doubles as the resume map). Up to `STREAMS_MAX_WATCH_BOXES` (default 256). | required, ≥1 |
-| `boxes[b].from_seq` | Deliver records with `$seq > from_seq`. `0` = from earliest. | `0` |
-| `boxes[b].tail` | If `true`, ignore `from_seq` and start at the box's current head (only records after subscribe; the SSE analog of Redis `XREAD $`). | `false` |
-| `limit` | Max records per `record` frame (per box, per flush). | `256` |
-| `max_batch_bytes` | **Enforced** soft byte budget for a single `record` frame: the per-box read stops once the batch reaches this many payload bytes (at least one record is always delivered), so a frame cannot balloon to `limit`×record-cap. `0` ⇒ server default (1 MiB), clamped to 8 MiB. | `262144` (256 KiB) |
+| `node` | Loop-prevention filter applied to all watched topics (this node never receives its own records). Omit for none. | none |
+| `topics` | Map of `topic → per-topic options`. The key is the topic (keeps cursors unambiguous and doubles as the resume map). Up to `STREAMS_MAX_WATCH_TOPICS` (default 256). | required, ≥1 |
+| `topics[b].from_seq` | Deliver records with `$seq > from_seq`. `0` = from earliest. | `0` |
+| `topics[b].tail` | If `true`, ignore `from_seq` and start at the topic's current head (only records after subscribe; the SSE analog of Redis `XREAD $`). | `false` |
+| `limit` | Max records per `record` frame (per topic, per flush). | `256` |
+| `max_batch_bytes` | **Enforced** soft byte budget for a single `record` frame: the per-topic read stops once the batch reaches this many payload bytes (at least one record is always delivered), so a frame cannot balloon to `limit`×record-cap. `0` ⇒ server default (1 MiB), clamped to 8 MiB. | `262144` (256 KiB) |
 | `heartbeat_ms` | Heartbeat interval. Clamped to `[1000, 60000]`. | `15000` |
 | `include_meta` | Include record `meta` in frames. | `true` |
 | `include_tags` | Include `$tag` in frames. | `false` |
@@ -964,7 +964,7 @@ to the creating key's scope so the stream can never exceed it.
   "wid": "wid_BuRguGorNdVFWNQULz-rrw",
   "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw",
   "session_ttl_ms": 300000,
-  "boxes": {
+  "topics": {
     "jobs":   { "from_seq": 4096,  "head_seq": 5210,  "earliest_seq": 3001 },
     "events": { "from_seq": 88123, "head_seq": 88123, "earliest_seq": 80000 },
     "audit":  { "from_seq": 1,     "head_seq": 990,   "earliest_seq": 1 }
@@ -973,12 +973,12 @@ to the creating key's scope so the stream can never exceed it.
 }
 ```
 
-Per-box `head_seq`/`earliest_seq` let the client compute lag and see, before streaming,
+Per-topic `head_seq`/`earliest_seq` let the client compute lag and see, before streaming,
 whether a cursor has already fallen off the start (it gets a tombstone on connect if so).
 
-**Errors** — `400 invalid_request` (malformed `boxes`, too many boxes); `404 box_not_found`
-(unknown box, unless `?lenient=true`, which simply **drops** unknown boxes — they are absent
-from the response `boxes` map; there is no separate warning frame).
+**Errors** — `400 invalid_request` (malformed `topics`, too many topics); `404 topic_not_found`
+(unknown topic, unless `?lenient=true`, which simply **drops** unknown topics — they are absent
+from the response `topics` map; there is no separate warning frame).
 
 ### 7.3 GET /v0/watch/:wid — open the stream
 
@@ -1003,7 +1003,7 @@ frame and sets `TCP_NODELAY` to hit the 1–5 ms target.
 
 ### 7.4 Resume via composite cursor (`Last-Event-ID`)
 
-Every data-bearing frame carries an `id:` encoding the **entire per-box cursor map** at that
+Every data-bearing frame carries an `id:` encoding the **entire per-topic cursor map** at that
 moment, as base64url-encoded JSON:
 
 ```
@@ -1014,8 +1014,8 @@ On reconnect, resolution order: (1) the server-side session cursors (authoritati
 lost `Last-Event-ID`); (2) the `Last-Event-ID` header, if present, used only to **rewind**
 the session to that exact map (never advance past it — protects the gap between "server
 flushed" and "client processed"); (3) the session's initial `from_seq`/`tail` if neither.
-Because the id is a full map, one reconnect restores all per-box positions atomically. For
-very large box sets (>64) the server may emit an opaque session-checkpoint token instead of
+Because the id is a full map, one reconnect restores all per-topic positions atomically. For
+very large topic sets (>64) the server may emit an opaque session-checkpoint token instead of
 the full map; clients treat `id` as opaque either way.
 
 ### 7.5 Frame types
@@ -1026,39 +1026,39 @@ the full map; clients treat `id` as opaque either way.
 retry: 2000
 ```
 
-**`event: record`** — new records for one box, batched. `id` is the post-batch composite cursor.
+**`event: record`** — new records for one topic, batched. `id` is the post-batch composite cursor.
 
 ```
 id: eyJqb2JzIjo0MDk4fQ
 event: record
-data: {"box":"jobs","records":[{"$seq":4097,"$ts":1748467200111,"$tag":"job:render","$node":"node-B","data":{"url":"..."}},{"$seq":4098,"$ts":1748467200119,"$node":"node-C","data":{"id":42}}],"from_seq":4096,"to_seq":4098,"head_seq":5210}
+data: {"topic":"jobs","records":[{"$seq":4097,"$ts":1748467200111,"$tag":"job:render","$node":"node-B","data":{"url":"..."}},{"$seq":4098,"$ts":1748467200119,"$node":"node-C","data":{"id":42}}],"from_seq":4096,"to_seq":4098,"head_seq":5210}
 ```
 
-Payload: `box`, `records[]`, and a `from_seq`/`to_seq`/`head_seq` triple per batch (lag =
+Payload: `topic`, `records[]`, and a `from_seq`/`to_seq`/`head_seq` triple per batch (lag =
 `head_seq - to_seq`). `$tag` present only if `include_tags`; `$node` present when set;
 `data` omitted per-record if `include_data:false`.
 
 **`event: tombstone`** — explicit, never-silent loss. Emitted whenever a gap crosses *this
-consumer's* cursor for a box.
+consumer's* cursor for a topic.
 
 ```
 id: eyJldmVudHMiOjgzMDAwfQ
 event: tombstone
-data: {"box":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
+data: {"topic":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
 ```
 
 `reason` ∈ `cap` | `ttl` | `mixed` | `recreated` | `from_seq_too_old`. The `from_seq_too_old`
 value is emitted **immediately on connect** when the requested `from_seq + 1 < earliest_seq`
-(the SSE expression of Kafka `OffsetOutOfRange`). The frame's `id` already advances the box
+(the SSE expression of Kafka `OffsetOutOfRange`). The frame's `id` already advances the topic
 cursor to `gap_to`, so a resume after it is correct.
 
-**`event: caught-up`** — the box is drained to head; the client is now live (one per box,
+**`event: caught-up`** — the topic is drained to head; the client is now live (one per topic,
 re-emitted on each backlog→tailing transition).
 
 ```
 id: eyJqb2JzIjo1MjEwfQ
 event: caught-up
-data: {"box":"jobs","head_seq":5210}
+data: {"topic":"jobs","head_seq":5210}
 ```
 
 **Heartbeat** — a bare SSE comment, no `id:` (never perturbs the resume cursor), trailing
@@ -1068,22 +1068,22 @@ epoch-ms for liveness/skew. Suppressed when real data went out within the window
 : hb 1748467205000
 ```
 
-**`event: box-deleted`** — the box was deleted while watched; terminal for that box only,
+**`event: topic-deleted`** — the topic was deleted while watched; terminal for that topic only,
 the rest of the stream continues.
 
 ```
 id: eyJqb2JzLmRscSI6MTJ9
-event: box-deleted
-data: {"box":"jobs.dlq","head_seq":12,"reason":"deleted"}
+event: topic-deleted
+data: {"topic":"jobs.dlq","head_seq":12,"reason":"deleted"}
 ```
 
 **`event: error`** — a per-stream problem with an HTTP-aligned `code`. `code: 429` is
-advisory (the stream stays open but the named boxes are paced); `code: 410` (session GC'd) is
+advisory (the stream stays open but the named topics are paced); `code: 410` (session GC'd) is
 terminal (re-POST).
 
 ```
 event: error
-data: {"code":429,"error":"watch throttled under CPU pressure","retry_after_ms":1500,"boxes":["events"]}
+data: {"code":429,"error":"watch throttled under CPU pressure","retry_after_ms":1500,"topics":["events"]}
 ```
 
 ### 7.6 Heartbeats, liveness, backpressure
@@ -1094,13 +1094,13 @@ data: {"code":429,"error":"watch throttled under CPU pressure","retry_after_ms":
   default); any frame resets it; on timeout, reconnect with `Last-Event-ID`.
 - **Slow consumers** (see ARCHITECTURE §5): each connection has a bounded outbound queue.
   While it can't drain, records coalesce into larger/fewer batches. If it stays full past
-  `buffer_grace_ms` (5 s), a lossy box degrades to a `tombstone(from_seq_too_old)` on resume;
-  a durable/unbounded box simply lags and replays. Past `slow_consumer_timeout` (30 s) the
+  `buffer_grace_ms` (5 s), a lossy topic degrades to a `tombstone(from_seq_too_old)` on resume;
+  a durable/unbounded topic simply lags and replays. Past `slow_consumer_timeout` (30 s) the
   server sends a final `error` frame and closes; the session survives `session_ttl_ms` so the
-  client resumes with no loss beyond the box's own cap/TTL.
+  client resumes with no loss beyond the topic's own cap/TTL.
 
 **Errors at establishment** — `200` (stream opened); `400 invalid_request` (bad/expired wid
-or boxes); `401 unauthorized` — when the session was created **with auth enabled** it is
+or topics); `401 unauthorized` — when the session was created **with auth enabled** it is
 bound to the creating key, so the SSE GET must present that **same** bearer (via the
 `Authorization` header **or** the dev-only `?token=` on the GET); a wrong key *or* **no
 bearer at all** is rejected (a leaked `wid` alone is not a credential). When the session was
@@ -1125,7 +1125,7 @@ not require auth by default (`STREAMS_PROBE_AUTH=true` to require it).
 ### 8.2 Readiness — `GET /v0/ready` (alias `GET /readyz`)
 
 ```json
-{ "status": "ready", "wal_replay_complete": true, "boxes": 42 }
+{ "status": "ready", "wal_replay_complete": true, "topics": 42 }
 ```
 `200 ready` when serving; `503 not_ready` during WAL replay (carries `Retry-After` and
 `error.detail.replay_progress` 0.0–1.0); `503 shutting_down` while draining.
@@ -1133,35 +1133,35 @@ not require auth by default (`STREAMS_PROBE_AUTH=true` to require it).
 ### 8.3 Metrics — `GET /v0/metrics`
 
 Prometheus text exposition (`text/plain; version=0.0.4`) by default; `Accept:
-application/json` for a JSON snapshot. Exposes process/aggregate gauges (`streams_boxes`,
-`streams_boxes_by_class{class=...}`, `streams_routers`, `streams_records_live`,
-`streams_bytes_live`, `streams_queue_boxes`, `streams_queue_leases_in_flight`,
+application/json` for a JSON snapshot. Exposes process/aggregate gauges (`streams_topics`,
+`streams_topics_by_class{class=...}`, `streams_routers`, `streams_records_live`,
+`streams_bytes_live`, `streams_queue_topics`, `streams_queue_leases_in_flight`,
 `streams_sse_connections`, `streams_watch_sessions`, `streams_ready`,
-`streams_recovery_progress`, `streams_uptime_ms`), **per-box gauges**
-(`streams_box_head_seq` / `_earliest_seq` / `_records_live` / `_bytes_live` /
-`_queue_ready` / `_queue_in_flight`, labelled `{box=...}`; the per-box block is bounded and
-sets `streams_box_metrics_truncated` if capped), the real **WAL metrics**
+`streams_recovery_progress`, `streams_uptime_ms`), **per-topic gauges**
+(`streams_topic_head_seq` / `_earliest_seq` / `_records_live` / `_bytes_live` /
+`_queue_ready` / `_queue_in_flight`, labelled `{topic=...}`; the per-topic block is bounded and
+sets `streams_topic_metrics_truncated` if capped), the real **WAL metrics**
 (`streams_wal_frames_total`, `_batches_total`, `_fsyncs_total`, `_bytes_written_total`,
 `_rotations_total`, `_queue_depth`, `_queue_depth_peak`, `_submit_full_total`,
 `_read_only`), and a **fsync-latency histogram** `streams_wal_fsync_latency_us` (with
 `_bucket{le=...}` / `_sum` / `_count`).
 
 ```
-# HELP streams_box_head_seq Highest assigned seq per box.
-# TYPE streams_box_head_seq gauge
-streams_box_head_seq{box="jobs"} 480231
-streams_box_earliest_seq{box="jobs"} 468188
-streams_box_records_live{box="jobs"} 12043
+# HELP streams_topic_head_seq Highest assigned seq per topic.
+# TYPE streams_topic_head_seq gauge
+streams_topic_head_seq{topic="jobs"} 480231
+streams_topic_earliest_seq{topic="jobs"} 468188
+streams_topic_records_live{topic="jobs"} 12043
 streams_wal_fsyncs_total 88241
 streams_wal_fsync_latency_us_bucket{le="500"} 84120
 streams_wal_fsync_latency_us_count 88241
 ```
 `200` always (even when not ready — metrics describe the recovering process). (There are no
-per-box append/read/eviction/tombstone counters and no scheduler-throttle metric — the
+per-topic append/read/eviction/tombstone counters and no scheduler-throttle metric — the
 surface is gauges + WAL counters + the fsync histogram above.)
 
 > **Auth.** Unlike `/v0/health` and `/v0/ready` (which stay unauthenticated so a load balancer
-> can poll liveness/readiness), `/v0/metrics` exposes operational state (box count, …) and is
+> can poll liveness/readiness), `/v0/metrics` exposes operational state (topic count, …) and is
 > therefore **gated behind auth by default** when keys are configured: it needs a key with the
 > `read` scope (a full-access key suffices). In dev mode (no keys) it is open. Set
 > `STREAMS_PROBE_AUTH` to additionally require auth on the liveness/readiness probes.
@@ -1172,24 +1172,24 @@ surface is gauges + WAL counters + the fsync histogram above.)
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PUT` | `/v0/boxes/:box` | Create/configure box (idempotent upsert) |
-| `GET` | `/v0/boxes/:box` | Get box state (head/earliest/count/config) |
-| `GET` | `/v0/boxes` | List boxes (opaque-cursor paginated) |
-| `DELETE` | `/v0/boxes/:box` | Delete box (cascades routers) |
-| `POST` | `/v0/boxes/:box` | Append record(s); returns assigned seqs + head |
-| `POST` | `/v0/boxes/:box/diff` | Read difference from cursor (batched + tombstones) |
-| `POST` | `/v0/boxes/:box/delete` | Permanently delete records by `before_seq` and/or tag `match` |
+| `PUT` | `/v0/topics/:topic` | Create/configure topic (idempotent upsert) |
+| `GET` | `/v0/topics/:topic` | Get topic state (head/earliest/count/config) |
+| `GET` | `/v0/topics` | List topics (opaque-cursor paginated) |
+| `DELETE` | `/v0/topics/:topic` | Delete topic (cascades routers) |
+| `POST` | `/v0/topics/:topic` | Append record(s); returns assigned seqs + head |
+| `POST` | `/v0/topics/:topic/diff` | Read difference from cursor (batched + tombstones) |
+| `POST` | `/v0/topics/:topic/delete` | Permanently delete records by `before_seq` and/or tag `match` |
 | `PUT` | `/v0/routers/:router` | Create/configure router (idempotent upsert) |
 | `GET` | `/v0/routers/:router` | Get router |
 | `GET` | `/v0/routers` | List routers |
 | `DELETE` | `/v0/routers/:router` | Delete router |
 | `POST` | `/v0/watch` | Create a multiplexed SSE watch session |
 | `GET` | `/v0/watch/:wid` | Open the SSE stream for a session |
-| `POST` | `/v0/boxes/:q/claim` | **Queue:** lease up to N claimable jobs to a node (§10.2) |
-| `POST` | `/v0/boxes/:q/ack` | **Queue:** complete jobs (ack == permanent delete) (§10.4) |
-| `POST` | `/v0/boxes/:q/nack` | **Queue:** release leased jobs for (delayed) reclaim (§10.5) |
-| `POST` | `/v0/boxes/:q/extend` | **Queue:** extend lease deadlines (heartbeat) (§10.6) |
-| `GET` | `/v0/boxes/:q/work` | **Queue:** SSE auto-claim/push (PUSH mode) (§10.8) |
+| `POST` | `/v0/topics/:q/claim` | **Queue:** lease up to N claimable jobs to a node (§10.2) |
+| `POST` | `/v0/topics/:q/ack` | **Queue:** complete jobs (ack == permanent delete) (§10.4) |
+| `POST` | `/v0/topics/:q/nack` | **Queue:** release leased jobs for (delayed) reclaim (§10.5) |
+| `POST` | `/v0/topics/:q/extend` | **Queue:** extend lease deadlines (heartbeat) (§10.6) |
+| `GET` | `/v0/topics/:q/work` | **Queue:** SSE auto-claim/push (PUSH mode) (§10.8) |
 | `GET` | `/v0/health` (`/healthz`) | Liveness |
 | `GET` | `/v0/ready` (`/readyz`) | Readiness (WAL replay / drain aware) |
 | `GET` | `/v0/metrics` | Prometheus / JSON metrics |
@@ -1198,10 +1198,10 @@ surface is gauges + WAL counters + the fsync histogram above.)
 
 ## 10. Queues (lease-based job delivery)
 
-A **queue** is a box created with `type:"queue"` (§0.10). It layers lease-based,
+A **queue** is a topic created with `type:"queue"` (§0.10). It layers lease-based,
 at-least-once job delivery on top of the same persistent log machinery (WAL, recovery,
-SSE, priority) — a queue **is** a box, so everything in §1–§7 still applies to it
-read-only. Internally a queue is **two logs**: the **jobs log** (the queue itself — the box
+SSE, priority) — a queue **is** a topic, so everything in §1–§7 still applies to it
+read-only. Internally a queue is **two logs**: the **jobs log** (the queue itself — the topic
 you write to with §2) and an append-only **leases log** of lifecycle events; the pending
 who-holds-what state is the materialized projection of that leases log (DESIGN §10,
 ARCHITECTURE §12). The endpoints below add the lease lifecycle on top.
@@ -1211,14 +1211,14 @@ All §0 conventions apply unchanged: the bearer auth (§0.2), the canonical erro
 idempotency (§0.8, on the produce path). Queue lifecycle calls (claim/ack/nack/extend) are
 `POST` and carry their parameters in the JSON body.
 
-**A non-queue box rejects every endpoint in this section with `409 not_a_queue`** (so a
-typo'd box name or a plain log can never silently swallow a claim). All §10 endpoints
-return `404 box_not_found` if the box does not exist (they never auto-create — produce via
+**A non-queue topic rejects every endpoint in this section with `409 not_a_queue`** (so a
+typo'd topic name or a plain log can never silently swallow a claim). All §10 endpoints
+return `404 topic_not_found` if the topic does not exist (they never auto-create — produce via
 §2 / create via §1.1 first).
 
 ### 10.1 Model in one paragraph
 
-You **produce** jobs with a normal append (§2 `POST /v0/boxes/:q`). A worker **claims** up
+You **produce** jobs with a normal append (§2 `POST /v0/topics/:q`). A worker **claims** up
 to N jobs (§10.2): the server leases them to that worker's `node`, returning each job's data
 plus a `lease_id` and a `deadline`. The worker processes them and **acks** (§10.4 — ack
 *is* the permanent delete of the job from the jobs log), **nacks** to release for immediate
@@ -1232,7 +1232,7 @@ Semantics are **at-least-once with idempotent consumers**: a slow-but-alive work
 past its deadline can cause a duplicate delivery (inherent and documented). Per-job FIFO is
 **not** guaranteed across parallel workers.
 
-### 10.2 Claim jobs — `POST /v0/boxes/:q/claim`
+### 10.2 Claim jobs — `POST /v0/topics/:q/claim`
 
 Lease up to `max` claimable jobs to a worker `node`.
 
@@ -1246,13 +1246,13 @@ Lease up to `max` claimable jobs to a worker `node`.
 |---|---|---|---|---|
 | `node` | string | yes | — | The claiming worker's identity. Recorded as the lease holder; used for `nack`/`extend`/`/work` ownership and for instant release on `/work` disconnect (§10.8). ≤ `MAX_NODE_BYTES`. |
 | `max` | `u32` | no | `1` | Max jobs to lease this call. Clamped to `STREAMS_MAX_CLAIM` (`1000`). The response may contain **fewer** (or zero) if the queue has less work available — `count < max` is the reliable "queue (near-)empty" signal, never an error. |
-| `lease_ms` | `u64` | no | box `lease_ms` | Lease duration for the jobs claimed by *this* call; overrides the box default. Clamped `[100, 86400000]`. |
+| `lease_ms` | `u64` | no | topic `lease_ms` | Lease duration for the jobs claimed by *this* call; overrides the topic default. Clamped `[100, 86400000]`. |
 
 A job is **claimable** iff it is not acked (still in the jobs log) and not currently leased
 (no active lease, or its lease has expired). Each returned job records a `claimed` event in
 the leases log and increments that job's delivery counter (§10.6).
 
-**Coalescing window (`claim_jitter_ms`).** If the box's `claim_jitter_ms > 0`, the claim
+**Coalescing window (`claim_jitter_ms`).** If the topic's `claim_jitter_ms > 0`, the claim
 **waits up to that window**; the server gathers **all** claimers that arrived during the
 window into a cohort and **divides the available jobs evenly** across the whole cohort
 (round-robin, proportional to each claimer's `max`) — *not* first-arrival-drains-the-head.
@@ -1266,7 +1266,7 @@ sleep affects correctness).
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "claimed": [
     { "$seq": 480101, "lease_id": "lease_7f3a9c", "deadline": 1748450039000,
       "$ts": 1748450001000, "$tag": "tenant42:job-8800", "deliveries": 1,
@@ -1291,7 +1291,7 @@ sleep affects correctness).
 | `ready` | Claimable jobs still waiting after this claim (the §10.7 `ready` counter). |
 
 **Errors** — `400 invalid_request` (missing `node`, bad `max`/`lease_ms` type);
-`404 box_not_found`; `409 not_a_queue`; `429 throttled`.
+`404 topic_not_found`; `409 not_a_queue`; `429 throttled`.
 
 ### 10.3 Lease expiry / visibility timeout
 
@@ -1305,11 +1305,11 @@ dead-lettering (§10.6). Because expiry is clock-driven and lazy, **losing the l
 a crash is self-healing**: every in-flight job simply has no active lease after restart and
 is immediately claimable (§10.1 durability note, DESIGN §10.6).
 
-### 10.4 Ack jobs — `POST /v0/boxes/:q/ack`
+### 10.4 Ack jobs — `POST /v0/topics/:q/ack`
 
 Complete jobs: the **ack is the delete**. The server records an `acked` event in the leases
 log and removes each seq from the jobs log via the existing permanent delete (§5). An
-acked+deleted job stays gone iff its delete was durable — i.e. **ack durability == the box's
+acked+deleted job stays gone iff its delete was durable — i.e. **ack durability == the topic's
 `durable`** (§0.10).
 
 **Request body**
@@ -1335,7 +1335,7 @@ consumers required, §10.1).
 **Response** (`200`)
 
 ```json
-{ "box": "jobs", "acked": 2, "skipped": [],
+{ "topic": "jobs", "acked": 2, "skipped": [],
   "ready": 840, "in_flight": 286,
   "performance": { "server_total_ms": 0.30, "fsync_ms": 0.21 } }
 ```
@@ -1349,9 +1349,9 @@ consumers required, §10.1).
 `fsync_ms > 0` only on a `durable` queue (the delete is fsynced before the ack returns).
 
 **Errors** — `400 invalid_request` (missing `node`/`seqs`, bad seq type);
-`404 box_not_found`; `409 not_a_queue`.
+`404 topic_not_found`; `409 not_a_queue`.
 
-### 10.5 Nack jobs — `POST /v0/boxes/:q/nack`
+### 10.5 Nack jobs — `POST /v0/topics/:q/nack`
 
 Release leased jobs back to the queue for **immediate** (or delayed) reclaim, without an ack.
 Records a `released` event in the leases log.
@@ -1377,7 +1377,7 @@ expire, just sooner (or after `delay_ms`).
 **Response** (`200`)
 
 ```json
-{ "box": "jobs", "nacked": 1, "skipped": [],
+{ "topic": "jobs", "nacked": 1, "skipped": [],
   "ready": 841, "in_flight": 285,
   "performance": { "server_total_ms": 0.18 } }
 ```
@@ -1388,9 +1388,9 @@ expire, just sooner (or after `delay_ms`).
 | `skipped` | Seqs not held by `node` (silently skipped). |
 | `ready` / `in_flight` | Post-nack counters (§10.7). A delayed nack does **not** count toward `ready` until `delay_ms` elapses. |
 
-**Errors** — `400 invalid_request`; `404 box_not_found`; `409 not_a_queue`.
+**Errors** — `400 invalid_request`; `404 topic_not_found`; `409 not_a_queue`.
 
-### 10.6 Extend a lease — `POST /v0/boxes/:q/extend`
+### 10.6 Extend a lease — `POST /v0/topics/:q/extend`
 
 Push out the deadline of held leases (the heartbeat for long jobs). Records an `extended`
 event in the leases log.
@@ -1414,7 +1414,7 @@ skipped; the worker should re-claim. Extending does **not** change the delivery 
 **Response** (`200`)
 
 ```json
-{ "box": "jobs", "extended": 1, "skipped": [],
+{ "topic": "jobs", "extended": 1, "skipped": [],
   "deadlines": { "480101": 1748450069000 },
   "performance": { "server_total_ms": 0.12 } }
 ```
@@ -1425,15 +1425,15 @@ skipped; the worker should re-claim. Extending does **not** change the delivery 
 | `skipped` | Seqs not held by `node` (expired/reclaimed/never-claimed). |
 | `deadlines` | New absolute deadline (ms) per extended seq. |
 
-**Errors** — `400 invalid_request` (missing `lease_ms`); `404 box_not_found`;
+**Errors** — `400 invalid_request` (missing `lease_ms`); `404 topic_not_found`;
 `409 not_a_queue`.
 
 #### Dead-lettering (`max_deliveries` + `dead_letter`)
 
 Each job carries a **delivery counter** incremented on every claim (including reclaims of
 expired leases and re-claims after a nack). When a job is about to be delivered for the
-`(max_deliveries + 1)`-th time and the box has a non-`null` `dead_letter`, it is **not**
-re-delivered: instead the server appends the job's record to the `dead_letter` box (preserving
+`(max_deliveries + 1)`-th time and the topic has a non-`null` `dead_letter`, it is **not**
+re-delivered: instead the server appends the job's record to the `dead_letter` topic (preserving
 `$tag`/`meta`/`data`, stamping `meta.$dead_letter_from`/`meta.$dead_letter_deliveries`/
 `meta.$dead_letter_src_seq` for traceability) and permanently deletes it from the jobs log
 (the same delete path as an ack). With `max_deliveries = 0` (default) or `dead_letter = null`,
@@ -1442,21 +1442,21 @@ a job is reclaimed forever and never dead-lettered. Dead-lettering increments th
 
 ### 10.7 Queue observability
 
-`GET /v0/boxes/:q` (§1.2) on a queue returns `type:"queue"` and a `queue` sub-object beside
-the normal box state:
+`GET /v0/topics/:q` (§1.2) on a queue returns `type:"queue"` and a `queue` sub-object beside
+the normal topic state:
 
 | `queue` field | Meaning |
 |---|---|
 | `ready` | Claimable jobs right now — in the jobs log, not acked, with no active lease (includes reclaim-freelist seqs whose lease expired or whose nack `delay_ms` elapsed). |
 | `in_flight` | Jobs with an active (un-expired) lease — currently held by some worker. |
-| `dead_lettered` | Cumulative count of jobs moved to the `dead_letter` box over this box instance's life (resets on delete+recreate). |
+| `dead_lettered` | Cumulative count of jobs moved to the `dead_letter` topic over this topic instance's life (resets on delete+recreate). |
 
 `ready + in_flight` equals the live job count (`count`) modulo jobs whose nack `delay_ms`
-has not yet elapsed (counted in neither until they become claimable). A queue box stays
+has not yet elapsed (counted in neither until they become claimable). A queue topic stays
 fully **readable via normal §3 `diff` and §7 `watch`** (read-only) for monitoring — those
 paths observe the jobs log and never claim, ack, or mutate leases.
 
-### 10.8 Auto-claim over SSE (PUSH mode) — `GET /v0/boxes/:q/work`
+### 10.8 Auto-claim over SSE (PUSH mode) — `GET /v0/topics/:q/work`
 
 A streaming alternative to the claim→process→claim poll loop: the server keeps up to `max`
 jobs leased-and-pushed to this one connection, claiming more as the worker acks, applying
@@ -1464,7 +1464,7 @@ backpressure at `max` in-flight. **The stream is one-way** (SSE) — the worker 
 (and may nack/extend) via the separate `POST` endpoints above; the stream only *delivers*.
 
 ```
-GET /v0/boxes/:q/work?node=worker-eu-1&max=8 HTTP/1.1
+GET /v0/topics/:q/work?node=worker-eu-1&max=8 HTTP/1.1
 Accept: text/event-stream
 ```
 
@@ -1472,7 +1472,7 @@ Accept: text/event-stream
 |---|---|---|---|
 | `node` | yes | — | The worker identity these jobs are leased to (as in §10.2). |
 | `max` | no | `1` | Target in-flight depth: the server keeps at most this many jobs leased to this connection at once (the backpressure bound). Clamped to `STREAMS_MAX_CLAIM`. |
-| `lease_ms` | no | box `lease_ms` | Lease duration for jobs pushed on this stream. |
+| `lease_ms` | no | topic `lease_ms` | Lease duration for jobs pushed on this stream. |
 | `token` | no | — | Dev-only `?token=<key>` fallback for browser `EventSource` (as in §7.1); prefer the `Authorization: Bearer` header — a query string leaks via logs/history/proxies. |
 
 Response headers are the SSE set from §7.3 (`Content-Type: text/event-stream`,
@@ -1486,10 +1486,10 @@ the job `$seq` (an opaque resume hint; the authoritative lease state lives serve
 ```
 id: 480101
 event: job
-data: {"box":"jobs","$seq":480101,"lease_id":"lease_7f3a9c","deadline":1748450039000,"$ts":1748450001000,"$tag":"tenant42:job-8800","deliveries":1,"data":{"type":"resize","url":"s3://b/x.png"}}
+data: {"topic":"jobs","$seq":480101,"lease_id":"lease_7f3a9c","deadline":1748450039000,"$ts":1748450001000,"$tag":"tenant42:job-8800","deliveries":1,"data":{"type":"resize","url":"s3://b/x.png"}}
 ```
 
-The worker processes the job and **acks** it via `POST /v0/boxes/:q/ack` (§10.4); on each ack
+The worker processes the job and **acks** it via `POST /v0/topics/:q/ack` (§10.4); on each ack
 the server claims and pushes replacement jobs to keep the stream at `max` in-flight. To
 reject, the worker `nack`s (§10.5); to keep a long job alive, it `extend`s (§10.6).
 
@@ -1497,7 +1497,7 @@ reject, the worker `nack`s (§10.5); to keep a long job alive, it `extend`s (§1
 real `job` frame went out in the window.
 
 **`event: error`** — a per-stream problem with an HTTP-aligned `code` (same shape as §7.5),
-e.g. `code: 429` advisory pacing under pressure, `code: 409` if the box ceased to be a queue
+e.g. `code: 429` advisory pacing under pressure, `code: 409` if the topic ceased to be a queue
 (deleted+recreated as a log). Terminal errors close the stream; the worker reconnects.
 
 **On disconnect (instant failover).** When the `/work` connection drops (clean close or
@@ -1508,7 +1508,7 @@ crashes where the disconnect is not observed. (Because release-on-disconnect is 
 connection's deliveries, a worker holding leases from a separate `claim` poll is unaffected.)
 
 **Errors at establishment** — `200` (stream opened); `400 invalid_request` (missing `node`,
-bad `max`); `404 box_not_found`; `406 not_acceptable` (`Accept` not `text/event-stream`);
+bad `max`); `404 topic_not_found`; `406 not_acceptable` (`Accept` not `text/event-stream`);
 `409 not_a_queue`; `429 throttled`.
 
 ---
@@ -1518,18 +1518,18 @@ bad `max`); `404 box_not_found`; `406 not_acceptable` (`Accept` not `text/event-
 streams enforces a small set of **configurable resource caps** so a single instance — or a
 single api key — cannot exhaust the server by creating unbounded resources or opening unbounded
 streams. Every cap has a **sane default** and is **disabled by setting it to `0`** (unlimited).
-The defaults are generous; a normal deployment never trips them, and an unconfigured dev box on
+The defaults are generous; a normal deployment never trips them, and an unconfigured dev topic on
 loopback behaves exactly as before.
 
 | Limit | Env var | Default | Scope | Enforced on |
 |---|---|---|---|---|
-| Max boxes | `STREAMS_MAX_BOXES` | `100000` | instance | every box **creation** (`PUT /v0/boxes/:box` and write auto-create) |
+| Max topics | `STREAMS_MAX_TOPICS` | `100000` | instance | every topic **creation** (`PUT /v0/topics/:topic` and write auto-create) |
 | Max routers | `STREAMS_MAX_ROUTERS` | `10000` | instance | every router **creation** (`PUT /v0/routers/:r`) |
 | Max watch sessions | `STREAMS_MAX_WATCH_SESSIONS` | `10000` | instance | `POST /v0/watch` |
-| Max SSE connections | `STREAMS_MAX_SSE_CONNECTIONS` | `10000` | instance | every SSE stream GET (`/v0/watch/:wid`, `/v0/boxes/:q/work`) |
+| Max SSE connections | `STREAMS_MAX_SSE_CONNECTIONS` | `10000` | instance | every SSE stream GET (`/v0/watch/:wid`, `/v0/topics/:q/work`) |
 | Max SSE connections / key | `STREAMS_MAX_SSE_CONNECTIONS_PER_KEY` | `1000` | per key | same, attributed to the authenticated key |
 | Max in-flight requests / key | `STREAMS_MAX_INFLIGHT_PER_KEY` | `1000` | per key | every request — a per-key **concurrency** cap (held for the request's duration) |
-| Max total bytes | `STREAMS_MAX_TOTAL_BYTES` | `0` (unlimited) | instance | every **write** — a global disk/RAM growth quota over the sum of retained record bytes across all boxes |
+| Max total bytes | `STREAMS_MAX_TOTAL_BYTES` | `0` (unlimited) | instance | every **write** — a global disk/RAM growth quota over the sum of retained record bytes across all topics |
 
 Two additional, **non-configurable** hard bounds protect the read/response paths:
 
@@ -1542,19 +1542,19 @@ Two additional, **non-configurable** hard bounds protect the read/response paths
 **Semantics.**
 
 - A **creation** that would exceed a cap returns **`429 throttled`** with a `Retry-After`
-  header and `error.detail.limit` naming the cap (e.g. `"max_boxes"`) and `error.detail.max`.
+  header and `error.detail.limit` naming the cap (e.g. `"max_topics"`) and `error.detail.max`.
   Capacity is transient — the client retries after another client sheds load. This reuses the
   existing elastic-throttle signal (§0.6), so a client that already handles `429` needs no
   change.
-- Only **new** resources count against the box/router caps: an idempotent re-`PUT` of an
-  **existing** box/router is an *update* and always succeeds, so a saturated server can still
-  be reconfigured. A router refused by `max_routers` is rejected **before** any source/dest box
-  auto-create, so it leaves no phantom boxes.
+- Only **new** resources count against the topic/router caps: an idempotent re-`PUT` of an
+  **existing** topic/router is an *update* and always succeeds, so a saturated server can still
+  be reconfigured. A router refused by `max_routers` is rejected **before** any source/dest topic
+  auto-create, so it leaves no phantom topics.
 - The **total-bytes** quota (`STREAMS_MAX_TOTAL_BYTES`, default `0`/unlimited) bounds disk/RAM
   growth from authenticated writers: a write that would push the live total over the cap is a
   `429 throttled` (`error.detail.limit:"max_total_bytes"`). It is checked only when enabled, so
-  the default path is unchanged. Combine with per-box `cap_bytes`/`cap_records` + `discard:"old"`
-  (§0.10) for fine-grained, self-trimming per-box bounds.
+  the default path is unchanged. Combine with per-topic `cap_bytes`/`cap_records` + `discard:"old"`
+  (§0.10) for fine-grained, self-trimming per-topic bounds.
 - Idle **watch sessions** are reclaimed after `session_ttl_ms` of no active stream (§7.1), so an
   abandoned session does not pin a `max_watch_sessions` slot until restart.
 - **Concurrency caps free their slot when the request/stream ends** (the response is sent, or
@@ -1588,12 +1588,12 @@ place.
   **constant time** with no early exit, so neither *which* key nor *how many leading bytes*
   matched leaks via timing.
 - **Authorization** — optional per-key **scopes** (`read`/`write`/`delete`/`admin`) and a
-  box-name **prefix allowlist**, enforced per route (§0.2). A key outside its scope or prefix
+  topic-name **prefix allowlist**, enforced per route (§0.2). A key outside its scope or prefix
   gets **`403 forbidden`**. The prefix allowlist is enforced not only on the path name but on
-  the **request body's** box names where relevant: the boxes a `POST /v0/watch` subscribes to,
+  the **request body's** topic names where relevant: the topics a `POST /v0/watch` subscribes to,
   and a router's `source` **and** `dest` (which the engine would otherwise auto-create) — so a
-  scoped key cannot watch, or route data into, a box outside its allowlist. **List** endpoints
-  (`GET /v0/boxes`, `GET /v0/routers`) are filtered to the key's allowlist, so a prefix-limited
+  scoped key cannot watch, or route data into, a topic outside its allowlist. **List** endpoints
+  (`GET /v0/topics`, `GET /v0/routers`) are filtered to the key's allowlist, so a prefix-limited
   key cannot even enumerate cross-tenant names. A bare `key` is full access (back-compat). A
   **malformed scope token** makes the server **refuse to start** (fail-closed — it never
   silently grants the wrong scope). `/v0/metrics` requires the `read` scope by default (§8.3).
@@ -1602,7 +1602,7 @@ place.
   stream**: the GET must present the creating key (header or the dev-only `?token=`), so a
   leaked `wid` is not a credential. The SSE GET cannot exceed the creator's scope, and a *valid
   but different* key presented on the GET is rejected (§7.1).
-- **Resource exhaustion (DoS)** — configurable caps on boxes / routers / watch sessions /
+- **Resource exhaustion (DoS)** — configurable caps on topics / routers / watch sessions /
   concurrent SSE connections (global + per-key) / per-key in-flight requests / **total retained
   bytes**, plus a **byte budget** on each read response and a **length bound** on queue
   ack/nack/extend `seqs` arrays, and **idle watch-session GC** so abandoned sessions free their
@@ -1610,9 +1610,9 @@ place.
 - **Accidental public exposure** — the default bind is **loopback** (`127.0.0.1:4000`); a
   non-loopback bind with no keys **refuses to start** unless `STREAMS_ALLOW_INSECURE_NO_AUTH=1`
   (§0.2).
-- **No path traversal** — user-controlled box/router **names never reach the filesystem** as
+- **No path traversal** — user-controlled topic/router **names never reach the filesystem** as
   path components. On-disk segment/WAL/snapshot files are keyed by an interned **numeric
-  box id**, not the name; names are strictly validated to a fixed charset
+  topic id**, not the name; names are strictly validated to a fixed charset
   (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$`, plus `>` for routers) at the engine boundary before
   any keyed-by-id filesystem use.
 
@@ -1624,7 +1624,7 @@ place.
   reverse proxy** (nginx / Caddy / Envoy / a cloud LB), or bind loopback and tunnel (SSH /
   WireGuard). Native TLS is **out of scope by design** — terminate it at the proxy.
 - **No hard tenant isolation.** The prefix allowlist is a *filter*, not a namespace partition:
-  two keys with overlapping prefixes share the same box namespace. Multi-tenancy beyond per-key
+  two keys with overlapping prefixes share the same topic namespace. Multi-tenancy beyond per-key
   scopes + prefix allowlists is **out of scope** (there is no hard per-tenant partition).
 - **No audit log / no key rotation API.** Keys are static for the process lifetime (set at
   startup); rotate by restarting with a new `STREAMS_API_KEYS`. There is no per-request audit
@@ -1642,7 +1642,7 @@ place.
    network-observable.
 2. **Set `STREAMS_API_KEYS`** with **least-privilege scopes + prefixes** per client — e.g. a
    read-only dashboard key `dash:read:tenant42:`, a producer `prod:write:tenant42:`, an admin
-   key `ops::` (all scopes, all boxes). Avoid bare full-access keys in production.
+   key `ops::` (all scopes, all topics). Avoid bare full-access keys in production.
 3. **Tune the resource caps (§11)** to your capacity. Leave the defaults unless you have a
    specific reason; set a cap to `0` only to deliberately disable it.
 4. **Never set `STREAMS_ALLOW_INSECURE_NO_AUTH=1`** outside a trusted private network — it
@@ -1650,4 +1650,3 @@ place.
 5. **Treat the data directory** (`STREAMS_DATA_DIR`) as sensitive: it contains every record's
    payload in the WAL/segments in the clear. Protect it with filesystem permissions and
    at-rest disk encryption as your threat model requires (streams does not encrypt payloads).
-

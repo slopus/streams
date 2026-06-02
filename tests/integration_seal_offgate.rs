@@ -1,11 +1,11 @@
 //! R6 — the segment seal fsync runs OFF the publish gate, so a slow seal `put`
-//! does not serialize same-box writers.
+//! does not serialize same-topic writers.
 //!
-//! Stage-2 moved the seal+fsync off the per-box publish gate: `publish_staged`
+//! Stage-2 moved the seal+fsync off the per-topic publish gate: `publish_staged`
 //! advances `head_seq` (makes records visible, wakes readers) and releases the gate
 //! FIRST, then materializes/seals the segment. This test proves the structural
 //! property directly: with a segment store whose durable `put` is BLOCKED, the
-//! box's published records are already VISIBLE (head advanced, records readable)
+//! topic's published records are already VISIBLE (head advanced, records readable)
 //! while the seal is still blocked — i.e. visibility never waits on the seal.
 //!
 //! The seal runs through the real `SegmentWriter` + `LocalSegmentStore` over an
@@ -27,15 +27,15 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use streams::clock::{SharedClock, TestClock};
 use streams::config::SegmentConfig;
-use streams::engine::box_state::{BoxState, StoredRecord};
+use streams::engine::topic_state::{TopicState, StoredRecord};
 use streams::engine::segwriter::SegmentWriter;
-use streams::storage::{BoxTier, File, Fs, LocalSegmentStore, OpenOpts, RealFs};
-use streams::types::BoxConfig;
+use streams::storage::{TopicTier, File, Fs, LocalSegmentStore, OpenOpts, RealFs};
+use streams::types::TopicConfig;
 
 /// An `Fs` wrapper that BLOCKS the first `rename` whose destination is a segment
 /// `.data`/`.idx` file (the atomic-publish step of a segment `put`/seal) until
 /// `release()` is called. Every other op forwards to the inner `RealFs`. This lets
-/// a test stall a seal deterministically (no sleeps) and observe that the box's
+/// a test stall a seal deterministically (no sleeps) and observe that the topic's
 /// published records are visible while the seal is parked.
 struct BlockingSealFs {
     inner: Arc<dyn Fs>,
@@ -121,7 +121,7 @@ fn rec(i: u64) -> StoredRecord {
 }
 
 #[test]
-fn slow_seal_does_not_block_same_box_visibility() {
+fn slow_seal_does_not_block_same_topic_visibility() {
     let tmp = tempfile::tempdir().unwrap();
     let fs = BlockingSealFs::new(RealFs::arc());
 
@@ -129,9 +129,9 @@ fn slow_seal_does_not_block_same_box_visibility() {
     // store backed by the blocking fs. So the 2nd publish triggers a seal whose
     // segment `put` (rename) blocks.
     let clock: SharedClock = Arc::new(TestClock::new(1_000_000));
-    let hot = LocalSegmentStore::open_with(tmp.path().join("boxes/1"), fs.clone() as Arc<dyn Fs>)
+    let hot = LocalSegmentStore::open_with(tmp.path().join("topics/1"), fs.clone() as Arc<dyn Fs>)
         .expect("hot store opens through the blocking fs");
-    let tier = Arc::new(BoxTier::new(Box::new(hot), None));
+    let tier = Arc::new(TopicTier::new(Box::new(hot), None));
     let cfg = SegmentConfig {
         max_events: 1,
         max_bytes: 0,
@@ -141,7 +141,7 @@ fn slow_seal_does_not_block_same_box_visibility() {
     };
     let writer = SegmentWriter::new(tier, cfg, clock.clone());
 
-    let mut bs = BoxState::new("d".to_string(), 1, BoxConfig::default(), 1, 0);
+    let mut bs = TopicState::new("d".to_string(), 1, TopicConfig::default(), 1, 0);
     bs.attach_segwriter(writer);
     let b = Arc::new(bs);
 

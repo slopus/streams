@@ -20,7 +20,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::types::{BoxConfig, DiffRequest, RecordIn, RouterCreateRequest, WriteRequest};
+use streams::types::{TopicConfig, DiffRequest, RecordIn, RouterCreateRequest, WriteRequest};
 
 /// Force the legacy synchronous forwarding path for THIS test process. Idempotent;
 /// every test in this binary wants it off, and the engine captures the flag at
@@ -41,10 +41,10 @@ fn engine_at(dir: &std::path::Path) -> Arc<Engine> {
     Engine::with_data_dir(config_at(dir), clock).expect("open durable engine")
 }
 
-fn durable_box() -> BoxConfig {
-    BoxConfig {
+fn durable_topic() -> TopicConfig {
+    TopicConfig {
         durable: true,
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     }
 }
 
@@ -93,8 +93,8 @@ fn legacy_forward_is_synchronous_and_inline() {
     force_legacy();
     let dir = tempfile::tempdir().unwrap();
     let engine = engine_at(dir.path());
-    engine.put_box("src", durable_box()).unwrap();
-    engine.put_box("dst", durable_box()).unwrap();
+    engine.put_topic("src", durable_topic()).unwrap();
+    engine.put_topic("dst", durable_topic()).unwrap();
     engine.put_router("src->dst", router("src", "dst")).unwrap();
 
     engine
@@ -120,10 +120,10 @@ fn legacy_fan_out_is_wal_amplified() {
     let engine = engine_at(dir.path());
 
     let n_dests = 5u64;
-    engine.put_box("src", durable_box()).unwrap();
+    engine.put_topic("src", durable_topic()).unwrap();
     for i in 0..n_dests {
         let dest = format!("dst{i}");
-        engine.put_box(&dest, durable_box()).unwrap();
+        engine.put_topic(&dest, durable_topic()).unwrap();
         engine
             .put_router(
                 &format!("src->{dest}"),
@@ -144,7 +144,7 @@ fn legacy_fan_out_is_wal_amplified() {
     let frames_after = engine.wal_metrics().unwrap().frames.load(Ordering::Relaxed);
     let appended = frames_after - frames_before;
 
-    // 1 source append + N dest appends = N+1 WAL frames (amplification). All boxes
+    // 1 source append + N dest appends = N+1 WAL frames (amplification). All topics
     // are fsync-class so no `disk` head-watermark reservation frames are mixed in.
     assert_eq!(
         appended,
@@ -168,9 +168,9 @@ fn legacy_permits_multi_source_fan_in() {
     force_legacy();
     let dir = tempfile::tempdir().unwrap();
     let engine = engine_at(dir.path());
-    engine.put_box("a", durable_box()).unwrap();
-    engine.put_box("x", durable_box()).unwrap();
-    engine.put_box("c", durable_box()).unwrap();
+    engine.put_topic("a", durable_topic()).unwrap();
+    engine.put_topic("x", durable_topic()).unwrap();
+    engine.put_topic("c", durable_topic()).unwrap();
 
     // a -> c and x -> c: under legacy BOTH succeed (v2 would refuse the second).
     engine.put_router("a->c", router("a", "c")).unwrap();
@@ -203,8 +203,8 @@ fn legacy_forwarded_copy_recovers_from_dest_wal_frame() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("src", durable_box()).unwrap();
-        engine.put_box("dst", durable_box()).unwrap();
+        engine.put_topic("src", durable_topic()).unwrap();
+        engine.put_topic("dst", durable_topic()).unwrap();
         engine.put_router("src->dst", router("src", "dst")).unwrap();
         engine
             .write(
@@ -221,7 +221,7 @@ fn legacy_forwarded_copy_recovers_from_dest_wal_frame() {
     // Reopen: the dest copy is recovered from its own durable WAL frame, present
     // exactly once with fidelity — the legacy durable-by-construction contract.
     let engine = engine_at(dir.path());
-    let st = engine.box_state("dst", false).unwrap();
+    let st = engine.topic_state("dst", false).unwrap();
     assert_eq!(
         st.head_seq, 1,
         "forwarded durable copy recovered from dest WAL"

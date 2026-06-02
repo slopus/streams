@@ -41,18 +41,18 @@ A correct, **complete** implementation of the entire `/v0` API with all data in 
 persistent, not yet scalable — but every endpoint, every semantic, and every error path works.
 
 **Scope**
-- Full HTTP surface (axum/hyper): boxes CRUD, write, diff, delete (`before_seq`/`match`), routers
+- Full HTTP surface (axum/hyper): topics CRUD, write, diff, delete (`before_seq`/`match`), routers
   CRUD, SSE (POST-create + GET-stream), health/ready/metrics.
-- In-memory `BoxIndex` (base+offset vector) + per-box tag index, dual floor
+- In-memory `TopicIndex` (base+offset vector) + per-topic tag index, dual floor
   (`earliest_seq`/`evict_floor`) + `epoch` atomics.
 - Cap (`cap_records`/`cap_bytes`) + TTL eviction advancing `evict_floor` with in-band tombstones.
-- `discard: "old" | "reject"` full-box policy (`422 box_full`).
+- `discard: "old" | "reject"` full-topic policy (`422 topic_full`).
 - Permanent deletion via `POST .../delete` (`before_seq` snapshot, tag `match` exact + `tag*` prefix,
   combined): point-in-time, silent (no tombstone), effective immediately on reads, `count`/`bytes`/
   `earliest_seq` updated synchronously, lazy front-reclaim of dead slots. Node loop-prevention,
   cursor-advance reads.
 - Routers: at-least-once forwarding, per-source FIFO, DAG cycle check (`409`), `allow_cycle` hop cap.
-- Multiplexed SSE: named events (`record`, `tombstone`, `caught-up`, `box-deleted`, `error`),
+- Multiplexed SSE: named events (`record`, `tombstone`, `caught-up`, `topic-deleted`, `error`),
   composite `id:` cursors, heartbeats, `retry:`, resume via `Last-Event-ID`.
 - Idempotency keys, `performance` blocks, error envelope, auth bearer.
 - Priority scheduler present in simplified form (banded ready-set + recency); no fsync to gate.
@@ -76,10 +76,10 @@ a no-op fast path in phase 2 (documented).
       same tag is NOT deleted); it is **permanent** (no un-delete) and **silent** (no tombstone for
       the deleted seqs); cap/TTL eviction STILL emits a tombstone (deletion never touches
       `evict_floor`).
-- [ ] Router fan-out verified: a write to `src` appears in all `dst` boxes with `$node` preserved; a
+- [ ] Router fan-out verified: a write to `src` appears in all `dst` topics with `$node` preserved; a
       cycle-creating router is rejected `409`; an `allow_cycle` mirror terminates via the hop cap.
-- [ ] SSE verified: multi-box stream delivers `record`/`tombstone`/`caught-up`/heartbeat frames; a
-      reconnect with `Last-Event-ID` resumes all per-box cursors atomically.
+- [ ] SSE verified: multi-topic stream delivers `record`/`tombstone`/`caught-up`/heartbeat frames; a
+      reconnect with `Last-Event-ID` resumes all per-topic cursors atomically.
 - [ ] Server starts, serves, and shuts down cleanly; restart loses all data (expected, documented).
 
 ---
@@ -118,7 +118,7 @@ Add persistence and scale underneath the unchanged API, staying a single restart
 **Scope**
 - WAL: framing (§ARCHITECTURE 2.1), **sharded writers** (`STREAMS_WAL_SHARDS`, default
   `min(num_cpus, 8)`; each shard an ordered writer with its own file set), adaptive group commit,
-  per-box durable fsync, preallocation, rotation; shard-count-agnostic recovery.
+  per-topic durable fsync, preallocation, rotation; shard-count-agnostic recovery.
 - Compactor: WAL→segment checkpointing; segment `.data`/`.idx`; mmap serving of sealed segments,
   buffered `pread` of the active one, WAL-direct serving of the newest records.
 - Segment-granular lazy cap/TTL eviction + persisted `EvictWatermark` (advances `evict_floor`).
@@ -127,16 +127,16 @@ Add persistence and scale underneath the unchanged API, staying a single restart
   `Delete` frame is appended, never mutated); a **whole segment is dropped** only when a delete
   clears it entirely. There is no partial-segment rewrite and no general reclaim of marked records.
   `Delete` control frames replay deterministically (idempotent across crashes).
-- Metadata store: WAL control frames + atomic bincode snapshots; interned `box_id`s.
+- Metadata store: WAL control frames + atomic bincode snapshots; interned `topic_id`s.
 - Restart recovery: snapshot load → segment `.idx` bulk load + tag-index rebuild → WAL replay
-  (**all shards by box_id**) from last checkpoint (incl. `Delete` frames) → **XXH3-64** torn-tail
+  (**all shards by topic_id**) from last checkpoint (incl. `Delete` frames) → **XXH3-64** torn-tail
   truncation → idempotent segment reclaim.
 - Full priority scheduler: banded DWRR + aging; governor-driven elastic throttling
   (coalesce → widen group commit → defer low priority → `429`).
 - Slow-consumer isolation for SSE (bounded channels, lagged-degrade-to-tombstone).
 
 **Acceptance criteria**
-- [ ] **Durability:** for `durable: true` boxes, an acked write survives a hard kill (`SIGKILL`) at
+- [ ] **Durability:** for `durable: true` topics, an acked write survives a hard kill (`SIGKILL`) at
       any instant and is present after restart; no acked durable write is ever lost.
 - [ ] **Crash consistency:** a kill during a write leaves the WAL recoverable — recovery truncates the
       torn tail (XXH3-64 checksum / length), and no partial frame is ever interpreted as data.
@@ -152,8 +152,8 @@ Add persistence and scale underneath the unchanged API, staying a single restart
       `bytes` always report the live logical floor regardless.
 - [ ] **Latency target met:** non-durable / `eventual` SSE delivery p99 ≤ 5 ms at a defined sustained
       load (see benchmark plan); durable write-ack p99 within budget with adaptive group commit.
-- [ ] **Elastic throttling:** under induced CPU pressure, high-priority boxes keep their latency while
-      low-priority boxes degrade visibly (`429` / SSE `error` frames), with **zero** data loss
+- [ ] **Elastic throttling:** under induced CPU pressure, high-priority topics keep their latency while
+      low-priority topics degrade visibly (`429` / SSE `error` frames), with **zero** data loss
       attributable to throttling.
 - [ ] **No regressions:** the full phase-3 test suite still passes; `docs/BENCHMARKS.md` is updated
       with phase-4 numbers alongside the phase-2 baseline.
@@ -173,12 +173,12 @@ flags (`--release`), and methodology.
 | **Append latency p50/p99/p999** | end-to-end ack latency | single-record and batched writes, durable (fsync-gated, group-committed) vs non-durable; report the group-commit batch-size distribution. |
 | **getDifference throughput** | records/s served | replay reads at varied `limit` (1, 256, 1000) from cold (mmap fault) and warm (page cache) segments; with and without deleted/node-skipped records in the scanned range. |
 | **getDifference latency p50/p99** | per-call latency | tail reads (caught-up, near head) vs deep replay (cold segments). |
-| **SSE fan-out latency** | write→deliver p50/p99 | 1 writer, N watchers (1, 10, 100, 1000) on one box; measure per-watcher delivery latency; verify the 1–5 ms target for `eventual`. |
+| **SSE fan-out latency** | write→deliver p50/p99 | 1 writer, N watchers (1, 10, 100, 1000) on one topic; measure per-watcher delivery latency; verify the 1–5 ms target for `eventual`. |
 | **SSE fan-out scale** | max watchers / connection churn | connection setup cost, heartbeat overhead, memory per idle connection. |
 | **Router forwarding** | added latency + throughput | src→dst delivery latency vs direct write; fan-out to N dests; chain depth cost. |
 | **Eviction / TTL cost** | impact on write path | sustained writes against a small cap and short TTL; confirm segment-granular drop, measure write-latency impact and tombstone-emission rate. |
-| **Recovery time** | time to ready after restart | WAL replay + segment `.idx` load for boxes holding 10⁶ / 10⁷ / 10⁸ records; report seconds-to-`ready` vs data size. |
-| **Throttling behavior** | latency under pressure | drive CPU saturation; chart high- vs low-priority box latency and `429` rate; assert zero loss. |
+| **Recovery time** | time to ready after restart | WAL replay + segment `.idx` load for topics holding 10⁶ / 10⁷ / 10⁸ records; report seconds-to-`ready` vs data size. |
+| **Throttling behavior** | latency under pressure | drive CPU saturation; chart high- vs low-priority topic latency and `429` rate; assert zero loss. |
 | **Memory footprint** | bytes/record resident | index + buffers per retained record at varied payload sizes; confirm the base+offset index overhead. |
 
 **Baseline doc:** `docs/BENCHMARKS.md` (created in phase 3). It records the phase-2/3 in-memory
@@ -200,17 +200,17 @@ recovery costs.
   to restore a value, write a new record. (This supersedes the earlier read-time-filter model, where
   removal was a reversible filter.)
 - **Per-message explicit ack / lease / heartbeat (BullMQ stalled-job mode):** **Resolved —
-  *implemented* as the `queue` box type** (`type:"queue"`): claim/ack/nack/extend + the `/work`
+  *implemented* as the `queue` topic type** (`type:"queue"`): claim/ack/nack/extend + the `/work`
   auto-claim SSE stream, visibility-timeout leases, redelivery, capped-redelivery → dead-letter, and
   optional `lease_id` fencing (validate-when-supplied). See API §10 / DESIGN §10.
-- **Compacted box type (Kafka log compaction, last-record-per-key):** **Out of scope** — LSM / keyed
+- **Compacted topic type (Kafka log compaction, last-record-per-key):** **Out of scope** — LSM / keyed
   compaction is not implemented and not planned. The last-record-per-key pattern is built at the
   application level with a tag + a point-in-time `match` delete of prior versions.
 - **Durable consumer groups as a server primitive:** **Out of scope** — they are an application-level
-  pattern (a box per consumer + delete-as-ack), not a built-in server feature.
+  pattern (a topic per consumer + delete-as-ack), not a built-in server feature.
 - **Multi-server / replication / HA / single-writer fencing, native TLS, hard multi-tenancy:**
   **Out of scope** — streams is single-server (TLS terminates at a reverse proxy; tenancy is per-key
-  scopes + box-name-prefix allowlists).
+  scopes + topic-name-prefix allowlists).
 - **Auto-priority constants** (`AUTO_MAX=500`, `HALF_LIFE_MS=30000`) and **band weights/boundaries**
   are starting defaults; phase 3/4 benchmarks may retune them. The formula and knobs are stable; the
   numbers are tunable.

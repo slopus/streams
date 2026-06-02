@@ -9,7 +9,7 @@
 //!   consistent and every acked-before-both write survives, no gap, no fabrication.
 //!
 //! - **F-PROP-OPSEQ-CRASH-RECOVER** — a proptest-generated random op sequence
-//!   ({put_box / append(durable?) / delete}) with a power loss injected at a
+//!   ({put_topic / append(durable?) / delete}) with a power loss injected at a
 //!   proptest-chosen step; after recovery the engine matches the reference model
 //!   under the contract (acked ⊆ survivors ⊆ ever_acked, no gap, monotone seq,
 //!   delete-never-resurrects, floors preserved) and recovery is idempotent.
@@ -44,7 +44,7 @@ use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::wal::{encode_frame, WalReader, WalRecord};
 use streams::storage::OpenOpts;
 use streams::types::{
-    BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
 };
 
 // ===========================================================================
@@ -60,9 +60,9 @@ struct ModelRecord {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ModelBox {
+struct ModelTopic {
     durable: bool,
-    /// Every acked record by seq (the must-survive set for a durable box). A delete
+    /// Every acked record by seq (the must-survive set for a durable topic). A delete
     /// removes from here; an eviction advances `evict_floor`.
     acked: BTreeMap<u64, ModelRecord>,
     /// Every record EVER acked — deletes/evictions never remove from here. A delete
@@ -78,7 +78,7 @@ struct ModelBox {
     cap: u64,
 }
 
-impl ModelBox {
+impl ModelTopic {
     fn live_seqs(&self) -> Vec<u64> {
         let floor = self.delete_floor.max(self.evict_floor);
         self.acked.keys().copied().filter(|s| *s >= floor).collect()
@@ -90,12 +90,12 @@ impl ModelBox {
 
 #[derive(Debug, Default)]
 struct RefModel {
-    boxes: BTreeMap<String, ModelBox>,
+    topics: BTreeMap<String, ModelTopic>,
 }
 
 impl RefModel {
-    fn ensure_box(&mut self, name: &str, durable: bool, cap: u64) {
-        self.boxes.entry(name.to_string()).or_insert(ModelBox {
+    fn ensure_topic(&mut self, name: &str, durable: bool, cap: u64) {
+        self.topics.entry(name.to_string()).or_insert(ModelTopic {
             durable,
             cap,
             ..Default::default()
@@ -103,7 +103,7 @@ impl RefModel {
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], recs: &[ModelRecord]) {
-        let b = self.boxes.get_mut(name).expect("box modeled before append");
+        let b = self.topics.get_mut(name).expect("topic modeled before append");
         for (s, r) in seqs.iter().zip(recs.iter()) {
             b.acked.insert(*s, r.clone());
             b.ever_acked.insert(*s, r.clone());
@@ -127,7 +127,7 @@ impl RefModel {
     }
 
     fn ack_delete(&mut self, name: &str, before_seq: Option<u64>, tag_eq: Option<&str>) {
-        let Some(b) = self.boxes.get_mut(name) else {
+        let Some(b) = self.topics.get_mut(name) else {
             return;
         };
         if let Some(bs) = before_seq {
@@ -148,7 +148,7 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox {
+    PutTopic {
         name: String,
         durable: bool,
         cap: u64,
@@ -171,15 +171,15 @@ enum Op {
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
     for op in ops {
         match op {
-            Op::PutBox { name, durable, cap } => {
-                let cfg = BoxConfig {
-                    r#type: BoxType::Log,
+            Op::PutTopic { name, durable, cap } => {
+                let cfg = TopicConfig {
+                    r#type: TopicType::Log,
                     durable: *durable,
                     cap_records: *cap,
                     ..Default::default()
                 };
-                if engine.put_box(name, cfg).is_ok() {
-                    model.ensure_box(name, *durable, *cap);
+                if engine.put_topic(name, cfg).is_ok() {
+                    model.ensure_topic(name, *durable, *cap);
                 }
             }
             Op::Append {
@@ -201,9 +201,9 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     config: None,
                     disable_backpressure: true,
                 };
-                if !model.boxes.contains_key(name) {
+                if !model.topics.contains_key(name) {
                     // Auto-created here ⇒ default config is non-durable.
-                    model.ensure_box(name, false, 0);
+                    model.ensure_topic(name, false, 0);
                 }
                 if let Ok(resp) = engine.write(name, req, true) {
                     let seqs = resp.seqs.clone().unwrap_or_else(|| vec![resp.last_seq]);
@@ -266,7 +266,7 @@ fn sync_dirs(disk: &FakeDisk) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -275,8 +275,8 @@ struct BoxDump {
 }
 
 /// Read the full recovered state of `name` through the engine's public API.
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone_reason = None;
     let mut from = 0u64;
@@ -319,7 +319,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -330,10 +330,10 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
 
 // ===========================================================================
 // The oracle: diff recovered engine state against the model under the contract
-// (distilled from `tests/crash_oracle.rs::assert_box_contract`).
+// (distilled from `tests/crash_oracle.rs::assert_topic_contract`).
 // ===========================================================================
 
-fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_durable: bool) {
+fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 
@@ -384,9 +384,9 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box (`model.durable`) has
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` topic (`model.durable`) has
     //     no head reservation, so its head matches the acked head exactly (never a
-    //     future seq) and equals it when the whole tail is durable. A `disk` box
+    //     future seq) and equals it when the whole tail is durable. A `disk` topic
     //     (acked before fsync) recovers at its durable head RESERVATION — its head
     //     may sit ABOVE the acked head by up to `DISK_HEAD_RESERVE_AHEAD` (the
     //     dropped un-fsynced tail becomes silent deleted gaps) but NEVER regresses
@@ -441,17 +441,17 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
 }
 
 fn assert_recovered_matches_model(engine: &Engine, model: &RefModel, whole_tail_durable: bool) {
-    for (name, mbox) in &model.boxes {
+    for (name, mbox) in &model.topics {
         if mbox.acked.is_empty() && mbox.head == 0 {
             continue;
         }
-        let Some(dump) = dump_box(engine, name) else {
+        let Some(dump) = dump_topic(engine, name) else {
             if mbox.durable && !mbox.live_seqs().is_empty() && whole_tail_durable {
-                panic!("{name}: durable box with acked records vanished after recovery");
+                panic!("{name}: durable topic with acked records vanished after recovery");
             }
             continue;
         };
-        assert_box_contract(name, mbox, &dump, whole_tail_durable);
+        assert_topic_contract(name, mbox, &dump, whole_tail_durable);
     }
 }
 
@@ -569,7 +569,7 @@ fn f_compound_torn_snap_and_torn_wal() {
             &engine,
             &mut model,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "jobs".into(),
                     durable: true,
                     cap: 0,
@@ -664,7 +664,7 @@ fn f_compound_torn_snap_and_torn_wal() {
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
 
-    let dump = dump_box(&engine, "jobs").expect("jobs survived the compound fault");
+    let dump = dump_topic(&engine, "jobs").expect("jobs survived the compound fault");
     assert_eq!(
         dump.records.keys().copied().collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5, 6],
@@ -678,7 +678,7 @@ fn f_compound_torn_snap_and_torn_wal() {
     // IDEMPOTENT: a second recovery over the same image yields identical state.
     stop(engine);
     let engine2 = open_engine(&disk);
-    let dump2 = dump_box(&engine2, "jobs").expect("jobs present on recovery #2");
+    let dump2 = dump_topic(&engine2, "jobs").expect("jobs present on recovery #2");
     assert_eq!(
         dump, dump2,
         "recover(recover(x)) == recover(x) after compound fault"
@@ -692,20 +692,20 @@ fn f_compound_torn_snap_and_torn_wal() {
 
 use proptest::prelude::*;
 
-/// A proptest strategy for a small random op sequence over a fixed handful of box
+/// A proptest strategy for a small random op sequence over a fixed handful of topic
 /// names. Appends carry a durable? flag; deletes use a before_seq prefix or a tag
 /// match. Kept bounded so each case (which spins a real engine + recovery) is fast.
 fn op_strategy() -> impl Strategy<Value = Op> {
     let names = prop::sample::select(vec!["a".to_string(), "b".to_string()]);
     let tags = prop::sample::select(vec![None, Some("x".to_string()), Some("y".to_string())]);
     prop_oneof![
-        // PutBox: durable bias toward true (the must-survive case) + small caps.
+        // PutTopic: durable bias toward true (the must-survive case) + small caps.
         (
             names.clone(),
             any::<bool>(),
             prop::sample::select(vec![0u64, 0, 3])
         )
-            .prop_map(|(name, durable, cap)| Op::PutBox { name, durable, cap }),
+            .prop_map(|(name, durable, cap)| Op::PutTopic { name, durable, cap }),
         // Append: a small payload + optional tag/node.
         (names.clone(), 0u8..16, tags.clone()).prop_map(|(name, d, tag)| Op::Append {
             name,
@@ -784,11 +784,11 @@ proptest! {
             // The `after` ops execute on the now-frozen device; their writes are
             // silently lost (power off). They are NOT mirrored into the model.
             let mut sink = RefModel::default();
-            // Pre-seed sink with the same box configs so run_ops does not panic on an
-            // append-before-modeled-box; their acks won't matter (frozen ⇒ no
+            // Pre-seed sink with the same topic configs so run_ops does not panic on an
+            // append-before-modeled-topic; their acks won't matter (frozen ⇒ no
             // durability), and we discard `sink` entirely.
-            for (name, b) in &model.boxes {
-                sink.ensure_box(name, b.durable, b.cap);
+            for (name, b) in &model.topics {
+                sink.ensure_topic(name, b.durable, b.cap);
             }
             run_ops(&engine, &mut sink, after);
             stop(engine);
@@ -802,21 +802,21 @@ proptest! {
         let engine = open_engine(&disk);
         assert_recovered_matches_model(&engine, &model, false);
 
-        // IDEMPOTENT RECOVERY: recover(recover(x)) == recover(x) for every box. The
+        // IDEMPOTENT RECOVERY: recover(recover(x)) == recover(x) for every topic. The
         // second recovery `open` is the costliest step (large WAL preallocation), so
         // run it on a deterministic subset of cases (keyed off the crash fraction) —
         // enough to catch a non-convergent recovery without tripling the wall time.
-        let dumps1: BTreeMap<String, Option<BoxDump>> = model
-            .boxes
+        let dumps1: BTreeMap<String, Option<TopicDump>> = model
+            .topics
             .keys()
-            .map(|n| (n.clone(), dump_box(&engine, n)))
+            .map(|n| (n.clone(), dump_topic(&engine, n)))
             .collect();
         stop(engine);
         if crash_frac % 2 == 0 {
             let engine2 = open_engine(&disk);
             for (name, d1) in &dumps1 {
-                let d2 = dump_box(&engine2, name);
-                prop_assert_eq!(d1, &d2, "recovery not idempotent for box {}", name);
+                let d2 = dump_topic(&engine2, name);
+                prop_assert_eq!(d1, &d2, "recovery not idempotent for topic {}", name);
             }
             stop(engine2);
         }
@@ -862,7 +862,7 @@ fn build_fuzz_buf(input: &FuzzInput) -> Vec<u8> {
             encode_frame(
                 &mut frame,
                 &WalRecord::Append {
-                    box_id: 1,
+                    topic_id: 1,
                     seq: *seq,
                     ts: 1,
                     node: None,
@@ -884,7 +884,7 @@ fn build_fuzz_buf(input: &FuzzInput) -> Vec<u8> {
             encode_frame(
                 &mut frame,
                 &WalRecord::Append {
-                    box_id: 1,
+                    topic_id: 1,
                     seq: *seq,
                     ts: 1,
                     node: None,

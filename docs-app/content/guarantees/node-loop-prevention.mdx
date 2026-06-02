@@ -21,7 +21,7 @@ or a batch-level default). The server records it as `$node`: immutable, never re
 echoed on reads when present.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs \
+curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "node": "worker-eu-1",
         "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
@@ -36,8 +36,8 @@ A read (`diff` or `watch`) may carry a reader `node` id — the **filter**. When
 read drops every record whose `$node` equals the filter, **byte-exact**, before delivery:
 
 ```bash
-# worker-eu-1 reads the box it also writes to; its own records are filtered out.
-curl -X POST localhost:4000/v0/boxes/jobs/diff \
+# worker-eu-1 reads the topic it also writes to; its own records are filtered out.
+curl -X POST localhost:4000/v0/topics/jobs/diff \
   -H 'content-type: application/json' \
   -d '{ "from_seq": 0, "node": "worker-eu-1" }'
 ```
@@ -60,7 +60,7 @@ simply absent from `records`; nothing signals their removal beyond their absence
 
 Crucially, the **cursor still advances past filtered records.** `next_from_seq` moves past
 every examined seq, including the ones that were node-filtered, so they are never re-scanned.
-Without this, a node reading a box full of its own events would loop forever, unable to
+Without this, a node reading a topic full of its own events would loop forever, unable to
 advance past records it can never see.
 
 <Callout type="warning">
@@ -72,7 +72,7 @@ advance past records it can never see.
 </Callout>
 
 This is the same uniform contract for both [`diff`](/api/reading) and
-[SSE watch](/api/watch): `node` on the watch session is applied to every box it watches, and
+[SSE watch](/api/watch): `node` on the watch session is applied to every topic it watches, and
 the resume cursor advances past filtered records identically.
 
 ## Multi-master safety
@@ -84,11 +84,11 @@ every router forward** — a router never rewrites it (with the default `preserv
 Consider three symmetric nodes A, B, C, each writing to and watching a shared topology:
 
 1. Node A writes a record stamped `$node: "A"`.
-2. Routers fan that record out to boxes that B and C watch. The forwarded copies still carry
+2. Routers fan that record out to topics that B and C watch. The forwarded copies still carry
    `$node: "A"` — the router did not touch it.
 3. B and C read with their own node filters (`"B"`, `"C"`). They receive A's record (it is
    not theirs) and act on it, but never re-emit it as their own.
-4. If a forwarded copy loops back to a box that **A** reads, A's own filter drops it.
+4. If a forwarded copy loops back to a topic that **A** reads, A's own filter drops it.
 
 Because no router ever changes `$node`, a record that loops around a cyclic router graph is
 always filtered at the read by its origin node. That makes N-way multi-master safe **even
@@ -106,18 +106,18 @@ the documented contract for the multi-master use case.
 
 ## The `dedupe_node` opt-out
 
-Node loop-prevention is enabled per box via the `dedupe_node` config field, which defaults
-to `true`. Set `dedupe_node: false` if you genuinely want echoes — a box where a node *does*
+Node loop-prevention is enabled per topic via the `dedupe_node` config field, which defaults
+to `true`. Set `dedupe_node: false` if you genuinely want echoes — a topic where a node *does*
 receive back its own records.
 
 ```bash
-curl -X PUT localhost:4000/v0/boxes/echo \
+curl -X PUT localhost:4000/v0/topics/echo \
   -H 'content-type: application/json' \
   -d '{ "dedupe_node": false }'
 ```
 
-With `dedupe_node: false`, the reader's `node` filter is ignored on that box and every
-record is delivered regardless of `$node`. This is rarely what you want; it exists so a box
+With `dedupe_node: false`, the reader's `node` filter is ignored on that topic and every
+record is delivered regardless of `$node`. This is rarely what you want; it exists so a topic
 can deliberately opt out of filtering entirely.
 
 ## See also

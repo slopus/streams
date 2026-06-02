@@ -4,7 +4,7 @@
 //! crash-consistency behavior at the cold-relocation `confirm_relocated` boundary
 //! (flip the tier pointer → delete the now-redundant HOT copy), reusing the
 //! Phase-8A harness (`FakeDisk` / `FaultFs` / `MonitorFs` from
-//! `streams::storage::testfs`, the real `SegmentWriter` + `BoxTier` +
+//! `streams::storage::testfs`, the real `SegmentWriter` + `TopicTier` +
 //! `LocalSegmentStore` wired through an injectable `Arc<dyn Fs>`, exactly as
 //! `tests/fault_seg_seal.rs` does).
 //!
@@ -12,7 +12,7 @@
 //!   - F-COLD-CRASH-AFTER-FLIP-BEFORE-DELETE — power loss after the in-memory tier
 //!       flip + the durable cold copy, before `hot().delete` completes. On restart
 //!       the in-memory flip is lost but the durable cold copy exists; both copies
-//!       survive, `BoxTier::resolve` re-derives the tier preferring HOT, the record
+//!       survive, `TopicTier::resolve` re-derives the tier preferring HOT, the record
 //!       is readable, and the relocator re-runs the idempotent drop — no loss,
 //!       never zero copies.
 //!   - F-COLD-EIO-DELETE-HOT — EIO deleting the hot copy after the flip. The
@@ -28,7 +28,7 @@
 //! `LocalSegmentStore::open` (always `RealFs`, never the injected `Arc<dyn Fs>`),
 //! so a `FakeDisk`/`FaultFs` installed through `Engine::with_data_dir_fs` does NOT
 //! reach the segment / cold path. To exercise the cold-delete-hot boundary under an
-//! injected FS we therefore drive the REAL `SegmentWriter` + `BoxTier` + the real
+//! injected FS we therefore drive the REAL `SegmentWriter` + `TopicTier` + the real
 //! `copy_segment_to_cold` / `confirm_relocated` code directly over stores opened
 //! with the hostile `Arc<dyn Fs>` — the exact production relocation code, just with
 //! the FS seam injected.
@@ -51,7 +51,7 @@ use streams::config::SegmentConfig;
 use streams::engine::segwriter::{copy_segment_to_cold, SegmentWriter};
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, MonitorFs, TornDamage};
 use streams::storage::{
-    data_name, BoxTier, Fs, LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier,
+    data_name, TopicTier, Fs, LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier,
 };
 
 // ===========================================================================
@@ -61,14 +61,14 @@ use streams::storage::{
 /// HOT store root (under the data dir) and COLD store root (the cold tier folder),
 /// both modeled on the SAME `FakeDisk` image so a single `crash()` is one device's
 /// power loss across both tiers (the real contract: one machine, two folders).
-const HOT_ROOT: &str = "/data/boxes/00000001";
-const COLD_ROOT: &str = "/cold/boxes/00000001";
+const HOT_ROOT: &str = "/data/topics/00000001";
+const COLD_ROOT: &str = "/cold/topics/00000001";
 
 fn test_clock() -> SharedClock {
     Arc::new(TestClock::new(1_700_000_000_000))
 }
 
-/// A `SegmentWriter` over a HOT + COLD `BoxTier`, both stores opened through `fs`.
+/// A `SegmentWriter` over a HOT + COLD `TopicTier`, both stores opened through `fs`.
 /// `max_events=1` seals every record into its own segment; `hot_retain_segments=1`
 /// keeps only the newest sealed segment hot so the older ones are relocation
 /// candidates. `set_cache_cap(0)` forces real segment reads (no cache shortcut).
@@ -81,7 +81,7 @@ fn seg_writer_cold(fs: Arc<dyn Fs>, clock: SharedClock) -> SegmentWriter {
         LocalSegmentStore::open_with(PathBuf::from(COLD_ROOT), fs)
             .expect("cold segment store opens through the injected fs"),
     );
-    let tier = Arc::new(BoxTier::new(hot, Some(cold)));
+    let tier = Arc::new(TopicTier::new(hot, Some(cold)));
     let cfg = SegmentConfig {
         max_events: 1,
         max_bytes: 0,
@@ -94,14 +94,14 @@ fn seg_writer_cold(fs: Arc<dyn Fs>, clock: SharedClock) -> SegmentWriter {
     w
 }
 
-/// Open a fresh `BoxTier` over `fs` (a "restart" — re-derives every tier pointer
+/// Open a fresh `TopicTier` over `fs` (a "restart" — re-derives every tier pointer
 /// from what is durably on disk, exactly as the engine does at boot). Used after a
 /// `crash()` to prove the relocation re-runs idempotently from the surviving copies.
-fn reopen_tier(fs: Arc<dyn Fs>) -> Arc<BoxTier> {
+fn reopen_tier(fs: Arc<dyn Fs>) -> Arc<TopicTier> {
     let hot = Box::new(LocalSegmentStore::open_with(PathBuf::from(HOT_ROOT), fs.clone()).unwrap());
     let cold: Box<dyn SegmentStore> =
         Box::new(LocalSegmentStore::open_with(PathBuf::from(COLD_ROOT), fs).unwrap());
-    Arc::new(BoxTier::new(hot, Some(cold)))
+    Arc::new(TopicTier::new(hot, Some(cold)))
 }
 
 /// Append one record (its own segment under `max_events=1`); returns sealed seqs.
@@ -138,7 +138,7 @@ fn sync_seg_dirs(disk: &FakeDisk) {
 /// durably — equivalently, the hot delete simply never happened).
 ///
 /// ORACLE: on restart the in-memory flip is lost but the durable cold copy exists;
-/// both copies survive, `BoxTier::resolve` re-derives the tier preferring HOT, the
+/// both copies survive, `TopicTier::resolve` re-derives the tier preferring HOT, the
 /// record is readable, and the relocator re-runs the idempotent copy(no-op)+flip+
 /// drop — no loss, never zero copies.
 #[test]

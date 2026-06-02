@@ -37,7 +37,7 @@ Two layers, matching the ROADMAP benchmark plan:
 
 1. **Criterion micro-benchmarks** (`benches/engine.rs`) — call the engine API
    directly in-process (`Engine::write`, `Engine::diff`,
-   `BoxState::matching_live_seqs`, `BoxState::apply_delete`, cap-eviction via
+   `TopicState::matching_live_seqs`, `TopicState::apply_delete`, cap-eviction via
    `enforce_retention`). No HTTP, no network. Criterion's default config: 3 s
    warm-up, 100 samples per bench. Reported value is the **median** of the
    estimate interval. Throughput is Criterion's `Throughput::Elements` over the
@@ -76,7 +76,7 @@ STREAMS_PORT=4090 ./target/release/streams &
 
 Median time per criterion run; throughput derived from batch size.
 
-### Append (`Engine::write`, fresh box per batch)
+### Append (`Engine::write`, fresh topic per batch)
 
 | Payload | Batch | Median time | Throughput (records/s) |
 |---|---:|---:|---:|
@@ -93,7 +93,7 @@ Batching amortizes per-call overhead strongly (1→100 records is ~6x cheaper pe
 record). 64 KiB payloads were not run as a separate micro-bench; the per-record
 trend at 1 KiB shows the path is allocation/copy-bound at large payloads.
 
-### getDifference (`Engine::diff` from seq 0, warm 10 k-record box)
+### getDifference (`Engine::diff` from seq 0, warm 10 k-record topic)
 
 | Limit | Median time | Throughput (records/s) |
 |---:|---:|---:|
@@ -108,14 +108,14 @@ trend at 1 KiB shows the path is allocation/copy-bound at large payloads.
 | exact (`Eq`, single posting list) | 266 ns |
 | prefix (`Glob` `tenant:*`, range scan all 100 tags) | 67.9 µs |
 
-### Cap eviction (`Engine::write` into a full `discard:old`, cap=10 k box)
+### Cap eviction (`Engine::write` into a full `discard:old`, cap=10 k topic)
 
 | Batch | Median time | Throughput (records/s) |
 |---:|---:|---:|
 | 1   | 474 ns  | ~2.11 M |
 | 100 | 25.8 µs | ~3.88 M |
 
-### Delete (`BoxState::apply_delete`, fresh warm 10 k box per iter)
+### Delete (`TopicState::apply_delete`, fresh warm 10 k topic per iter)
 
 | Selector | Median time | Throughput (records/s) |
 |---|---:|---:|
@@ -237,7 +237,7 @@ exit 0, against a release server booted on a temp `STREAMS_DATA_DIR`).
 ## Methodology (Phase 4 additions)
 
 - **Durable vs non-durable write-ack** (`streams-probe bench-durable <url>`):
-  boots two boxes that differ ONLY in `durable` (`true` vs `false`) and drives
+  boots two topics that differ ONLY in `durable` (`true` vs `false`) and drives
   the identical HTTP write path against each — single-record write-ack latency
   (one in-flight at a time, n=5000) and concurrent batched throughput (16
   writers × batch 100, ~50 000 records). The durable class additionally reports
@@ -289,18 +289,18 @@ Under concurrent durable load the adaptive group commit coalesces many writers'
 batches into far fewer `fdatasync` calls, so durable throughput (~232 K rec/s) is
 ~100× the naive "one fsync per write" ceiling (1000 fsyncs/s × 100/batch). The
 non-durable class (~2.35 M rec/s here; run-to-run it ranges up to the baseline's
-~4.7 M) is bounded by the single-box append-serialization + HTTP path, not disk.
+~4.7 M) is bounded by the single-topic append-serialization + HTTP path, not disk.
 Both classes lose no acked data on a clean restart; durable additionally survives
 SIGKILL.
 
-> Note: the per-box append path now serializes seq-assignment + WAL-enqueue under
-> a per-box lock (the durability-correctness fix below), so single-box throughput
-> is slightly lower than the lock-free in-memory baseline; cross-box throughput
+> Note: the per-topic append path now serializes seq-assignment + WAL-enqueue under
+> a per-topic lock (the durability-correctness fix below), so single-topic throughput
+> is slightly lower than the lock-free in-memory baseline; cross-topic throughput
 > still scales with sharding.
 
 ## 3. Recovery time — `time-to-ready` after SIGKILL (pure WAL replay, no snapshot)
 
-| Records in box | Load time | **time-to-ready** | Recovered `head_seq` |
+| Records in topic | Load time | **time-to-ready** | Recovered `head_seq` |
 |---:|---:|---:|---:|
 | 100 000 (1e5) | ~0.15 s | **~0.14 s** | 100 000 (no loss) |
 | 1 000 000 (1e6) | ~1.40 s | **~0.68–0.94 s** | 1 000 000 (no loss) |
@@ -318,13 +318,13 @@ later phase; the in-memory index holds the full set as the cache here).
 
 The recovery benchmark initially exposed a **silent loss of acked durable
 writes** under concurrent writers (~5 % loss at 1e5 with 16 writers): seq
-assignment (`BoxState::append`, under the index lock) and the WAL enqueue were
+assignment (`TopicState::append`, under the index lock) and the WAL enqueue were
 not a single atomic unit, so two writers could assign seqs `A < B` yet enqueue
 `B`'s frame ahead of `A`'s. Recovery applies frames in WAL order and skips any
 `seq <= head`, so the lower-seq frame `A` was dropped on replay despite having
-been acked. The fix adds a per-box `append_lock` that makes
+been acked. The fix adds a per-topic `append_lock` that makes
 seq-assignment + WAL-enqueue atomic (the fsync wait stays *outside* the lock, so
-durable group commit still coalesces across boxes). Post-fix: **zero loss** at
+durable group commit still coalesces across topics). Post-fix: **zero loss** at
 1e5 and 1e6 (recovered `head_seq == N` every run), covered by a deterministic
 in-process regression test (`concurrent_durable_writers_no_loss_across_restart`)
 plus the real SIGKILL subprocess tests.
@@ -334,7 +334,7 @@ plus the real SIGKILL subprocess tests.
 | Property | Proof |
 |---|---|
 | **Durability:** acked `durable:true` write survives SIGKILL at any instant | `crash_recovery::sigkill_durable_writes_survive_with_identical_state` (real `kill -9` of the binary; the write ack is fsync-gated so a 2xx ⇒ on disk) |
-| **Recovery correctness:** post-restart head/earliest/count/config/routers/delete match pre-crash | same test asserts each field for durable boxes + deleted-stays-gone + cap-floor-tombstones; `integration_durability::write_snapshot_more_writes_restart_matches` |
+| **Recovery correctness:** post-restart head/earliest/count/config/routers/delete match pre-crash | same test asserts each field for durable topics + deleted-stays-gone + cap-floor-tombstones; `integration_durability::write_snapshot_more_writes_restart_matches` |
 | **Crash consistency (clean prefix):** SIGKILL during a non-durable burst ⇒ recovered tail is a contiguous prefix, no torn frame misread | `crash_recovery::sigkill_during_nondurable_burst_recovers_clean_prefix` |
 | **Torn tail truncated, not misread:** a corrupted/oversized last frame on disk ⇒ clean recovery, no panic, no bogus record, WAL writable again | `crash_recovery::torn_tail_on_subprocess_wal_recovers_clean`; `integration_durability::torn_tail_is_truncated_not_read_as_data`; WAL-reader unit tests (XXH3-64 checksum + length-overrun + trailing-zeros) |
 | **No silent loss across restart:** cursor below recovered `evict_floor` ⇒ tombstone; purely-deleted gap ⇒ silent | `integration_durability::tombstone_vs_silent_gap_survive_restart` |
@@ -392,7 +392,7 @@ Same hardware/OS/toolchain as the baseline: **Apple M4 Max, 16 cores, 128 GiB,
 Darwin 25.2.0, rustc 1.92.0, `--release`**. The server ran on `127.0.0.1` on an
 ephemeral port over a fresh temp `STREAMS_DATA_DIR` on local NVMe (APFS); every
 workload is a live end-to-end HTTP run (reqwest h1/h2, loopback, keep-alive) from
-a single client process. Boxes use the default (`durable:false`) class, so these
+a single client process. Topics use the default (`durable:false`) class, so these
 exercise the engine + HTTP + SSE + scheduler path, not the fsync floor.
 
 ## Methodology (Phase 5 additions)
@@ -403,25 +403,25 @@ interpolation. The SSE write→deliver latency uses a shared monotonic `epoch`
 stamped into each pulse payload (writer and watchers share one process clock), so
 it is a true end-to-end write-to-delivery interval with no clock skew.
 
-- `broadcast <url> --watchers 1,10,100,1000` — one source box, N concurrent SSE
+- `broadcast <url> --watchers 1,10,100,1000` — one source topic, N concurrent SSE
   watchers all tailing it, one writer emitting timed single-record pulses. This is
   the **shared zero-copy fan-out**: a pulse is serialized into ONE frame and
-  ref-counted to every watcher (never copied into N boxes). The headline metric is
+  ref-counted to every watcher (never copied into N topics). The headline metric is
   the **per-watcher write→deliver latency** and how flat it stays as watchers grow
   100×. NOTE: the pulse loop is deliberately *paced* (a fixed inter-pulse gap to
   measure delivery latency cleanly), so the reported `deliveries/sec` is a
   latency-paced aggregate (`≈ watchers × pulse-rate`), **not** a saturation
   throughput figure — the saturation story is the latency headroom (see the
   millions/sec discussion below).
-- `distribution <url> --boxes N --batch B --writers W` — round-robins batched
-  appends across many boxes via W concurrent writer tasks; aggregate appends/sec.
+- `distribution <url> --topics N --batch B --writers W` — round-robins batched
+  appends across many topics via W concurrent writer tasks; aggregate appends/sec.
 - `queue <url> --workers N --jobs J --claim-max K [--jitter ms]` — producers
   batch-fill the Phase-5A lease queue, then N worker nodes claim→ack in a loop;
   jobs/sec, claim latency, and per-worker distribution evenness.
 - `actors <url> --actors K --inferences N --tool-results T --snapshot-every S` —
-  each actor is a box; per inference appends a chain (model-answer + tool-call + T
+  each actor is a topic; per inference appends a chain (model-answer + tool-call + T
   tool-results) as one batch, then snapshot-compacts via `delete {before_seq}`
-  every S inferences; events/sec + box-count scaling.
+  every S inferences; events/sec + topic-count scaling.
 
 ## 1. BROADCAST — 1 source → many SSE watchers (shared zero-copy frame)
 
@@ -441,7 +441,7 @@ runs: a clean sweep (1/10/100, 500 pulses) and the heavy tiers (100 @ 100 pulses
 up 1000 SSE connections from one process over loopback before the first pulse.
 Once all connections are warm the steady-state delivery is **p50 2.2 ms / p99
 4.9 ms**, at the top of the 1–5 ms target. The writer-append latency at 1000
-watchers is p50 3.9 ms / p99 6.1 ms (the source box's drain wakes 1000 watchers
+watchers is p50 3.9 ms / p99 6.1 ms (the source topic's drain wakes 1000 watchers
 per write).
 
 **Fan-out scaling is the key result:** per-watcher delivery latency stays sub-2 ms
@@ -451,16 +451,16 @@ extra watcher is a bounded-channel send (tens to hundreds of ns), which is exact
 why the per-delivery latency does not blow up with N. The aggregate `deliveries/s`
 columns are latency-paced, not saturated (see §5 on millions/sec).
 
-## 2. DISTRIBUTION — 1 source → many boxes (batched, sharded fan-out)
+## 2. DISTRIBUTION — 1 source → many topics (batched, sharded fan-out)
 
-5000 destination boxes, batch 100, 32 concurrent writer tasks, 500 000 records.
+5000 destination topics, batch 100, 32 concurrent writer tasks, 500 000 records.
 
-| Boxes | Batch | Writers | Records | Elapsed | Appends/s | req p50 | req p99 | req max |
+| Topics | Batch | Writers | Records | Elapsed | Appends/s | req p50 | req p99 | req max |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 5 000 | 100 | 32 | 500 000 | 1.426 s | **~350 737 /s** | 7.73 ms | 18.55 ms | 19.90 ms |
 
-500 000 small appends spread across 5000 boxes at ~351 K appends/s. The per-box
-write path is lock-free across distinct boxes (sharded), so this is bounded by the
+500 000 small appends spread across 5000 topics at ~351 K appends/s. The per-topic
+write path is lock-free across distinct topics (sharded), so this is bounded by the
 **single client process's HTTP request rate over loopback** (32 in-flight batched
 requests), not the engine — the per-request latency (p50 7.7 ms with 32 writers in
 flight) is the HTTP round-trip + queueing, not append cost (the micro-bench append
@@ -480,9 +480,9 @@ acked (`jobs_acked == jobs_produced`); evenness across 100 workers is good
 With `--jitter > 0` the coalescing claim pass (DESIGN §10.3) trades a little claim
 latency for near-perfect evenness — the documented §10.2 tradeoff.
 
-## 4. ACTORS / INFERENCE — per-actor box, event chains + snapshot compaction
+## 4. ACTORS / INFERENCE — per-actor topic, event chains + snapshot compaction
 
-1000 actor boxes, 5 inferences each, chain length 5 (model-answer + tool-call + 3
+1000 actor topics, 5 inferences each, chain length 5 (model-answer + tool-call + 3
 tool-results), snapshot-compact (`delete before_seq=head`) every 2 inferences, 32
 concurrent drivers.
 
@@ -492,8 +492,8 @@ concurrent drivers.
 
 Each inference is one batched append of the 5-event chain; 2000 `delete before_seq`
 snapshot-compactions ran inline without stalling the append path (logical delete is
-immediate, physical reclaim is the background reclaimer, ARCHITECTURE §3.5). Per-box
-scaling holds across 1000 simultaneously-active actor boxes.
+immediate, physical reclaim is the background reclaimer, ARCHITECTURE §3.5). Per-topic
+scaling holds across 1000 simultaneously-active actor topics.
 
 ## 5. h2c effect, and are the millions/sec + 1–5 ms targets met?
 
@@ -516,7 +516,7 @@ serialize-once + ref-count keeps per-watcher latency flat as N grows 100×.
 client, not the engine.** Distribution hit ~351 K appends/s and the queue ~204 K
 jobs/s (produce alone ~1.11 M jobs/s) — bounded by one client process's loopback
 HTTP request rate (per-request overhead dominates), exactly the lever the brief
-identifies: **batching is what gets to millions/sec.** The evidence is on-box: the
+identifies: **batching is what gets to millions/sec.** The evidence is on-topic: the
 Phase-2/3 micro-benches append at ~4 M records/s at 64 B batch-100 in-process, and
 the produce phase here (large batched fills) already exceeds 1 M jobs/s end-to-end.
 The route to millions of deliveries/sec is the same batching + the shared zero-copy
@@ -532,8 +532,8 @@ the server.
 
 - All Phase-5 numbers are single representative live runs over loopback HTTP from
   one client process; expect run-to-run variance. They were captured against the
-  release binary on a temp data dir; boxes are torn down by each workload, so the
-  server's box gauge returns to 0 afterward (~44 MB of WAL was written across the
+  release binary on a temp data dir; topics are torn down by each workload, so the
+  server's topic gauge returns to 0 afterward (~44 MB of WAL was written across the
   runs, confirming the durable path was exercised).
 - The `broadcast` `deliveries/sec` figure is latency-paced (fixed inter-pulse gap),
   not a saturation throughput; the headline broadcast result is the per-watcher
@@ -545,7 +545,7 @@ the server.
   U=http://127.0.0.1:4090
   ./target/release/streams-probe conformance  $U                 # 117/117, exit 0
   ./target/release/streams-probe broadcast     $U --watchers 100,1000 --json
-  ./target/release/streams-probe distribution  $U --boxes 5000 --batch 100 --writers 32 --json
+  ./target/release/streams-probe distribution  $U --topics 5000 --batch 100 --writers 32 --json
   ./target/release/streams-probe queue         $U --workers 100 --jobs 20000 --json
   ./target/release/streams-probe actors        $U --actors 1000 --inferences 5 --json
   ```
@@ -555,7 +555,7 @@ the server.
 # Phase 6 — tiered storage (HOT NVMe + COLD folder)
 
 These numbers were captured against the **same persistent release binary** as
-Phases 4–5, now built with the Phase-6 layered/tiered segment store: each box
+Phases 4–5, now built with the Phase-6 layered/tiered segment store: each topic
 log is split into sealed, immutable **segment files** (`seg-<first_seq>.data` +
 `.idx`); the active + newest `hot_retain_segments` sealed segments stay **HOT**
 (the data dir on NVMe) and older sealed segments **relocate to a COLD tier**
@@ -580,10 +580,10 @@ disk). Latencies are wall-clock loopback HTTP, percentiles by sort.
 
 ## Methodology (Phase 6 additions)
 
-- **Tiering proof.** A durable box is written 6 100 records with
+- **Tiering proof.** A durable topic is written 6 100 records with
   `segment_max_events=50` and `hot_retain_segments=2`. The background relocator
   (a 5 s tick, runs the copy on the blocking pool) drains the old sealed segments
-  to cold. The physical split is observed on disk (`ls` of the hot vs cold box
+  to cold. The physical split is observed on disk (`ls` of the hot vs cold topic
   dir), then `getDifference` from seq 0 (spanning cold + hot + active) is verified
   to return all 6 100 records contiguously with byte-identical payloads.
 - **Hot vs cold read latency.** A read whose payloads are still in the bounded
@@ -598,7 +598,7 @@ disk). Latencies are wall-clock loopback HTTP, percentiles by sort.
   independent processes** continuously replaying full seq-0 `getDifference` scans
   over the cold tier (each confirmed cold via `cold_segments_read`). Separate
   processes so the load generator is not the client bottleneck.
-- **Durability across segments.** A durable box is loaded with data spanning many
+- **Durability across segments.** A durable topic is loaded with data spanning many
   sealed segments + a WAL tail, the binary is `kill -9`'d, restarted on the same
   hot+cold dirs, and the recovered `head_seq`/payloads are checked for zero
   acked-durable loss.
@@ -621,7 +621,7 @@ is silent; DESIGN §5.1).
 
 ## 2. Hot vs cold getDifference latency (the degradation is bounded to cold)
 
-`limit=50` window reads against the 6 100-record tiered box:
+`limit=50` window reads against the 6 100-record tiered topic:
 
 | Read | p50 | p99 / max | Notes |
 |---|---:|---:|---|
@@ -656,7 +656,7 @@ write-ack and live SSE delivery latency are statistically identical to baseline
 (the small p50 deltas are within run-to-run loopback/GIL noise; the ~14 ms p99 is
 pre-existing client-side jitter present in *both* columns, not server
 contention). Cold I/O + the relocator run via `spawn_blocking` and never hold a
-box write lock or block an SSE push — the hot tail (active segment + in-memory
+topic write lock or block an SSE push — the hot tail (active segment + in-memory
 index + recent-seal cache) is independent of cold access. This is additionally
 proven deterministically by the unit test
 `segwriter::slow_cold_read_does_not_hold_the_writer_lock` (a cold read parked on a
@@ -679,17 +679,17 @@ barrier; a concurrent thread still takes the writer lock to append + seal).
   re-derived each segment's tier (HOT-preferred), replayed the WAL tail, and
   **idempotently reclaimed 1 orphan segment file** (a pre-crash reclaim whose
   unlink had not completed) — the segment-aware recovery step (ARCHITECTURE §4.5).
-  A clean SIGKILL of a 350-record durable box spanning 7 sealed segments + WAL
+  A clean SIGKILL of a 350-record durable topic spanning 7 sealed segments + WAL
   tail recovered to-ready in **92 ms** with `head_seq == 350` (zero loss).
 
 ## 5. Durability across segments (SIGKILL → restart, zero acked-durable loss)
 
 | Property | Result |
 |---|---|
-| Durable box (350 recs, 7 sealed segments + WAL tail) survives `kill -9` | recovered `head_seq 350`, `count 350`, every payload byte-identical — **no loss** |
-| Cross-tier box (6 100 recs, 119 cold + 2 hot segments) survives `kill -9` | full readback **contiguous 1..6100, 0 payload mismatches**; tiers re-derived |
+| Durable topic (350 recs, 7 sealed segments + WAL tail) survives `kill -9` | recovered `head_seq 350`, `count 350`, every payload byte-identical — **no loss** |
+| Cross-tier topic (6 100 recs, 119 cold + 2 hot segments) survives `kill -9` | full readback **contiguous 1..6100, 0 payload mismatches**; tiers re-derived |
 | Prefix-delete floor (`earliest_seq=3000`) survives restart | recovered `earliest_seq 3000`, deleted prefix stays silently gone |
-| A second hard kill + restart | all boxes intact again; orphan reclaim idempotent (re-runnable) |
+| A second hard kill + restart | all topics intact again; orphan reclaim idempotent (re-runnable) |
 
 The WAL remains the durability boundary; segments are a derivable materialization,
 so an acked durable write (fsync-gated 2xx ⇒ on disk in the WAL) is never lost
@@ -707,7 +707,7 @@ reclaim) — all green.
   store (S3, future work) would widen the cold read latency further — but, per §3,
   **not** the write or delivery latency, which is the whole point of the tiering.
 - The in-memory recent-seal cache (`PAYLOAD_CACHE_CAP = 4096`) is why a read near
-  the head never pays cold I/O even when most of the box lives cold; a read deep
+  the head never pays cold I/O even when most of the topic lives cold; a read deep
   in cold history is the degraded path and is surfaced via
   `performance.cold_segments_read`.
 - Reproduce:
@@ -717,9 +717,9 @@ reclaim) — all green.
     STREAMS_SEGMENT_MAX_EVENTS=50 STREAMS_HOT_RETAIN_SEGMENTS=2 ./target/release/streams &
   U=http://127.0.0.1:4090
   ./target/release/streams-probe conformance $U          # 117/117, exit 0
-  # write >6000 records to one durable box, wait ~5s for the relocator, then:
-  ls $D/boxes/*/ ; ls $C/boxes/*/                        # observe hot vs cold split
-  curl -s -X POST $U/v0/boxes/<box>/diff -d '{"from_seq":0,"limit":1000}'  # cross-tier read
+  # write >6000 records to one durable topic, wait ~5s for the relocator, then:
+  ls $D/topics/*/ ; ls $C/topics/*/                        # observe hot vs cold split
+  curl -s -X POST $U/v0/topics/<topic>/diff -d '{"from_seq":0,"limit":1000}'  # cross-tier read
   ```
 
 ---
@@ -727,8 +727,8 @@ reclaim) — all green.
 # Phase-6 PERFORMANCE iteration (hot-path optimization, 2026-05-30)
 
 Same machine/env as above (Apple M4 Max, 16 cores, 128 GiB, Darwin 25.2.0,
-`--release`). After the correctness work that added per-box append locking, a
-measurement pass found the locking serialized a single box's durable writers at
+`--release`). After the correctness work that added per-topic append locking, a
+measurement pass found the locking serialized a single topic's durable writers at
 one-fsync-per-write (durable throughput collapsed to ~17.9 K rec/s) and added
 per-call overhead to append/diff. This iteration restores throughput and trims
 the hot paths WITHOUT changing the `/v0` contract or weakening the
@@ -738,12 +738,12 @@ conformance` 117/117.
 
 ## Optimizations applied
 
-1. **Off-lock fsync + per-box commit sequencer** (`engine/mod.rs` write +
-   `durable_append`, `engine/box_state.rs`). The `append_lock` now covers only
+1. **Off-lock fsync + per-topic commit sequencer** (`engine/mod.rs` write +
+   `durable_append`, `engine/topic_state.rs`). The `append_lock` now covers only
    the seq-order critical section (stage + WAL-enqueue + take a publish ticket);
    the fsync `wait()` happens OFF the lock, so concurrent durable writers to the
-   SAME box coalesce into ONE group-commit fsync. Publish/rollback are gated back
-   into strict seq order by a per-box ticket gate, so the single ordered WAL
+   SAME topic coalesce into ONE group-commit fsync. Publish/rollback are gated back
+   into strict seq order by a per-topic ticket gate, so the single ordered WAL
    writer's prefix-commit guarantee holds (when a writer's frames are fsynced,
    every earlier writer's lower-seq frames are fsynced too) — ordered publish
    never exposes a non-durable record. Seqs are reserved from the index deque
@@ -754,16 +754,16 @@ conformance` 117/117.
    durable write whose frame precedes the checkpoint offset is never excluded.
 2. **Skip the router-forward clone on the no-router fast path**
    (`engine/mod.rs`, `engine/router.rs`). A write only deep-clones its records
-   for forwarding when the box is actually a router source (cheap
+   for forwarding when the topic is actually a router source (cheap
    `has_routers_for_source` existence scan) and only clones for the WAL when a
-   WAL exists on a non-`memory` box. A plain write with no routers no longer
+   WAL exists on a non-`memory` topic. A plain write with no routers no longer
    clones every `serde_json::Value`.
 3. **Single-pass diff projection** (`engine/mod.rs::diff`). The deliverable walk
    builds `RecordOut` directly under the index read lock for resident payloads
    (the common case); only sealed (non-resident) payloads are deferred and
    patched off-lock. Removes the intermediate `Vec<DiffSlot>` + second pass.
-4. **Read-path retention fast path** (`engine/box_state.rs::enforce_retention`).
-   A box with no TTL and no caps returns immediately, skipping the index-read +
+4. **Read-path retention fast path** (`engine/topic_state.rs::enforce_retention`).
+   A topic with no TTL and no caps returns immediately, skipping the index-read +
    floors-write locks that every `diff`/SSE pass used to take (deletes already
    reclaim their own front).
 
@@ -785,7 +785,7 @@ batch=1 ticket/gate adds a few ns of fixed cost, more than offset by the
 router/WAL-snapshot skip. Diff wins are the single-pass projection + retention
 fast path.)
 
-## Durable write throughput (`bench-durable`, 16 writers × batch 100, one box)
+## Durable write throughput (`bench-durable`, 16 writers × batch 100, one topic)
 
 | Class | Single-write ack p50 / p99 | Throughput |
 |---|---:|---:|
@@ -803,7 +803,7 @@ while every acked durable write is still fsync-gated and survives restart
 ## Queue / live HTTP
 
 Queue workload (100 workers, 20 k jobs, claim-max 8): ~115 K jobs/s, produce
-~524 K rec/s — stable vs the pre-iteration measurement (these queue boxes are
+~524 K rec/s — stable vs the pre-iteration measurement (these queue topics are
 non-durable, so they are unaffected by the durable-fsync coalescing; the
 remaining per-job ack-delete fsync on a *durable* lease queue is a separate,
 larger change not taken this pass). SSE fan-out and router forwarding overhead
@@ -914,9 +914,9 @@ Ordering memory > disk > fsync holds; memory ≈ 1.7× disk ≈ 5× fsync.
 | Workload | Config | Result |
 |---|---|---:|
 | BROADCAST | 1 src → N SSE watchers, 100 pulses | 1 w: deliver p50 0.29 ms · 100 w: 12.5 K deliv/s, p50 1.06 ms · 1000 w: 92.3 K deliv/s, p50 2.21 ms (one straggler tail at max 1083 ms) |
-| DISTRIBUTION | 5000 boxes, batch 100, 32 writers | **285 K appends/s**, 500 K records, per-req p50 11.2 ms |
+| DISTRIBUTION | 5000 topics, batch 100, 32 writers | **285 K appends/s**, 500 K records, per-req p50 11.2 ms |
 | QUEUE | 50 workers, 20 k jobs, claim-max 8 | **126 K jobs/s** (produce 481 K rec/s), claim p50 1.18 ms, even (CV 0.075) |
-| ACTORS | 1000 actor boxes, 5 inferences, chain 5, snapshot every 2 | **31.5 K events/s**, 6.3 K inferences/s, 2000 snapshot-compactions, chain-append p50 0.77 ms |
+| ACTORS | 1000 actor topics, 5 inferences, chain 5, snapshot every 2 | **31.5 K events/s**, 6.3 K inferences/s, 2000 snapshot-compactions, chain-append p50 0.77 ms |
 
 ## 4. Are the ~1 M events/s + ~1 ms targets met? (honest assessment)
 
@@ -932,18 +932,18 @@ it across concurrent writers (143 K fsync-class rec/s aggregate).
 **Throughput target (~1 M events/s batched):**
 - **Engine core: MET** — in-process append is **5.6–5.9 M records/s** and diff
   projection **12–13 M records/s** (criterion §1).
-- **Live single-box HTTP: PARTIALLY MET** — **525–566 K rec/s** disk-class over
-  loopback HTTP through one box (16 writers × batch 100). The ~1 M/s bar is
-  reachable in aggregate across boxes/connections (memory class hits 614 K
-  through one box on a slower client; the engine has 5×+ headroom) but a single
-  box over a single loopback HTTP origin lands at ~0.5 M/s. **The ceiling here is
+- **Live single-topic HTTP: PARTIALLY MET** — **525–566 K rec/s** disk-class over
+  loopback HTTP through one topic (16 writers × batch 100). The ~1 M/s bar is
+  reachable in aggregate across topics/connections (memory class hits 614 K
+  through one topic on a slower client; the engine has 5×+ headroom) but a single
+  topic over a single loopback HTTP origin lands at ~0.5 M/s. **The ceiling here is
   the HTTP request/`serde_json` serialization path and per-request lock acquisition,
   not the engine** — the engine-side append fast path is now 5.6 M/s.
 
 **Where the ceiling is, by class:**
 - `memory`: HTTP + JSON parse/serialize cost. Engine append is essentially free.
 - `disk`: same HTTP/serialization ceiling plus the WAL buffered-write + the
-  single ordered WAL-writer's per-batch work; ~525–566 K rec/s through one box.
+  single ordered WAL-writer's per-batch work; ~525–566 K rec/s through one topic.
 - `fsync`: the **physical NVMe `fdatasync` (~5 ms)** is the floor for *latency*;
   for *throughput* the group-commit coalescing (this iteration's headline fix,
   17.9 K → 143 K rec/s, ~8×) lifts the ceiling to how many writers' frames fit in
@@ -957,10 +957,10 @@ start of the iteration; "After" = these final verified numbers.
 
 | # | Optimization | Site | Before → After |
 |---|---|---|---|
-| 1 | **Off-lock fsync + per-box commit sequencer** (group-commit; `append_lock` covers only stage+enqueue+ticket, fsync `wait()` off-lock, publish gated back into strict seq order) | `engine/mod.rs` write + `durable_append`; `engine/box_state.rs` ticket gate; `engine/snapshot.rs` quiesce | **durable throughput 17.9 K → 143 K rec/s (~8×)**; durable single-write p50 unchanged (~5.2 ms, the fsync floor). Surfaced + fixed two real races (staged-but-unpublished seq; snapshot-capture-vs-in-flight-write) — both green. |
-| 2 | **No-router / no-WAL write fast path** (skip the per-record `serde_json::Value` deep clone when the box has no routers and no WAL frame is needed) | `engine/mod.rs`; `engine/router.rs::has_routers_for_source` | append/64B/1 1.272 → 1.239 µs; append/1KiB/1 1.737 → 1.648 µs |
+| 1 | **Off-lock fsync + per-topic commit sequencer** (group-commit; `append_lock` covers only stage+enqueue+ticket, fsync `wait()` off-lock, publish gated back into strict seq order) | `engine/mod.rs` write + `durable_append`; `engine/topic_state.rs` ticket gate; `engine/snapshot.rs` quiesce | **durable throughput 17.9 K → 143 K rec/s (~8×)**; durable single-write p50 unchanged (~5.2 ms, the fsync floor). Surfaced + fixed two real races (staged-but-unpublished seq; snapshot-capture-vs-in-flight-write) — both green. |
+| 2 | **No-router / no-WAL write fast path** (skip the per-record `serde_json::Value` deep clone when the topic has no routers and no WAL frame is needed) | `engine/mod.rs`; `engine/router.rs::has_routers_for_source` | append/64B/1 1.272 → 1.239 µs; append/1KiB/1 1.737 → 1.648 µs |
 | 3 | **Single-pass diff projection** (build `RecordOut` directly under the read lock for resident payloads; defer only sealed; removed `DiffSlot`) | `engine/mod.rs::diff` | diff/256 22.82 → 20.51 µs (−10%); diff/1000 84.44 → 76.45 µs (−9%) |
-| 4 | **Read-path retention fast path** (no-TTL/no-cap box returns immediately, skipping two locks per diff/SSE) | `engine/box_state.rs::enforce_retention` | diff/1 207.8 → 153.4 ns (−26%); cap_evict/1 −18%, cap_evict/100 −28% |
+| 4 | **Read-path retention fast path** (no-TTL/no-cap topic returns immediately, skipping two locks per diff/SSE) | `engine/topic_state.rs::enforce_retention` | diff/1 207.8 → 153.4 ns (−26%); cap_evict/1 −18%, cap_evict/100 −28% |
 
 ## 6. Remaining performance gaps (not closed this iteration, out of safe scope)
 
@@ -968,9 +968,9 @@ start of the iteration; "After" = these final verified numbers.
   by the HTTP response serialization of the large body, not engine diff cost (the
   engine-side diff is 12–13 M records/s). Closing it needs a streaming/chunked
   response encoder, a larger change.
-- **Single-box single-origin HTTP write throughput** tops out at ~0.5 M rec/s
+- **Single-topic single-origin HTTP write throughput** tops out at ~0.5 M rec/s
   (disk) vs the 5.6 M/s engine core — the gap is the HTTP/`serde_json` path.
-  Reaching ~1 M/s through one box would need a leaner request decode (e.g.
+  Reaching ~1 M/s through one topic would need a leaner request decode (e.g.
   borrowed/zero-copy JSON or a binary ingress), not taken here.
 - **Durable lease-queue per-job ack-delete fsync** (a fsync per ack on a *durable*
   queue) is a separate, larger change; the queue workload here is non-durable
@@ -983,14 +983,14 @@ start of the iteration; "After" = these final verified numbers.
 The single ordered WAL writer (one thread / mpsc / fsync stream) serialized ALL
 durable writes — the write-throughput bottleneck. This iteration splits it into
 `N` independent shards (`STREAMS_WAL_SHARDS`), each its own WAL file set + writer
-thread + group commit + per-shard checkpoint, with each box routed to exactly one
-shard by a stable hash of its interned `box_id`. Recovery is **shard-count-agnostic**:
+thread + group commit + per-shard checkpoint, with each topic routed to exactly one
+shard by a stable hash of its interned `topic_id`. Recovery is **shard-count-agnostic**:
 it replays every WAL group on disk (flat `wal/` + every `shard-NN/`) dispatched by
-`box_id`, so `STREAMS_WAL_SHARDS` can be reconfigured between restarts with no data
+`topic_id`, so `STREAMS_WAL_SHARDS` can be reconfigured between restarts with no data
 loss (verified live below: 8 → 3 → 1 restarts, all acked durable records recovered).
 
 **Machine:** Apple M4 Max, 16 cores (12P+4E), 128 GiB, macOS/APFS single volume.
-Bench: `benches/wal_scaling.rs` — 64 concurrent writers across 256 boxes, 256 B
+Bench: `benches/wal_scaling.rs` — 64 concurrent writers across 256 topics, 256 B
 payload, aggregate write-ack throughput; `cargo bench --bench wal_scaling`.
 
 ## The hardware ceiling: fsync-class is device-bound, not software-bound
@@ -1021,7 +1021,7 @@ removed, measure the `memory`-class path (no `fsync` at all, so only software co
 contention remains). This iteration also removed the two GLOBAL locks that previously
 sat on the per-write hot path and capped scaling regardless of shard count (codex
 P1): the router-graph mutex (`has_routers_for_source` on every append → a lock-free
-per-box `is_router_source` atomic) and the scheduler ready-set mutex (`mark_dirty` on
+per-topic `is_router_source` atomic) and the scheduler ready-set mutex (`mark_dirty` on
 every append → a lock-free `sched_dirty` fast path). With those gone the memory-class
 path scales positively with shards up to the core/contention limit:
 
@@ -1031,7 +1031,7 @@ path scales positively with shards up to the core/contention limit:
 | speedup vs 1 shard | 1.00× | 1.23× | 1.61× | 1.40× (plateau) |
 
 The curve climbs to ~1.6× at 4 shards then plateaus at 8 — the expected shape for 64
-writers / 256 boxes on a 16-core box: the software path no longer has a single global
+writers / 256 topics on a 16-core topic: the software path no longer has a single global
 write lock, so throughput rises with parallelism until it saturates CPU / cross-core
 cache traffic. (Before the P1 fix, the global router + scheduler mutexes pinned the
 per-write critical section, so adding shards bought little.)
@@ -1043,10 +1043,10 @@ per-write critical section, so adding shards bought little.)
   APFS volume and gets *worse* with shards — set `STREAMS_WAL_SHARDS=1` on such a host.
 - The **software write path** scales positively (≈1.6× at 4 shards, memory-class)
   now that the global hot-path locks are gone — sub-linear because of CPU/cache
-  saturation at this writer/box/core ratio, not a shared lock. Per-box append-order,
+  saturation at this writer/topic/core ratio, not a shared lock. Per-topic append-order,
   the commit sequencer, R3 durable head watermark, R5 atomic batch, and the
-  durability classes all still hold per shard (each box owns one shard's ordered
-  writer); cross-box global order was never a guarantee.
+  durability classes all still hold per shard (each topic owns one shard's ordered
+  writer); cross-topic global order was never a guarantee.
 - True near-linear durable scaling needs **fsync parallelism** (Linux + NVMe/XFS or
   per-shard devices), where each shard's independent fsync stream actually runs
   concurrently. That is the planned dedicated iteration; this Mac's single-volume
@@ -1070,9 +1070,9 @@ single-volume host should set `STREAMS_WAL_SHARDS=1`.
 - `streams-probe conformance` **117/117** against a default-config server running an
   8-shard WAL (`shard-00..07` confirmed on disk), and **117/117** against a 3-shard
   server after reconfigure.
-- **kill -9 + restart with a DIFFERENT shard count**: 12 durable boxes × 20 records
+- **kill -9 + restart with a DIFFERENT shard count**: 12 durable topics × 20 records
   written, `kill -9`, restart 8 → 3 → 1; every acked durable record recovered
-  (head/count = 20/20 per box, seqs 1..20 contiguous with correct payloads), and a
+  (head/count = 20/20 per topic, seqs 1..20 contiguous with correct payloads), and a
   post-reconfigure durable write acked + persisted.
 
 ---
@@ -1089,7 +1089,7 @@ section records the **before (v1, legacy synchronous `forward_from`)** vs. **aft
 
 Deterministic in-process measurement via `examples/forward_fanout_bench.rs` (the
 engine API directly, a real durable WAL under a temp dir, so the WAL-frame delta is
-EXACT). Every box is `fsync`-class, so the only WAL frames a source write produces
+EXACT). Every topic is `fsync`-class, so the only WAL frames a source write produces
 are `Append` frames — the frame delta therefore IS the append amplification. The
 mode is captured at engine construction from the env var; the harness runs the
 binary twice. `ack_avg_us` is the wall-clock of the `Engine::write` call (the
@@ -1160,6 +1160,6 @@ background drainer / the dest reader's catch-up, NOT by the source writer's ack.
   — all green. clippy clean (default + `test-fs` + `--all-features`, `--all-targets`).
 - `streams-probe conformance` **117/117** with v2 OFF **and** v2 ON (the read-path
   catch-up preserves the no-sleep `/v0` contract).
-- **kill -9 + restart** of a v2 server: the derived dest boxes re-materialize from
+- **kill -9 + restart** of a v2 server: the derived dest topics re-materialize from
   the source WAL + the durable per-router cursor with identical seqs (a consumer
   cursor into a dest stays valid); no duplicate re-forward, no silent loss.

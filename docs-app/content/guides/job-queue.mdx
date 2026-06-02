@@ -7,7 +7,7 @@ import { Callout, Steps, Tabs } from 'nextra/components'
 
 # Job Queue
 
-streams gives you two ways to run a durable job queue, and they share the same persistent log underneath. The **cursor queue** (Bull-style) is a durable unbounded box where each worker owns its own cursor and acks by advancing it — simple, stateless on the server, perfect for a known partition of workers. The **lease queue** (`type: "queue"`) adds claim/ack/nack/extend with per-job visibility-timeout leases, redelivery, and dead-lettering — what you reach for when many workers compete for one pool of jobs and you need stalled-job recovery.
+streams gives you two ways to run a durable job queue, and they share the same persistent log underneath. The **cursor queue** (Bull-style) is a durable unbounded topic where each worker owns its own cursor and acks by advancing it — simple, stateless on the server, perfect for a known partition of workers. The **lease queue** (`type: "queue"`) adds claim/ack/nack/extend with per-job visibility-timeout leases, redelivery, and dead-lettering — what you reach for when many workers compete for one pool of jobs and you need stalled-job recovery.
 
 Both are at-least-once. Both keep jobs durable across a crash. The difference is *who tracks delivery*: in the cursor model the client owns its position; in the lease model the server leases jobs and reclaims them on timeout.
 
@@ -16,26 +16,26 @@ Both are at-least-once. Both keep jobs durable across a crash. The difference is
   worker, or per shard) and you want zero server-side per-job state. Pick the **lease
   queue** when an arbitrary fleet competes for a shared backlog and you need per-job acks,
   redelivery on stall, and dead-lettering. You can start with the cursor queue and migrate
-  later — the lease queue is the same box with `type: "queue"` set.
+  later — the lease queue is the same topic with `type: "queue"` set.
 </Callout>
 
 ## Model A — Bull-style cursor queue
 
-A durable, unbounded box. Producers append jobs; each worker reads from its own `from_seq`, processes the batch, then persists `next_from_seq` as its ack. The server keeps **no per-consumer state** on this path — the [cursor *is* the ack](/api/reading#the-cursor-is-the-ack).
+A durable, unbounded topic. Producers append jobs; each worker reads from its own `from_seq`, processes the batch, then persists `next_from_seq` as its ack. The server keeps **no per-consumer state** on this path — the [cursor *is* the ack](/api/reading#the-cursor-is-the-ack).
 
-### Create the queue box
+### Create the queue topic
 
 Durable so an acked job survives a crash; unbounded (`cap_records: 0`) so nothing is ever lost to eviction — replay is just reading from an earlier `from_seq`.
 
 ```bash
-curl -X PUT localhost:4000/v0/boxes/jobs \
+curl -X PUT localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "durable": true, "cap_records": 0, "ttl_ms": 0 }'
 ```
 
 ```json
 # →
-{ "box": "jobs", "created": true,
+{ "topic": "jobs", "created": true,
   "config": { "ttl_ms": 0, "cap_records": 0, "cap_bytes": 0, "discard": "old",
               "durable": true, "durability": "fsync", "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true },
@@ -54,7 +54,7 @@ curl -X PUT localhost:4000/v0/boxes/jobs \
 A producer appends with a normal write. Tag each job so you can cancel it later. Set `node` only if a producer also consumes (so [loop-prevention](/guarantees/node-loop-prevention) filters its own jobs back out).
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs \
+curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "records": [
           { "data": { "url": "s3://b/a.png", "w": 256 }, "tag": "tenant42:job-9001" },
@@ -64,7 +64,7 @@ curl -X POST localhost:4000/v0/boxes/jobs \
 
 ```json
 # →
-{ "box": "jobs", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
+{ "topic": "jobs", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
   "head_seq": 2, "count": 2, "created": false, "deduped": false,
   "performance": { "server_total_ms": 0.62, "fsync_ms": 0.39 } }
 ```
@@ -81,14 +81,14 @@ curl -X POST localhost:4000/v0/boxes/jobs \
 Each worker reads from its stored `from_seq`, processes the batch, then persists `next_from_seq`. Pass the worker's own `node` so it never receives jobs it produced.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs/diff \
+curl -X POST localhost:4000/v0/topics/jobs/diff \
   -H 'content-type: application/json' \
   -d '{ "from_seq": 0, "limit": 50, "node": "worker-1" }'
 ```
 
 ```json
 # →
-{ "box": "jobs",
+{ "topic": "jobs",
   "records": [
     { "$seq": 1, "$ts": 1748470000123, "data": { "url": "s3://b/a.png", "w": 256 } },
     { "$seq": 2, "$ts": 1748470000140, "data": { "url": "s3://b/b.png", "w": 512 } }
@@ -98,7 +98,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/diff \
   "performance": { "server_total_ms": 0.30 } }
 ```
 
-The loop is: **read → process the batch → persist `next_from_seq` → repeat.** Persisting `next_from_seq` past seq N acks 1..N at once (cursor-advance = ack-all). Because the server holds no consumer state, *where* you persist the cursor is your choice — a row in your DB, a key in another box, a file. A crash mid-batch just re-reads from the last persisted cursor; jobs are reprocessed, so **workers must be idempotent**.
+The loop is: **read → process the batch → persist `next_from_seq` → repeat.** Persisting `next_from_seq` past seq N acks 1..N at once (cursor-advance = ack-all). Because the server holds no consumer state, *where* you persist the cursor is your choice — a row in your DB, a key in another topic, a file. A crash mid-batch just re-reads from the last persisted cursor; jobs are reprocessed, so **workers must be idempotent**.
 
 <Callout type="warning">
   Use **`caught_up`, not `records.length`, as the "no more work right now" signal.**
@@ -118,7 +118,7 @@ Cancellation is a [permanent delete](/api/deletion) by tag. It is silent (never 
   <Tabs.Tab>
 ```bash
 # Cancel one job by exact tag match.
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
 ```
@@ -126,7 +126,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/delete \
   <Tabs.Tab>
 ```bash
 # Cancel every currently-queued job for a tenant (trailing-prefix match).
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Glob", "tenant42:*"] }'
 ```
@@ -135,36 +135,36 @@ curl -X POST localhost:4000/v0/boxes/jobs/delete \
 
 ```json
 # →
-{ "box": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
+{ "topic": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
   "performance": { "server_total_ms": 0.12 } }
 ```
 
 A consumer whose cursor was behind the deleted seq simply advances past it — no tombstone, because a delete is voluntary removal, not capacity loss. To compact already-processed jobs, delete by `before_seq` after a checkpoint:
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs/delete -d '{ "before_seq": 480000 }'
+curl -X POST localhost:4000/v0/topics/jobs/delete -d '{ "before_seq": 480000 }'
 ```
 
 ### When the cursor queue fits
 
 - **Statically partitioned workers** — one cursor per worker, or per shard key, so two workers never claim the same job. (Two workers sharing one cursor would each process every job — there is no per-job lease to prevent it.)
 - **Replay is free** — durable + unbounded means a worker can reset to any earlier `from_seq` and reprocess. No special "replay" mode.
-- **Zero server state** — nothing to fsync per ack beyond the records themselves; the throughput ceiling is the box's write/read path, not a lease table.
+- **Zero server state** — nothing to fsync per ack beyond the records themselves; the throughput ceiling is the topic's write/read path, not a lease table.
 
 If instead you have an arbitrary fleet competing for one backlog and need stalled-job recovery, use the lease queue.
 
 ## Model B — lease queue (`type: "queue"`)
 
-Set `type: "queue"` and the box layers a lease lifecycle on the same log: workers **claim** jobs (leased with a visibility timeout), **ack** to complete (ack *is* the permanent delete), **nack** to release early, and **extend** to keep a long job alive. A lease that expires unacked makes the job claimable again — redelivery with no per-job timers. After too many redeliveries a job is **dead-lettered**.
+Set `type: "queue"` and the topic layers a lease lifecycle on the same log: workers **claim** jobs (leased with a visibility timeout), **ack** to complete (ack *is* the permanent delete), **nack** to release early, and **extend** to keep a long job alive. A lease that expires unacked makes the job claimable again — redelivery with no per-job timers. After too many redeliveries a job is **dead-lettered**.
 
-Internally a queue is two logs: the **jobs log** (the box you produce to, durable per `durable`) and a **leases log** of lifecycle events. The live who-holds-what is a projection of the leases log, rebuilt on restart. See [Queues](/api/queues) and DESIGN §10 for the full model.
+Internally a queue is two logs: the **jobs log** (the topic you produce to, durable per `durable`) and a **leases log** of lifecycle events. The live who-holds-what is a projection of the leases log, rebuilt on restart. See [Queues](/api/queues) and DESIGN §10 for the full model.
 
 ### Create the queue
 
 `discard: "reject"` so a full durable queue refuses new jobs loudly instead of dropping unconsumed work. `dead_letter` + `max_deliveries` send poison jobs aside after N failed deliveries.
 
 ```bash
-curl -X PUT localhost:4000/v0/boxes/jobs \
+curl -X PUT localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "type": "queue", "durable": true, "discard": "reject",
         "lease_ms": 30000, "claim_jitter_ms": 0,
@@ -173,7 +173,7 @@ curl -X PUT localhost:4000/v0/boxes/jobs \
 
 ```json
 # →
-{ "box": "jobs", "created": true,
+{ "topic": "jobs", "created": true,
   "config": { "type": "queue", "durable": true, "durability": "fsync",
               "discard": "reject", "lease_ms": 30000, "claim_jitter_ms": 0,
               "max_deliveries": 5, "dead_letter": "jobs.dlq", "leases_durable": false,
@@ -182,11 +182,11 @@ curl -X PUT localhost:4000/v0/boxes/jobs \
 ```
 
 <Callout type="info">
-  `type` is the one immutable field. A `PUT` that flips an existing box between `log` and
-  `queue` returns `409 box_exists_incompatible`. Decide the type at creation.
+  `type` is the one immutable field. A `PUT` that flips an existing topic between `log` and
+  `queue` returns `409 topic_exists_incompatible`. Decide the type at creation.
 </Callout>
 
-Produce jobs with the same normal write as Model A (`POST /v0/boxes/jobs`). A non-queue box rejects every claim/ack/nack/extend/work endpoint with `409 not_a_queue`.
+Produce jobs with the same normal write as Model A (`POST /v0/topics/jobs`). A non-queue topic rejects every claim/ack/nack/extend/work endpoint with `409 not_a_queue`.
 
 ### Claim → process → ack
 
@@ -197,14 +197,14 @@ Produce jobs with the same normal write as Model A (`POST /v0/boxes/jobs`). A no
 Lease up to `max` claimable jobs to a worker `node`. A job is claimable iff it is in the jobs log, not acked, and has no active lease.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs/claim \
+curl -X POST localhost:4000/v0/topics/jobs/claim \
   -H 'content-type: application/json' \
   -d '{ "node": "worker-1", "max": 8, "lease_ms": 30000 }'
 ```
 
 ```json
 # →
-{ "box": "jobs",
+{ "topic": "jobs",
   "claimed": [
     { "$seq": 1, "lease_id": "lease_7f3a9c", "deadline": 1748470030000,
       "$ts": 1748470000123, "$tag": "tenant42:job-9001", "deliveries": 1,
@@ -221,18 +221,18 @@ curl -X POST localhost:4000/v0/boxes/jobs/claim \
 Ack the seqs you completed. **The ack is the delete** — the server records the completion and permanently removes the job from the jobs log. Ack is idempotent: seqs not currently leased to `node` are silently skipped and reported in `skipped`. To fence a stale worker, optionally echo the claim's `lease_id` tokens in a `lease_ids` array (validate-when-supplied — a superseded token's seq is skipped); omit it for the plain `node` + `seqs` match.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs/ack \
+curl -X POST localhost:4000/v0/topics/jobs/ack \
   -H 'content-type: application/json' \
   -d '{ "node": "worker-1", "seqs": [1] }'
 ```
 
 ```json
 # →
-{ "box": "jobs", "acked": 1, "skipped": [], "ready": 0, "in_flight": 0,
+{ "topic": "jobs", "acked": 1, "skipped": [], "ready": 0, "in_flight": 0,
   "performance": { "server_total_ms": 0.30, "fsync_ms": 0.21 } }
 ```
 
-Ack durability equals the box's `durable`: on an `fsync` queue the delete is fsynced before the ack returns (`fsync_ms > 0`), so an acked-and-deleted job stays gone across a crash.
+Ack durability equals the topic's `durable`: on an `fsync` queue the delete is fsynced before the ack returns (`fsync_ms > 0`), so an acked-and-deleted job stays gone across a crash.
 
 </Steps>
 
@@ -240,11 +240,11 @@ Ack durability equals the box's `durable`: on an `fsync` queue the delete is fsy
 
 ```bash
 # Nack: release a job back to the queue, optionally delayed (backoff).
-curl -X POST localhost:4000/v0/boxes/jobs/nack \
+curl -X POST localhost:4000/v0/topics/jobs/nack \
   -d '{ "node": "worker-1", "seqs": [2], "delay_ms": 5000 }'
 
 # Extend: heartbeat a long-running job to push its deadline out.
-curl -X POST localhost:4000/v0/boxes/jobs/extend \
+curl -X POST localhost:4000/v0/topics/jobs/extend \
   -d '{ "node": "worker-1", "seqs": [3], "lease_ms": 30000 }'
 ```
 
@@ -266,22 +266,22 @@ Because the leases log defaults non-durable (`leases_durable: false`), losing it
 
 ### Dead-lettering
 
-Each job carries a delivery counter incremented on every claim (including reclaims). When a job would be delivered for the `(max_deliveries + 1)`-th time and `dead_letter` is non-null, the server **moves** it to the dead-letter box — appending the record there (stamping `meta.$dead_letter_from` / `$dead_letter_deliveries` / `$dead_letter_src_seq`) and deleting it from the jobs log — instead of redelivering. With `max_deliveries: 0` or `dead_letter: null`, jobs are reclaimed forever.
+Each job carries a delivery counter incremented on every claim (including reclaims). When a job would be delivered for the `(max_deliveries + 1)`-th time and `dead_letter` is non-null, the server **moves** it to the dead-letter topic — appending the record there (stamping `meta.$dead_letter_from` / `$dead_letter_deliveries` / `$dead_letter_src_seq`) and deleting it from the jobs log — instead of redelivering. With `max_deliveries: 0` or `dead_letter: null`, jobs are reclaimed forever.
 
-The dead-letter box is an ordinary box, so inspect poison jobs with a normal read:
+The dead-letter topic is an ordinary topic, so inspect poison jobs with a normal read:
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs.dlq/diff -d '{ "from_seq": 0, "include_meta": true }'
+curl -X POST localhost:4000/v0/topics/jobs.dlq/diff -d '{ "from_seq": 0, "include_meta": true }'
 ```
 
-To re-drive, read the dead-letter box and re-produce the jobs into the source queue.
+To re-drive, read the dead-letter topic and re-produce the jobs into the source queue.
 
 ### PUSH mode — auto-claim over SSE
 
 Instead of a claim→ack→claim poll loop, open the `/work` SSE stream. The server keeps up to `max` jobs leased-and-pushed to that one connection, claiming replacements as you ack, applying backpressure at `max` in-flight.
 
 ```bash
-curl -N "localhost:4000/v0/boxes/jobs/work?node=worker-1&max=8" \
+curl -N "localhost:4000/v0/topics/jobs/work?node=worker-1&max=8" \
   -H 'accept: text/event-stream'
 ```
 
@@ -290,7 +290,7 @@ retry: 2000
 
 id: 1
 event: job
-data: {"box":"jobs","$seq":1,"lease_id":"lease_7f3a9c","deadline":1748470030000,"$ts":1748470000123,"$tag":"tenant42:job-9001","deliveries":1,"data":{"url":"s3://b/a.png"}}
+data: {"topic":"jobs","$seq":1,"lease_id":"lease_7f3a9c","deadline":1748470030000,"$ts":1748470000123,"$tag":"tenant42:job-9001","deliveries":1,"data":{"url":"s3://b/a.png"}}
 
 : hb
 ```

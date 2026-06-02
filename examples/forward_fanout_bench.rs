@@ -25,7 +25,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::types::{BoxConfig, DiffRequest, RecordIn, RouterCreateRequest, WriteRequest};
+use streams::types::{TopicConfig, DiffRequest, RecordIn, RouterCreateRequest, WriteRequest};
 
 fn durable_engine(dir: &std::path::Path) -> Arc<Engine> {
     let clock: SharedClock = Arc::new(SystemClock);
@@ -36,7 +36,7 @@ fn durable_engine(dir: &std::path::Path) -> Arc<Engine> {
     Engine::with_data_dir(cfg, clock).expect("durable engine")
 }
 
-fn write_one(engine: &Engine, box_name: &str) -> std::time::Duration {
+fn write_one(engine: &Engine, topic_name: &str) -> std::time::Duration {
     let req = WriteRequest {
         records: vec![RecordIn {
             data: json!({"k": 1}),
@@ -51,12 +51,12 @@ fn write_one(engine: &Engine, box_name: &str) -> std::time::Duration {
         disable_backpressure: false,
     };
     let t0 = Instant::now();
-    engine.write(box_name, req, false).expect("write");
+    engine.write(topic_name, req, false).expect("write");
     t0.elapsed()
 }
 
 /// Measure one fan-out degree: build a fresh durable engine with `fanout` dest
-/// boxes fed by `fanout` routers, then time a single source write and count the WAL
+/// topics fed by `fanout` routers, then time a single source write and count the WAL
 /// frames it produced. For v2 the forwarding is driven off the ack path; we then
 /// fully drain it and time the end-to-end delivery so the async-forward latency is
 /// reported too.
@@ -65,15 +65,15 @@ fn measure(fanout: usize, v2: bool) {
     let engine = durable_engine(dir.path());
 
     // fsync class everywhere so the only frames a write produces are Appends (a
-    // `disk` box would add an R3 head-watermark frame and muddy the count).
-    let fsync_cfg = || BoxConfig {
+    // `disk` topic would add an R3 head-watermark frame and muddy the count).
+    let fsync_cfg = || TopicConfig {
         durable: true,
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     };
-    engine.put_box("src", fsync_cfg()).unwrap();
+    engine.put_topic("src", fsync_cfg()).unwrap();
     for i in 0..fanout {
         let dest = format!("d{i}");
-        engine.put_box(&dest, fsync_cfg()).unwrap();
+        engine.put_topic(&dest, fsync_cfg()).unwrap();
         engine
             .put_router(
                 &format!("src->{dest}"),

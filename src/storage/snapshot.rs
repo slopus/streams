@@ -6,15 +6,15 @@
 //!
 //! # What a snapshot captures
 //!
-//! - the box registry: name↔interned `box_id`, per-box [`SnapshotBoxConfig`]
-//!   (the serialized [`crate::types::BoxConfig`]) and `epoch`;
-//! - per-box materialized state: `base_seq`, `head_seq`, the three floors
+//! - the topic registry: name↔interned `topic_id`, per-topic [`SnapshotTopicConfig`]
+//!   (the serialized [`crate::types::TopicConfig`]) and `epoch`;
+//! - per-topic materialized state: `base_seq`, `head_seq`, the three floors
 //!   (`evict_floor`/`expiry_floor`/`delete_floor`), `delete_below`, retained
 //!   `bytes`/`count`, and the **live record set** (every physically-present,
 //!   non-deleted record at snapshot time — the compacted form, so deleted
 //!   middle-holes and front-reclaimed prefixes are simply absent);
 //! - routers (the full forwarding rules);
-//! - `next_box_id` (so ids stay stable across restart);
+//! - `next_topic_id` (so ids stay stable across restart);
 //! - the checkpoint: `(wal_idx, wal_offset)` + `last_checkpoint_seq`.
 //!
 //! Idempotency-dedupe state is intentionally **not** persisted (a best-effort
@@ -71,13 +71,13 @@ pub struct SnapshotRecord {
     pub bytes: u64,
 }
 
-/// Per-box materialized state captured in a snapshot.
+/// Per-topic materialized state captured in a snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotBox {
+pub struct SnapshotTopic {
     pub name: String,
-    pub box_id: u32,
+    pub topic_id: u32,
     pub epoch: u64,
-    /// Postcard-opaque: the JSON-encoded [`crate::types::BoxConfig`].
+    /// Postcard-opaque: the JSON-encoded [`crate::types::TopicConfig`].
     pub config_json: Vec<u8>,
     pub base_seq: u64,
     pub head_seq: u64,
@@ -226,9 +226,9 @@ pub struct Snapshot {
     pub id: u64,
     /// Server commit ms when the snapshot was taken.
     pub ts: u64,
-    pub next_box_id: u32,
+    pub next_topic_id: u32,
     pub checkpoint: Checkpoint,
-    pub boxes: Vec<SnapshotBox>,
+    pub topics: Vec<SnapshotTopic>,
     pub routers: Vec<SnapshotRouter>,
 }
 
@@ -466,7 +466,7 @@ mod tests {
         Snapshot {
             id: 7,
             ts: 1_700_000_000_000,
-            next_box_id: 4,
+            next_topic_id: 4,
             checkpoint: Checkpoint {
                 wal_idx: 3,
                 wal_offset: 4096,
@@ -474,9 +474,9 @@ mod tests {
                 shards: vec![(3, 4096)],
                 shard_keys: vec![String::new()],
             },
-            boxes: vec![SnapshotBox {
+            topics: vec![SnapshotTopic {
                 name: "jobs".into(),
-                box_id: 1,
+                topic_id: 1,
                 epoch: 1,
                 config_json: b"{\"durable\":true}".to_vec(),
                 base_seq: 1,

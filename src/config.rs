@@ -44,8 +44,8 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// Max list page size.
 pub const MAX_PAGE_SIZE: usize = 1000;
 
-/// Max boxes per watch subscription (`STREAMS_MAX_WATCH_BOXES`).
-pub const MAX_WATCH_BOXES: usize = 256;
+/// Max topics per watch subscription (`STREAMS_MAX_WATCH_TOPICS`).
+pub const MAX_WATCH_TOPICS: usize = 256;
 /// Watch session TTL after no active GET (ms).
 pub const SESSION_TTL_MS: u64 = 300_000;
 /// Heartbeat clamp bounds (ms).
@@ -133,8 +133,8 @@ pub const MAX_CLAIM_JITTER_MS: u64 = 5_000;
 /// Nack `delay_ms` clamp upper bound (ms) (API §10.5).
 pub const MAX_NACK_DELAY_MS: u64 = 86_400_000;
 /// `/work` SSE refill re-check fallback interval (ms): the stream parks on the
-/// box `Notify` for low-latency wakeups, but also re-checks on this cadence so an
-/// out-of-band ack (which frees an in-flight slot without touching the box
+/// topic `Notify` for low-latency wakeups, but also re-checks on this cadence so an
+/// out-of-band ack (which frees an in-flight slot without touching the topic
 /// `Notify`) is reflected promptly (API §10.8).
 pub const WORK_POLL_MS: u64 = 250;
 
@@ -156,7 +156,7 @@ pub const MAX_WAL_SHARDS: usize = 8;
 /// durable write throughput ~linearly with shard count (each shard is an
 /// independent thread / mpsc / fsync stream with no shared hot-path contention),
 /// so matching the shard count to the available CPU parallelism (capped) is a good
-/// out-of-the-box default; the operator can override via the env var.
+/// out-of-the-topic default; the operator can override via the env var.
 pub fn default_wal_shards() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -173,10 +173,10 @@ pub fn default_wal_shards() -> usize {
 /// this many records.
 pub const SEGMENT_MAX_EVENTS: u64 = 10_000;
 /// Also seal on this many bytes (`STREAMS_SEGMENT_MAX_BYTES`, default 64 MiB), so
-/// a box of big payloads does not build one giant segment.
+/// a topic of big payloads does not build one giant segment.
 pub const SEGMENT_MAX_BYTES: u64 = 64 << 20;
 /// Also seal a partially-filled active segment after this much wall-clock age
-/// (`STREAMS_SEGMENT_MAX_AGE_MS`, default 1 h), so an idle box still seals and its
+/// (`STREAMS_SEGMENT_MAX_AGE_MS`, default 1 h), so an idle topic still seals and its
 /// data can age out / relocate. `0` disables the age trigger.
 pub const SEGMENT_MAX_AGE_MS: u64 = 3_600_000; // 1 hour
 
@@ -198,21 +198,21 @@ pub const SNAPSHOT_INTERVAL_MS: u64 = 60_000; // 60 s
 /// How often the background snapshotter checks the snapshot triggers (ms).
 pub const SNAPSHOT_CHECK_INTERVAL_MS: u64 = 5_000;
 
-/// How many seqs ahead of the in-use head a `disk`-class box durably RESERVES
+/// How many seqs ahead of the in-use head a `disk`-class topic durably RESERVES
 /// per fsynced `HeadWatermark` (R3). A `disk` write acks before its frame is
 /// fsynced, so to guarantee an already-acked seq is never re-handed after a
-/// crash that dropped the un-fsynced frame, the box fsyncs a reservation ceiling
+/// crash that dropped the un-fsynced frame, the topic fsyncs a reservation ceiling
 /// ahead of use; crossing it forces one fresh fsync. Larger ⇒ fewer reservation
 /// fsyncs but a bigger unused-seq gap after a crash; smaller ⇒ the reverse.
 /// Recovery sets `head = max(replayed head, reservation)`. NOTE: because the
-/// reservation is fsynced ahead of use, a `disk` box that recovers WITHOUT an
+/// reservation is fsynced ahead of use, a `disk` topic that recovers WITHOUT an
 /// intervening snapshot (which would re-capture the exact head and absorb the
 /// watermark) resumes at the reservation ceiling — the unwritten reserved seqs
 /// become silent deleted gaps. The periodic snapshot collapses this gap in
 /// steady state; the bound keeps any one gap small.
 pub const DISK_HEAD_RESERVE_AHEAD: u64 = 256;
 
-/// How often the background relocator sweeps boxes for sealed segments beyond the
+/// How often the background relocator sweeps topics for sealed segments beyond the
 /// hot-retention bound and relocates them HOT → COLD (ms). Only runs when a cold
 /// tier is configured; the copy I/O runs on the blocking pool off the hot path.
 pub const RELOCATE_CHECK_INTERVAL_MS: u64 = 5_000;
@@ -360,8 +360,8 @@ pub struct ServerConfig {
     pub segment: SegmentConfig,
     /// Number of WAL shards (`STREAMS_WAL_SHARDS`): the single ordered WAL writer
     /// is split into this many independent shards (own thread / mpsc / fsync stream
-    /// / file set) to scale durable write throughput. Each box routes to exactly
-    /// one shard by a stable hash of its interned id, so per-box ordering and every
+    /// / file set) to scale durable write throughput. Each topic routes to exactly
+    /// one shard by a stable hash of its interned id, so per-topic ordering and every
     /// durability guarantee still hold. `1` (the struct [`Default`]) is the
     /// pre-sharding single-writer behavior with the flat on-disk layout, exactly.
     /// [`ServerConfig::from_env`] picks [`default_wal_shards`] (num_cpus-based) when
@@ -369,7 +369,7 @@ pub struct ServerConfig {
     /// changed between restarts without data loss.
     pub wal_shards: usize,
     /// Resource / rate limits (DoS hardening; see [`crate::limits`]). Caps the
-    /// number of boxes/routers/watch-sessions and concurrent SSE connections +
+    /// number of topics/routers/watch-sessions and concurrent SSE connections +
     /// per-key in-flight requests. Defaults are generous; a literal `0` for any
     /// limit means unlimited. Read on every creation path.
     pub limits: crate::limits::Limits,
@@ -624,7 +624,7 @@ impl ServerConfig {
     }
 }
 
-/// Validate a box name against the documented charset
+/// Validate a topic name against the documented charset
 /// `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts alphanumeric).
 pub fn is_valid_name(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -640,7 +640,7 @@ pub fn is_valid_name(name: &str) -> bool {
         .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b':' || b == b'-')
 }
 
-/// Validate a router name. Routers use the box-name charset plus `>` so the
+/// Validate a router name. Routers use the topic-name charset plus `>` so the
 /// documented default-name convention `"<source>-><dest>"` (e.g. `jobs->audit`,
 /// API §6.1) is a legal `:router` path segment.
 pub fn is_valid_router_name(name: &str) -> bool {

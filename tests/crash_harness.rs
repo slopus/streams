@@ -33,7 +33,7 @@ use streams::storage::{Fs, OpenOpts};
 
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: Some("n".into()),
@@ -326,7 +326,7 @@ fn monitorfs_passes_real_snapshot_write() {
     let snap = Snapshot {
         id: 1,
         ts: 1,
-        next_box_id: 1,
+        next_topic_id: 1,
         checkpoint: Checkpoint {
             wal_idx: 1,
             wal_offset: 0,
@@ -334,7 +334,7 @@ fn monitorfs_passes_real_snapshot_write() {
             shards: vec![(1, 0)],
             shard_keys: vec![String::new()],
         },
-        boxes: vec![],
+        topics: vec![],
         routers: vec![],
     };
     // If the snapshot writer renamed the .tmp before fsync, MonitorFs would panic.

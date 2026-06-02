@@ -103,21 +103,21 @@ If you have prior durable state, the server replays its WAL before serving. Poll
 
 ```bash
 curl -fsS http://127.0.0.1:4000/v0/ready
-# → 200 {"status":"ready", "wal_replay_complete":true, "boxes":0}
+# → 200 {"status":"ready", "wal_replay_complete":true, "topics":0}
 ```
 
 ### Write a record
 
-A box is created lazily on first write — no setup needed.
+A topic is created lazily on first write — no setup needed.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs \
+curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
 ```
 
 ```json
-{ "box": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
+{ "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
   "head_seq": 1, "count": 1, "created": true, "deduped": false,
   "performance": { "server_total_ms": 0.62 } }
 ```
@@ -135,7 +135,7 @@ to a process that is still recovering.
 - `GET /v0/health` (alias `/healthz`) always returns `200` with
   `{"status":"ok", "version", "uptime_ms"}` once the process is up. It is liveness only.
 - `GET /v0/ready` (alias `/readyz`) returns `200`
-  `{"status":"ready", "wal_replay_complete":true, "boxes":N}` **only after WAL replay
+  `{"status":"ready", "wal_replay_complete":true, "topics":N}` **only after WAL replay
   completes**. During replay it returns `503 not_ready` with a `Retry-After` header and a
   replay progress fraction; while draining for shutdown it returns `503 shutting_down`.
 
@@ -177,7 +177,7 @@ Everything above runs on defaults. To go further:
   segment size limits, hot-retention bounds, and every resource cap — are documented in
   [Configuration](/deployment/configuration).
 - **Production hardening** — API keys (hashed at rest, with optional per-key scopes and a
-  box-name prefix allowlist), the loopback/`STREAMS_ALLOW_INSECURE_NO_AUTH` interlock, TLS
+  topic-name prefix allowlist), the loopback/`STREAMS_ALLOW_INSECURE_NO_AUTH` interlock, TLS
   via a reverse proxy, and the DoS resource limits — is covered in
   [Security](/deployment/security).
 

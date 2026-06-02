@@ -1,15 +1,15 @@
 //! Zero-copy SSE broadcast fan-out (ARCHITECTURE §8.4, Phase-5B Stage 2).
 //!
-//! When one box has many SSE watchers, each watcher used to independently
+//! When one topic has many SSE watchers, each watcher used to independently
 //! re-serialize every record it delivered (`serde_json` over the same
-//! [`RecordOut`] N times). For a broadcast (1 writer → N watchers on one box)
+//! [`RecordOut`] N times). For a broadcast (1 writer → N watchers on one topic)
 //! that is N× the serialization cost on the hot read path.
 //!
 //! This module hands every watcher the **same ref-counted serialized frame**.
 //! Each record's `record`-frame JSON body is serialized **once** into an
-//! `Arc<RawValue>` and cached in a small per-box ring keyed by `(seq, variant)`,
+//! `Arc<RawValue>` and cached in a small per-topic ring keyed by `(seq, variant)`,
 //! then shared (one `Arc` clone — a refcount bump, no copy) to all watchers. The
-//! per-connection envelope (`{box, records, from_seq, to_seq, head_seq}`) and the
+//! per-connection envelope (`{topic, records, from_seq, to_seq, head_seq}`) and the
 //! composite `id:` cursor are still assembled per connection (they depend on the
 //! session's cursor map), but the expensive per-record serialization is paid
 //! once and amortized across the whole fan-out.
@@ -27,7 +27,7 @@ use serde_json::value::RawValue;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-/// How many recent seqs to keep serialized per box. Watchers tail near head, so
+/// How many recent seqs to keep serialized per topic. Watchers tail near head, so
 /// a small ring captures the shared fan-out window; lagging watchers re-serialize
 /// (a miss) rather than pinning unbounded memory.
 const RING_CAP: usize = 1024;
@@ -65,9 +65,9 @@ struct CachedFrame {
     variants: [Option<Arc<RawValue>>; N_VARIANTS],
 }
 
-/// Per-box bounded ring of recently-serialized record frames. Cheap to clone the
-/// `Arc<BroadcastCache>` onto each box; the inner ring is mutex-guarded and only
-/// touched on the SSE delivery path (never on the write path, so boxes with zero
+/// Per-topic bounded ring of recently-serialized record frames. Cheap to clone the
+/// `Arc<BroadcastCache>` onto each topic; the inner ring is mutex-guarded and only
+/// touched on the SSE delivery path (never on the write path, so topics with zero
 /// watchers pay nothing).
 #[derive(Default)]
 pub struct BroadcastCache {

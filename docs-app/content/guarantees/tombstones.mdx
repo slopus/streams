@@ -16,12 +16,12 @@ records — is never a tombstone.
 
 ## The dual watermark
 
-Every box tracks **two floors** so that involuntary loss is decoupled from voluntary removal.
+Every topic tracks **two floors** so that involuntary loss is decoupled from voluntary removal.
 
 - **`earliest_seq`** — the seq of the **first currently-live record**: not eviction-reclaimed,
-  not TTL-expired, and **not deleted**. It is reported in box state and in every `diff`
+  not TTL-expired, and **not deleted**. It is reported in topic state and in every `diff`
   response. If no live record exists it is `head_seq + 1`. It is **monotonically
-  non-decreasing** over a box instance's life — eviction, TTL expiry, **and deletion** all
+  non-decreasing** over a topic instance's life — eviction, TTL expiry, **and deletion** all
   advance it — and resets only on delete+recreate.
 - **`evict_floor`** — advanced **only** by **involuntary** loss of live records: cap eviction
   and TTL expiry. It is the **sole tombstone trigger**. Voluntary deletion advances
@@ -67,7 +67,7 @@ In a `diff` response it is the `tombstone` field (`null` when there is no gap):
 
 ```json
 {
-  "box": "events",
+  "topic": "events",
   "records": [ { "$seq": 479101, "$ts": 1748450001000, "data": { "...": "..." } } ],
   "tombstone": {
     "gap_from": 478501,
@@ -102,8 +102,8 @@ tombstone is delivered *alongside* the records that follow it, never as an error
 | `cap` | Live records were evicted for capacity (`cap_records` / `cap_bytes`). | diff + SSE |
 | `ttl` | Live records were TTL-expired (`now - $ts > ttl_ms`, strict). | diff + SSE |
 | `mixed` | Both cap and TTL contributed to the gap. | diff + SSE |
-| `recreated` | The box was deleted and recreated; a stale cursor is from the old instance. | diff + SSE |
-| `source_trim` | A derived-router destination could not re-materialize a forwarded record because the **source** box had already evicted/trimmed it (involuntary TTL/cap loss) below the router's forward cursor — the dest faithfully reflects the source's retention rather than silently skipping. | diff + SSE |
+| `recreated` | The topic was deleted and recreated; a stale cursor is from the old instance. | diff + SSE |
+| `source_trim` | A derived-router destination could not re-materialize a forwarded record because the **source** topic had already evicted/trimmed it (involuntary TTL/cap loss) below the router's forward cursor — the dest faithfully reflects the source's retention rather than silently skipping. | diff + SSE |
 | `from_seq_too_old` | Connect-time variant: the requested `from_seq + 1 < earliest_seq` was detected when the watch opened (the SSE expression of Kafka `OffsetOutOfRange`). | SSE only |
 
 Some seqs inside `[gap_from, gap_to]` may have been *deleted* rather than evicted — the
@@ -116,15 +116,15 @@ The contract is identical across the two read paths; only the framing differs.
 
 In a `diff` response, the tombstone is the `tombstone` field shown above. In a
 [watch](/api/watch) SSE stream it is a framed `event: tombstone`, emitted whenever a gap
-crosses *this consumer's* cursor for a box:
+crosses *this consumer's* cursor for a topic:
 
 ```text
 id: eyJldmVudHMiOjgzMDAwfQ
 event: tombstone
-data: {"box":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
+data: {"topic":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
 ```
 
-The frame's `id:` already advances the box cursor to `gap_to`, so a reconnect resuming after
+The frame's `id:` already advances the topic cursor to `gap_to`, so a reconnect resuming after
 it is correct. The `from_seq_too_old` variant is emitted **immediately on connect** when the
 requested `from_seq` has already fallen off the start of the retained range. A consumer
 handles `record` and `tombstone` frames uniformly — both carry a resumable `id:`.

@@ -1,5 +1,5 @@
-//! Per-box in-memory state: the base+offset [`BoxIndex`], the watermark
-//! atomics, retained payload bytes, the per-box tag index, recency clocks, and
+//! Per-topic in-memory state: the base+offset [`TopicIndex`], the watermark
+//! atomics, retained payload bytes, the per-topic tag index, recency clocks, and
 //! the `Notify` used to wake SSE/diff long-pollers (ARCHITECTURE §1).
 //!
 //! Phase 2 stores payload bytes directly on the heap (`StoredRecord`); phase 4
@@ -16,7 +16,7 @@ use crate::engine::broadcast::BroadcastCache;
 use crate::engine::eviction::Floors;
 use crate::engine::queue::QueueProjection;
 use crate::engine::segwriter::{read_locator, ResolvedPayload, SealedResolve, SegmentWriter};
-use crate::types::{BoxConfig, Filter};
+use crate::types::{TopicConfig, Filter};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -48,15 +48,15 @@ pub struct StoredRecord {
     pub data: Value,
     pub meta: Option<Value>,
     /// Accounted payload size (`data` + `meta` + framing estimate). Zeroed once
-    /// the slot is deleted (its bytes already subtracted from the box total).
+    /// the slot is deleted (its bytes already subtracted from the topic total).
     pub bytes: u64,
     /// Set when this record has been deleted (permanent, silent). The slot is
     /// retained only as a hole for O(1) indexing; its payload is freed.
     pub deleted: bool,
     /// Whether `data`/`meta` are still resident in this slot (Phase 6 memory
-    /// bounding). `true` for a fresh append and for any box without a segment
+    /// bounding). `true` for a fresh append and for any topic without a segment
     /// writer (the unchanged default). Once a record is durably in a *sealed*
-    /// segment, a writer-backed box frees the slot's `data`/`meta` (sets this
+    /// segment, a writer-backed topic frees the slot's `data`/`meta` (sets this
     /// `false`) and the read path resolves the payload from the bounded cache or
     /// the segment. The `bytes` accounting is unchanged (the record is still
     /// live; only where its payload lives changed).
@@ -75,14 +75,14 @@ pub struct StoredRecord {
 /// The seq→record index: a contiguous deque offset by `base_seq`
 /// (ARCHITECTURE §1.1). `index i` corresponds to `seq = base_seq + i`.
 ///
-/// Carries the per-box **tag index** (`tag → ascending live seqs`) so a tag
+/// Carries the per-topic **tag index** (`tag → ascending live seqs`) so a tag
 /// delete is a point lookup (exact) or a bounded range scan (prefix) rather
 /// than a full log scan (DESIGN §7.2), and a `delete_below` marker (the max
 /// `before_seq` ever applied) so snapshot/prefix deletes are O(1) to apply: a
 /// read starts at `max(from_seq + 1, base_seq)` and then skips any remaining
 /// deleted slots.
 #[derive(Debug, Default)]
-pub struct BoxIndex {
+pub struct TopicIndex {
     /// Seq of `records[0]`; the earliest physically present seq.
     pub base_seq: u64,
     pub records: VecDeque<StoredRecord>,
@@ -92,9 +92,9 @@ pub struct BoxIndex {
     pub delete_below: u64,
 }
 
-impl BoxIndex {
+impl TopicIndex {
     pub fn new(base_seq: u64) -> Self {
-        BoxIndex {
+        TopicIndex {
             base_seq,
             records: VecDeque::new(),
             tag_index: BTreeMap::new(),
@@ -252,16 +252,16 @@ impl BoxIndex {
 }
 
 /// A staged-but-not-yet-published append batch (the WAL-first reservation,
-/// ARCHITECTURE §2.2). Returned by [`BoxState::stage_append`]; consumed by
-/// [`BoxState::publish_staged`] (on a successful WAL commit) or
-/// [`BoxState::rollback_staged`] (on a WAL/fsync failure). The records are
+/// ARCHITECTURE §2.2). Returned by [`TopicState::stage_append`]; consumed by
+/// [`TopicState::publish_staged`] (on a successful WAL commit) or
+/// [`TopicState::rollback_staged`] (on a WAL/fsync failure). The records are
 /// already in the index deque (the contiguous tail past `pre_len`) but invisible
 /// (`head_seq` unchanged) until published.
 #[derive(Debug)]
 pub struct StagedAppend {
     /// First seq assigned to the batch — the index deque tail at stage time
     /// (`base_seq + len`), which equals `head_seq + 1` only when no earlier batch
-    /// is still staged-but-unpublished (see [`BoxState::stage_append`]).
+    /// is still staged-but-unpublished (see [`TopicState::stage_append`]).
     start: u64,
     /// Number of records in the batch.
     count: u64,
@@ -326,7 +326,7 @@ pub(crate) fn deleted_hole() -> StoredRecord {
     }
 }
 
-/// The outcome of one [`BoxState::enforce_retention`] pass: whether the
+/// The outcome of one [`TopicState::enforce_retention`] pass: whether the
 /// involuntary loss floor advanced, whether a NON-RE-DERIVABLE cause (TTL or
 /// byte-cap) drove it (so the engine must durably persist the resolved floor,
 /// R7), and the resolved involuntary floor `max(evict_floor, expiry_floor)`.
@@ -345,7 +345,7 @@ pub struct RetentionAdvance {
 }
 
 impl RetentionAdvance {
-    /// No floor moved (the common hot-path / empty-box case).
+    /// No floor moved (the common hot-path / empty-topic case).
     pub const NONE: RetentionAdvance = RetentionAdvance {
         floor_advanced: false,
         durable_advance: false,
@@ -354,21 +354,21 @@ impl RetentionAdvance {
     };
 }
 
-/// The full in-memory state of one box.
-pub struct BoxState {
-    /// The box name (also the identity).
+/// The full in-memory state of one topic.
+pub struct TopicState {
+    /// The topic name (also the identity).
     pub name: String,
     /// Interned numeric id used in WAL frames (ARCHITECTURE §2.1). Stable for the
-    /// lifetime of this box instance; reassigned on delete+recreate.
-    pub box_id: u32,
+    /// lifetime of this topic instance; reassigned on delete+recreate.
+    pub topic_id: u32,
     /// Live config (read-mostly; mutated under `index` write lock on `PUT`).
-    pub config: RwLock<BoxConfig>,
-    /// The seq→record index (carries the per-box tag index + `delete_below`).
-    pub index: RwLock<BoxIndex>,
+    pub config: RwLock<TopicConfig>,
+    /// The seq→record index (carries the per-topic tag index + `delete_below`).
+    pub index: RwLock<TopicIndex>,
     /// Eviction/expiry/delete floors driving `earliest_seq` (DESIGN §5.1).
     pub floors: RwLock<Floors>,
     /// `(idempotency_key → assigned seqs)` dedupe state (API §0.8). Entries are
-    /// reclaimed lazily once older than the box's `idempotency_window_ms`.
+    /// reclaimed lazily once older than the topic's `idempotency_window_ms`.
     pub dedupe: RwLock<HashMap<String, DedupeEntry>>,
     /// Per-key in-flight gates for idempotent writes. A write carrying an
     /// `idempotency_key` holds that key's gate across its WHOLE reservation
@@ -381,15 +381,15 @@ pub struct BoxState {
     /// The registry is pruned lazily (a gate is removed once no writer holds it).
     pub dedupe_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 
-    /// Highest assigned seq (`0` for a fresh empty box).
+    /// Highest assigned seq (`0` for a fresh empty topic).
     pub head_seq: AtomicU64,
-    /// Highest seq this box has DURABLY reserved via a fsynced `HeadWatermark`
+    /// Highest seq this topic has DURABLY reserved via a fsynced `HeadWatermark`
     /// (R3). A `disk`-class write may only ack seqs `<= reserved_head`; crossing
     /// it forces a fresh fsynced reservation so a crash can never re-hand an
     /// already-acked `disk` seq. `0` ⇒ nothing reserved yet (the first disk write
     /// reserves the first block). Always `>= head_seq`.
     pub reserved_head: AtomicU64,
-    /// First seq this box instance will ever assign (`seq_base`, default 1).
+    /// First seq this topic instance will ever assign (`seq_base`, default 1).
     pub seq_base: u64,
     /// Bumped on create; detects delete+recreate (DESIGN §5.5).
     pub epoch: AtomicU64,
@@ -405,10 +405,10 @@ pub struct BoxState {
     /// `last_consumed_at` for auto-priority (DESIGN §3).
     pub last_consumed_ms: AtomicI64,
 
-    /// Whether this box is the SOURCE of at least one router (forwarding rule).
+    /// Whether this topic is the SOURCE of at least one router (forwarding rule).
     /// A lock-free fast path for the write hot path: a write checks this atomic
     /// instead of taking the global router-graph mutex on EVERY append (codex P1).
-    /// Maintained by the router-graph mutations (create/delete/box-delete) under the
+    /// Maintained by the router-graph mutations (create/delete/topic-delete) under the
     /// graph lock — the rare control path — so the common write path never contends
     /// on the graph lock just to learn "are there routers fed by me?". `Relaxed` is
     /// sufficient: a momentarily-stale read only over- or under-triggers a forward
@@ -417,10 +417,10 @@ pub struct BoxState {
     pub is_router_source: std::sync::atomic::AtomicBool,
     /// Advisory "already marked dirty in the scheduler" flag (codex P1). The
     /// scheduler ready-set is drained only by the (not-yet-wired) phase-4 governor,
-    /// so once a box is dirty it stays dirty; this atomic lets the write hot path
+    /// so once a topic is dirty it stays dirty; this atomic lets the write hot path
     /// skip the global scheduler mutex + string alloc on every append after the
     /// first, removing a global lock that capped WAL-shard scaling. Reset to `false`
-    /// when the ready-set is drained so the box re-enters on its next write.
+    /// when the ready-set is drained so the topic re-enters on its next write.
     pub sched_dirty: std::sync::atomic::AtomicBool,
 
     /// Wakes SSE/diff long-pollers on append (ARCHITECTURE §1.2).
@@ -429,28 +429,28 @@ pub struct BoxState {
     /// Zero-copy SSE broadcast cache (ARCHITECTURE §8.4): each delivered record
     /// frame is serialized once and shared (ref-counted) across all watchers, so
     /// a 1→N broadcast pays serialization once, not N times. Bounded; populated
-    /// lazily on the read path only (boxes with no watchers pay nothing).
+    /// lazily on the read path only (topics with no watchers pay nothing).
     pub broadcast: BroadcastCache,
 
-    /// The materialized lease projection for a queue box (DESIGN §10,
-    /// ARCHITECTURE §12). `None` on a plain `"log"` box. Lives under its own
+    /// The materialized lease projection for a queue topic (DESIGN §10,
+    /// ARCHITECTURE §12). `None` on a plain `"log"` topic. Lives under its own
     /// mutex (queue lifecycle transitions are rare relative to the read path);
     /// the single batched cohort claim pass holds it for one critical section.
     pub queue: Option<Mutex<QueueProjection>>,
 
     /// Serializes the **seq-assignment + WAL-enqueue** critical section on the
-    /// write path so a box's WAL frames are appended to the single ordered writer
+    /// write path so a topic's WAL frames are appended to the single ordered writer
     /// in the *same order* their seqs were assigned. Without this, two concurrent
     /// durable writers can assign seqs `A < B` under the index lock yet enqueue
     /// `B` before `A`; recovery (which applies frames in WAL order and skips any
     /// `seq <= head`) would then drop the lower-seq frame — a silent loss of an
     /// acked durable write. Held only across the (fast, non-blocking) channel
     /// enqueue; the fsync wait happens *after* the lock is released, so durable
-    /// group commit still coalesces across boxes AND across writers of THIS box
+    /// group commit still coalesces across topics AND across writers of THIS topic
     /// (ARCHITECTURE §2.2/§2.3, codex P0 #1).
     pub append_lock: Mutex<()>,
 
-    /// Per-box commit sequencer enabling concurrent same-box durable writers to
+    /// Per-topic commit sequencer enabling concurrent same-topic durable writers to
     /// coalesce into ONE group-commit fsync (codex P0 #1). The `append_lock`
     /// covers only stage+enqueue; the fsync `wait()` then happens OFF the lock so
     /// many writers' frames batch into a single fsync. But publish (and rollback)
@@ -466,10 +466,10 @@ pub struct BoxState {
     pub publish_gate: std::sync::Mutex<u64>,
     pub publish_cv: std::sync::Condvar,
 
-    /// The per-box HOT segment writer + bounded payload cache (Phase 6 Stage 2).
-    /// `None` for a pure in-memory box (every existing unit test) — then payloads
+    /// The per-topic HOT segment writer + bounded payload cache (Phase 6 Stage 2).
+    /// `None` for a pure in-memory topic (every existing unit test) — then payloads
     /// stay resident and the read path is unchanged by construction. When present
-    /// (a durable, writer-backed box), committed records are materialized into
+    /// (a durable, writer-backed topic), committed records are materialized into
     /// HOT segments off the commit path, and once a record is sealed its resident
     /// payload is freed and reads resolve from the bounded cache or the segment.
     /// Lives behind a `Mutex`: touched on the commit path (append/seal) and the
@@ -478,7 +478,7 @@ pub struct BoxState {
     pub segwriter: Option<Mutex<SegmentWriter>>,
 
     /// Ordered-materialization seam (R6 / codex P1 #7). With the segment seal moved
-    /// OFF the publish gate, two same-box writers can reach `materialize_published`
+    /// OFF the publish gate, two same-topic writers can reach `materialize_published`
     /// out of seq order (writer B publishes + materializes `N+1` before writer A
     /// materializes `N`). [`SegmentWriter`] assumes strictly monotonic append order
     /// (a backwards seq trips its contiguity assert; a forward jump force-seals a
@@ -490,7 +490,7 @@ pub struct BoxState {
     pub materialize_seam: Mutex<MaterializeSeam>,
 }
 
-/// The ordered-materialization cursor + out-of-order buffer for one box (R6 / codex
+/// The ordered-materialization cursor + out-of-order buffer for one topic (R6 / codex
 /// P1 #7). `next` is the next seq the segment writer expects; `pending` holds
 /// published ranges that arrived before their predecessor (keyed by start seq).
 #[derive(Debug, Default)]
@@ -500,29 +500,29 @@ pub struct MaterializeSeam {
     /// first range from `seq_base`).
     pub next: u64,
     /// Ranges `(start, end)` published out of order, awaiting their predecessor.
-    /// Keyed by `start`; small in practice (bounded by in-flight same-box writers).
+    /// Keyed by `start`; small in practice (bounded by in-flight same-topic writers).
     pub pending: std::collections::BTreeMap<u64, u64>,
 }
 
 /// Sentinel for a recency clock that has never fired.
 pub const TS_NEVER: i64 = i64::MIN;
 
-impl BoxState {
-    /// Create a fresh box with the given config, interned id, and epoch.
-    pub fn new(name: String, box_id: u32, config: BoxConfig, seq_base: u64, epoch: u64) -> Self {
-        // A queue box carries a materialized lease projection (DESIGN §10); a
+impl TopicState {
+    /// Create a fresh topic with the given config, interned id, and epoch.
+    pub fn new(name: String, topic_id: u32, config: TopicConfig, seq_base: u64, epoch: u64) -> Self {
+        // A queue topic carries a materialized lease projection (DESIGN §10); a
         // plain log does not. The claim cursor starts at `seq_base` (the first
-        // job seq this box instance will assign).
+        // job seq this topic instance will assign).
         let queue = if config.is_queue() {
             Some(Mutex::new(QueueProjection::new(seq_base)))
         } else {
             None
         };
-        BoxState {
+        TopicState {
             name,
-            box_id,
+            topic_id,
             config: RwLock::new(config),
-            index: RwLock::new(BoxIndex::new(seq_base)),
+            index: RwLock::new(TopicIndex::new(seq_base)),
             floors: RwLock::new(Floors::default()),
             dedupe: RwLock::new(HashMap::new()),
             dedupe_gates: Mutex::new(HashMap::new()),
@@ -552,16 +552,16 @@ impl BoxState {
         }
     }
 
-    /// Attach a HOT [`SegmentWriter`] to this box (durable, writer-backed mode).
+    /// Attach a HOT [`SegmentWriter`] to this topic (durable, writer-backed mode).
     /// Pre-seeds the writer's active segment with any records already in the
     /// index (e.g. after recovery/snapshot load) so the materialization starts
-    /// consistent. Called by the engine at box creation/recovery; absent for a
-    /// pure in-memory box. Takes `&mut self` because it runs during construction
-    /// before the box is shared in an `Arc`.
+    /// consistent. Called by the engine at topic creation/recovery; absent for a
+    /// pure in-memory topic. Takes `&mut self` because it runs during construction
+    /// before the topic is shared in an `Arc`.
     pub fn attach_segwriter(&mut self, mut writer: SegmentWriter) {
         // Materialize any pre-existing records (recovery/snapshot) into the
         // writer so its sealed/active state is consistent with the index.
-        // Segments mirror the box's gapless append order, so a deleted middle
+        // Segments mirror the topic's gapless append order, so a deleted middle
         // hole is materialized too (as a tombstone frame, never served) to keep
         // the segment seq run contiguous (a `SegmentBuilder` requires it). We do
         // NOT free resident payloads here (recovery correctness first);
@@ -588,7 +588,7 @@ impl BoxState {
         self.materialize_seam.lock().next = base + len;
     }
 
-    /// Whether this box is a queue (carries a lease projection).
+    /// Whether this topic is a queue (carries a lease projection).
     pub fn is_queue(&self) -> bool {
         self.queue.is_some()
     }
@@ -678,7 +678,7 @@ impl BoxState {
 
     /// Logical earliest retained, deliverable (first live) seq (DESIGN §5.1):
     /// the seq of the first currently-live record, or `head_seq + 1` when the
-    /// box is empty. Driven by cap/TTL **and** deletes.
+    /// topic is empty. Driven by cap/TTL **and** deletes.
     ///
     /// A `match`-only delete that removes the front of the log advances
     /// `base_seq` (via lazy front reclaim) without advancing any floor, so the
@@ -714,7 +714,7 @@ impl BoxState {
     /// transparently across the resident slot, the bounded cache, and a cold
     /// segment read. Returns `(record, alive)` where `alive` is `false` for a
     /// deleted/missing slot (a deleted record is not forwarded). `None` if the seq
-    /// is physically below the box's base (reclaimed). Never holds the index lock
+    /// is physically below the topic's base (reclaimed). Never holds the index lock
     /// across a (possibly slow) segment read (the Phase-6 HARD INVARIANT).
     pub fn forward_lookup(&self, seq: u64) -> Option<(StoredRecord, bool)> {
         // Snapshot the slot's metadata under a brief read lock.
@@ -763,7 +763,7 @@ impl BoxState {
         // codex P1 #7), exactly like a deleted middle hole, so the seam's `next`
         // advances past it and a following derived record materializes contiguously
         // (otherwise the live record's range would start past `next` and stall
-        // forever in the out-of-order buffer). A writer-less box is a no-op.
+        // forever in the out-of-order buffer). A writer-less topic is a no-op.
         self.materialize_published(hole_seq, hole_seq);
         self.notify.notify_waiters();
     }
@@ -805,9 +805,9 @@ impl BoxState {
     /// reader (which gates on `head_seq`) observes NOTHING yet (the WAL-first
     /// reservation rule, ARCHITECTURE §2.2).
     ///
-    /// The caller MUST hold the box's `append_lock` across the SEQ-ORDER critical
+    /// The caller MUST hold the topic's `append_lock` across the SEQ-ORDER critical
     /// section only — stage → enqueue the WAL frame(s) → take a publish ticket
-    /// ([`Self::next_publish_ticket`]) — so a box's WAL frames are enqueued in seq
+    /// ([`Self::next_publish_ticket`]) — so a topic's WAL frames are enqueued in seq
     /// order. The fsync `wait()` then happens OFF the lock (codex P0 #1, so
     /// concurrent durable writers coalesce into one group commit), and publish /
     /// rollback is gated back into strict seq order by the ticket
@@ -855,14 +855,14 @@ impl BoxState {
     /// `head_seq` (making the records visible), account retained bytes/live
     /// count, set the write-recency clock, materialize the records into the HOT
     /// segment writer, and wake SSE/diff long-pollers. Called only AFTER the
-    /// batch's WAL frame is durably committed (for a durable box), so an
+    /// batch's WAL frame is durably committed (for a durable topic), so an
     /// acknowledged write is always already durable.
     pub fn publish_staged(&self, staged: StagedAppend, now_ms: i64) {
         if let Some((start, end)) = self.publish_staged_no_seal(staged, now_ms) {
             // Materialize + seal inline (the convenience path: `append`, in-memory
             // helpers, tests). Routed through the ORDERED seam (R6 / codex P1 #7) so
             // the inline path and the gated path share one materialization cursor —
-            // a box never mixes a direct `materialize_segment` (which would desync the
+            // a topic never mixes a direct `materialize_segment` (which would desync the
             // seam's `next`) with the ordered `materialize_published`. The gated write
             // paths call `publish_staged_no_seal` + `materialize_published` directly
             // AFTER releasing the publish gate (keep the seal fsync off the gate).
@@ -874,7 +874,7 @@ impl BoxState {
     /// account bytes/count, set the write-recency clock, and wake waiters. Returns
     /// `Some((start, end))` of the published range so the caller can run
     /// [`Self::materialize_segment`] **after releasing the publish gate** (R6: the
-    /// segment seal `put` fsync no longer serializes same-box writers behind the
+    /// segment seal `put` fsync no longer serializes same-topic writers behind the
     /// gate, which only orders head advances now). Returns `None` for an empty
     /// batch. Crash-safety is preserved: the WAL already made the records durable
     /// (a segment is a derivable materialization), and resident payloads are freed
@@ -901,7 +901,7 @@ impl BoxState {
     /// Materialize a published `[start, end]` range into the HOT segment writer and
     /// free the resident payloads of any seqs sealing crossed. Safe to run OFF the
     /// publish gate (R6) — purely derivable from the already-published in-memory
-    /// index. No-op for a writer-less box. Public so the gated write paths can run
+    /// index. No-op for a writer-less topic. Public so the gated write paths can run
     /// it after `ticket.done()`.
     ///
     /// ORDERED (R6 / codex P1 #7): because the seal is off the publish gate, a later
@@ -915,7 +915,7 @@ impl BoxState {
     /// publish gate; only the cheap in-order bookkeeping is under the seam.
     pub fn materialize_published(&self, start: u64, end: u64) {
         if self.segwriter.is_none() {
-            return; // writer-less box: nothing to materialize, nothing to order.
+            return; // writer-less topic: nothing to materialize, nothing to order.
         }
         // Collect the contiguous prefix of ranges to feed, under the seam lock, then
         // feed them off the lock.
@@ -960,7 +960,7 @@ impl BoxState {
     /// **Roll back** a staged batch whose WAL append/fsync FAILED: pop the staged
     /// records (the contiguous tail of the deque — the caller holds `append_lock`,
     /// so nothing was appended after them) and prune their tag postings. `head_seq`
-    /// was never advanced, so the records were never visible; this leaves the box
+    /// was never advanced, so the records were never visible; this leaves the topic
     /// exactly as it was before [`Self::stage_append`]. The acknowledgement never
     /// happens (the caller returns an error), so the contract holds: not
     /// acknowledged ⇒ not committed, and nothing visible-but-not-durable remains.
@@ -995,7 +995,7 @@ impl BoxState {
     pub fn next_publish_ticket(&self) -> PublishGuard<'_> {
         let ticket = self.publish_ticket.fetch_add(1, Ordering::Relaxed);
         PublishGuard {
-            box_state: self,
+            topic_state: self,
             ticket,
             waited: false,
             done: false,
@@ -1027,7 +1027,7 @@ impl BoxState {
     /// `append_lock`, so no NEW ticket can be issued while we wait — the in-flight
     /// set only shrinks, so this always terminates. Used by snapshot capture: with
     /// the fsync now waiting off the `append_lock` (codex P0 #1), holding the lock
-    /// alone no longer means the box is quiescent (a writer may be mid-fsync,
+    /// alone no longer means the topic is quiescent (a writer may be mid-fsync,
     /// staged-but-unpublished, with its WAL frame already before the checkpoint
     /// offset). Quiescing the publish gate guarantees `head_seq` covers every such
     /// in-flight frame, so the snapshot never excludes an acked write the
@@ -1041,7 +1041,7 @@ impl BoxState {
     }
 
     /// **Roll back** a staged batch whose WAL append/fsync FAILED, robust to
-    /// concurrent same-box staging (codex P0 #1): because the fsync now waits off
+    /// concurrent same-topic staging (codex P0 #1): because the fsync now waits off
     /// the `append_lock`, a *later* writer may have staged records past this batch
     /// in the deque, so a tail truncation would wrongly drop the later writer's
     /// records. Instead mark each of THIS batch's seqs deleted in place (freeing
@@ -1065,7 +1065,7 @@ impl BoxState {
 
     /// Feed the records `[start, end]` to the HOT segment writer and free the
     /// resident payloads of any seqs that sealing pushed into an immutable
-    /// segment. No-op for a box without a writer. The index lock is taken only
+    /// segment. No-op for a topic without a writer. The index lock is taken only
     /// briefly to read the just-committed values and (separately) to free sealed
     /// payloads — never held across the writer's segment `put`/`read`.
     fn materialize_segment(&self, start: u64, end: u64) {
@@ -1082,7 +1082,7 @@ impl BoxState {
             meta: Option<serde_json::Value>,
         }
         // Capture every seq in the freshly-appended range (contiguous, gapless —
-        // the segment mirrors the box's append order). A just-appended record is
+        // the segment mirrors the topic's append order). A just-appended record is
         // always present and non-deleted, so the resident payload is exact.
         let pending: Vec<Pending> = {
             let index = self.index.read();
@@ -1144,7 +1144,7 @@ impl BoxState {
     /// read (Phase 6 memory bounding). `rec` is the in-memory slot at `seq`.
     ///
     /// - If the slot still holds its payload (`payload_resident`) — the common
-    ///   tail/active case and every writer-less box — clone it directly.
+    ///   tail/active case and every writer-less topic — clone it directly.
     /// - Otherwise the payload was freed after sealing: resolve it from the
     ///   writer's bounded cache (hot) or a segment `read_range` (cold-ish). This
     ///   runs off the index write lock so a slow read never blocks writes/delivery.
@@ -1241,10 +1241,10 @@ impl BoxState {
 
         let head = self.head_seq();
         if head == 0 {
-            return Ok(RetentionAdvance::NONE); // empty box, nothing retained.
+            return Ok(RetentionAdvance::NONE); // empty topic, nothing retained.
         }
 
-        // Hot read-path fast path (codex P2 #11): a box with NO TTL and NO caps
+        // Hot read-path fast path (codex P2 #11): a topic with NO TTL and NO caps
         // has no involuntary floor that this call could advance, and every delete
         // already reclaims its own dead front (`delete_*`/`delete_seqs` call
         // `reclaim_front` directly), so there is no pending front prefix for this
@@ -1378,7 +1378,7 @@ impl BoxState {
     /// Physically pop the fully-dead front prefix (below `earliest_seq` or a run
     /// of already-deleted slots at the front), advancing `base_seq` and pruning
     /// their tag postings. Lazy reclaim shared by cap/TTL eviction and deletes
-    /// (DESIGN §7, ARCHITECTURE §1.1). `head` is the box head at call time.
+    /// (DESIGN §7, ARCHITECTURE §1.1). `head` is the topic head at call time.
     fn reclaim_front(&self, head: u64) {
         let earliest = {
             let floors = self.floors.read();
@@ -1430,7 +1430,7 @@ impl BoxState {
     /// This runs **off the hot path**: the index read lock is taken only to test
     /// segment dead-ness (a bounded scan over the candidate's seq range), and the
     /// segwriter lock is taken only to plan + drop — never held across a (possibly
-    /// slow, cold) read, and never gating a concurrent write/delivery. A box with
+    /// slow, cold) read, and never gating a concurrent write/delivery. A topic with
     /// no writer (pure in-memory / non-durable) skips all of this. Idempotent: a
     /// drop of an already-dropped segment is a no-op, so it is crash-safe to
     /// re-derive and re-run on restart.
@@ -1487,7 +1487,7 @@ impl BoxState {
     /// flip handles a PARTIALLY-cleared segment — only the seqs still on disk (their
     /// whole segment was not dropped) are flipped. Crash-safe per byte; best-effort
     /// (a flip failure leaves the WAL frame + in-memory mark as the witnesses). A
-    /// box without a writer, or a seq still in the active (unsealed) tail, is a
+    /// topic without a writer, or a seq still in the active (unsealed) tail, is a
     /// no-op. Runs off the index lock (only the writer lock is taken per flip).
     pub fn flag_sealed_deletes(&self, seqs: &[u64]) {
         let Some(sw) = &self.segwriter else { return };
@@ -1510,7 +1510,7 @@ impl BoxState {
     /// each flagged seq deleted in place (freeing its payload/tag, adjusting
     /// `bytes`/`count`), exactly like the live-path delete, then reclaims the now-
     /// dead front. Idempotent (an already-deleted slot is skipped) and crash-safe to
-    /// re-run. A no-op for a box without a writer or with no on-disk-flagged records.
+    /// re-run. A no-op for a topic without a writer or with no on-disk-flagged records.
     pub fn apply_ondisk_segment_deletes_on_recovery(&self) {
         let Some(sw) = &self.segwriter else { return };
         let flagged = sw.lock().scan_ondisk_deleted();
@@ -1543,10 +1543,10 @@ impl BoxState {
     }
 
     /// On-restart segment reclaim (ARCHITECTURE §4 step 5): after recovery rebuilt
-    /// this box's index + floors + segment registry, drop (1) any registered sealed
+    /// this topic's index + floors + segment registry, drop (1) any registered sealed
     /// segment now fully below the live set, and (2) any **orphan** segment object
     /// left on disk (a pre-crash reclaim whose unlink never completed). Idempotent,
-    /// off the hot path; a no-op for a box without a writer. Returns the orphan
+    /// off the hot path; a no-op for a topic without a writer. Returns the orphan
     /// count dropped (registry drops go through the normal `reclaim_segments`).
     ///
     /// FIRST re-derives sealed-record deletions from the on-disk segment delete-flag
@@ -1751,14 +1751,14 @@ impl BoxState {
 }
 
 /// RAII guard for a publish ticket (R14). Created by
-/// [`BoxState::next_publish_ticket`] under the append lock; the writer calls
+/// [`TopicState::next_publish_ticket`] under the append lock; the writer calls
 /// [`Self::wait_turn`] then publishes/rolls back and finally [`Self::done`].
 ///
 /// The guard exists to make the ticket release **panic-safe**: the publish gate
 /// is a strict-order baton (`publish_next` must reach exactly `ticket` before the
 /// gate advances), so if a ticketed writer panics — or returns early on an error
 /// path — without releasing its ticket, every later writer parks forever on
-/// [`BoxState::publish_wait_turn`] and [`BoxState::quiesce_publishes`] (snapshot
+/// [`TopicState::publish_wait_turn`] and [`TopicState::quiesce_publishes`] (snapshot
 /// capture) hangs. The `Drop` impl closes that hole: on unwind it waits for this
 /// ticket's turn (so the baton is advanced strictly in order, preserving the
 /// prefix-durability invariant) and then advances the gate, releasing every
@@ -1790,7 +1790,7 @@ enum UnwindAction {
 
 #[must_use = "a publish ticket must be waited on and released in order"]
 pub struct PublishGuard<'a> {
-    box_state: &'a BoxState,
+    topic_state: &'a TopicState,
     ticket: u64,
     /// Whether [`Self::wait_turn`] already advanced this ticket to the front of
     /// the gate (so `Drop` need not wait again before releasing).
@@ -1825,9 +1825,9 @@ impl PublishGuard<'_> {
     }
 
     /// Block until it is this ticket's turn to publish/rollback. See
-    /// [`BoxState::publish_wait_turn`].
+    /// [`TopicState::publish_wait_turn`].
     pub fn wait_turn(&mut self) {
-        self.box_state.publish_wait_turn(self.ticket);
+        self.topic_state.publish_wait_turn(self.ticket);
         self.waited = true;
     }
 
@@ -1836,7 +1836,7 @@ impl PublishGuard<'_> {
     /// publishing/rolling back. Disarms the `Drop` fallback (both the gate-leak
     /// release and any armed unwind action).
     pub fn done(mut self) {
-        self.box_state.publish_done(self.ticket);
+        self.topic_state.publish_done(self.ticket);
         self.done = true;
     }
 }
@@ -1855,7 +1855,7 @@ impl Drop for PublishGuard<'_> {
         // ticketed writer already published/rolled back, so the in-place rollback
         // below targets exactly our (still-unpublished) seqs.
         if !self.waited {
-            self.box_state.publish_wait_turn(self.ticket);
+            self.topic_state.publish_wait_turn(self.ticket);
         }
         // Complete the in-flight operation's required cleanup BEFORE releasing the
         // gate (R14 / codex P0 #2), so a later writer / a quiescing snapshot never
@@ -1868,7 +1868,7 @@ impl Drop for PublishGuard<'_> {
                 // writer, so they were never visible; a later writer that advances
                 // head past them now reads a deleted gap instead of a record whose
                 // WAL frame may never have been durable.
-                let mut index = self.box_state.index.write();
+                let mut index = self.topic_state.index.write();
                 for i in 0..count {
                     index.mark_deleted_pub(start + i);
                 }
@@ -1878,14 +1878,14 @@ impl Drop for PublishGuard<'_> {
                 // not run, and we cannot safely reconcile visibility on the unwind
                 // path. Abort so recovery rebuilds consistent state from the WAL.
                 tracing::error!(
-                    box_id = self.box_state.box_id,
+                    topic_id = self.topic_state.topic_id,
                     ticket = self.ticket,
                     "publish guard unwound with a committed-but-unapplied durable op; aborting for crash-consistent recovery"
                 );
                 std::process::abort();
             }
         }
-        self.box_state.publish_done(self.ticket);
+        self.topic_state.publish_done(self.ticket);
     }
 }
 
@@ -1894,11 +1894,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    fn box_for_test() -> Arc<BoxState> {
-        Arc::new(BoxState::new(
+    fn topic_for_test() -> Arc<TopicState> {
+        Arc::new(TopicState::new(
             "t".to_string(),
             1,
-            BoxConfig::default(),
+            TopicConfig::default(),
             1,
             1,
         ))
@@ -1911,7 +1911,7 @@ mod tests {
     /// blocking forever on a ticket that is never advanced.
     #[test]
     fn publish_guard_releases_gate_on_panic() {
-        let b = box_for_test();
+        let b = topic_for_test();
 
         // Writer A takes ticket 0 (under the would-be append lock), waits its turn
         // (it is first, so immediate), then PANICS without calling `done`. The
@@ -1969,10 +1969,10 @@ mod tests {
     }
 
     /// The happy path is unchanged: a guard whose `done()` is called advances the
-    /// gate exactly once and a subsequent `quiesce_publishes` sees a quiescent box.
+    /// gate exactly once and a subsequent `quiesce_publishes` sees a quiescent topic.
     #[test]
     fn publish_guard_done_advances_gate_once() {
-        let b = box_for_test();
+        let b = topic_for_test();
         {
             let mut t = b.next_publish_ticket();
             t.wait_turn();
@@ -1994,7 +1994,7 @@ mod tests {
     /// they read as a deleted gap rather than as live, never-durable records.
     #[test]
     fn publish_guard_rolls_back_staged_append_on_panic() {
-        let b = box_for_test();
+        let b = topic_for_test();
 
         // Writer A stages one record, takes ticket 0, ARMS the guard with the
         // staged batch, then panics before publishing. `head_seq` stays 0.

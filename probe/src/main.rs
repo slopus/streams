@@ -1,4 +1,4 @@
-//! streams-probe — a standalone black-box tool that runs against a LIVE
+//! streams-probe — a standalone black-topic tool that runs against a LIVE
 //! streams server over HTTP (Phase-3 §4).
 //!
 //! Two subcommands:
@@ -11,7 +11,7 @@
 //!     watchers, router forwarding overhead). Prints numbers and, with `--json`,
 //!     a machine-readable summary for BENCHMARKS.md.
 //!
-//! The crate is deliberately black-box: it does NOT depend on the `streams`
+//! The crate is deliberately black-topic: it does NOT depend on the `streams`
 //! crate — only its public HTTP contract.
 
 use std::process::ExitCode;
@@ -23,7 +23,7 @@ use argh::FromArgs;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-/// streams-probe: black-box conformance + benchmark tool for a live streams server.
+/// streams-probe: black-topic conformance + benchmark tool for a live streams server.
 #[derive(FromArgs, Debug)]
 struct TopLevel {
     #[argh(subcommand)]
@@ -106,7 +106,7 @@ struct BenchDurableCmd {
     json: bool,
 }
 
-/// BROADCAST workload (Phase-5B): one source box, N concurrent SSE watchers, one
+/// BROADCAST workload (Phase-5B): one source topic, N concurrent SSE watchers, one
 /// writer appending. Measures aggregate deliveries/sec and per-watcher
 /// write->deliver p50/p99 — demonstrates the shared zero-copy frame fan-out
 /// scaling (serialize once, ref-count to all watchers).
@@ -138,9 +138,9 @@ struct BroadcastCmd {
     json: bool,
 }
 
-/// DISTRIBUTION workload (Phase-5B): fan a source stream into many boxes via
+/// DISTRIBUTION workload (Phase-5B): fan a source stream into many topics via
 /// batched, sharded, concurrent appends. Measures aggregate appends/sec and
-/// per-box append latency — pushes toward the millions-of-small-appends/sec
+/// per-topic append latency — pushes toward the millions-of-small-appends/sec
 /// target.
 #[derive(FromArgs, Debug)]
 #[argh(subcommand, name = "distribution")]
@@ -153,11 +153,11 @@ struct DistributionCmd {
     #[argh(option)]
     token: Option<String>,
 
-    /// number of destination boxes to fan into (default 5000)
+    /// number of destination topics to fan into (default 5000)
     #[argh(option, default = "5_000")]
-    boxes: u64,
+    topics: u64,
 
-    /// records per append request — boxes are sharded across batched requests
+    /// records per append request — topics are sharded across batched requests
     /// (default 100)
     #[argh(option, default = "100")]
     batch: u64,
@@ -206,10 +206,10 @@ struct QueueCmd {
     json: bool,
 }
 
-/// ACTORS / INFERENCE workload (Phase-5B): each actor is a box; per "inference"
+/// ACTORS / INFERENCE workload (Phase-5B): each actor is a topic; per "inference"
 /// append a chain (model-answer + tool-call + several tool-result events), then
 /// periodically snapshot-compact via delete before_seq. Measures events/sec and
-/// box-count scaling.
+/// topic-count scaling.
 #[derive(FromArgs, Debug)]
 #[argh(subcommand, name = "actors")]
 struct ActorsCmd {
@@ -221,7 +221,7 @@ struct ActorsCmd {
     #[argh(option)]
     token: Option<String>,
 
-    /// number of actor boxes (default 1000)
+    /// number of actor topics (default 1000)
     #[argh(option, default = "1_000")]
     actors: u64,
 
@@ -485,7 +485,7 @@ async fn run_conformance(cmd: ConformanceCmd) -> ExitCode {
     let mut rep = Report::new();
 
     // Unique-ish namespace so repeated runs against a long-lived server don't
-    // collide on box names.
+    // collide on topic names.
     let ns = format!(
         "probe{}",
         std::time::SystemTime::now()
@@ -496,7 +496,7 @@ async fn run_conformance(cmd: ConformanceCmd) -> ExitCode {
 
     conformance_health(&c, &mut rep).await;
     conformance_http2(&cmd.base_url, cmd.token.clone(), &mut rep, &ns).await;
-    conformance_box_lifecycle(&c, &mut rep, &ns).await;
+    conformance_topic_lifecycle(&c, &mut rep, &ns).await;
     conformance_write_and_diff(&c, &mut rep, &ns).await;
     conformance_idempotency(&c, &mut rep, &ns).await;
     conformance_errors(&c, &mut rep, &ns).await;
@@ -510,7 +510,7 @@ async fn run_conformance(cmd: ConformanceCmd) -> ExitCode {
         conformance_auth(&cmd.base_url, &c, &mut rep, &ns).await;
     }
 
-    // Best-effort cleanup of the boxes we created.
+    // Best-effort cleanup of the topics we created.
     cleanup(&c, &ns).await;
 
     println!("=== streams-probe conformance: {} ===", cmd.base_url);
@@ -611,7 +611,7 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
 
     // Write + diff over h2c.
     let b = format!("{ns}-h2c");
-    let path = format!("{base}/v0/boxes/{b}");
+    let path = format!("{base}/v0/topics/{b}");
     let wrote_ok = match auth(
         h2.post(&path)
             .header("content-type", "application/json")
@@ -694,9 +694,9 @@ async fn conformance_http2(base_url: &str, token: Option<String>, rep: &mut Repo
     }
 }
 
-async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
+async fn conformance_topic_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
     let b = format!("{ns}-life");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
 
     // PUT create -> 201 created:true, config echoed with defaults merged.
     let put = c
@@ -705,12 +705,12 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
             &json!({ "ttl_ms": 60000, "cap_records": 1000, "discard": "old" }),
         )
         .await;
-    rep.status("PUT /v0/boxes/:box create -> 201", &put, 201);
+    rep.status("PUT /v0/topics/:topic create -> 201", &put, 201);
     if let Ok(r) = &put {
         rep.check(
-            "PUT create: created=true, box echoed, config merged",
+            "PUT create: created=true, topic echoed, config merged",
             bool_of(&r.body, "created") == Some(true)
-                && r.body.get("box").and_then(|v| v.as_str()) == Some(b.as_str())
+                && r.body.get("topic").and_then(|v| v.as_str()) == Some(b.as_str())
                 && u64_of(r.body.get("config").unwrap_or(&Value::Null), "ttl_ms") == Some(60000)
                 && r.body
                     .get("config")
@@ -741,12 +741,12 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
     let put3 = c.put(&path, &json!({ "ttl_ms": 120000 })).await;
     rep.status("PUT changed config -> 200", &put3, 200);
 
-    // GET state on a fresh (empty) box: head_seq=0, count=0.
+    // GET state on a fresh (empty) topic: head_seq=0, count=0.
     let get = c.get(&path).await;
-    rep.status("GET /v0/boxes/:box state -> 200", &get, 200);
+    rep.status("GET /v0/topics/:topic state -> 200", &get, 200);
     if let Ok(r) = &get {
         rep.check(
-            "GET state: fresh box head_seq=0, count=0, next_seq=1, has effective_priority",
+            "GET state: fresh topic head_seq=0, count=0, next_seq=1, has effective_priority",
             u64_of(&r.body, "head_seq") == Some(0)
                 && u64_of(&r.body, "count") == Some(0)
                 && u64_of(&r.body, "next_seq") == Some(1)
@@ -757,38 +757,38 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
 
     // GET ?touch=false still 200.
     let gett = c.get(&format!("{path}?touch=false")).await;
-    rep.status("GET /v0/boxes/:box?touch=false -> 200", &gett, 200);
+    rep.status("GET /v0/topics/:topic?touch=false -> 200", &gett, 200);
 
-    // List boxes (with prefix) shows the box.
-    let list = c.get(&format!("/v0/boxes?prefix={ns}-life")).await;
-    rep.status("GET /v0/boxes?prefix -> 200", &list, 200);
+    // List topics (with prefix) shows the topic.
+    let list = c.get(&format!("/v0/topics?prefix={ns}-life")).await;
+    rep.status("GET /v0/topics?prefix -> 200", &list, 200);
     if let Ok(r) = &list {
         let found = r
             .body
-            .get("boxes")
+            .get("topics")
             .and_then(|v| v.as_array())
             .map(|a| {
                 a.iter()
-                    .any(|x| x.get("box").and_then(|v| v.as_str()) == Some(b.as_str()))
+                    .any(|x| x.get("topic").and_then(|v| v.as_str()) == Some(b.as_str()))
             })
             .unwrap_or(false);
-        rep.check("list boxes: created box present", found, || {
+        rep.check("list topics: created topic present", found, || {
             format!("body {}", r.body)
         });
     }
 
-    // GET missing box -> 404 box_not_found (no auto-create on state read).
-    let miss = c.get(&format!("/v0/boxes/{ns}-doesnotexist")).await;
+    // GET missing topic -> 404 topic_not_found (no auto-create on state read).
+    let miss = c.get(&format!("/v0/topics/{ns}-doesnotexist")).await;
     rep.error_code(
-        "GET missing box -> 404 box_not_found",
+        "GET missing topic -> 404 topic_not_found",
         &miss,
         404,
-        "box_not_found",
+        "topic_not_found",
     );
 
-    // DELETE box -> 200 deleted:true.
+    // DELETE topic -> 200 deleted:true.
     let del = c.delete(&path).await;
-    rep.status("DELETE /v0/boxes/:box -> 200", &del, 200);
+    rep.status("DELETE /v0/topics/:topic -> 200", &del, 200);
     if let Ok(r) = &del {
         rep.check(
             "DELETE: deleted=true",
@@ -797,9 +797,9 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
         );
     }
 
-    // DELETE absent box -> 200 deleted:false (idempotent).
+    // DELETE absent topic -> 200 deleted:false (idempotent).
     let del2 = c.delete(&path).await;
-    rep.status("DELETE absent box -> 200", &del2, 200);
+    rep.status("DELETE absent topic -> 200", &del2, 200);
     if let Ok(r) = &del2 {
         rep.check(
             "DELETE absent: deleted=false",
@@ -808,26 +808,26 @@ async fn conformance_box_lifecycle(c: &Client, rep: &mut Report, ns: &str) {
         );
     }
 
-    // if_empty on a non-empty box -> 409 box_not_empty.
+    // if_empty on a non-empty topic -> 409 topic_not_empty.
     let b2 = format!("{ns}-ifempty");
     let _ = c
         .post(
-            &format!("/v0/boxes/{b2}"),
+            &format!("/v0/topics/{b2}"),
             &json!({ "records": [{ "data": 1 }] }),
         )
         .await;
-    let ife = c.delete(&format!("/v0/boxes/{b2}?if_empty=true")).await;
+    let ife = c.delete(&format!("/v0/topics/{b2}?if_empty=true")).await;
     rep.error_code(
-        "DELETE ?if_empty=true non-empty -> 409 box_not_empty",
+        "DELETE ?if_empty=true non-empty -> 409 topic_not_empty",
         &ife,
         409,
-        "box_not_empty",
+        "topic_not_empty",
     );
 }
 
 async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
     let b = format!("{ns}-wd");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
     let dpath = format!("{path}/diff");
 
     // First write auto-creates -> 201 created:true, contiguous seqs from 1.
@@ -966,38 +966,38 @@ async fn conformance_write_and_diff(c: &Client, rep: &mut Report, ns: &str) {
         );
     }
 
-    // create:false on absent box -> 404 (NOMKSTREAM).
+    // create:false on absent topic -> 404 (NOMKSTREAM).
     let nomk = c
         .post(
-            &format!("/v0/boxes/{ns}-nomk"),
+            &format!("/v0/topics/{ns}-nomk"),
             &json!({ "records": [{ "data": 1 }], "create": false }),
         )
         .await;
     rep.error_code(
-        "write create:false on absent -> 404 box_not_found",
+        "write create:false on absent -> 404 topic_not_found",
         &nomk,
         404,
-        "box_not_found",
+        "topic_not_found",
     );
 
-    // diff on absent box -> 404.
+    // diff on absent topic -> 404.
     let dmiss = c
         .post(
-            &format!("/v0/boxes/{ns}-nodiff/diff"),
+            &format!("/v0/topics/{ns}-nodiff/diff"),
             &json!({ "from_seq": 0 }),
         )
         .await;
     rep.error_code(
-        "diff on absent box -> 404 box_not_found",
+        "diff on absent topic -> 404 topic_not_found",
         &dmiss,
         404,
-        "box_not_found",
+        "topic_not_found",
     );
 }
 
 async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
     let b = format!("{ns}-idem");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
 
     let key = "probe-idem-1";
     let w1 = c
@@ -1048,7 +1048,7 @@ async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
 
     // Header-based idempotency key (body omits it) is honored.
     let bh = format!("{ns}-idemhdr");
-    let hpath = format!("/v0/boxes/{bh}");
+    let hpath = format!("/v0/topics/{bh}");
     let _ = c
         .send(
             c.http
@@ -1078,7 +1078,7 @@ async fn conformance_idempotency(c: &Client, rep: &mut Report, ns: &str) {
 
 async fn conformance_errors(c: &Client, rep: &mut Report, ns: &str) {
     let b = format!("{ns}-err");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
 
     // 415: non-JSON content type on a write.
     let r415 = c.post_raw_ct(&path, "text/plain", "{}").await;
@@ -1145,47 +1145,47 @@ async fn conformance_errors(c: &Client, rep: &mut Report, ns: &str) {
     let r404 = c.get("/v0/nonexistent/route").await;
     rep.status("GET unknown /v0 route -> 404", &r404, 404);
 
-    // 400: invalid box name (PUT). A '.' leading char is invalid.
-    let rname = c.put("/v0/boxes/.bad", &json!({})).await;
+    // 400: invalid topic name (PUT). A '.' leading char is invalid.
+    let rname = c.put("/v0/topics/.bad", &json!({})).await;
     rep.error_code(
-        "PUT invalid box name -> 400 invalid_request",
+        "PUT invalid topic name -> 400 invalid_request",
         &rname,
         400,
         "invalid_request",
     );
 
-    // 422: write to a full discard:"reject" box.
+    // 422: write to a full discard:"reject" topic.
     let rb = format!("{ns}-reject");
     let _ = c
         .put(
-            &format!("/v0/boxes/{rb}"),
+            &format!("/v0/topics/{rb}"),
             &json!({ "cap_records": 1, "discard": "reject" }),
         )
         .await;
     let _ = c
         .post(
-            &format!("/v0/boxes/{rb}"),
+            &format!("/v0/topics/{rb}"),
             &json!({ "records": [{ "data": 1 }] }),
         )
         .await;
     let full = c
         .post(
-            &format!("/v0/boxes/{rb}"),
+            &format!("/v0/topics/{rb}"),
             &json!({ "records": [{ "data": 2 }] }),
         )
         .await;
     rep.error_code(
-        "write to full discard:reject box -> 422 box_full",
+        "write to full discard:reject topic -> 422 topic_full",
         &full,
         422,
-        "box_full",
+        "topic_full",
     );
 }
 
 async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
     // Snapshot delete (before_seq), silent, point-in-time + match flows.
     let b = format!("{ns}-del");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
     let dpath = format!("{path}/diff");
     let delpath = format!("{path}/delete");
 
@@ -1248,7 +1248,7 @@ async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
 
     // Point-in-time: a NEW record with a matching tag after a tag delete survives.
     let b2 = format!("{ns}-pit");
-    let p2 = format!("/v0/boxes/{b2}");
+    let p2 = format!("/v0/topics/{b2}");
     let _ = c
         .post(&p2, &json!({ "records": [{ "data": 1, "tag": "a:1" }] }))
         .await;
@@ -1292,18 +1292,18 @@ async fn conformance_deletion(c: &Client, rep: &mut Report, ns: &str) {
         "invalid_request",
     );
 
-    // delete on absent box -> 404.
+    // delete on absent topic -> 404.
     let da = c
         .post(
-            &format!("/v0/boxes/{ns}-noxdel/delete"),
+            &format!("/v0/topics/{ns}-noxdel/delete"),
             &json!({ "before_seq": 1 }),
         )
         .await;
     rep.error_code(
-        "delete on absent box -> 404 box_not_found",
+        "delete on absent topic -> 404 topic_not_found",
         &da,
         404,
-        "box_not_found",
+        "topic_not_found",
     );
 }
 
@@ -1313,7 +1313,7 @@ async fn conformance_cap_tombstone(c: &Client, rep: &mut Report, ns: &str) {
     // engine unit tests with TestClock; over HTTP we can deterministically force
     // cap eviction via discard:"old").
     let b = format!("{ns}-cap");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
     let dpath = format!("{path}/diff");
 
     let _ = c
@@ -1358,7 +1358,7 @@ async fn conformance_node_loop(c: &Client, rep: &mut Report, ns: &str) {
     // A node never receives its own records via diff, but the cursor advances to
     // caught_up (no infinite empty loop).
     let b = format!("{ns}-node");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
     let dpath = format!("{path}/diff");
 
     let _ = c
@@ -1432,13 +1432,13 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
     // Write to source: forwarded copy appears in dest with $node preserved + fresh seq.
     let _ = c
         .post(
-            &format!("/v0/boxes/{src}"),
+            &format!("/v0/topics/{src}"),
             &json!({ "records": [{ "data": { "k": "v" }, "node": "origin-1", "tag": "tag-1" }] }),
         )
         .await;
     let dd = c
         .post(
-            &format!("/v0/boxes/{dst}/diff"),
+            &format!("/v0/topics/{dst}/diff"),
             &json!({ "from_seq": 0, "include_tags": true }),
         )
         .await;
@@ -1564,7 +1564,7 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
     // guards against an infinite loop; we just confirm the write returns.
     let cyclic_write = c
         .post(
-            &format!("/v0/boxes/{src}"),
+            &format!("/v0/topics/{src}"),
             &json!({ "records": [{ "data": "cycle", "node": "n9" }] }),
         )
         .await;
@@ -1582,10 +1582,10 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
         )
         .await;
     rep.error_code(
-        "router create_dest:false missing dest -> 404 box_not_found",
+        "router create_dest:false missing dest -> 404 topic_not_found",
         &cdf,
         404,
-        "box_not_found",
+        "topic_not_found",
     );
 
     // DELETE router -> 200 deleted:true; idempotent -> deleted:false.
@@ -1609,13 +1609,13 @@ async fn conformance_routers(c: &Client, rep: &mut Report, ns: &str) {
 }
 
 /// Queue layer (API §10): create a queue, produce jobs, then assert the
-/// claim/ack/nack/extend shapes + status codes, `409 not_a_queue` on a log box,
+/// claim/ack/nack/extend shapes + status codes, `409 not_a_queue` on a log topic,
 /// and that `/work` SSE delivers a `job` frame. Timing-dependent semantics
 /// (lease expiry / dead-letter) are covered deterministically by the engine +
 /// integration tests under a TestClock; here we assert the wire contract.
 async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     let q = format!("{ns}-q");
-    let path = format!("/v0/boxes/{q}");
+    let path = format!("/v0/topics/{q}");
 
     // PUT type:"queue" -> 201, config echoes type + queue tuning fields.
     let put = c
@@ -1805,9 +1805,9 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
         "invalid_request",
     );
 
-    // 409 not_a_queue: every queue endpoint on a plain LOG box.
+    // 409 not_a_queue: every queue endpoint on a plain LOG topic.
     let logb = format!("{ns}-qlog");
-    let logpath = format!("/v0/boxes/{logb}");
+    let logpath = format!("/v0/topics/{logb}");
     let _ = c.put(&logpath, &json!({})).await; // default type=log.
     for ep in ["claim", "ack", "nack", "extend"] {
         let r = c
@@ -1817,13 +1817,13 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
             )
             .await;
         rep.error_code(
-            &format!("queue /{ep} on a log box -> 409 not_a_queue"),
+            &format!("queue /{ep} on a log topic -> 409 not_a_queue"),
             &r,
             409,
             "not_a_queue",
         );
     }
-    // /work on a log box -> 409 not_a_queue (validated before the stream opens).
+    // /work on a log topic -> 409 not_a_queue (validated before the stream opens).
     let worklog = c
         .send(
             c.http
@@ -1832,24 +1832,24 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
         )
         .await;
     rep.error_code(
-        "GET /work on a log box -> 409 not_a_queue",
+        "GET /work on a log topic -> 409 not_a_queue",
         &worklog,
         409,
         "not_a_queue",
     );
 
-    // queue op on an ABSENT box -> 404 box_not_found (not 409).
+    // queue op on an ABSENT topic -> 404 topic_not_found (not 409).
     let missing = c
         .post(
-            &format!("/v0/boxes/{ns}-qmiss/claim"),
+            &format!("/v0/topics/{ns}-qmiss/claim"),
             &json!({ "node": "w1" }),
         )
         .await;
     rep.error_code(
-        "claim on absent box -> 404 box_not_found",
+        "claim on absent topic -> 404 topic_not_found",
         &missing,
         404,
-        "box_not_found",
+        "topic_not_found",
     );
 
     // /work with a non-SSE Accept -> 406 not_acceptable.
@@ -1870,7 +1870,7 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     // /work SSE delivers a job frame. Produce a couple of fresh jobs on a clean
     // queue so the stream has work to push, then collect the first job frame.
     let wq = format!("{ns}-qwork");
-    let wpath = format!("/v0/boxes/{wq}");
+    let wpath = format!("/v0/topics/{wq}");
     let _ = c
         .put(&wpath, &json!({ "type": "queue", "lease_ms": 30000 }))
         .await;
@@ -1892,10 +1892,10 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
     .await;
     let job = frames.iter().find(|f| f.event == "job");
     rep.check(
-        "/work SSE delivers an `event: job` frame with box/$seq/lease_id/deliveries",
+        "/work SSE delivers an `event: job` frame with topic/$seq/lease_id/deliveries",
         job.map(|f| {
             let d: Value = serde_json::from_str(&f.data).unwrap_or(Value::Null);
-            d.get("box").and_then(|v| v.as_str()) == Some(wq.as_str())
+            d.get("topic").and_then(|v| v.as_str()) == Some(wq.as_str())
                 && d.get("$seq")
                     .and_then(|v| v.as_u64())
                     .map(|s| s >= 1)
@@ -1919,19 +1919,19 @@ async fn conformance_queue(c: &Client, rep: &mut Report, ns: &str) {
         },
     );
 
-    // type is immutable: re-PUT the queue as a log -> 409 box_exists_incompatible.
+    // type is immutable: re-PUT the queue as a log -> 409 topic_exists_incompatible.
     let immut = c.put(&path, &json!({ "type": "log" })).await;
     rep.error_code(
-        "PUT changing type queue->log -> 409 box_exists_incompatible",
+        "PUT changing type queue->log -> 409 topic_exists_incompatible",
         &immut,
         409,
-        "box_exists_incompatible",
+        "topic_exists_incompatible",
     );
 }
 
 async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
     let b = format!("{ns}-sse");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
 
     // Seed a couple of records so the stream has backlog + a caught-up transition.
     let _ = c
@@ -1941,11 +1941,11 @@ async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
         )
         .await;
 
-    // POST /v0/watch -> 200 with wid + stream_url + per-box head/earliest.
+    // POST /v0/watch -> 200 with wid + stream_url + per-topic head/earliest.
     let watch = c
         .post(
             "/v0/watch",
-            &json!({ "boxes": { b.clone(): { "from_seq": 0 } }, "include_tags": true }),
+            &json!({ "topics": { b.clone(): { "from_seq": 0 } }, "include_tags": true }),
         )
         .await;
     rep.status("POST /v0/watch -> 200", &watch, 200);
@@ -1957,11 +1957,11 @@ async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
     });
     if let Ok(r) = &watch {
         rep.check(
-            "watch create: wid + stream_url + per-box head/earliest",
+            "watch create: wid + stream_url + per-topic head/earliest",
             r.body.get("wid").is_some()
                 && stream_url.is_some()
                 && r.body
-                    .get("boxes")
+                    .get("topics")
                     .and_then(|m| m.get(&b))
                     .and_then(|s| s.get("head_seq"))
                     .is_some(),
@@ -1969,27 +1969,27 @@ async fn conformance_sse(c: &Client, rep: &mut Report, ns: &str) {
         );
     }
 
-    // POST /v0/watch missing boxes -> 400.
-    let wbad = c.post("/v0/watch", &json!({ "boxes": {} })).await;
+    // POST /v0/watch missing topics -> 400.
+    let wbad = c.post("/v0/watch", &json!({ "topics": {} })).await;
     rep.error_code(
-        "watch create empty boxes -> 400 invalid_request",
+        "watch create empty topics -> 400 invalid_request",
         &wbad,
         400,
         "invalid_request",
     );
 
-    // POST /v0/watch unknown box -> 404.
+    // POST /v0/watch unknown topic -> 404.
     let wmiss = c
         .post(
             "/v0/watch",
-            &json!({ "boxes": { format!("{ns}-ssemiss"): {} } }),
+            &json!({ "topics": { format!("{ns}-ssemiss"): {} } }),
         )
         .await;
     rep.error_code(
-        "watch create unknown box -> 404 box_not_found",
+        "watch create unknown topic -> 404 topic_not_found",
         &wmiss,
         404,
-        "box_not_found",
+        "topic_not_found",
     );
 
     let Some(stream_url) = stream_url else {
@@ -2121,7 +2121,7 @@ async fn conformance_auth(base_url: &str, c: &Client, rep: &mut Report, ns: &str
     // authed client works but the anon client is rejected.
     let anon = Client::new(base_url, None);
     let b = format!("{ns}-auth");
-    let path = format!("/v0/boxes/{b}");
+    let path = format!("/v0/topics/{b}");
 
     // Authed write must succeed.
     let authed = c.post(&path, &json!({ "records": [{ "data": 1 }] })).await;
@@ -2278,27 +2278,27 @@ fn parse_sse_block(block: &str) -> Option<SseFrame> {
     }
 }
 
-/// Best-effort delete of every box we created under `ns`.
+/// Best-effort delete of every topic we created under `ns`.
 async fn cleanup(c: &Client, ns: &str) {
     let mut cursor: Option<String> = None;
     loop {
         let path = match &cursor {
-            Some(cur) => format!("/v0/boxes?prefix={ns}&page_size=1000&cursor={cur}"),
-            None => format!("/v0/boxes?prefix={ns}&page_size=1000"),
+            Some(cur) => format!("/v0/topics?prefix={ns}&page_size=1000&cursor={cur}"),
+            None => format!("/v0/topics?prefix={ns}&page_size=1000"),
         };
         let Ok(r) = c.get(&path).await else { break };
         let names: Vec<String> = r
             .body
-            .get("boxes")
+            .get("topics")
             .and_then(|v| v.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|x| x.get("box").and_then(|v| v.as_str()).map(String::from))
+                    .filter_map(|x| x.get("topic").and_then(|v| v.as_str()).map(String::from))
                     .collect()
             })
             .unwrap_or_default();
         for n in &names {
-            let _ = c.delete(&format!("/v0/boxes/{n}")).await;
+            let _ = c.delete(&format!("/v0/topics/{n}")).await;
         }
         cursor = r
             .body
@@ -2402,7 +2402,7 @@ async fn run_bench(cmd: BenchCmd) -> ExitCode {
 
 /// Durability cost benchmark: durable (fsync-gated, group-committed) vs
 /// non-durable write-ack latency + throughput, side by side. Drives a `durable`
-/// box and a `non-durable` box over the same HTTP path so the only difference is
+/// topic and a `non-durable` topic over the same HTTP path so the only difference is
 /// the per-write fsync gate.
 async fn run_bench_durable(cmd: BenchDurableCmd) -> ExitCode {
     let c = Client::new(&cmd.base_url, cmd.token.clone());
@@ -2472,14 +2472,14 @@ async fn bench_one_durability_class(
     let label = if durable { "dur" } else { "nodur" };
 
     // --- Single-record write-ack latency (one in-flight at a time). ----------
-    let lat_box = format!("{ns}-{label}-lat");
+    let lat_topic = format!("{ns}-{label}-lat");
     let _ = c
         .put(
-            &format!("/v0/boxes/{lat_box}"),
+            &format!("/v0/topics/{lat_topic}"),
             &json!({ "durable": durable }),
         )
         .await;
-    let lat_path = format!("/v0/boxes/{lat_box}");
+    let lat_path = format!("/v0/topics/{lat_topic}");
     let n = samples.max(1);
     let mut latencies = Vec::with_capacity(n as usize);
     let mut fsync_ms_samples = Vec::with_capacity(n as usize);
@@ -2504,14 +2504,14 @@ async fn bench_one_durability_class(
     let server_fsync = summarize(fsync_ms_samples);
 
     // --- Concurrent batched throughput. --------------------------------------
-    let tput_box = format!("{ns}-{label}-tput");
+    let tput_topic = format!("{ns}-{label}-tput");
     let _ = c
         .put(
-            &format!("/v0/boxes/{tput_box}"),
+            &format!("/v0/topics/{tput_topic}"),
             &json!({ "durable": durable }),
         )
         .await;
-    let tput_path = Arc::new(format!("/v0/boxes/{tput_box}"));
+    let tput_path = Arc::new(format!("/v0/topics/{tput_topic}"));
     let writers = 16usize;
     let batch = 100u64;
     let batches = (total_writes / batch).max(1);
@@ -2601,9 +2601,9 @@ fn print_durable_bench_table(s: &Value) {
 /// writers, batched).
 async fn bench_write(c: &Client, ns: &str, total_writes: u64) -> Value {
     // --- Latency: single-record writes measured one at a time. ---
-    let lat_box = format!("{ns}-wlat");
-    let _ = c.put(&format!("/v0/boxes/{lat_box}"), &json!({})).await;
-    let lat_path = format!("/v0/boxes/{lat_box}");
+    let lat_topic = format!("{ns}-wlat");
+    let _ = c.put(&format!("/v0/topics/{lat_topic}"), &json!({})).await;
+    let lat_path = format!("/v0/topics/{lat_topic}");
     let lat_samples_n = 5_000.min(total_writes).max(1);
     let mut latencies = Vec::with_capacity(lat_samples_n as usize);
     let body = json!({ "records": [{ "data": { "x": "abcdefghij0123456789" } }] });
@@ -2619,9 +2619,9 @@ async fn bench_write(c: &Client, ns: &str, total_writes: u64) -> Value {
     let lat_summary = summarize(latencies);
 
     // --- Throughput: concurrent writers, batched appends. ---
-    let tput_box = format!("{ns}-wtput");
-    let _ = c.put(&format!("/v0/boxes/{tput_box}"), &json!({})).await;
-    let tput_path = Arc::new(format!("/v0/boxes/{tput_box}"));
+    let tput_topic = format!("{ns}-wtput");
+    let _ = c.put(&format!("/v0/topics/{tput_topic}"), &json!({})).await;
+    let tput_path = Arc::new(format!("/v0/topics/{tput_topic}"));
     let writers = 16usize;
     let batch = 100u64;
     let total = total_writes;
@@ -2681,8 +2681,8 @@ async fn bench_write(c: &Client, ns: &str, total_writes: u64) -> Value {
 /// getDifference throughput + per-call latency at limits 1 / 256 / 1000.
 async fn bench_diff(c: &Client, ns: &str) -> Value {
     let b = format!("{ns}-diff");
-    let path = format!("/v0/boxes/{b}");
-    let dpath = format!("/v0/boxes/{b}/diff");
+    let path = format!("/v0/topics/{b}");
+    let dpath = format!("/v0/topics/{b}/diff");
 
     // Seed ~20k records so deep reads have something to chew on.
     let seed_total = 20_000u64;
@@ -2752,7 +2752,7 @@ async fn bench_diff(c: &Client, ns: &str) -> Value {
     Value::Object(out)
 }
 
-/// SSE fan-out write->deliver latency with N watchers on one box.
+/// SSE fan-out write->deliver latency with N watchers on one topic.
 async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Value {
     let mut out = serde_json::Map::new();
 
@@ -2764,8 +2764,8 @@ async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Val
 
     for &n in watcher_counts {
         let b = format!("{ns}-sse{n}");
-        let path = format!("/v0/boxes/{b}");
-        // Create + seed one record so the box exists and watchers tail the head.
+        let path = format!("/v0/topics/{b}");
+        // Create + seed one record so the topic exists and watchers tail the head.
         let _ = c
             .post(&path, &json!({ "records": [{ "data": "seed" }] }))
             .await;
@@ -2775,11 +2775,11 @@ async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Val
         let mut watcher_handles = Vec::with_capacity(n);
 
         for _ in 0..n {
-            // Create a session tailing the box (only records after subscribe).
+            // Create a session tailing the topic (only records after subscribe).
             let watch = c
                 .post(
                     "/v0/watch",
-                    &json!({ "boxes": { b.clone(): { "tail": true } }, "heartbeat_ms": 1000 }),
+                    &json!({ "topics": { b.clone(): { "tail": true } }, "heartbeat_ms": 1000 }),
                 )
                 .await;
             let Some(stream_url) = watch.ok().and_then(|r| {
@@ -2839,7 +2839,7 @@ async fn bench_sse_fanout(c: &Client, ns: &str, watcher_counts: &[usize]) -> Val
                 "write_to_deliver_latency": summarize(samples),
             }),
         );
-        // Tear down the box so the next watcher tier starts clean.
+        // Tear down the topic so the next watcher tier starts clean.
         let _ = c.delete(&path).await;
     }
 
@@ -2918,8 +2918,8 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
     let src = format!("{ns}-rsrc");
     let dst = format!("{ns}-rdst");
     let rname = format!("{ns}-rbench");
-    let _ = c.put(&format!("/v0/boxes/{src}"), &json!({})).await;
-    let _ = c.put(&format!("/v0/boxes/{dst}"), &json!({})).await;
+    let _ = c.put(&format!("/v0/topics/{src}"), &json!({})).await;
+    let _ = c.put(&format!("/v0/topics/{dst}"), &json!({})).await;
     let _ = c
         .put(
             &format!("/v0/routers/{rname}"),
@@ -2932,12 +2932,12 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
     // Forwarded path: write to src, then read dst from its prior head to confirm
     // the forwarded record landed; measure end-to-end.
     let mut fwd = Vec::with_capacity(iters);
-    let src_path = format!("/v0/boxes/{src}");
-    let dst_diff = format!("/v0/boxes/{dst}/diff");
+    let src_path = format!("/v0/topics/{src}");
+    let dst_diff = format!("/v0/topics/{dst}/diff");
     for i in 0..iters {
         // current dst head
         let dst_head = c
-            .get(&format!("/v0/boxes/{dst}"))
+            .get(&format!("/v0/topics/{dst}"))
             .await
             .ok()
             .and_then(|r| u64_of(&r.body, "head_seq"))
@@ -2962,11 +2962,11 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
         fwd.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // Direct baseline: write to a plain box + read it back (no router).
-    let direct_box = format!("{ns}-direct");
-    let _ = c.put(&format!("/v0/boxes/{direct_box}"), &json!({})).await;
-    let dpath = format!("/v0/boxes/{direct_box}");
-    let ddiff = format!("/v0/boxes/{direct_box}/diff");
+    // Direct baseline: write to a plain topic + read it back (no router).
+    let direct_topic = format!("{ns}-direct");
+    let _ = c.put(&format!("/v0/topics/{direct_topic}"), &json!({})).await;
+    let dpath = format!("/v0/topics/{direct_topic}");
+    let ddiff = format!("/v0/topics/{direct_topic}/diff");
     let mut direct = Vec::with_capacity(iters);
     for i in 0..iters {
         let head = c
@@ -3160,7 +3160,7 @@ fn fmt_latency(v: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 1. BROADCAST — 1 source box -> N SSE watchers over shared zero-copy frames
+// 1. BROADCAST — 1 source topic -> N SSE watchers over shared zero-copy frames
 // ---------------------------------------------------------------------------
 
 /// Emit-side of a broadcast pulse measurement: a per-watcher write->deliver
@@ -3187,8 +3187,8 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
 
     for &n in &counts {
         let b = format!("{ns}-w{n}");
-        let path = format!("/v0/boxes/{b}");
-        // Create + seed so the box exists; watchers then tail the head.
+        let path = format!("/v0/topics/{b}");
+        // Create + seed so the topic exists; watchers then tail the head.
         let _ = c
             .post(&path, &json!({ "records": [{ "data": "seed" }] }))
             .await;
@@ -3197,11 +3197,11 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
         let mut handles = Vec::with_capacity(n);
         for _ in 0..n {
-            // One shared session per watcher, tailing the box (records after subscribe).
+            // One shared session per watcher, tailing the topic (records after subscribe).
             let watch = c
                 .post(
                     "/v0/watch",
-                    &json!({ "boxes": { b.clone(): { "tail": true } }, "heartbeat_ms": 2000 }),
+                    &json!({ "topics": { b.clone(): { "tail": true } }, "heartbeat_ms": 2000 }),
                 )
                 .await;
             let Some(stream_url) = watch.ok().and_then(|r| {
@@ -3288,7 +3288,7 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
         println!("{}", serde_json::to_string_pretty(&summary).unwrap());
     } else {
         println!("\n=== streams-probe broadcast: {} ===", cmd.base_url);
-        println!("one source box -> N SSE watchers (shared zero-copy frame fan-out):");
+        println!("one source topic -> N SSE watchers (shared zero-copy frame fan-out):");
         let mut keys: Vec<&String> = tiers.keys().collect();
         keys.sort_by_key(|k| {
             k.trim_start_matches("watchers_")
@@ -3311,7 +3311,7 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// 2. DISTRIBUTION — 1 source -> many boxes via batched, sharded fan-out
+// 2. DISTRIBUTION — 1 source -> many topics via batched, sharded fan-out
 // ---------------------------------------------------------------------------
 
 async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
@@ -3320,18 +3320,18 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let ns = format!("dist{}", std::process::id());
-    let n_boxes = cmd.boxes.max(1);
+    let n_topics = cmd.topics.max(1);
     let batch = cmd.batch.max(1);
     let writers = cmd.writers.max(1);
     eprintln!(
-        "distribution {} (boxes={}, batch={}, writers={})",
-        cmd.base_url, n_boxes, batch, writers
+        "distribution {} (topics={}, batch={}, writers={})",
+        cmd.base_url, n_topics, batch, writers
     );
 
-    // Each request appends `batch` records to ONE destination box (a small,
-    // sharded append). We round-robin boxes across `total_batches` requests so
+    // Each request appends `batch` records to ONE destination topic (a small,
+    // sharded append). We round-robin topics across `total_batches` requests so
     // the fan-out spreads evenly. total appends == total_batches * batch.
-    let total_batches = n_boxes; // one batch per box: every box gets `batch` records.
+    let total_batches = n_topics; // one batch per topic: every topic gets `batch` records.
     let total_records = total_batches * batch;
 
     // Pre-build a reusable batch payload (return_seqs=false to keep responses tiny).
@@ -3345,7 +3345,7 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
     let next = Arc::new(AtomicU64::new(0));
     let done_records = Arc::new(AtomicU64::new(0));
     let done_batches = Arc::new(AtomicU64::new(0));
-    // Per-box append latency samples (a sampled subset to bound memory).
+    // Per-topic append latency samples (a sampled subset to bound memory).
     let lat = Arc::new(std::sync::Mutex::new(Vec::<f64>::with_capacity(20_000)));
 
     let base = Arc::new(format!("{ns}-b"));
@@ -3366,7 +3366,7 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
                 if idx >= total_batches {
                     break;
                 }
-                let path = format!("/v0/boxes/{base}{idx}?return_seqs=false");
+                let path = format!("/v0/topics/{base}{idx}?return_seqs=false");
                 let t = Instant::now();
                 let ok = cc
                     .post(&path, &pl)
@@ -3410,7 +3410,7 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
     let summary = json!({
         "base_url": cmd.base_url,
         "workload": "distribution",
-        "boxes": n_boxes,
+        "topics": n_topics,
         "batch_size": batch,
         "writers": writers,
         "records_target": total_records,
@@ -3426,11 +3426,11 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
     } else {
         println!("\n=== streams-probe distribution: {} ===", cmd.base_url);
         println!(
-            "1 source -> {} boxes via {} batched writers (batch={}):",
-            n_boxes, writers, batch
+            "1 source -> {} topics via {} batched writers (batch={}):",
+            n_topics, writers, batch
         );
         println!(
-            "  {:.0} appends/s  ({} records into {} boxes in {:.3}s)",
+            "  {:.0} appends/s  ({} records into {} topics in {:.3}s)",
             appends_per_s, recs, batches_ok, elapsed
         );
         println!(
@@ -3439,7 +3439,7 @@ async fn run_distribution(cmd: DistributionCmd) -> ExitCode {
         );
         if appends_per_s < 1_000_000.0 {
             println!(
-                "  NOTE: {:.0} appends/s is below the 1M/s target. Single-process HTTP probe is\n        the ceiling here — per-request overhead (TCP/HTTP/JSON parse) dominates over\n        a localhost loopback. Raise --batch and --writers, and run the probe on a\n        separate host/core set, to push closer; the write path itself is sharded\n        and lock-free per box (ARCHITECTURE §8).",
+                "  NOTE: {:.0} appends/s is below the 1M/s target. Single-process HTTP probe is\n        the ceiling here — per-request overhead (TCP/HTTP/JSON parse) dominates over\n        a localhost loopback. Raise --batch and --writers, and run the probe on a\n        separate host/core set, to push closer; the write path itself is sharded\n        and lock-free per topic (ARCHITECTURE §8).",
                 appends_per_s
             );
         }
@@ -3466,7 +3466,7 @@ async fn run_queue(cmd: QueueCmd) -> ExitCode {
     );
 
     let q = format!("{ns}-q");
-    let path = format!("/v0/boxes/{q}");
+    let path = format!("/v0/topics/{q}");
     // Create the queue. lease_ms generous so workers never lose a lease mid-run.
     let _ = c
         .put(
@@ -3654,7 +3654,7 @@ async fn run_queue(cmd: QueueCmd) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// 4. ACTORS / INFERENCE — per-actor box, event chains, snapshot compaction
+// 4. ACTORS / INFERENCE — per-actor topic, event chains, snapshot compaction
 // ---------------------------------------------------------------------------
 
 async fn run_actors(cmd: ActorsCmd) -> ExitCode {
@@ -3697,7 +3697,7 @@ async fn run_actors(cmd: ActorsCmd) -> ExitCode {
                 if a >= actors {
                     break;
                 }
-                let path = format!("/v0/boxes/{base}{a}");
+                let path = format!("/v0/topics/{base}{a}");
                 for inf in 0..inferences {
                     // One inference = one chain appended as a single batch:
                     //   model-answer + tool-call + N tool-result events.
@@ -3784,7 +3784,7 @@ async fn run_actors(cmd: ActorsCmd) -> ExitCode {
     } else {
         println!("\n=== streams-probe actors: {} ===", cmd.base_url);
         println!(
-            "{} actor boxes x {} inferences (chain_len={}, snapshot every {}):",
+            "{} actor topics x {} inferences (chain_len={}, snapshot every {}):",
             actors, inferences, chain_len, cmd.snapshot_every
         );
         println!(

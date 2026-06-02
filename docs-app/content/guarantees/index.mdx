@@ -28,7 +28,7 @@ Mixing those two would make the gap alarm useless. If a delete you issued looked
 data that fell off a retention window, you could never trust a tombstone to mean "something
 was lost that I wanted." So streams keeps the two structurally separate.
 
-The mechanism is a **dual watermark** per box. `earliest_seq` is the first currently-live seq
+The mechanism is a **dual watermark** per topic. `earliest_seq` is the first currently-live seq
 — it advances on eviction, TTL expiry, **and** deletion. `evict_floor` advances **only** on
 involuntary cap/TTL loss, and it is the *sole* tombstone trigger. The invariant
 `evict_floor <= earliest_seq` always holds, which has a precise consequence:
@@ -67,8 +67,8 @@ The full contract, distilled:
 6. **Routers are at-least-once, per-source FIFO, DAG-by-default**; a `dst` enforces its own
    retention and `discard:"reject"` applies backpressure rather than silently dropping. Pair
    that with [idempotent consumers](/guarantees/idempotency).
-7. **Durability is per-box and explicit.** Only data not yet in the WAL (fsynced, for `fsync`
-   boxes) is lost on crash, and such loss appears to consumers as ordinary eviction-style gaps.
+7. **Durability is per-topic and explicit.** Only data not yet in the WAL (fsynced, for `fsync`
+   topics) is lost on crash, and such loss appears to consumers as ordinary eviction-style gaps.
    See [Durability](/guarantees/durability).
 
 ## Where each guarantee lives

@@ -44,7 +44,7 @@ use streams::config::SegmentConfig;
 use streams::engine::segwriter::{SealedResolve, SegmentWriter};
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
-use streams::storage::{BoxTier, Fs, LocalSegmentStore};
+use streams::storage::{TopicTier, Fs, LocalSegmentStore};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_wal_append_b.rs)
@@ -70,7 +70,7 @@ fn wal_cfg(file_size: u64) -> WalConfig {
 /// One durable Append record (same shape as the crash_oracle `ap` helper).
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -128,20 +128,20 @@ fn sync_wal_dir(disk: &FakeDisk) {
 // The engine's `build_segment_writer` opens the hot store via
 // `LocalSegmentStore::open` (always `RealFs`, never the injected `Arc<dyn Fs>`),
 // so a `FakeDisk`/`FaultFs` installed through `Engine::with_data_dir_fs` does NOT
-// reach the segment path — a durable box in that harness simply runs with no
+// reach the segment path — a durable topic in that harness simply runs with no
 // segment writer (resident-only). To exercise the segment-SEAL boundary under an
 // injected FS we therefore drive the REAL `SegmentWriter` directly over a
-// `BoxTier` whose hot store is opened with the hostile `Arc<dyn Fs>` — the exact
+// `TopicTier` whose hot store is opened with the hostile `Arc<dyn Fs>` — the exact
 // production seal/put/resolve code, just with the FS seam injected.
 
-const SEG_ROOT: &str = "/data/boxes/00000001";
+const SEG_ROOT: &str = "/data/topics/00000001";
 
 fn test_clock(ms: i64) -> (SharedClock, Arc<TestClock>) {
     let tc = Arc::new(TestClock::new(ms));
     (tc.clone() as SharedClock, tc)
 }
 
-/// A `SegmentWriter` over a HOT-only `BoxTier` backed by `fs`, with the given seal
+/// A `SegmentWriter` over a HOT-only `TopicTier` backed by `fs`, with the given seal
 /// caps and clock. `max_events`/`max_age_ms` drive the seal triggers under test.
 fn seg_writer(
     fs: Arc<dyn Fs>,
@@ -151,7 +151,7 @@ fn seg_writer(
 ) -> SegmentWriter {
     let hot = LocalSegmentStore::open_with(PathBuf::from(SEG_ROOT), fs)
         .expect("hot segment store opens through the injected fs");
-    let tier = Arc::new(BoxTier::new(Box::new(hot), None));
+    let tier = Arc::new(TopicTier::new(Box::new(hot), None));
     let cfg = SegmentConfig {
         max_events,
         max_bytes: 0,

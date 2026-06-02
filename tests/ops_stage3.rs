@@ -34,18 +34,18 @@ fn metric_value(body: &str, name: &str) -> Option<f64> {
 fn metrics_exposes_new_gauges() {
     let h = Harness::start();
 
-    // Create a durable box (drives the WAL) and a queue box (drives lease gauges).
+    // Create a durable topic (drives the WAL) and a queue topic (drives lease gauges).
     let (s, _) = h.put(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "durable": true, "cap_records": 1_000_000 }),
     );
     assert_eq!(s, StatusCode::CREATED);
-    let (s, _) = h.put("/v0/boxes/q", json!({ "durable": true, "type": "queue" }));
+    let (s, _) = h.put("/v0/topics/q", json!({ "durable": true, "type": "queue" }));
     assert_eq!(s, StatusCode::CREATED);
 
     // Two durable writes ⇒ WAL frames + at least one group-commit fsync.
     let (s, _) = h.post(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": { "n": 1 } }, { "data": { "n": 2 } }] }),
     );
     assert_eq!(s, StatusCode::OK);
@@ -56,9 +56,9 @@ fn metrics_exposes_new_gauges() {
 
     // Engine gauges.
     assert_eq!(
-        metric_value(&body, "streams_boxes"),
+        metric_value(&body, "streams_topics"),
         Some(2.0),
-        "two boxes:\n{body}"
+        "two topics:\n{body}"
     );
     assert_eq!(
         metric_value(&body, "streams_records_live"),
@@ -66,9 +66,9 @@ fn metrics_exposes_new_gauges() {
         "two live records:\n{body}"
     );
     assert_eq!(
-        metric_value(&body, "streams_queue_boxes"),
+        metric_value(&body, "streams_queue_topics"),
         Some(1.0),
-        "one queue box:\n{body}"
+        "one queue topic:\n{body}"
     );
     assert_eq!(
         metric_value(&body, "streams_sse_connections"),
@@ -123,43 +123,43 @@ fn metrics_exposes_new_gauges() {
         "histogram count tracks the fsync counter"
     );
 
-    // Boxes-by-class labelled gauge present (durable ⇒ fsync class).
+    // Topics-by-class labelled gauge present (durable ⇒ fsync class).
     assert!(
-        body.contains("streams_boxes_by_class{class=\"fsync\"} 2"),
-        "two fsync-class boxes:\n{body}"
+        body.contains("streams_topics_by_class{class=\"fsync\"} 2"),
+        "two fsync-class topics:\n{body}"
     );
 
-    // Per-box labelled gauges (M3 / codex P2 #1): the `jobs` box has 2 records and
-    // a head at seq 2; the queue box `q` carries ready/in-flight series.
+    // Per-topic labelled gauges (M3 / codex P2 #1): the `jobs` topic has 2 records and
+    // a head at seq 2; the queue topic `q` carries ready/in-flight series.
     assert!(
-        body.contains("streams_box_head_seq{box=\"jobs\"} 2"),
-        "per-box head_seq for jobs:\n{body}"
+        body.contains("streams_topic_head_seq{topic=\"jobs\"} 2"),
+        "per-topic head_seq for jobs:\n{body}"
     );
     assert!(
-        body.contains("streams_box_records_live{box=\"jobs\"} 2"),
-        "per-box records_live for jobs:\n{body}"
+        body.contains("streams_topic_records_live{topic=\"jobs\"} 2"),
+        "per-topic records_live for jobs:\n{body}"
     );
     assert!(
-        body.contains("streams_box_bytes_live{box=\"jobs\"}"),
-        "per-box bytes_live for jobs:\n{body}"
+        body.contains("streams_topic_bytes_live{topic=\"jobs\"}"),
+        "per-topic bytes_live for jobs:\n{body}"
     );
     assert!(
-        body.contains("streams_box_queue_ready{box=\"q\"}"),
-        "per-queue-box ready gauge for q:\n{body}"
+        body.contains("streams_topic_queue_ready{topic=\"q\"}"),
+        "per-queue-topic ready gauge for q:\n{body}"
     );
     assert!(
-        body.contains("streams_box_queue_in_flight{box=\"q\"}"),
-        "per-queue-box in-flight gauge for q:\n{body}"
+        body.contains("streams_topic_queue_in_flight{topic=\"q\"}"),
+        "per-queue-topic in-flight gauge for q:\n{body}"
     );
-    // The non-queue box must NOT emit a queue series.
+    // The non-queue topic must NOT emit a queue series.
     assert!(
-        !body.contains("streams_box_queue_ready{box=\"jobs\"}"),
-        "no queue gauge for a non-queue box:\n{body}"
+        !body.contains("streams_topic_queue_ready{topic=\"jobs\"}"),
+        "no queue gauge for a non-queue topic:\n{body}"
     );
     assert_eq!(
-        metric_value(&body, "streams_box_metrics_truncated"),
+        metric_value(&body, "streams_topic_metrics_truncated"),
         Some(0.0),
-        "per-box series not truncated (2 boxes):\n{body}"
+        "per-topic series not truncated (2 topics):\n{body}"
     );
 
     // -- JSON content negotiation still works -------------------------------
@@ -171,8 +171,8 @@ fn metrics_exposes_new_gauges() {
         .expect("json metrics request");
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = resp.json().expect("metrics json");
-    assert_eq!(v["boxes"], 2, "json boxes:\n{v}");
-    assert_eq!(v["queue_boxes"], 1, "json queue boxes:\n{v}");
+    assert_eq!(v["topics"], 2, "json topics:\n{v}");
+    assert_eq!(v["queue_topics"], 1, "json queue topics:\n{v}");
     assert!(
         v["wal"]["frames"].as_u64().unwrap() > 0,
         "json wal frames:\n{v}"
@@ -187,8 +187,8 @@ fn metrics_exposes_new_gauges() {
 fn shutdown_drains_sse_within_timeout() {
     let mut h = Harness::start();
 
-    // A box to watch.
-    let (s, _) = h.put("/v0/boxes/events", json!({ "durable": true }));
+    // A topic to watch.
+    let (s, _) = h.put("/v0/topics/events", json!({ "durable": true }));
     assert_eq!(s, StatusCode::CREATED);
 
     // Create a watch session and open the SSE stream on a background thread. The
@@ -196,7 +196,7 @@ fn shutdown_drains_sse_within_timeout() {
     // graceful drain would block until the connection is force-closed.
     let (s, sess) = h.post(
         "/v0/watch",
-        json!({ "boxes": { "events": { "from": "tail" } } }),
+        json!({ "topics": { "events": { "from": "tail" } } }),
     );
     assert_eq!(s, StatusCode::OK, "watch created: {sess}");
     let stream_url = format!("{}{}", h.base_url(), sess["stream_url"].as_str().unwrap());
@@ -257,19 +257,19 @@ fn shutdown_drains_sse_within_timeout() {
     );
 }
 
-/// codex P1 #3: many concurrent creates of the SAME new box name must resolve to
-/// exactly ONE box, and after a restart (WAL replay) there must be NO orphan box
+/// codex P1 #3: many concurrent creates of the SAME new topic name must resolve to
+/// exactly ONE topic, and after a restart (WAL replay) there must be NO orphan topic
 /// (the losing creates must not have logged a create frame under their own
-/// distinct box id that replay would materialize as a second box). The serialized
+/// distinct topic id that replay would materialize as a second topic). The serialized
 /// WAL-first create routes a duplicate through the normal update path under the
-/// winner's box id, so the durable log and the live registry always agree.
+/// winner's topic id, so the durable log and the live registry always agree.
 #[test]
 fn concurrent_same_name_create_leaves_no_orphan_after_restart() {
     use std::sync::Arc;
     use streams::clock::SharedClock;
     use streams::config::ServerConfig;
     use streams::engine::Engine;
-    use streams::types::BoxConfig;
+    use streams::types::TopicConfig;
 
     let data_dir = tempfile::tempdir().expect("temp data dir");
     let cfg = ServerConfig {
@@ -277,7 +277,7 @@ fn concurrent_same_name_create_leaves_no_orphan_after_restart() {
         ..ServerConfig::default()
     };
 
-    // First boot: 16 threads race to create the same durable box name.
+    // First boot: 16 threads race to create the same durable topic name.
     let created_count = {
         let clock: SharedClock = Arc::new(streams::clock::SystemClock);
         let engine = Engine::with_data_dir(cfg.clone(), clock).expect("durable engine");
@@ -285,11 +285,11 @@ fn concurrent_same_name_create_leaves_no_orphan_after_restart() {
         for _ in 0..16 {
             let e = engine.clone();
             handles.push(std::thread::spawn(move || {
-                let bc = BoxConfig {
+                let bc = TopicConfig {
                     durable: true,
-                    ..BoxConfig::default()
+                    ..TopicConfig::default()
                 };
-                let (created, _cfg) = e.put_box("racy", bc).expect("put_box ok");
+                let (created, _cfg) = e.put_topic("racy", bc).expect("put_topic ok");
                 created
             }));
         }
@@ -300,25 +300,25 @@ fn concurrent_same_name_create_leaves_no_orphan_after_restart() {
             .count();
         // Exactly one create won; the rest resolved as updates.
         assert_eq!(created_count, 1, "exactly one create wins the name race");
-        // Exactly one live box.
-        assert_eq!(engine.box_count(), 1, "one live box after the race");
+        // Exactly one live topic.
+        assert_eq!(engine.topic_count(), 1, "one live topic after the race");
         created_count
     };
     assert_eq!(created_count, 1);
 
-    // Second boot: replay the WAL. There must be EXACTLY ONE box and NO orphan
-    // (a losing create logging under its own box id would replay as a `box-<id>`).
+    // Second boot: replay the WAL. There must be EXACTLY ONE topic and NO orphan
+    // (a losing create logging under its own topic id would replay as a `topic-<id>`).
     {
         let clock: SharedClock = Arc::new(streams::clock::SystemClock);
         let engine = Engine::with_data_dir(cfg, clock).expect("reopen durable engine");
         assert_eq!(
-            engine.box_count(),
+            engine.topic_count(),
             1,
-            "exactly one box survives replay — no orphan from a losing create"
+            "exactly one topic survives replay — no orphan from a losing create"
         );
         assert!(
-            engine.get_box("racy").is_some(),
-            "the named box survives replay"
+            engine.get_topic("racy").is_some(),
+            "the named topic survives replay"
         );
     }
 }

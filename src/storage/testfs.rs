@@ -1276,7 +1276,7 @@ mod tests {
 
     fn ap(seq: u64) -> WalRecord {
         WalRecord::Append {
-            box_id: 1,
+            topic_id: 1,
             seq,
             ts: 1_700_000_000_000 + seq,
             node: None,
@@ -1429,7 +1429,7 @@ mod tests {
         let mk = |id: u64, seq: u64| Snapshot {
             id,
             ts: 1,
-            next_box_id: 1,
+            next_topic_id: 1,
             checkpoint: Checkpoint {
                 wal_idx: 1,
                 wal_offset: 0,
@@ -1437,7 +1437,7 @@ mod tests {
                 shards: vec![(1, 0)],
                 shard_keys: vec![String::new()],
             },
-            boxes: vec![],
+            topics: vec![],
             routers: vec![],
         };
 

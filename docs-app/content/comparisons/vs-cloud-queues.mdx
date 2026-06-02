@@ -41,10 +41,10 @@ read by cursor; SQS has no log behind the queue.
 
 SNS is **stateless push fan-out**: publish once, deliver to many endpoints (SQS, Lambda,
 HTTP, email, SMS) with optional filter policies. There is **no storage and no replay** —
-it routes and forgets. The streams analog is a [router](/api/routers) fanning one box into
-several boxes (each with its own durability), plus [SSE watch](/api/watch) for live push.
+it routes and forgets. The streams analog is a [router](/api/routers) fanning one topic into
+several topics (each with its own durability), plus [SSE watch](/api/watch) for live push.
 SNS wins decisively on **heterogeneous** delivery: streams pushes to SSE clients and other
-boxes, not to email/SMS/Lambda.
+topics, not to email/SMS/Lambda.
 
 ### AWS Kinesis — sharded log, with replay
 
@@ -53,7 +53,7 @@ per-shard sequence numbers, **replay by sequence number or timestamp**, and rete
 24 h to 365 days. Capacity is provisioned per shard (or on-demand). The shape — an ordered,
 seq-addressable, replayable log — is what streams is, with two differences: Kinesis scales
 horizontally by adding shards (ordering only *within* a shard), and streams replays by
-its own monotonic `seq` cursor on a single box with no sharding.
+its own monotonic `seq` cursor on a single topic with no sharding.
 
 ### GCP Pub/Sub — lease + ordering + seek replay
 
@@ -76,7 +76,7 @@ streams is the inverse on every one of those points:
 
 - **You operate it** — one binary, one disk; you handle backup, upgrades, and security.
 - **Single machine is the entire durability and failure domain.** No replication, no
-  multi-AZ, no failover. An `fsync` box survives any crash of that machine and replays its
+  multi-AZ, no failover. An `fsync` topic survives any crash of that machine and replays its
   [WAL](/how-it-works/wal-and-group-commit) on restart, but if the machine or disk is gone,
   you restore from backup. See [durability](/guarantees/durability).
 - **Vertical scale only** — millions of records/sec in the engine core, ~0.5 M rec/sec at
@@ -117,7 +117,7 @@ The other streams pull is economics and location:
 
 - **Fixed cost on your own NVMe** — no per-request or per-GB metering, no egress charges,
   no vendor lock-in. A high, steady, predictable volume that would meter expensively in
-  the cloud runs at the flat cost of the box it's on.
+  the cloud runs at the flat cost of the machine it's on.
 - **Data locality** — sub-millisecond local delivery (disk-class write-ack p50 around
   0.06 ms on the reference machine; SSE write→deliver in the 1–5 ms range), and the data
   physically stays where you put it: on-prem, at the edge, or fully air-gapped. No data

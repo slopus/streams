@@ -9,12 +9,12 @@
 //! ```text
 //!  off  size  field
 //!    0    4   frame_len   u32   bytes of this frame EXCLUDING this field
-//!    4    1   type        u8    1=Append 2=BoxCreate 3=BoxDelete 4=RouterCreate
+//!    4    1   type        u8    1=Append 2=TopicCreate 3=TopicDelete 4=RouterCreate
 //!                                 5=RouterDelete 6=Delete 7=EvictWatermark
 //!                                 8=CheckpointMark 9=ConfigUpdate 10=Lease
 //!                                 11=HeadWatermark
 //!    5    1   flags       u8    bit0=has_tag bit1=has_node bit2=durable
-//!    6    4   box_id      u32   interned numeric box id (string<->id in meta)
+//!    6    4   topic_id      u32   interned numeric topic id (string<->id in meta)
 //!   10    8   seq         u64   server-assigned (0 for non-Append control frames)
 //!   18    8   ts          u64   server commit ms
 //!   26    2   node_len    u16
@@ -35,10 +35,10 @@
 //! # Record types
 //!
 //! The `type` byte + the variable body encode the [`WalRecord`] variants:
-//! `Append`, `Delete`, `BoxCreate`/`ConfigUpdate`/`BoxDelete` (box config and
+//! `Append`, `Delete`, `TopicCreate`/`ConfigUpdate`/`TopicDelete` (topic config and
 //! tombstone), `RouterCreate`/`RouterDelete`, `EvictWatermark`, and
-//! `CheckpointMark`. The `box_id` is an interned `u32` (the name↔id table is
-//! itself logged via `BoxCreate`), keeping data frames small.
+//! `CheckpointMark`. The `topic_id` is an interned `u32` (the name↔id table is
+//! itself logged via `TopicCreate`), keeping data frames small.
 //!
 //! # Writer + adaptive group commit (ARCHITECTURE §2.3)
 //!
@@ -75,7 +75,7 @@ use super::fs::{File, Fs, OpenOpts, RealFs};
 
 /// Fixed header size: everything from `type` through `data_len` inclusive,
 /// i.e. the bytes immediately following `frame_len`. (`type`1 + `flags`1 +
-/// `box_id`4 + `seq`8 + `ts`8 + `node_len`2 + `tag_len`2 + `data_len`4 = 30.)
+/// `topic_id`4 + `seq`8 + `ts`8 + `node_len`2 + `tag_len`2 + `data_len`4 = 30.)
 pub const FRAME_HEADER_LEN: usize = 30;
 /// Trailing XXH3-64 checksum size.
 pub const FRAME_CRC_LEN: usize = 8;
@@ -93,7 +93,7 @@ const T_EVICT_WATERMARK: u8 = 7;
 const T_CHECKPOINT_MARK: u8 = 8;
 const T_CONFIG_UPDATE: u8 = 9;
 const T_LEASE: u8 = 10;
-/// A durable per-box head reservation watermark (R3): the highest seq this box
+/// A durable per-topic head reservation watermark (R3): the highest seq this topic
 /// has DURABLY reserved, fsynced ahead of use so a `disk`-class write (acked
 /// before its frame is fsynced) can never have its seq re-handed after a crash
 /// that lost the un-fsynced frame. Recovery sets `head = max(replayed, watermark)`.
@@ -161,11 +161,11 @@ pub struct RouterOp {
     pub initial_dest_base: Option<u64>,
 }
 
-/// A box create/config payload logged with [`WalRecord::BoxConfig`]. The opaque
-/// `config` bytes are the bincode/serde-encoded [`crate::types::BoxConfig`]; the
+/// A topic create/config payload logged with [`WalRecord::TopicConfig`]. The opaque
+/// `config` bytes are the bincode/serde-encoded [`crate::types::TopicConfig`]; the
 /// storage layer treats them as a blob (no dependency on the engine config).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoxConfigOp {
+pub struct TopicConfigOp {
     pub name: String,
     /// Opaque serialized config; replayed verbatim by the metadata store.
     pub config: Vec<u8>,
@@ -180,7 +180,7 @@ pub enum WalRecord {
     /// A data record. `data` is the opaque `data+meta` payload blob; `node`/`tag`
     /// are the resolved values (absent ⇒ `None`).
     Append {
-        box_id: u32,
+        topic_id: u32,
         seq: u64,
         ts: u64,
         node: Option<String>,
@@ -193,7 +193,7 @@ pub enum WalRecord {
     /// delete is never swept), while an explicit `seqs` set deletes exactly those
     /// seqs (ARCHITECTURE §2.1).
     Delete {
-        box_id: u32,
+        topic_id: u32,
         /// `before_seq` selector (every live seq `< before_seq`), if supplied.
         before_seq: Option<u64>,
         /// `match` selector, if supplied.
@@ -202,7 +202,7 @@ pub enum WalRecord {
         /// delete exactly these seqs. Empty for the API §5 selector-based delete.
         /// Replays deterministically (the exact seqs are logged, not re-derived).
         seqs: Vec<u64>,
-        /// Point-in-time UPPER BOUND for a selector-based delete: the box's
+        /// Point-in-time UPPER BOUND for a selector-based delete: the topic's
         /// `head + 1` captured (under the append lock) at the moment the delete was
         /// logged, so replay only ever sweeps seqs strictly below it. A
         /// CONCURRENT/later append that landed after the delete frame carries a seq
@@ -214,12 +214,12 @@ pub enum WalRecord {
         bound_head: Option<u64>,
         ts: u64,
     },
-    /// Box created or its config updated. `tombstone == false` for create/update;
-    /// `BoxConfig{tombstone:true}` is the box-delete marker.
-    BoxConfig {
-        box_id: u32,
-        op: BoxConfigOp,
-        /// `true` ⇒ this frame is the box-delete tombstone (config bytes empty).
+    /// Topic created or its config updated. `tombstone == false` for create/update;
+    /// `TopicConfig{tombstone:true}` is the topic-delete marker.
+    TopicConfig {
+        topic_id: u32,
+        op: TopicConfigOp,
+        /// `true` ⇒ this frame is the topic-delete tombstone (config bytes empty).
         tombstone: bool,
         ts: u64,
     },
@@ -227,7 +227,7 @@ pub enum WalRecord {
     RouterCreate { op: RouterOp, ts: u64 },
     /// Router deleted (by name).
     RouterDelete { name: String, ts: u64 },
-    /// Eviction watermark advanced (cap/TTL involuntary floor) for a box. The
+    /// Eviction watermark advanced (cap/TTL involuntary floor) for a topic. The
     /// `evict_floor` (cap-records / byte-cap) and `expiry_floor` (TTL) are carried
     /// SEPARATELY so recovery restores each into its own floor and the from-0
     /// tombstone reason (ttl / cap / mixed) is preserved across restart (R7). A
@@ -235,20 +235,20 @@ pub enum WalRecord {
     /// field is absent on the wire); recovery folds it into `evict_floor` only, the
     /// prior best-effort behavior.
     EvictWatermark {
-        box_id: u32,
+        topic_id: u32,
         evict_floor: u64,
         expiry_floor: u64,
         earliest_seq: u64,
         ts: u64,
     },
-    /// Checkpoint boundary: every box's highest seq absorbed into segments.
+    /// Checkpoint boundary: every topic's highest seq absorbed into segments.
     CheckpointMark { last_checkpoint_seq: u64, ts: u64 },
-    /// A leases-log lifecycle event for a queue box (DESIGN §10.1): the pending
+    /// A leases-log lifecycle event for a queue topic (DESIGN §10.1): the pending
     /// who-holds-what state is the materialized projection of these events. Only
     /// written when the queue's `leases_durable:true`; otherwise the projection
     /// is purely in-memory and self-heals on restart (DESIGN §10.6).
     Lease {
-        box_id: u32,
+        topic_id: u32,
         /// The job seq this event concerns.
         seq: u64,
         /// Event kind: 0=claimed 1=released 2=extended 3=acked (see [`LeaseEvent`]).
@@ -263,14 +263,14 @@ pub enum WalRecord {
         deliveries: u64,
         ts: u64,
     },
-    /// A durable per-box head reservation watermark (R3). `head_seq` is the
-    /// highest seq the box has durably reserved; it is fsynced AHEAD of the seqs
+    /// A durable per-topic head reservation watermark (R3). `head_seq` is the
+    /// highest seq the topic has durably reserved; it is fsynced AHEAD of the seqs
     /// actually handed out so a `disk`-class write (acked before its own frame is
     /// fsynced) never has its seq re-handed after a crash that dropped the
     /// un-fsynced frame. Recovery sets `head = max(replayed head, watermark)` and
     /// pads any reserved-but-unwritten seqs as silent deleted gaps, so the seq
     /// counter never regresses and an acked seq is never reused.
-    HeadWatermark { box_id: u32, head_seq: u64, ts: u64 },
+    HeadWatermark { topic_id: u32, head_seq: u64, ts: u64 },
 }
 
 /// The kind of a leases-log lifecycle event (the `event` byte of
@@ -288,10 +288,10 @@ impl WalRecord {
         match self {
             WalRecord::Append { .. } => T_APPEND,
             WalRecord::Delete { .. } => T_DELETE,
-            WalRecord::BoxConfig {
+            WalRecord::TopicConfig {
                 tombstone: false, ..
             } => T_BOX_CREATE,
-            WalRecord::BoxConfig {
+            WalRecord::TopicConfig {
                 tombstone: true, ..
             } => T_BOX_DELETE,
             WalRecord::RouterCreate { .. } => T_ROUTER_CREATE,
@@ -303,16 +303,16 @@ impl WalRecord {
         }
     }
 
-    /// The interned box id this record targets (`0` for box-agnostic control
+    /// The interned topic id this record targets (`0` for topic-agnostic control
     /// frames like routers and checkpoints).
-    pub fn box_id(&self) -> u32 {
+    pub fn topic_id(&self) -> u32 {
         match self {
-            WalRecord::Append { box_id, .. } => *box_id,
-            WalRecord::Delete { box_id, .. } => *box_id,
-            WalRecord::BoxConfig { box_id, .. } => *box_id,
-            WalRecord::EvictWatermark { box_id, .. } => *box_id,
-            WalRecord::Lease { box_id, .. } => *box_id,
-            WalRecord::HeadWatermark { box_id, .. } => *box_id,
+            WalRecord::Append { topic_id, .. } => *topic_id,
+            WalRecord::Delete { topic_id, .. } => *topic_id,
+            WalRecord::TopicConfig { topic_id, .. } => *topic_id,
+            WalRecord::EvictWatermark { topic_id, .. } => *topic_id,
+            WalRecord::Lease { topic_id, .. } => *topic_id,
+            WalRecord::HeadWatermark { topic_id, .. } => *topic_id,
             WalRecord::RouterCreate { .. }
             | WalRecord::RouterDelete { .. }
             | WalRecord::CheckpointMark { .. } => 0,
@@ -437,7 +437,7 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
 
     // --- Build the header fields (some depend on the body, computed below). --
     let type_tag = record.type_tag();
-    let box_id = record.box_id();
+    let topic_id = record.topic_id();
     let seq = record.seq();
 
     // node/tag/data are the three §2.1 inline byte-strings; for control frames
@@ -508,7 +508,7 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
             }
             data = &data_buf;
         }
-        WalRecord::BoxConfig { op, ts: rts, .. } => {
+        WalRecord::TopicConfig { op, ts: rts, .. } => {
             ts = *rts;
             // body: [lp name][lp config]
             write_lp_bytes(&mut data_buf, op.name.as_bytes());
@@ -589,7 +589,7 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
         WalRecord::HeadWatermark {
             head_seq, ts: rts, ..
         } => {
-            // `box_id` is taken from `record.box_id()` above; the watermark's seq
+            // `topic_id` is taken from `record.topic_id()` above; the watermark's seq
             // ceiling rides the body (the header `seq` field stays 0, a control
             // frame, so `WalRecord::seq()` excludes it from data-record scans).
             ts = *rts;
@@ -601,7 +601,7 @@ pub fn encode_frame(out: &mut Vec<u8>, record: &WalRecord, durable: bool) {
     // --- Fixed header (§2.1 offsets 4..34). ---------------------------------
     out.push(type_tag);
     out.push(flags);
-    out.extend_from_slice(&box_id.to_le_bytes());
+    out.extend_from_slice(&topic_id.to_le_bytes());
     out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&ts.to_le_bytes());
     out.extend_from_slice(&(node.len() as u16).to_le_bytes());
@@ -659,7 +659,7 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
     let h = &buf[FRAME_LEN_PREFIX..]; // header starts right after frame_len.
     let type_tag = h[0];
     let flags = h[1];
-    let box_id = u32::from_le_bytes(h[2..6].try_into().unwrap());
+    let topic_id = u32::from_le_bytes(h[2..6].try_into().unwrap());
     let seq = u64::from_le_bytes(h[6..14].try_into().unwrap());
     let ts = u64::from_le_bytes(h[14..22].try_into().unwrap());
     let node_len = u16::from_le_bytes(h[22..24].try_into().unwrap()) as usize;
@@ -695,7 +695,7 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
 
     let record = match type_tag {
         T_APPEND => WalRecord::Append {
-            box_id,
+            topic_id,
             seq,
             ts,
             node: node_s,
@@ -755,7 +755,7 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
                 None
             };
             WalRecord::Delete {
-                box_id,
+                topic_id,
                 before_seq,
                 match_,
                 seqs,
@@ -773,9 +773,9 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
                 Some(b) => b,
                 None => return DecodeStep::Torn,
             };
-            WalRecord::BoxConfig {
-                box_id,
-                op: BoxConfigOp { name, config },
+            WalRecord::TopicConfig {
+                topic_id,
+                op: TopicConfigOp { name, config },
                 tombstone: type_tag == T_BOX_DELETE,
                 ts,
             }
@@ -839,7 +839,7 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
             let expiry_floor = read_u64(data, &mut pos).unwrap_or(0);
             match (evict_floor, earliest_seq) {
                 (Some(evict_floor), Some(earliest_seq)) => WalRecord::EvictWatermark {
-                    box_id,
+                    topic_id,
                     evict_floor,
                     expiry_floor,
                     earliest_seq,
@@ -849,7 +849,7 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
             }
         }
         T_CONFIG_UPDATE => {
-            // ConfigUpdate shares the BoxConfig wire shape (name + config blob).
+            // ConfigUpdate shares the TopicConfig wire shape (name + config blob).
             let mut pos = 0usize;
             let name = match read_lp_str(data, &mut pos) {
                 Some(s) => s,
@@ -859,9 +859,9 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
                 Some(b) => b,
                 None => return DecodeStep::Torn,
             };
-            WalRecord::BoxConfig {
-                box_id,
-                op: BoxConfigOp { name, config },
+            WalRecord::TopicConfig {
+                topic_id,
+                op: TopicConfigOp { name, config },
                 tombstone: false,
                 ts,
             }
@@ -886,7 +886,7 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
             match (event, lease_id, deadline, deliveries, node) {
                 (Some(event), Some(lease_id), Some(deadline), Some(deliveries), Some(node)) => {
                     WalRecord::Lease {
-                        box_id,
+                        topic_id,
                         seq,
                         event,
                         node,
@@ -903,7 +903,7 @@ fn decode_one(buf: &[u8]) -> DecodeStep {
             let mut pos = 0usize;
             match read_u64(data, &mut pos) {
                 Some(head_seq) => WalRecord::HeadWatermark {
-                    box_id,
+                    topic_id,
                     head_seq,
                     ts,
                 },
@@ -1911,14 +1911,14 @@ mod tests {
     use super::*;
 
     fn append(
-        box_id: u32,
+        topic_id: u32,
         seq: u64,
         node: Option<&str>,
         tag: Option<&str>,
         data: &[u8],
     ) -> WalRecord {
         WalRecord::Append {
-            box_id,
+            topic_id,
             seq,
             ts: 1_700_000_000_000 + seq,
             node: node.map(str::to_string),
@@ -1961,7 +1961,7 @@ mod tests {
     fn roundtrip_delete_before_seq_only() {
         roundtrip(
             WalRecord::Delete {
-                box_id: 9,
+                topic_id: 9,
                 before_seq: Some(50),
                 match_: None,
                 seqs: Vec::new(),
@@ -1976,7 +1976,7 @@ mod tests {
     fn roundtrip_delete_explicit_seqs() {
         roundtrip(
             WalRecord::Delete {
-                box_id: 9,
+                topic_id: 9,
                 before_seq: None,
                 match_: None,
                 seqs: vec![480101, 480104, 480200],
@@ -1991,7 +1991,7 @@ mod tests {
     fn roundtrip_lease_events() {
         roundtrip(
             WalRecord::Lease {
-                box_id: 3,
+                topic_id: 3,
                 seq: 480101,
                 event: 0, // claimed
                 node: "worker-eu-1".into(),
@@ -2004,7 +2004,7 @@ mod tests {
         );
         roundtrip(
             WalRecord::Lease {
-                box_id: 3,
+                topic_id: 3,
                 seq: 480104,
                 event: 3, // acked
                 node: "worker-eu-1".into(),
@@ -2021,7 +2021,7 @@ mod tests {
     fn roundtrip_delete_match_eq_and_glob() {
         roundtrip(
             WalRecord::Delete {
-                box_id: 9,
+                topic_id: 9,
                 before_seq: None,
                 match_: Some(MatchSel::Eq("exact-tag".into())),
                 seqs: Vec::new(),
@@ -2032,7 +2032,7 @@ mod tests {
         );
         roundtrip(
             WalRecord::Delete {
-                box_id: 9,
+                topic_id: 9,
                 before_seq: Some(10),
                 match_: Some(MatchSel::Glob("tenant:".into())),
                 seqs: Vec::new(),
@@ -2063,7 +2063,7 @@ mod tests {
         frame.extend_from_slice(&[0u8; FRAME_LEN_PREFIX]);
         frame.push(T_DELETE);
         frame.push(0u8); // flags (not durable)
-        frame.extend_from_slice(&9u32.to_le_bytes()); // box_id
+        frame.extend_from_slice(&9u32.to_le_bytes()); // topic_id
         frame.extend_from_slice(&0u64.to_le_bytes()); // seq
         frame.extend_from_slice(&123u64.to_le_bytes()); // ts
         frame.extend_from_slice(&0u16.to_le_bytes()); // node_len
@@ -2079,7 +2079,7 @@ mod tests {
         assert_eq!(
             got.record,
             WalRecord::Delete {
-                box_id: 9,
+                topic_id: 9,
                 before_seq: Some(50),
                 match_: None,
                 seqs: Vec::new(),
@@ -2090,11 +2090,11 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_box_create_and_tombstone() {
+    fn roundtrip_topic_create_and_tombstone() {
         roundtrip(
-            WalRecord::BoxConfig {
-                box_id: 1,
-                op: BoxConfigOp {
+            WalRecord::TopicConfig {
+                topic_id: 1,
+                op: TopicConfigOp {
                     name: "jobs".into(),
                     config: vec![1, 2, 3, 4, 5],
                 },
@@ -2104,9 +2104,9 @@ mod tests {
             true,
         );
         roundtrip(
-            WalRecord::BoxConfig {
-                box_id: 1,
-                op: BoxConfigOp {
+            WalRecord::TopicConfig {
+                topic_id: 1,
+                op: TopicConfigOp {
                     name: "jobs".into(),
                     config: vec![],
                 },
@@ -2170,7 +2170,7 @@ mod tests {
     fn roundtrip_evict_watermark_and_checkpoint() {
         roundtrip(
             WalRecord::EvictWatermark {
-                box_id: 4,
+                topic_id: 4,
                 evict_floor: 1000,
                 expiry_floor: 800,
                 earliest_seq: 1001,
@@ -2191,7 +2191,7 @@ mod tests {
     fn roundtrip_head_watermark() {
         roundtrip(
             WalRecord::HeadWatermark {
-                box_id: 7,
+                topic_id: 7,
                 head_seq: 4096,
                 ts: 12,
             },
@@ -2207,7 +2207,7 @@ mod tests {
             append(1, 1, None, None, b"a"),
             append(1, 2, Some("n"), Some("t"), b"bb"),
             WalRecord::Delete {
-                box_id: 1,
+                topic_id: 1,
                 before_seq: Some(2),
                 match_: None,
                 seqs: Vec::new(),

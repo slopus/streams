@@ -4,13 +4,13 @@
 //! harness server (a real socket, the exact `http::build_router` the binary
 //! serves):
 //!
-//!   * `POST /v0/watch` session create → `wid` / `stream_url` / per-box
+//!   * `POST /v0/watch` session create → `wid` / `stream_url` / per-topic
 //!     `from_seq`/`head_seq`/`earliest_seq` (API §7.2).
 //!   * `GET /v0/watch/:wid` streams `record` (batched, composite base64url
-//!     `id`), `caught-up`, `tombstone`, and `box-deleted` frames (§7.5).
+//!     `id`), `caught-up`, `tombstone`, and `topic-deleted` frames (§7.5).
 //!   * `retry: 2000` is sent once at open (§7.5).
 //!   * Heartbeat `: hb` comment arrives on an idle stream (§7.6).
-//!   * `Last-Event-ID` resume rewinds the per-box cursors and re-delivers
+//!   * `Last-Event-ID` resume rewinds the per-topic cursors and re-delivers
 //!     (§7.4).
 //!   * `406 not_acceptable` when `Accept` is not `text/event-stream` (§7.5).
 //!   * Node loop-prevention + permanent-deletion silence are reflected in the
@@ -122,17 +122,17 @@ fn raw_sse(
 // Small helpers.
 // ---------------------------------------------------------------------------
 
-/// Write `records` (already-formed `data` objects) to `box`, asserting a 2xx.
-fn write(h: &Harness, box_name: &str, body: Value) -> Value {
-    let (status, resp) = h.post(&format!("/v0/boxes/{box_name}"), body);
+/// Write `records` (already-formed `data` objects) to `topic`, asserting a 2xx.
+fn write(h: &Harness, topic_name: &str, body: Value) -> Value {
+    let (status, resp) = h.post(&format!("/v0/topics/{topic_name}"), body);
     assert!(
         status == StatusCode::OK || status == StatusCode::CREATED,
-        "write to {box_name} should be 2xx, got {status}: {resp}"
+        "write to {topic_name} should be 2xx, got {status}: {resp}"
     );
     resp
 }
 
-/// Create a watch session over `boxes`, returning `(stream_url, response-body)`.
+/// Create a watch session over `topics`, returning `(stream_url, response-body)`.
 fn create_watch(h: &Harness, body: Value) -> (String, Value) {
     let (status, resp) = h.post("/v0/watch", body);
     assert_eq!(
@@ -212,7 +212,7 @@ fn b64url_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Decode a composite base64url SSE `id` back to its `box → seq` map.
+/// Decode a composite base64url SSE `id` back to its `topic → seq` map.
 fn decode_id(id: &str) -> serde_json::Map<String, Value> {
     let bytes = b64url_decode(id);
     serde_json::from_slice::<Value>(&bytes)
@@ -225,14 +225,14 @@ fn decode_id(id: &str) -> serde_json::Map<String, Value> {
 const SHORT: Duration = Duration::from_secs(5);
 
 // ===========================================================================
-// 1. Session create: wid / stream_url / per-box watermarks (§7.2).
+// 1. Session create: wid / stream_url / per-topic watermarks (§7.2).
 // ===========================================================================
 
 #[test]
-fn watch_create_returns_wid_and_per_box_watermarks() {
+fn watch_create_returns_wid_and_per_topic_watermarks() {
     let h = Harness::start();
 
-    // Seed two boxes with differing backlogs.
+    // Seed two topics with differing backlogs.
     write(
         &h,
         "jobs",
@@ -243,7 +243,7 @@ fn watch_create_returns_wid_and_per_box_watermarks() {
     let (status, body) = h.post(
         "/v0/watch",
         json!({
-            "boxes": {
+            "topics": {
                 "jobs":   { "from_seq": 1 },
                 "events": { "tail": true }
             }
@@ -260,33 +260,33 @@ fn watch_create_returns_wid_and_per_box_watermarks() {
     );
     assert!(body["session_ttl_ms"].as_u64().unwrap() > 0);
 
-    // Per-box watermarks resolve the requested cursor against current state.
-    let jobs = &body["boxes"]["jobs"];
+    // Per-topic watermarks resolve the requested cursor against current state.
+    let jobs = &body["topics"]["jobs"];
     assert_eq!(jobs["from_seq"], 1, "explicit from_seq echoed");
     assert_eq!(jobs["head_seq"], 3);
     assert_eq!(jobs["earliest_seq"], 1);
 
-    let evb = &body["boxes"]["events"];
+    let evb = &body["topics"]["events"];
     assert_eq!(evb["from_seq"], 1, "tail resolves from_seq to current head");
     assert_eq!(evb["head_seq"], 1);
 }
 
 #[test]
-fn watch_create_rejects_empty_boxes_and_unknown_box() {
+fn watch_create_rejects_empty_topics_and_unknown_topic() {
     let h = Harness::start();
 
-    // Empty `boxes` map → 400 invalid_request (§7.2).
-    let (status, body) = h.post("/v0/watch", json!({ "boxes": {} }));
+    // Empty `topics` map → 400 invalid_request (§7.2).
+    let (status, body) = h.post("/v0/watch", json!({ "topics": {} }));
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "invalid_request");
 
-    // Unknown box → 404 box_not_found (no `?lenient=true`).
+    // Unknown topic → 404 topic_not_found (no `?lenient=true`).
     let (status, body) = h.post(
         "/v0/watch",
-        json!({ "boxes": { "ghost": { "from_seq": 0 } } }),
+        json!({ "topics": { "ghost": { "from_seq": 0 } } }),
     );
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"]["code"], "box_not_found");
+    assert_eq!(body["error"]["code"], "topic_not_found");
 }
 
 // ===========================================================================
@@ -310,9 +310,9 @@ fn stream_delivers_record_and_caught_up_with_composite_id() {
 
     let (url, body) = create_watch(
         &h,
-        json!({ "boxes": { "jobs": { "from_seq": 0 } }, "include_tags": true }),
+        json!({ "topics": { "jobs": { "from_seq": 0 } }, "include_tags": true }),
     );
-    assert_eq!(body["boxes"]["jobs"]["head_seq"], 2);
+    assert_eq!(body["topics"]["jobs"]["head_seq"], 2);
 
     let frames = h.sse_frames(&url, 2, SHORT);
     assert!(
@@ -329,7 +329,7 @@ fn stream_delivers_record_and_caught_up_with_composite_id() {
     // The `record` frame carries the documented batch shape.
     let rec = find(&frames, "record");
     let d = data_of(&rec);
-    assert_eq!(d["box"], "jobs");
+    assert_eq!(d["topic"], "jobs");
     assert_eq!(d["from_seq"], 0);
     assert_eq!(d["to_seq"], 2);
     assert_eq!(d["head_seq"], 2);
@@ -355,7 +355,7 @@ fn stream_delivers_record_and_caught_up_with_composite_id() {
 
     // caught-up reports the head and is one-per-backlog→tailing transition.
     let cu = find(&frames, "caught-up");
-    assert_eq!(data_of(&cu)["box"], "jobs");
+    assert_eq!(data_of(&cu)["topic"], "jobs");
     assert_eq!(data_of(&cu)["head_seq"], 2);
 }
 
@@ -370,7 +370,7 @@ fn include_data_false_yields_metadata_only_frames() {
 
     let (url, _) = create_watch(
         &h,
-        json!({ "boxes": { "feed": { "from_seq": 0 } }, "include_data": false, "include_tags": true }),
+        json!({ "topics": { "feed": { "from_seq": 0 } }, "include_data": false, "include_tags": true }),
     );
     let frames = h.sse_frames(&url, 2, SHORT);
     let rec = find(&frames, "record");
@@ -397,8 +397,8 @@ fn tail_subscription_skips_backlog_and_delivers_new_records() {
         json!({ "records": [{ "data": 1 }, { "data": 2 }] }),
     );
 
-    let (url, body) = create_watch(&h, json!({ "boxes": { "live": { "tail": true } } }));
-    assert_eq!(body["boxes"]["live"]["from_seq"], 2, "tail starts at head");
+    let (url, body) = create_watch(&h, json!({ "topics": { "live": { "tail": true } } }));
+    assert_eq!(body["topics"]["live"]["from_seq"], 2, "tail starts at head");
 
     // Open the stream in a background thread, then append a fresh record; the
     // stream should deliver only that new record (seq 3), never the backlog.
@@ -463,7 +463,7 @@ fn tail_subscription_skips_backlog_and_delivers_new_records() {
 fn stream_opens_with_retry_directive() {
     let h = Harness::start();
     write(&h, "jobs", json!({ "records": [{ "data": 1 }] }));
-    let (url, _) = create_watch(&h, json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
+    let (url, _) = create_watch(&h, json!({ "topics": { "jobs": { "from_seq": 0 } } }));
 
     // Raw read so the `retry:` line (skipped by `sse_frames`) is visible.
     let raw = raw_sse(&h, &url, "text/event-stream", None, Some("retry:"), SHORT);
@@ -514,7 +514,7 @@ fn idle_stream_emits_heartbeat_comment() {
     // for a 200ms keep-alive cadence (well above the 100ms floor we just set).
     let (url, _) = create_watch(
         &h,
-        json!({ "boxes": { "quiet": { "tail": true } }, "heartbeat_ms": 200 }),
+        json!({ "topics": { "quiet": { "tail": true } }, "heartbeat_ms": 200 }),
     );
 
     // A 2s deadline still spans ~10 heartbeat intervals, so the comment must
@@ -544,7 +544,7 @@ fn idle_stream_emits_heartbeat_comment() {
 fn stream_rejects_non_event_stream_accept() {
     let h = Harness::start();
     write(&h, "jobs", json!({ "records": [{ "data": 1 }] }));
-    let (url, _) = create_watch(&h, json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
+    let (url, _) = create_watch(&h, json!({ "topics": { "jobs": { "from_seq": 0 } } }));
 
     let raw = raw_sse(&h, &url, "application/json", None, None, SHORT);
     assert_eq!(
@@ -562,7 +562,7 @@ fn stream_rejects_non_event_stream_accept() {
 }
 
 // ===========================================================================
-// 6. Last-Event-ID resume restores per-box cursors (§7.4).
+// 6. Last-Event-ID resume restores per-topic cursors (§7.4).
 // ===========================================================================
 
 #[test]
@@ -573,7 +573,7 @@ fn last_event_id_resume_rewinds_and_redelivers() {
         "jobs",
         json!({ "records": [{ "data": 1 }, { "data": 2 }, { "data": 3 }] }),
     );
-    let (url, _) = create_watch(&h, json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
+    let (url, _) = create_watch(&h, json!({ "topics": { "jobs": { "from_seq": 0 } } }));
 
     // First connection drains the whole backlog; its record frame's id is the
     // post-batch composite cursor ({"jobs":3}). The session cursor is now at 3.
@@ -659,14 +659,14 @@ fn deleted_prefix_is_silent_in_stream_no_tombstone() {
     // Permanently delete the first two records (snapshot by seq). earliest_seq
     // advances to 3; evict_floor stays at 1 ⇒ a reader at from_seq:0 crosses a
     // purely-deleted gap, which is silent (no tombstone; API §5/§3.3).
-    let (status, del) = h.post("/v0/boxes/jobs/delete", json!({ "before_seq": 3 }));
+    let (status, del) = h.post("/v0/topics/jobs/delete", json!({ "before_seq": 3 }));
     assert_eq!(status, StatusCode::OK);
     assert_eq!(del["deleted"], 2);
     assert_eq!(del["earliest_seq"], 3);
 
-    let (url, body) = create_watch(&h, json!({ "boxes": { "jobs": { "from_seq": 0 } } }));
+    let (url, body) = create_watch(&h, json!({ "topics": { "jobs": { "from_seq": 0 } } }));
     assert_eq!(
-        body["boxes"]["jobs"]["earliest_seq"], 3,
+        body["topics"]["jobs"]["earliest_seq"], 3,
         "earliest advanced past delete"
     );
 
@@ -686,27 +686,27 @@ fn deleted_prefix_is_silent_in_stream_no_tombstone() {
 }
 
 // ===========================================================================
-// 8. box-deleted frame: terminal for that box, stream continues (§7.5).
+// 8. topic-deleted frame: terminal for that topic, stream continues (§7.5).
 // ===========================================================================
 //
-// Watch two boxes. Delete one; then write to the other (the write wakes the
+// Watch two topics. Delete one; then write to the other (the write wakes the
 // stream's park, so we don't wait on the 15s heartbeat). On the woken pass the
-// deleted box yields a `box-deleted` frame while the live box delivers its
-// record — proving the deletion is terminal for one box only.
+// deleted topic yields a `topic-deleted` frame while the live topic delivers its
+// record — proving the deletion is terminal for one topic only.
 
 #[test]
-fn box_deleted_frame_is_terminal_for_that_box_only() {
+fn topic_deleted_frame_is_terminal_for_that_topic_only() {
     let h = Harness::start();
     write(&h, "boxA", json!({ "records": [{ "data": 1 }] }));
     write(&h, "boxB", json!({ "records": [{ "data": 10 }] }));
 
     let (url, _) = create_watch(
         &h,
-        json!({ "boxes": { "boxA": { "from_seq": 0 }, "boxB": { "from_seq": 0 } } }),
+        json!({ "topics": { "boxA": { "from_seq": 0 }, "boxB": { "from_seq": 0 } } }),
     );
 
     // Open the stream in the background and collect raw text until we see the
-    // box-deleted frame (or time out).
+    // topic-deleted frame (or time out).
     let base = h.base_url().to_string();
     let url2 = url.clone();
     let handle = std::thread::spawn(move || {
@@ -724,7 +724,7 @@ fn box_deleted_frame_is_terminal_for_that_box_only() {
         let mut chunk = [0u8; 4096];
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(6) {
-            if String::from_utf8_lossy(&buf).contains("box-deleted") {
+            if String::from_utf8_lossy(&buf).contains("topic-deleted") {
                 break;
             }
             match resp.read(&mut chunk) {
@@ -737,29 +737,29 @@ fn box_deleted_frame_is_terminal_for_that_box_only() {
     });
 
     // Let the stream reach its parked caught-up state, then delete boxA and
-    // poke boxB so the park wakes and the loop re-checks both boxes.
+    // poke boxB so the park wakes and the loop re-checks both topics.
     std::thread::sleep(Duration::from_millis(300));
-    let (status, _) = h.delete("/v0/boxes/boxA");
+    let (status, _) = h.delete("/v0/topics/boxA");
     assert_eq!(status, StatusCode::OK);
     write(&h, "boxB", json!({ "records": [{ "data": 11 }] }));
 
     let text = handle.join().unwrap();
     assert!(
-        text.contains("event: box-deleted") || text.contains("event:box-deleted"),
-        "deleting a watched box must emit a box-deleted frame, got:\n{text}"
+        text.contains("event: topic-deleted") || text.contains("event:topic-deleted"),
+        "deleting a watched topic must emit a topic-deleted frame, got:\n{text}"
     );
     assert!(
-        text.contains("\"box\":\"boxA\""),
-        "box-deleted names the deleted box (boxA):\n{text}"
+        text.contains("\"topic\":\"boxA\""),
+        "topic-deleted names the deleted topic (boxA):\n{text}"
     );
     assert!(
         text.contains("\"reason\":\"deleted\""),
-        "box-deleted reason is `deleted`:\n{text}"
+        "topic-deleted reason is `deleted`:\n{text}"
     );
-    // The other box keeps streaming: its new record (seq 11) is delivered.
+    // The other topic keeps streaming: its new record (seq 11) is delivered.
     assert!(
-        text.contains("\"$seq\":11") || text.contains("\"box\":\"boxB\""),
-        "the surviving box keeps streaming after the peer's deletion:\n{text}"
+        text.contains("\"$seq\":11") || text.contains("\"topic\":\"boxB\""),
+        "the surviving topic keeps streaming after the peer's deletion:\n{text}"
     );
 }
 
@@ -786,7 +786,7 @@ fn node_loop_prevention_filters_own_records_in_stream() {
     // delivered.
     let (url, _) = create_watch(
         &h,
-        json!({ "node": "self", "boxes": { "topic": { "from_seq": 0 } }, "include_tags": false }),
+        json!({ "node": "self", "topics": { "topic": { "from_seq": 0 } }, "include_tags": false }),
     );
 
     let frames = h.sse_frames(&url, 2, SHORT);
@@ -829,10 +829,10 @@ fn watcher_that_owns_all_records_sees_only_caught_up() {
 
     let (url, _) = create_watch(
         &h,
-        json!({ "node": "only", "boxes": { "echo": { "from_seq": 0 } } }),
+        json!({ "node": "only", "topics": { "echo": { "from_seq": 0 } } }),
     );
 
-    // No `record` frame is delivered (all filtered); the box still drains to
+    // No `record` frame is delivered (all filtered); the topic still drains to
     // caught-up so the consumer isn't stuck in an empty loop (API §3.2).
     let frames = h.sse_frames(&url, 1, SHORT);
     let evs = events(&frames);

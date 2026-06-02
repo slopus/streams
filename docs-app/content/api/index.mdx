@@ -10,7 +10,7 @@ import { Callout, Cards } from 'nextra/components'
 streams is a persistent event engine exposed as a **JSON-first HTTP API**: every operation
 is a plain request with a JSON body and a JSON response, so `curl` is a complete client. No
 SDK, no binary framing, no connection modes. This is the index to the full `/v0` surface —
-boxes, writes, diff reads, deletes, routers, multiplexed SSE, and lease queues — with one
+topics, writes, diff reads, deletes, routers, multiplexed SSE, and lease queues — with one
 reference page per area.
 
 ## Base URL & versioning
@@ -51,7 +51,7 @@ A few conventions hold across every endpoint and make the surface predictable:
 </Callout>
 
 These rules — the error body, the status-code table, the `$`-metadata convention,
-pagination, idempotency, and the Box config object — are specified once on
+pagination, idempotency, and the Topic config object — are specified once on
 [Conventions](/api/conventions).
 
 ## Endpoint index
@@ -61,40 +61,40 @@ The complete `/v0` surface. Auth scopes and per-route requirements are covered o
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PUT` | `/v0/boxes/:box` | Create / configure a box (idempotent upsert) |
-| `GET` | `/v0/boxes/:box` | Get box state (head / earliest / count / config) |
-| `GET` | `/v0/boxes` | List boxes (opaque-cursor paginated) |
-| `DELETE` | `/v0/boxes/:box` | Delete a box (cascades routers) |
-| `POST` | `/v0/boxes/:box` | Append record(s); returns assigned seqs + head |
-| `POST` | `/v0/boxes/:box/diff` | Read difference from a cursor (batched + tombstones) |
-| `POST` | `/v0/boxes/:box/delete` | Permanently delete records by `before_seq` and/or tag `match` |
+| `PUT` | `/v0/topics/:topic` | Create / configure a topic (idempotent upsert) |
+| `GET` | `/v0/topics/:topic` | Get topic state (head / earliest / count / config) |
+| `GET` | `/v0/topics` | List topics (opaque-cursor paginated) |
+| `DELETE` | `/v0/topics/:topic` | Delete a topic (cascades routers) |
+| `POST` | `/v0/topics/:topic` | Append record(s); returns assigned seqs + head |
+| `POST` | `/v0/topics/:topic/diff` | Read difference from a cursor (batched + tombstones) |
+| `POST` | `/v0/topics/:topic/delete` | Permanently delete records by `before_seq` and/or tag `match` |
 | `PUT` | `/v0/routers/:router` | Create / configure a router (idempotent upsert) |
 | `GET` | `/v0/routers/:router` | Get a router |
 | `GET` | `/v0/routers` | List routers (opaque-cursor paginated) |
 | `DELETE` | `/v0/routers/:router` | Delete a router |
 | `POST` | `/v0/watch` | Create a multiplexed SSE watch session |
 | `GET` | `/v0/watch/:wid` | Open the SSE stream for a session |
-| `POST` | `/v0/boxes/:q/claim` | **Queue:** lease up to N claimable jobs to a node |
-| `POST` | `/v0/boxes/:q/ack` | **Queue:** complete jobs (ack == permanent delete) |
-| `POST` | `/v0/boxes/:q/nack` | **Queue:** release leased jobs for (delayed) reclaim |
-| `POST` | `/v0/boxes/:q/extend` | **Queue:** extend lease deadlines (heartbeat) |
-| `GET` | `/v0/boxes/:q/work` | **Queue:** SSE auto-claim / push (PUSH mode) |
+| `POST` | `/v0/topics/:q/claim` | **Queue:** lease up to N claimable jobs to a node |
+| `POST` | `/v0/topics/:q/ack` | **Queue:** complete jobs (ack == permanent delete) |
+| `POST` | `/v0/topics/:q/nack` | **Queue:** release leased jobs for (delayed) reclaim |
+| `POST` | `/v0/topics/:q/extend` | **Queue:** extend lease deadlines (heartbeat) |
+| `GET` | `/v0/topics/:q/work` | **Queue:** SSE auto-claim / push (PUSH mode) |
 | `GET` | `/v0/health` (`/healthz`) | Liveness |
 | `GET` | `/v0/ready` (`/readyz`) | Readiness (WAL-replay / drain aware) |
 | `GET` | `/v0/metrics` | Prometheus / JSON metrics |
 
-The five queue endpoints (`claim`/`ack`/`nack`/`extend`/`work`) are only available on a box
-created with `type:"queue"`; calling them on a plain log box returns `409 not_a_queue`. See
+The five queue endpoints (`claim`/`ack`/`nack`/`extend`/`work`) are only available on a topic
+created with `type:"queue"`; calling them on a plain log topic returns `409 not_a_queue`. See
 [Queues](/api/queues).
 
 ## Reference pages
 
 <Cards>
   <Cards.Card title="Conventions" href="/api/conventions" arrow>
-    Base URL, auth, error body, status codes, cursors, idempotency, and the Box config object.
+    Base URL, auth, error body, status codes, cursors, idempotency, and the Topic config object.
   </Cards.Card>
-  <Cards.Card title="Boxes" href="/api/boxes" arrow>
-    Create, configure, inspect, list, and delete boxes — the control plane.
+  <Cards.Card title="Topics" href="/api/topics" arrow>
+    Create, configure, inspect, list, and delete topics — the control plane.
   </Cards.Card>
   <Cards.Card title="Writing Records" href="/api/writing" arrow>
     Append one or many records atomically; seq assignment and idempotency.

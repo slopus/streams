@@ -11,7 +11,7 @@
 //!
 //! [`capture`] records the WAL checkpoint position **first** (after a durable
 //! `CheckpointMark` flush barrier so the published position covers every
-//! prior frame), *then* materializes box/router state. Any write committed
+//! prior frame), *then* materializes topic/router state. Any write committed
 //! after the position-read has a WAL offset `>=` the checkpoint, so recovery
 //! replays it; any such write that also raced into the materialized snapshot is
 //! skipped on replay by seq (`seq <= recovered head`). No acked write can fall
@@ -20,10 +20,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::engine::box_state::{BoxState, StoredRecord};
+use crate::engine::topic_state::{TopicState, StoredRecord};
 use crate::engine::{Engine, SEQ_BASE};
-use crate::storage::{Checkpoint, Snapshot, SnapshotBox, SnapshotRecord, SnapshotRouter};
-use crate::types::{BoxConfig, Filter, FilterOp, Router};
+use crate::storage::{Checkpoint, Snapshot, SnapshotTopic, SnapshotRecord, SnapshotRouter};
+use crate::types::{TopicConfig, Filter, FilterOp, Router};
 
 /// Capture the engine's current durable state into a [`Snapshot`].
 ///
@@ -58,7 +58,7 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     // frames were already replayed + materialized into this snapshot, so its current
     // tail is the fully-absorbed boundary; recording it means a later recovery skips
     // that group entirely even if its files were not yet (or could not be) deleted —
-    // so an absorbed group's control frames (Delete/BoxConfig/EvictWatermark/
+    // so an absorbed group's control frames (Delete/TopicConfig/EvictWatermark/
     // HeadWatermark) can never replay-from-zero and regress snapshotted state
     // (codex P0 #2). Best-effort: a group we cannot stat is simply not recorded
     // (recovery then replays it, still correct — Appends are seq-idempotent).
@@ -79,7 +79,7 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     let shard_keys: Vec<String> = keyed.iter().map(|(k, _)| k.clone()).collect();
     let (wal_idx, wal_offset) = shard_positions.first().copied().unwrap_or((0, 0));
 
-    // Quiesce router advancement across BOTH the box capture and the router-cursor
+    // Quiesce router advancement across BOTH the topic capture and the router-cursor
     // capture below (codex P0 #1). `advance_router` holds this lock SHARED while it
     // publishes a router's derived dest records and advances that router's cursor;
     // taking it EXCLUSIVE here freezes every router so the captured (derived dest
@@ -90,7 +90,7 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     // v2-off (no `advance_router` ever contends).
     let _router_freeze = engine.router_snapshot_lock.write();
 
-    // 3) Materialize every box's live state + the router set. Each box is captured
+    // 3) Materialize every topic's live state + the router set. Each topic is captured
     //    under its own `append_lock` (codex P0): a durable write may have its WAL
     //    frame *before* the checkpoint offset yet still be staged-but-unpublished
     //    when we read the index. Holding the lock blocks any NEW stage; we then
@@ -98,11 +98,11 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     //    (its fsync now waits OFF the lock, codex P0 #1) so `head_seq` covers
     //    every frame the checkpoint offset already includes. After that we observe
     //    a consistent `(head_seq, index)` and never exclude a covered frame.
-    //    `capture_box` additionally snapshots only `seq <= head_seq`, so a
+    //    `capture_topic` additionally snapshots only `seq <= head_seq`, so a
     //    concurrently-staged (invisible) tail is never persisted.
-    let mut boxes = Vec::with_capacity(engine.boxes.len());
+    let mut topics = Vec::with_capacity(engine.topics.len());
     let mut max_seq = 0u64;
-    for entry in engine.boxes.iter() {
+    for entry in engine.topics.iter() {
         let b = entry.value();
         // Enforce retention so the captured floors/records are current.
         b.enforce_retention(engine.clock.now_ms());
@@ -110,9 +110,9 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
         // Drain in-flight (ticketed-but-unpublished) durable writes so head_seq
         // covers every frame at/before the checkpoint offset captured above.
         b.quiesce_publishes();
-        let snap_box = capture_box(b);
-        max_seq = max_seq.max(snap_box.head_seq);
-        boxes.push(snap_box);
+        let snap_topic = capture_topic(b);
+        max_seq = max_seq.max(snap_topic.head_seq);
+        topics.push(snap_topic);
     }
 
     let routers = engine
@@ -126,7 +126,7 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     Some(Snapshot {
         id,
         ts: now,
-        next_box_id: engine.next_box_id.load(Ordering::Relaxed) as u32,
+        next_topic_id: engine.next_topic_id.load(Ordering::Relaxed) as u32,
         checkpoint: Checkpoint {
             wal_idx,
             wal_offset,
@@ -134,21 +134,21 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
             shards: shard_positions,
             shard_keys,
         },
-        boxes,
+        topics,
         routers,
     })
 }
 
-/// Materialize one box into a [`SnapshotBox`] (its live record set + floors).
+/// Materialize one topic into a [`SnapshotTopic`] (its live record set + floors).
 ///
-/// Caller holds the box's `append_lock`, so `head_seq` and the index are
+/// Caller holds the topic's `append_lock`, so `head_seq` and the index are
 /// consistent and any staged-but-unpublished tail is excluded by the `seq <=
 /// head` clamp.
-fn capture_box(b: &BoxState) -> SnapshotBox {
+fn capture_topic(b: &TopicState) -> SnapshotTopic {
     let config = b.config.read().clone();
     let config_json = serde_json::to_vec(&config).unwrap_or_default();
 
-    // A `memory`-class box is captured exactly like a `disk` box: it shares the
+    // A `memory`-class topic is captured exactly like a `disk` topic: it shares the
     // disk-like best-effort path (§0.10), so its live records are snapshotted and
     // MAY survive a restart — the contract is only that there is no durability
     // GUARANTEE (records may persist OR be lost). No empty-capture special-casing.
@@ -225,9 +225,9 @@ fn capture_box(b: &BoxState) -> SnapshotBox {
         });
     }
 
-    SnapshotBox {
+    SnapshotTopic {
         name: b.name.clone(),
-        box_id: b.box_id,
+        topic_id: b.topic_id,
         epoch: b.epoch(),
         config_json,
         base_seq,
@@ -272,34 +272,34 @@ fn router_to_snapshot(r: Router, cursor: u64, total: u64, dest_base: u64) -> Sna
 /// before WAL replay during recovery (the WAL frames after the checkpoint are
 /// then layered on top). Returns the checkpoint position to replay from.
 pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
-    // Restore the id allocator so newly-created boxes never collide with a
+    // Restore the id allocator so newly-created topics never collide with a
     // snapshotted id.
     engine
-        .next_box_id
-        .store(snapshot.next_box_id as u64, Ordering::Relaxed);
+        .next_topic_id
+        .store(snapshot.next_topic_id as u64, Ordering::Relaxed);
 
-    for sb in snapshot.boxes {
-        let config: BoxConfig = serde_json::from_slice(&sb.config_json).unwrap_or_default();
-        let box_id = sb.box_id;
-        let mut state = restore_box(sb, config);
+    for sb in snapshot.topics {
+        let config: TopicConfig = serde_json::from_slice(&sb.config_json).unwrap_or_default();
+        let topic_id = sb.topic_id;
+        let mut state = restore_topic(sb, config);
         // Attach a HOT segment writer for a durable engine so post-restore
         // appends materialize into segments (Phase 6 Stage 2). `attach_segwriter`
         // pre-seeds the writer's active segment with the restored live records so
         // its sealed/active state is consistent with the index. Idempotent `put`s
-        // make re-materializing a previously-sealed range safe. A `memory`-class box
+        // make re-materializing a previously-sealed range safe. A `memory`-class topic
         // gets a writer too — it shares the disk-like best-effort path (§0.10), so
-        // whatever the snapshot captured for it is restored just like a disk box
+        // whatever the snapshot captured for it is restored just like a disk topic
         // (best-effort: it MAY have persisted records or MAY come back empty).
-        if let Some(writer) = engine.build_segment_writer(box_id) {
+        if let Some(writer) = engine.build_segment_writer(topic_id) {
             state.attach_segwriter(writer);
         }
         let bx = Arc::new(state);
         // Keep the live gauges in lockstep with the restored registry so the
-        // `max_boxes` / `max_total_bytes` reservation counters reflect recovered
-        // state (a fresh insert bumps the box count by 1 and the byte total by the
-        // box's retained bytes).
-        if engine.boxes.insert(bx.name.clone(), bx.clone()).is_none() {
-            engine.box_count.fetch_add(1, Ordering::AcqRel);
+        // `max_topics` / `max_total_bytes` reservation counters reflect recovered
+        // state (a fresh insert bumps the topic count by 1 and the byte total by the
+        // topic's retained bytes).
+        if engine.topics.insert(bx.name.clone(), bx.clone()).is_none() {
+            engine.topic_count.fetch_add(1, Ordering::AcqRel);
         }
         engine
             .total_bytes_live
@@ -334,11 +334,11 @@ pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
     snapshot.checkpoint
 }
 
-/// Rebuild a single [`BoxState`] from a [`SnapshotBox`], re-inserting its live
+/// Rebuild a single [`TopicState`] from a [`SnapshotTopic`], re-inserting its live
 /// record set at the recorded seqs (so `base_seq`/`head_seq` and the tag index
 /// match exactly) and restoring the floors + counters.
-fn restore_box(sb: SnapshotBox, config: BoxConfig) -> BoxState {
-    let state = BoxState::new(sb.name, sb.box_id, config, SEQ_BASE, sb.epoch);
+fn restore_topic(sb: SnapshotTopic, config: TopicConfig) -> TopicState {
+    let state = TopicState::new(sb.name, sb.topic_id, config, SEQ_BASE, sb.epoch);
 
     {
         let mut index = state.index.write();
@@ -400,4 +400,4 @@ fn restore_box(sb: SnapshotBox, config: BoxConfig) -> BoxState {
     state
 }
 
-use crate::engine::box_state::deleted_hole;
+use crate::engine::topic_state::deleted_hole;

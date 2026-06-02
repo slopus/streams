@@ -7,12 +7,12 @@
 //!
 //!   * a *failed* cold copy must leave the HOT copy intact and the tier pointer
 //!     un-flipped — relocation simply does not advance, never a loss;
-//!   * a half-written / torn cold copy must be non-authoritative: `BoxTier::resolve`
+//!   * a half-written / torn cold copy must be non-authoritative: `TopicTier::resolve`
 //!     prefers the surviving HOT copy and a re-run of the idempotent copy completes
 //!     it — at every point at least one readable copy of the segment exists.
 //!
 //! These drive the real `copy_segment_to_cold` / `confirm_relocated` against a
-//! `BoxTier` whose COLD store routes through the Phase-8A hostile FS impls
+//! `TopicTier` whose COLD store routes through the Phase-8A hostile FS impls
 //! (`FaultFs` for EIO/ENOSPC/ESTALE, `FakeDisk` for the torn crash), exactly the
 //! `inject_how` the catalog prescribes ("FaultFs fail-once on the cold put
 //! write_at", "FakeDisk tears the cold tmp before rename", "FaultFs returns ESTALE
@@ -38,17 +38,17 @@ use std::sync::Arc;
 
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{
-    decode_data_frame, lookup, BoxTier, Fs, LocalSegmentStore, SegmentBuilder, SegmentId,
+    decode_data_frame, lookup, TopicTier, Fs, LocalSegmentStore, SegmentBuilder, SegmentId,
     SegmentPart, SegmentRecord, SegmentStore, Tier,
 };
 
 // ===========================================================================
-// Fixtures: a one-segment HOT store + a (hostile-FS) COLD store in a BoxTier.
+// Fixtures: a one-segment HOT store + a (hostile-FS) COLD store in a TopicTier.
 // ===========================================================================
 
 const SEG_ID: SegmentId = 1;
-const HOT_ROOT: &str = "/hot/boxes/00000001";
-const COLD_ROOT: &str = "/cold/boxes/00000001";
+const HOT_ROOT: &str = "/hot/topics/00000001";
+const COLD_ROOT: &str = "/cold/topics/00000001";
 
 /// Build a tiny segment (`SEG_ID` covering seqs 1..=3) and return its
 /// `(data, idx)` byte buffers — the same bytes a real seal would persist.
@@ -68,7 +68,7 @@ fn build_segment() -> (Vec<u8>, Vec<u8>) {
 
 /// Open a HOT `LocalSegmentStore` on a clean (fully durable) `FakeDisk` and seal
 /// `SEG_ID` into it; return the disk (so the hot copy stays durable) plus the
-/// store boxed for a `BoxTier`. The hot side is never hostile — only the cold
+/// store boxed for a `TopicTier`. The hot side is never hostile — only the cold
 /// path under test is.
 fn hot_store_with_segment() -> (FakeDisk, Box<dyn SegmentStore>) {
     let hot_disk = FakeDisk::new();
@@ -87,7 +87,7 @@ fn hot_store_with_segment() -> (FakeDisk, Box<dyn SegmentStore>) {
 /// Read seq `seq` of `SEG_ID` back through whichever tier currently holds it and
 /// assert it decodes to the genuine record bytes — the "still readable, no loss"
 /// half of every cold-copy oracle.
-fn assert_record_readable(tier: &BoxTier, seq: u64) {
+fn assert_record_readable(tier: &TopicTier, seq: u64) {
     let store = tier
         .store_for(SEG_ID)
         .expect("segment resolvable in some tier (never zero copies)");
@@ -106,9 +106,9 @@ fn assert_record_readable(tier: &BoxTier, seq: u64) {
 }
 
 /// Drive the real relocation COPY step against `tier` for `SEG_ID`, as the engine
-/// does on its blocking pool (`relocate_box_cold` step 2). Returns the copy
+/// does on its blocking pool (`relocate_topic_cold` step 2). Returns the copy
 /// result so the caller can assert it failed/succeeded.
-fn copy_to_cold(tier: &Arc<BoxTier>) -> Result<(), streams::storage::StoreError> {
+fn copy_to_cold(tier: &Arc<TopicTier>) -> Result<(), streams::storage::StoreError> {
     streams::engine::segwriter::copy_segment_to_cold(tier, SEG_ID)
 }
 
@@ -119,7 +119,7 @@ fn copy_to_cold(tier: &Arc<BoxTier>) -> Result<(), streams::storage::StoreError>
 /// EIO fired (fail-once) on the cold store's `write_at` during the relocation
 /// copy. ORACLE: `copy_segment_to_cold` returns `Err`; the engine leaves HOT
 /// intact, never flips the pointer nor deletes hot on a failed copy — relocation
-/// simply does not advance. `BoxTier::resolve` stays HOT and the record is still
+/// simply does not advance. `TopicTier::resolve` stays HOT and the record is still
 /// readable.
 #[test]
 fn f_cold_eio_copy() {
@@ -132,7 +132,7 @@ fn f_cold_eio_copy() {
     let cold_fs = FaultFs::new(cold_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, 0, true);
     let cold = LocalSegmentStore::open_with(COLD_ROOT, cold_fs.arc()).unwrap();
 
-    let tier = Arc::new(BoxTier::new(hot, Some(Box::new(cold))));
+    let tier = Arc::new(TopicTier::new(hot, Some(Box::new(cold))));
 
     // The copy MUST fail (the engine then logs + moves on, never flipping).
     let res = copy_to_cold(&tier);
@@ -188,7 +188,7 @@ fn f_cold_enospc_copy() {
     );
     let cold = LocalSegmentStore::open_with(COLD_ROOT, cold_fs.arc()).unwrap();
 
-    let tier = Arc::new(BoxTier::new(hot, Some(Box::new(cold))));
+    let tier = Arc::new(TopicTier::new(hot, Some(Box::new(cold))));
 
     let res = copy_to_cold(&tier);
     assert!(res.is_err(), "ENOSPC on cold must fail the copy");
@@ -234,7 +234,7 @@ fn f_cold_torn_copy() {
     let cold_fs = FaultFs::new(cold_disk.arc(), FaultOp::WriteAt, FaultKind::Eio, 1, true);
     let cold = LocalSegmentStore::open_with(COLD_ROOT, cold_fs.arc()).unwrap();
 
-    let tier = Arc::new(BoxTier::new(hot, Some(Box::new(cold))));
+    let tier = Arc::new(TopicTier::new(hot, Some(Box::new(cold))));
 
     // The put aborts mid-copy (returns Err); the engine would NOT flip.
     let res = copy_to_cold(&tier);
@@ -265,7 +265,7 @@ fn f_cold_torn_copy() {
     // cold device power and re-open the store fresh (reopen-by-path).
     cold_disk.reset_power();
     let cold2 = LocalSegmentStore::open_with(COLD_ROOT, cold_disk.arc()).unwrap();
-    let tier2 = Arc::new(BoxTier::new(
+    let tier2 = Arc::new(TopicTier::new(
         Box::new(LocalSegmentStore::open_with(HOT_ROOT, _hot_disk.arc()).unwrap()),
         Some(Box::new(cold2)),
     ));
@@ -304,7 +304,7 @@ fn f_cold_nfs_estale_copy() {
     );
     let cold = LocalSegmentStore::open_with(COLD_ROOT, cold_fs.arc()).unwrap();
 
-    let tier = Arc::new(BoxTier::new(hot, Some(Box::new(cold))));
+    let tier = Arc::new(TopicTier::new(hot, Some(Box::new(cold))));
 
     // First attempt hits ESTALE and fails.
     let res = copy_to_cold(&tier);
@@ -327,7 +327,7 @@ fn f_cold_nfs_estale_copy() {
     // NFS reopen-by-path on retry) and re-run the copy — it now succeeds and
     // installs a complete cold copy. Nothing was lost across the stale handle.
     let cold_retry = LocalSegmentStore::open_with(COLD_ROOT, cold_fs.arc()).unwrap();
-    let tier_retry = Arc::new(BoxTier::new(
+    let tier_retry = Arc::new(TopicTier::new(
         Box::new(LocalSegmentStore::open_with(HOT_ROOT, hot_disk.arc()).unwrap()),
         Some(Box::new(cold_retry)),
     ));

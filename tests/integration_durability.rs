@@ -46,10 +46,10 @@ fn one(data: serde_json::Value, tag: Option<&str>) -> WriteRequest {
     }
 }
 
-fn durable_box() -> BoxConfig {
-    BoxConfig {
+fn durable_topic() -> TopicConfig {
+    TopicConfig {
         durable: true,
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     }
 }
 
@@ -68,7 +68,7 @@ fn durable_writes_survive_restart() {
 
     {
         let engine = engine_at(dir.path());
-        engine.put_box("jobs", durable_box()).unwrap();
+        engine.put_topic("jobs", durable_topic()).unwrap();
         for i in 1..=5 {
             // durable:true ⇒ fsync-gated; fsync_ms is populated and > 0.
             let resp = engine
@@ -84,7 +84,7 @@ fn durable_writes_survive_restart() {
 
     // Reopen the same data dir: state must be fully recovered.
     let engine = engine_at(dir.path());
-    let st = engine.box_state("jobs", false).unwrap();
+    let st = engine.topic_state("jobs", false).unwrap();
     assert_eq!(st.head_seq, 5, "all 5 durable writes recovered");
     assert_eq!(st.earliest_seq, 1);
     assert_eq!(st.count, 5);
@@ -98,12 +98,12 @@ fn durable_writes_survive_restart() {
 }
 
 /// Regression test for a concurrent-durable-writer ordering bug: many threads
-/// writing durable single-record appends to the SAME box must all survive a
+/// writing durable single-record appends to the SAME topic must all survive a
 /// restart, with a contiguous `[1..=N]` seq set and no loss. The bug: seq
-/// assignment (`BoxState::append`, under the index lock) and WAL enqueue were
+/// assignment (`TopicState::append`, under the index lock) and WAL enqueue were
 /// not atomic, so two writers could assign seqs `A < B` yet enqueue `B`'s frame
 /// before `A`'s; recovery (apply-in-WAL-order, skip `seq <= head`) then silently
-/// dropped `A`. The per-box `append_lock` makes assignment+enqueue atomic, so
+/// dropped `A`. The per-topic `append_lock` makes assignment+enqueue atomic, so
 /// WAL order matches seq order and every acked durable write is recovered.
 #[test]
 fn concurrent_durable_writers_no_loss_across_restart() {
@@ -113,7 +113,7 @@ fn concurrent_durable_writers_no_loss_across_restart() {
     let total = writers * per_writer;
     {
         let engine = engine_at(dir.path());
-        engine.put_box("hot", durable_box()).unwrap();
+        engine.put_topic("hot", durable_topic()).unwrap();
         let mut handles = Vec::new();
         for w in 0..writers {
             let engine = engine.clone();
@@ -130,14 +130,14 @@ fn concurrent_durable_writers_no_loss_across_restart() {
         for h in handles {
             h.join().unwrap();
         }
-        let st = engine.box_state("hot", false).unwrap();
+        let st = engine.topic_state("hot", false).unwrap();
         assert_eq!(st.head_seq, total, "all concurrent durable writes acked");
         assert_eq!(st.count, total);
     }
 
     // Restart: every acked durable write is recovered as a contiguous prefix.
     let engine = engine_at(dir.path());
-    let st = engine.box_state("hot", false).unwrap();
+    let st = engine.topic_state("hot", false).unwrap();
     assert_eq!(
         st.head_seq, total,
         "no acked durable write lost across restart"
@@ -181,7 +181,7 @@ fn nondurable_writes_survive_clean_teardown() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("evts", BoxConfig::default()).unwrap(); // durable:false
+        engine.put_topic("evts", TopicConfig::default()).unwrap(); // durable:false
         for i in 1..=3 {
             engine
                 .write("evts", one(json!({ "i": i }), None), true)
@@ -189,9 +189,9 @@ fn nondurable_writes_survive_clean_teardown() {
         }
     }
     let engine = engine_at(dir.path());
-    let st = engine.box_state("evts", false).unwrap();
+    let st = engine.topic_state("evts", false).unwrap();
     // All 3 acked records survive a clean teardown (the writer drains + fsyncs on
-    // drop). `count` is exact; for a `disk` box `head_seq` may sit at the durable
+    // drop). `count` is exact; for a `disk` topic `head_seq` may sit at the durable
     // head RESERVATION (R3 fsyncs a head ceiling ahead of use to prevent seq reuse
     // across a power loss), so it is `>= 3` and within the reservation block — the
     // reserved-but-unwritten seqs are silent gaps that don't affect the live count.
@@ -215,7 +215,7 @@ fn deletes_replay_and_stay_gone() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("d", durable_box()).unwrap();
+        engine.put_topic("d", durable_topic()).unwrap();
         for i in 1..=5 {
             engine
                 .write("d", one(json!({ "i": i }), Some(&format!("tag{i}"))), true)
@@ -253,10 +253,10 @@ fn deletes_replay_and_stay_gone() {
         d.tombstone.is_none(),
         "deletion stays silent across restart"
     );
-    assert_eq!(engine.box_state("d", false).unwrap().count, 3);
+    assert_eq!(engine.topic_state("d", false).unwrap().count, 3);
 }
 
-/// Routers (and their auto-created boxes) survive a restart and keep forwarding.
+/// Routers (and their auto-created topics) survive a restart and keep forwarding.
 #[test]
 fn routers_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -278,7 +278,7 @@ fn routers_survive_restart() {
             .unwrap();
     }
     let engine = engine_at(dir.path());
-    // The router and both boxes are back.
+    // The router and both topics are back.
     let g = engine.get_router("src->dst").unwrap();
     assert_eq!(g.source, "src");
     assert_eq!(g.dest, "dst");
@@ -298,22 +298,22 @@ fn evict_floor_tombstone_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             cap_records: 3,
             durable: true,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box("cap", cfg).unwrap();
+        engine.put_topic("cap", cfg).unwrap();
         for i in 1..=6 {
             engine
                 .write("cap", one(json!({ "i": i }), None), true)
                 .unwrap();
         }
         // head=6, cap=3 ⇒ earliest=4, evict_floor=3.
-        assert_eq!(engine.box_state("cap", false).unwrap().earliest_seq, 4);
+        assert_eq!(engine.topic_state("cap", false).unwrap().earliest_seq, 4);
     }
     let engine = engine_at(dir.path());
-    let st = engine.box_state("cap", false).unwrap();
+    let st = engine.topic_state("cap", false).unwrap();
     assert_eq!(st.head_seq, 6);
     assert_eq!(st.earliest_seq, 4, "cap floor recovered");
     assert_eq!(st.count, 3);
@@ -331,7 +331,7 @@ fn torn_tail_is_truncated_not_read_as_data() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("t", durable_box()).unwrap();
+        engine.put_topic("t", durable_topic()).unwrap();
         for i in 1..=3 {
             engine
                 .write("t", one(json!({ "i": i }), None), true)
@@ -371,7 +371,7 @@ fn torn_tail_is_truncated_not_read_as_data() {
 
     // Recovery must truncate the torn tail and recover exactly the 3 good frames.
     let engine = engine_at(dir.path());
-    let st = engine.box_state("t", false).unwrap();
+    let st = engine.topic_state("t", false).unwrap();
     assert_eq!(st.head_seq, 3, "good frames recovered; torn tail discarded");
     assert_eq!(st.count, 3);
     let d = engine.diff("t", diff_from(0)).unwrap();
@@ -388,7 +388,7 @@ fn torn_tail_is_truncated_not_read_as_data() {
         .unwrap();
     drop(engine);
     let engine = engine_at(dir.path());
-    assert_eq!(engine.box_state("t", false).unwrap().head_seq, 4);
+    assert_eq!(engine.topic_state("t", false).unwrap().head_seq, 4);
 }
 
 // ===========================================================================
@@ -397,14 +397,14 @@ fn torn_tail_is_truncated_not_read_as_data() {
 
 /// A durable engine is `ready` the instant `with_data_dir` returns (recovery is
 /// synchronous and completes before serving), and an empty/missing data dir is a
-/// clean fresh start (no error, no boxes, ready).
+/// clean fresh start (no error, no topics, ready).
 #[test]
 fn fresh_dir_is_clean_start_and_ready() {
     let dir = tempfile::tempdir().unwrap();
     let engine = engine_at(dir.path());
     assert!(engine.is_ready(), "fresh engine is ready after recovery");
     assert!((engine.replay_progress() - 1.0).abs() < f64::EPSILON);
-    assert_eq!(engine.box_count(), 0, "empty data dir ⇒ no boxes");
+    assert_eq!(engine.topic_count(), 0, "empty data dir ⇒ no topics");
 }
 
 /// write → snapshot → more writes → simulate restart (drop + reopen the same
@@ -416,12 +416,12 @@ fn write_snapshot_more_writes_restart_matches() {
     {
         let engine = engine_at(dir.path());
         engine
-            .put_box(
+            .put_topic(
                 "jobs",
-                BoxConfig {
+                TopicConfig {
                     durable: true,
                     ttl_ms: 0,
-                    ..BoxConfig::default()
+                    ..TopicConfig::default()
                 },
             )
             .unwrap();
@@ -443,7 +443,7 @@ fn write_snapshot_more_writes_restart_matches() {
     // Simulate a restart: a brand-new engine over the same data dir.
     let engine = engine_at(dir.path());
     assert!(engine.is_ready(), "engine is ready after restart recovery");
-    let st = engine.box_state("jobs", false).unwrap();
+    let st = engine.topic_state("jobs", false).unwrap();
     assert_eq!(st.head_seq, 8, "snapshotted prefix + replayed tail");
     assert_eq!(st.earliest_seq, 1);
     assert_eq!(st.count, 8);
@@ -465,14 +465,14 @@ fn tombstone_vs_silent_gap_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        // Cap-eviction box: head 5, cap 3 ⇒ evict_floor advances (involuntary).
+        // Cap-eviction topic: head 5, cap 3 ⇒ evict_floor advances (involuntary).
         engine
-            .put_box(
+            .put_topic(
                 "capped",
-                BoxConfig {
+                TopicConfig {
                     cap_records: 3,
                     durable: true,
-                    ..BoxConfig::default()
+                    ..TopicConfig::default()
                 },
             )
             .unwrap();
@@ -481,8 +481,8 @@ fn tombstone_vs_silent_gap_survive_restart() {
                 .write("capped", one(json!({ "i": i }), None), true)
                 .unwrap();
         }
-        // Deletion box: delete a prefix (voluntary ⇒ silent, no evict_floor bump).
-        engine.put_box("pruned", durable_box()).unwrap();
+        // Deletion topic: delete a prefix (voluntary ⇒ silent, no evict_floor bump).
+        engine.put_topic("pruned", durable_topic()).unwrap();
         for i in 1..=5 {
             engine
                 .write("pruned", one(json!({ "i": i }), None), true)
@@ -501,7 +501,7 @@ fn tombstone_vs_silent_gap_survive_restart() {
 
     let engine = engine_at(dir.path());
 
-    // Cap box: a cursor below the recovered involuntary floor ⇒ tombstone.
+    // Cap topic: a cursor below the recovered involuntary floor ⇒ tombstone.
     let cap = engine.diff("capped", diff_from(0)).unwrap();
     let tomb = cap
         .tombstone
@@ -509,7 +509,7 @@ fn tombstone_vs_silent_gap_survive_restart() {
     assert_eq!(tomb.reason, TombstoneReason::Cap);
     assert!(cap.records.iter().all(|r| r.seq >= cap.earliest_seq));
 
-    // Deletion box: a cursor in the purely-deleted gap ⇒ NO tombstone, silent
+    // Deletion topic: a cursor in the purely-deleted gap ⇒ NO tombstone, silent
     // advance past the deleted prefix.
     let pruned = engine.diff("pruned", diff_from(0)).unwrap();
     assert!(
@@ -521,7 +521,7 @@ fn tombstone_vs_silent_gap_survive_restart() {
         vec![3, 4, 5],
         "deleted prefix gone; survivors remain"
     );
-    assert_eq!(engine.box_state("pruned", false).unwrap().earliest_seq, 3);
+    assert_eq!(engine.topic_state("pruned", false).unwrap().earliest_seq, 3);
 }
 
 // --- The readiness gate, exercised through the real `/v0/ready` handler. ---
@@ -565,7 +565,7 @@ fn ready_request(engine: Arc<Engine>) -> (u16, serde_json::Value) {
 fn ready_gate_503_during_replay_then_200() {
     let dir = tempfile::tempdir().unwrap();
     let engine = engine_at(dir.path());
-    engine.put_box("jobs", durable_box()).unwrap();
+    engine.put_topic("jobs", durable_topic()).unwrap();
 
     // Simulate "mid-replay": gate closed, 3 of 8 frames applied.
     engine.set_ready_for_test(false, 3, 8);
@@ -581,7 +581,7 @@ fn ready_gate_503_during_replay_then_200() {
     assert_eq!(status, 200, "ready ⇒ 200");
     assert_eq!(body["status"], json!("ready"));
     assert_eq!(body["wal_replay_complete"], json!(true));
-    assert_eq!(body["boxes"], json!(1));
+    assert_eq!(body["topics"], json!(1));
 }
 
 // ===========================================================================
@@ -612,7 +612,7 @@ fn snapshot_round_trips_materialized_state() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("jobs", durable_box()).unwrap();
+        engine.put_topic("jobs", durable_topic()).unwrap();
         for i in 1..=10 {
             engine
                 .write("jobs", one(json!({ "i": i }), Some(&format!("t{i}"))), true)
@@ -639,7 +639,7 @@ fn snapshot_round_trips_materialized_state() {
             .unwrap();
 
         // Capture the pre-snapshot materialized view.
-        let pre = engine.box_state("jobs", false).unwrap();
+        let pre = engine.topic_state("jobs", false).unwrap();
 
         // Write a snapshot; it must be durably present and the WAL prefix dropped.
         assert!(engine.write_snapshot().unwrap(), "snapshot written");
@@ -650,7 +650,7 @@ fn snapshot_round_trips_materialized_state() {
         );
 
         // Re-read state from the SAME engine: snapshot must not perturb it.
-        let post = engine.box_state("jobs", false).unwrap();
+        let post = engine.topic_state("jobs", false).unwrap();
         assert_eq!(post.head_seq, pre.head_seq);
         assert_eq!(post.earliest_seq, pre.earliest_seq);
         assert_eq!(post.count, pre.count);
@@ -658,7 +658,7 @@ fn snapshot_round_trips_materialized_state() {
 
     // Reopen: state restored from the snapshot (+ replay of the tiny WAL tail).
     let engine = engine_at(dir.path());
-    let st = engine.box_state("jobs", false).unwrap();
+    let st = engine.topic_state("jobs", false).unwrap();
     assert_eq!(st.head_seq, 10);
     // seqs 1,2 (prefix) and 6 (tag) deleted ⇒ earliest 3, count 7.
     assert_eq!(st.earliest_seq, 3);
@@ -684,7 +684,7 @@ fn snapshot_drops_absorbed_wal_and_replays_tail() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("b", durable_box()).unwrap();
+        engine.put_topic("b", durable_topic()).unwrap();
         for i in 1..=4 {
             engine
                 .write("b", one(json!({ "i": i }), None), true)
@@ -697,7 +697,7 @@ fn snapshot_drops_absorbed_wal_and_replays_tail() {
             .unwrap();
     }
     let engine = engine_at(dir.path());
-    let st = engine.box_state("b", false).unwrap();
+    let st = engine.topic_state("b", false).unwrap();
     assert_eq!(
         st.head_seq, 5,
         "snapshotted 4 + post-snapshot tail write recovered"
@@ -710,7 +710,7 @@ fn snapshot_drops_absorbed_wal_and_replays_tail() {
     );
 }
 
-/// Routers + their auto-created boxes survive a snapshot-based restart and keep
+/// Routers + their auto-created topics survive a snapshot-based restart and keep
 /// forwarding from the right cursor.
 #[test]
 fn routers_survive_snapshot_restart() {
@@ -759,12 +759,12 @@ fn evict_floor_survives_snapshot_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             cap_records: 3,
             durable: true,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box("cap", cfg).unwrap();
+        engine.put_topic("cap", cfg).unwrap();
         for i in 1..=6 {
             engine
                 .write("cap", one(json!({ "i": i }), None), true)
@@ -773,7 +773,7 @@ fn evict_floor_survives_snapshot_restart() {
         assert!(engine.write_snapshot().unwrap());
     }
     let engine = engine_at(dir.path());
-    let st = engine.box_state("cap", false).unwrap();
+    let st = engine.topic_state("cap", false).unwrap();
     assert_eq!(st.head_seq, 6);
     assert_eq!(st.earliest_seq, 4, "cap floor recovered from snapshot");
     assert_eq!(st.count, 3);
@@ -792,7 +792,7 @@ fn repeated_snapshots_keep_one_and_stay_consistent() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("b", durable_box()).unwrap();
+        engine.put_topic("b", durable_topic()).unwrap();
         for round in 0..3 {
             for i in 1..=3 {
                 engine
@@ -804,7 +804,7 @@ fn repeated_snapshots_keep_one_and_stay_consistent() {
         }
     }
     let engine = engine_at(dir.path());
-    assert_eq!(engine.box_state("b", false).unwrap().head_seq, 9);
+    assert_eq!(engine.topic_state("b", false).unwrap().head_seq, 9);
 }
 
 // ===========================================================================
@@ -896,18 +896,18 @@ fn kill_during_durable_write_survives_sigkill_restart() {
 
     let (status, _b) = {
         let r = client
-            .put(format!("{base}/v0/boxes/jobs"))
+            .put(format!("{base}/v0/topics/jobs"))
             .json(&json!({ "durable": true }))
             .send()
             .unwrap();
         (r.status(), r)
     };
-    assert!(status.is_success(), "create durable box");
+    assert!(status.is_success(), "create durable topic");
 
     // The write response returns ONLY after the fsync (durable:true), so once we
     // hold a 2xx the record is on disk — a SIGKILL now must not lose it.
     let resp = client
-        .post(format!("{base}/v0/boxes/jobs"))
+        .post(format!("{base}/v0/topics/jobs"))
         .json(&json!({ "records": [{ "data": { "n": 42 }, "tag": "k" }] }))
         .send()
         .unwrap();
@@ -936,7 +936,7 @@ fn kill_during_durable_write_survives_sigkill_restart() {
     wait_healthy(&client, &base, Duration::from_secs(10));
 
     let st: serde_json::Value = client
-        .get(format!("{base}/v0/boxes/jobs"))
+        .get(format!("{base}/v0/topics/jobs"))
         .send()
         .unwrap()
         .json()
@@ -948,7 +948,7 @@ fn kill_during_durable_write_survives_sigkill_restart() {
     assert_eq!(st["count"], 1);
 
     let diff: serde_json::Value = client
-        .post(format!("{base}/v0/boxes/jobs/diff"))
+        .post(format!("{base}/v0/topics/jobs/diff"))
         .json(&json!({ "from_seq": 0, "include_tags": true }))
         .send()
         .unwrap()
@@ -1007,16 +1007,16 @@ fn graceful_shutdown_writes_snapshot() {
     let base = server.base;
     wait_healthy(&client, &base, Duration::from_secs(10));
 
-    // A durable box + a few writes.
+    // A durable topic + a few writes.
     let r = client
-        .put(format!("{base}/v0/boxes/jobs"))
+        .put(format!("{base}/v0/topics/jobs"))
         .json(&json!({ "durable": true }))
         .send()
         .unwrap();
     assert!(r.status().is_success());
     for i in 1..=3 {
         let r = client
-            .post(format!("{base}/v0/boxes/jobs"))
+            .post(format!("{base}/v0/topics/jobs"))
             .json(&json!({ "records": [{ "data": { "n": i } }] }))
             .send()
             .unwrap();
@@ -1050,7 +1050,7 @@ fn graceful_shutdown_writes_snapshot() {
     let base = server2.base;
     wait_healthy(&client, &base, Duration::from_secs(10));
     let st: serde_json::Value = client
-        .get(format!("{base}/v0/boxes/jobs"))
+        .get(format!("{base}/v0/topics/jobs"))
         .send()
         .unwrap()
         .json()
@@ -1110,15 +1110,15 @@ fn engine_with_cold(
     Engine::with_data_dir(config_with_cold(dir, cold, seg), clock).expect("open durable engine")
 }
 
-/// Count `seg-*.data` files under `<root>/boxes` (across all box dirs).
+/// Count `seg-*.data` files under `<root>/topics` (across all topic dirs).
 fn count_tier_segments(root: &std::path::Path) -> usize {
-    let boxes = root.join("boxes");
+    let topics = root.join("topics");
     let mut n = 0usize;
-    let Ok(rd) = std::fs::read_dir(&boxes) else {
+    let Ok(rd) = std::fs::read_dir(&topics) else {
         return 0;
     };
-    for box_entry in rd.flatten() {
-        if let Ok(inner) = std::fs::read_dir(box_entry.path()) {
+    for topic_entry in rd.flatten() {
+        if let Ok(inner) = std::fs::read_dir(topic_entry.path()) {
             for f in inner.flatten() {
                 if let Some(name) = f.file_name().to_str() {
                     if name.starts_with("seg-") && name.ends_with(".data") {
@@ -1140,16 +1140,16 @@ fn engine_with_segment(
     Engine::with_data_dir(config_with_segment(dir, seg), clock).expect("open durable engine")
 }
 
-/// Count `seg-*.data` files under `<data_dir>/boxes` (across all box dirs) — the
+/// Count `seg-*.data` files under `<data_dir>/topics` (across all topic dirs) — the
 /// number of sealed segments materialized to the HOT tier.
 fn count_segment_files(data_dir: &std::path::Path) -> usize {
-    let boxes = data_dir.join("boxes");
+    let topics = data_dir.join("topics");
     let mut n = 0usize;
-    let Ok(rd) = std::fs::read_dir(&boxes) else {
+    let Ok(rd) = std::fs::read_dir(&topics) else {
         return 0;
     };
-    for box_entry in rd.flatten() {
-        if let Ok(inner) = std::fs::read_dir(box_entry.path()) {
+    for topic_entry in rd.flatten() {
+        if let Ok(inner) = std::fs::read_dir(topic_entry.path()) {
             for f in inner.flatten() {
                 if let Some(name) = f.file_name().to_str() {
                     if name.starts_with("seg-") && name.ends_with(".data") {
@@ -1181,7 +1181,7 @@ fn segment_rolls_at_event_threshold_and_reads_match() {
     // Seal every 3 records; disable byte/age triggers.
     let engine = engine_with_segment(dir.path(), seg_cfg(3, 0, 0), shared);
 
-    engine.put_box("logs", durable_box()).unwrap();
+    engine.put_topic("logs", durable_topic()).unwrap();
     for i in 1..=10u64 {
         engine
             .write("logs", one(json!({ "i": i }), Some("t")), true)
@@ -1206,8 +1206,8 @@ fn segment_rolls_at_event_threshold_and_reads_match() {
         assert_eq!(r.tag.as_deref(), Some("t"));
     }
 
-    // Sealing must NOT perturb the box's observable counters.
-    let st = engine.box_state("logs", false).unwrap();
+    // Sealing must NOT perturb the topic's observable counters.
+    let st = engine.topic_state("logs", false).unwrap();
     assert_eq!(st.head_seq, 10);
     assert_eq!(st.earliest_seq, 1);
     assert_eq!(st.count, 10, "all 10 still live (sealing is not eviction)");
@@ -1223,7 +1223,7 @@ fn segment_rolls_at_byte_threshold() {
     // Large event cap, tiny byte cap so each ~big record seals the prior segment.
     let engine = engine_with_segment(dir.path(), seg_cfg(1_000_000, 64, 0), shared);
 
-    engine.put_box("big", durable_box()).unwrap();
+    engine.put_topic("big", durable_topic()).unwrap();
     let payload = "x".repeat(80); // each record's frame well exceeds 64 bytes.
     for i in 1..=5u64 {
         engine
@@ -1255,7 +1255,7 @@ fn segment_rolls_at_age_threshold_via_test_clock() {
     // Big event/byte caps so only the age trigger can seal.
     let engine = engine_with_segment(dir.path(), seg_cfg(1_000_000, 0, 5_000), shared);
 
-    engine.put_box("aged", durable_box()).unwrap();
+    engine.put_topic("aged", durable_topic()).unwrap();
     engine
         .write("aged", one(json!({ "i": 1 }), None), true)
         .unwrap();
@@ -1295,7 +1295,7 @@ fn sealed_records_survive_restart() {
     {
         let clock: SharedClock = Arc::new(SystemClock);
         let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
-        engine.put_box("s", durable_box()).unwrap();
+        engine.put_topic("s", durable_topic()).unwrap();
         for i in 1..=7u64 {
             engine
                 .write("s", one(json!({ "i": i }), Some("k")), true)
@@ -1310,7 +1310,7 @@ fn sealed_records_survive_restart() {
     // Reopen: WAL replay restores every record; reads match.
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
-    let st = engine.box_state("s", false).unwrap();
+    let st = engine.topic_state("s", false).unwrap();
     assert_eq!(st.head_seq, 7);
     assert_eq!(st.count, 7);
     let d = engine.diff("s", diff_from(0)).unwrap();
@@ -1326,7 +1326,7 @@ fn sealed_records_survive_restart() {
 // Phase-6 Stage-3: cold relocation + tiered reads (the HARD-INVARIANT stage),
 // driven through the REAL durable engine with a configured COLD dir.
 //
-// `relocate_box_cold` / `relocate_all_due` run the relocator state machine
+// `relocate_topic_cold` / `relocate_all_due` run the relocator state machine
 // synchronously here (the production background task just calls them on a tick),
 // so the tests are deterministic with no wall-clock sleeps: a relocated segment
 // still reads correctly (data identical), an interrupted relocation recovers
@@ -1356,7 +1356,7 @@ fn relocated_segment_reads_identically_through_diff() {
     // Seal every 2 records; keep the newest 1 sealed segment hot.
     let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
 
-    engine.put_box("logs", durable_box()).unwrap();
+    engine.put_topic("logs", durable_topic()).unwrap();
     for i in 1..=7u64 {
         engine
             .write("logs", one(json!({ "i": i }), Some("t")), true)
@@ -1371,7 +1371,7 @@ fn relocated_segment_reads_identically_through_diff() {
     assert_eq!(count_tier_segments(cold.path()), 0);
 
     // Relocate: keep the newest 1 sealed (5-6) hot; spill 1-2 and 3-4 to cold.
-    let n = engine.relocate_box_cold("logs");
+    let n = engine.relocate_topic_cold("logs");
     assert_eq!(n, 2, "two oldest sealed segments relocated");
     assert_eq!(
         count_tier_segments(dir.path()),
@@ -1415,7 +1415,7 @@ fn relocated_segment_reads_identically_through_diff() {
     );
 
     // Counters are unperturbed by relocation (it is not eviction).
-    let st = engine.box_state("logs", false).unwrap();
+    let st = engine.topic_state("logs", false).unwrap();
     assert_eq!(st.head_seq, 7);
     assert_eq!(st.earliest_seq, 1);
     assert_eq!(st.count, 7, "all live; relocation moved bytes, not records");
@@ -1431,7 +1431,7 @@ fn interrupted_relocation_recovers_through_engine() {
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 0), clock);
 
-    engine.put_box("logs", durable_box()).unwrap();
+    engine.put_topic("logs", durable_topic()).unwrap();
     for i in 1..=5u64 {
         engine
             .write("logs", one(json!({ "i": i }), None), true)
@@ -1443,22 +1443,22 @@ fn interrupted_relocation_recovers_through_engine() {
     // Simulate the crash window: copy a segment's files into COLD *manually*
     // (mirroring the relocator's copy step) but DO NOT drop the hot copy — i.e. a
     // crash after the cold fsync, before the hot unlink. Both tiers now hold seg 1.
-    let box_dir_name = std::fs::read_dir(dir.path().join("boxes"))
+    let topic_dir_name = std::fs::read_dir(dir.path().join("topics"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
         .file_name();
-    let hot_box = dir.path().join("boxes").join(&box_dir_name);
-    let cold_box = cold.path().join("boxes").join(&box_dir_name);
-    std::fs::create_dir_all(&cold_box).unwrap();
+    let hot_topic = dir.path().join("topics").join(&topic_dir_name);
+    let cold_topic = cold.path().join("topics").join(&topic_dir_name);
+    std::fs::create_dir_all(&cold_topic).unwrap();
     for ext in ["data", "idx"] {
         let name = format!("seg-{:016}.{}", 1u64, ext);
-        std::fs::copy(hot_box.join(&name), cold_box.join(&name)).unwrap();
+        std::fs::copy(hot_topic.join(&name), cold_topic.join(&name)).unwrap();
     }
     // Seg 1 is now in BOTH tiers, hot copy intact (the interrupted state).
-    assert!(hot_box.join(format!("seg-{:016}.data", 1u64)).exists());
-    assert!(cold_box.join(format!("seg-{:016}.data", 1u64)).exists());
+    assert!(hot_topic.join(format!("seg-{:016}.data", 1u64)).exists());
+    assert!(cold_topic.join(format!("seg-{:016}.data", 1u64)).exists());
 
     // The record is fully readable (no loss) despite the duplicate.
     let d = engine.diff("logs", diff_from(0)).unwrap();
@@ -1470,7 +1470,7 @@ fn interrupted_relocation_recovers_through_engine() {
 
     // Re-running the relocator completes idempotently: the copy is a no-op (cold
     // exists), the flip+drop finishes, and reads still match.
-    engine.relocate_box_cold("logs");
+    engine.relocate_topic_cold("logs");
     let d2 = engine.diff("logs", diff_from(0)).unwrap();
     assert_eq!(
         d2.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
@@ -1493,13 +1493,13 @@ fn relocated_segments_survive_restart() {
     {
         let clock: SharedClock = Arc::new(SystemClock);
         let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
-        engine.put_box("logs", durable_box()).unwrap();
+        engine.put_topic("logs", durable_topic()).unwrap();
         for i in 1..=7u64 {
             engine
                 .write("logs", one(json!({ "i": i }), Some("t")), true)
                 .unwrap();
         }
-        let n = engine.relocate_box_cold("logs");
+        let n = engine.relocate_topic_cold("logs");
         assert_eq!(n, 2);
         assert_eq!(
             count_tier_segments(cold.path()),
@@ -1511,7 +1511,7 @@ fn relocated_segments_survive_restart() {
     // resident via WAL replay) and the segments are still present across tiers.
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
-    let st = engine.box_state("logs", false).unwrap();
+    let st = engine.topic_state("logs", false).unwrap();
     assert_eq!(st.head_seq, 7);
     assert_eq!(st.count, 7, "no record lost across restart");
     let d = engine.diff("logs", diff_from(0)).unwrap();
@@ -1535,7 +1535,7 @@ fn no_cold_dir_means_no_relocation() {
     let dir = tempfile::tempdir().unwrap();
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
-    engine.put_box("logs", durable_box()).unwrap();
+    engine.put_topic("logs", durable_topic()).unwrap();
     for i in 1..=7u64 {
         engine
             .write("logs", one(json!({ "i": i }), None), true)
@@ -1546,7 +1546,7 @@ fn no_cold_dir_means_no_relocation() {
         0,
         "no cold tier ⇒ nothing relocates"
     );
-    assert_eq!(engine.relocate_box_cold("logs"), 0);
+    assert_eq!(engine.relocate_topic_cold("logs"), 0);
     // All sealed segments stay hot; reads unchanged.
     let d = engine.diff("logs", diff_from(0)).unwrap();
     assert_eq!(d.records.len(), 7);
@@ -1579,12 +1579,12 @@ fn cap_eviction_drops_whole_segments_and_still_tombstones() {
     // Seal every 2 records; cap at 4 live records.
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
     engine
-        .put_box(
+        .put_topic(
             "cap",
-            BoxConfig {
+            TopicConfig {
                 cap_records: 4,
                 durable: true,
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             },
         )
         .unwrap();
@@ -1598,7 +1598,7 @@ fn cap_eviction_drops_whole_segments_and_still_tombstones() {
             .unwrap();
     }
 
-    let st = engine.box_state("cap", false).unwrap();
+    let st = engine.topic_state("cap", false).unwrap();
     assert_eq!(st.head_seq, 12);
     assert_eq!(st.earliest_seq, 9, "cap=4 keeps the newest 4 live");
     assert_eq!(st.count, 4);
@@ -1637,12 +1637,12 @@ fn ttl_expiry_drops_whole_segments_and_tombstones() {
     let shared: SharedClock = Arc::new(clock.clone());
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), shared);
     engine
-        .put_box(
+        .put_topic(
             "ttl",
-            BoxConfig {
+            TopicConfig {
                 ttl_ms: 1_000,
                 durable: true,
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             },
         )
         .unwrap();
@@ -1661,7 +1661,7 @@ fn ttl_expiry_drops_whole_segments_and_tombstones() {
             .unwrap();
     }
 
-    let st = engine.box_state("ttl", false).unwrap();
+    let st = engine.topic_state("ttl", false).unwrap();
     assert_eq!(st.head_seq, 8);
     assert_eq!(st.earliest_seq, 7, "seqs 1..=6 expired");
     assert_eq!(st.count, 2);
@@ -1692,7 +1692,7 @@ fn prefix_delete_reclaims_segments_silently() {
     let dir = tempfile::tempdir().unwrap();
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
-    engine.put_box("d", durable_box()).unwrap();
+    engine.put_topic("d", durable_topic()).unwrap();
     for i in 1..=8u64 {
         engine
             .write("d", one(json!({ "i": i }), None), true)
@@ -1733,7 +1733,7 @@ fn prefix_delete_reclaims_segments_silently() {
         d.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
         vec![7, 8]
     );
-    assert_eq!(engine.box_state("d", false).unwrap().count, 2);
+    assert_eq!(engine.topic_state("d", false).unwrap().count, 2);
 }
 
 /// A `match` delete that clears an **interior** sealed segment (every record in it
@@ -1744,7 +1744,7 @@ fn interior_match_delete_reclaims_its_segment_silently() {
     let dir = tempfile::tempdir().unwrap();
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
-    engine.put_box("m", durable_box()).unwrap();
+    engine.put_topic("m", durable_topic()).unwrap();
     // Tag seqs 3 and 4 (one whole sealed segment) "mid"; the rest "keep".
     for i in 1..=8u64 {
         let tag = if i == 3 || i == 4 { "mid" } else { "keep" };
@@ -1776,7 +1776,7 @@ fn interior_match_delete_reclaims_its_segment_silently() {
         count_segment_files(dir.path()) < before,
         "interior fully-deleted segment dropped whole"
     );
-    let st = engine.box_state("m", false).unwrap();
+    let st = engine.topic_state("m", false).unwrap();
     assert_eq!(st.earliest_seq, 1, "front still live; floor unchanged");
     assert_eq!(st.count, 6);
 
@@ -1802,12 +1802,12 @@ fn reclaimed_segments_stay_gone_across_restart() {
         let clock: SharedClock = Arc::new(SystemClock);
         let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
         engine
-            .put_box(
+            .put_topic(
                 "cap",
-                BoxConfig {
+                TopicConfig {
                     cap_records: 4,
                     durable: true,
-                    ..BoxConfig::default()
+                    ..TopicConfig::default()
                 },
             )
             .unwrap();
@@ -1823,7 +1823,7 @@ fn reclaimed_segments_stay_gone_across_restart() {
     // Reopen: state rebuilt across the surviving segments + WAL tail.
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_segment(dir.path(), seg_cfg(2, 0, 0), clock);
-    let st = engine.box_state("cap", false).unwrap();
+    let st = engine.topic_state("cap", false).unwrap();
     assert_eq!(st.head_seq, 12, "head recovered");
     assert_eq!(
         st.earliest_seq, 9,
@@ -1854,14 +1854,14 @@ fn restart_rebuilds_across_hot_cold_and_reclaim() {
     {
         let clock: SharedClock = Arc::new(SystemClock);
         let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
-        engine.put_box("logs", durable_box()).unwrap();
+        engine.put_topic("logs", durable_topic()).unwrap();
         for i in 1..=10u64 {
             engine
                 .write("logs", one(json!({ "i": i }), Some(&format!("t{i}"))), true)
                 .unwrap();
         }
         // Relocate older sealed segments to cold (keep newest 1 sealed hot).
-        let n = engine.relocate_box_cold("logs");
+        let n = engine.relocate_topic_cold("logs");
         assert!(n >= 1, "some segments relocated to cold");
         assert!(count_tier_segments(cold.path()) >= 1);
         // Voluntary prefix delete of seqs < 3 — drops a whole (cold) segment file.
@@ -1879,7 +1879,7 @@ fn restart_rebuilds_across_hot_cold_and_reclaim() {
     // Reopen the SAME hot+cold dirs.
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
-    let st = engine.box_state("logs", false).unwrap();
+    let st = engine.topic_state("logs", false).unwrap();
     assert_eq!(st.head_seq, 10, "head recovered across tiers");
     assert_eq!(st.earliest_seq, 3, "prefix delete recovered (silent)");
     assert_eq!(st.count, 8);
@@ -1922,12 +1922,12 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
     // the first 6 writes don't evict — we relocate first, then overflow).
     let engine = engine_with_cold(dir.path(), cold.path(), seg_cfg_retain(2, 1), clock);
     engine
-        .put_box(
+        .put_topic(
             "cap",
-            BoxConfig {
+            TopicConfig {
                 cap_records: 6,
                 durable: true,
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             },
         )
         .unwrap();
@@ -1938,7 +1938,7 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
             .write("cap", one(json!({ "i": i }), None), true)
             .unwrap();
     }
-    let relocated = engine.relocate_box_cold("cap");
+    let relocated = engine.relocate_topic_cold("cap");
     assert!(relocated >= 1, "at least one segment relocated to cold");
     let cold_before = count_tier_segments(cold.path());
     assert!(
@@ -1952,7 +1952,7 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
             .write("cap", one(json!({ "i": i }), None), true)
             .unwrap();
     }
-    let st = engine.box_state("cap", false).unwrap();
+    let st = engine.topic_state("cap", false).unwrap();
     assert_eq!(st.head_seq, 14);
     assert_eq!(st.earliest_seq, 9, "cap=6 keeps the newest 6 live");
 
@@ -1987,7 +1987,7 @@ fn cap_eviction_reclaims_a_relocated_cold_segment() {
 // Phase-7 Stage-1: the three critical durability fixes.
 // ===========================================================================
 
-/// A forwarded copy into a destination box survives a restart and is present
+/// A forwarded copy into a destination topic survives a restart and is present
 /// EXACTLY ONCE with $node/$tag fidelity. This is the observable recovery contract
 /// the product guarantees regardless of forwarding mode. Under the v2 default
 /// (async + derived) recovery RE-DERIVES the copy from the still-retained source
@@ -2002,8 +2002,8 @@ fn forwarded_copy_into_durable_dest_survives_restart() {
     {
         let engine = engine_at(dir.path());
         // Both source and dest durable; preserve $node/$tag across the forward.
-        engine.put_box("src", durable_box()).unwrap();
-        engine.put_box("dst", durable_box()).unwrap();
+        engine.put_topic("src", durable_topic()).unwrap();
+        engine.put_topic("dst", durable_topic()).unwrap();
         engine
             .put_router(
                 "src->dst",
@@ -2048,7 +2048,7 @@ fn forwarded_copy_into_durable_dest_survives_restart() {
     // Reopen: the forwarded copy is recovered from the WAL (durable by
     // construction), present exactly once with $node/$tag preserved.
     let engine = engine_at(dir.path());
-    let st = engine.box_state("dst", false).unwrap();
+    let st = engine.topic_state("dst", false).unwrap();
     assert_eq!(st.head_seq, 1, "forwarded durable copy recovered");
     assert_eq!(st.count, 1);
     let d = engine.diff("dst", diff_from(0)).unwrap();
@@ -2091,7 +2091,7 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("d", durable_box()).unwrap();
+        engine.put_topic("d", durable_topic()).unwrap();
         let resp = engine
             .write("d", one(json!({ "n": 1 }), None), true)
             .unwrap();
@@ -2101,7 +2101,7 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
         assert_eq!(engine.diff("d", diff_from(0)).unwrap().records.len(), 1);
     }
     let engine = engine_at(dir.path());
-    assert_eq!(engine.box_state("d", false).unwrap().head_seq, 1);
+    assert_eq!(engine.topic_state("d", false).unwrap().head_seq, 1);
     assert_eq!(
         engine.diff("d", diff_from(0)).unwrap().records[0].data,
         json!({ "n": 1 })
@@ -2111,7 +2111,7 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
 // ===========================================================================
 // Durability commit classes (memory / disk / fsync) — Stage 2.
 //
-// A box's `durability` selects where its records land and when an ack returns:
+// A topic's `durability` selects where its records land and when an ack returns:
 //   - memory: "disk-like but best-effort" — takes the SAME group-committed WAL
 //     write + recovery path as disk (fully queryable), but with NO durability
 //     GUARANTEE: records MAY survive a restart OR be lost; recovery is best-effort.
@@ -2120,15 +2120,15 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
 //   - fsync:  fsync-gated ack (today's durable:true); survives any crash.
 // ===========================================================================
 
-/// A box of the given durability class (queue/log defaults otherwise).
-fn class_box(class: Durability) -> BoxConfig {
-    BoxConfig {
+/// A topic of the given durability class (queue/log defaults otherwise).
+fn class_topic(class: Durability) -> TopicConfig {
+    TopicConfig {
         durability: Some(class),
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     }
 }
 
-/// A `memory`-class box is "disk-like but best-effort" (§0.10): it takes the same
+/// A `memory`-class topic is "disk-like but best-effort" (§0.10): it takes the same
 /// group-committed WAL write + recovery path as `disk`, is fully queryable, and is
 /// never fsync-gated (`fsync_ms == 0`). The WEAK contract: its records MAY survive
 /// a restart OR be lost (no fabrication, seq monotone) — so this test asserts only
@@ -2136,19 +2136,19 @@ fn class_box(class: Durability) -> BoxConfig {
 /// subset of what was written; head never exceeds the acked head), NOT an exact
 /// empty-on-restart nor an exact full-survival.
 #[test]
-fn memory_box_best_effort_recovery_no_fabrication() {
+fn memory_topic_best_effort_recovery_no_fabrication() {
     let dir = tempfile::tempdir().unwrap();
     let written: Vec<i64> = (1..=5).collect();
     {
         let engine = engine_at(dir.path());
-        // A memory box with a non-default field so we can prove the CONFIG persists.
+        // A memory topic with a non-default field so we can prove the CONFIG persists.
         engine
-            .put_box(
+            .put_topic(
                 "cache",
-                BoxConfig {
+                TopicConfig {
                     durability: Some(Durability::Memory),
                     cap_records: 99,
-                    ..BoxConfig::default()
+                    ..TopicConfig::default()
                 },
             )
             .unwrap();
@@ -2165,21 +2165,21 @@ fn memory_box_best_effort_recovery_no_fabrication() {
             );
         }
         // Pre-restart the records are present and fully queryable.
-        let st = engine.box_state("cache", false).unwrap();
+        let st = engine.topic_state("cache", false).unwrap();
         assert_eq!(st.head_seq, 5);
         assert_eq!(st.count, 5);
         assert_eq!(
             engine.diff("cache", diff_from(0)).unwrap().records.len(),
             5,
-            "memory box is fully queryable pre-restart"
+            "memory topic is fully queryable pre-restart"
         );
         assert!(engine.write_snapshot().unwrap());
     }
 
-    // Restart: the box CONFIG always survives (a control-frame mutation). The
+    // Restart: the topic CONFIG always survives (a control-frame mutation). The
     // records MAY survive OR be lost (best-effort) — assert only the weak contract.
     let engine = engine_at(dir.path());
-    let st = engine.box_state("cache", false).unwrap();
+    let st = engine.topic_state("cache", false).unwrap();
     assert_eq!(
         st.config.durability,
         Some(Durability::Memory),
@@ -2208,28 +2208,28 @@ fn memory_box_best_effort_recovery_no_fabrication() {
         );
     }
 
-    // The box is fully functional post-restart: a fresh write is accepted and
+    // The topic is fully functional post-restart: a fresh write is accepted and
     // queryable (regardless of whether the prior records survived).
-    let before = engine.box_state("cache", false).unwrap().head_seq;
+    let before = engine.topic_state("cache", false).unwrap().head_seq;
     engine
         .write("cache", one(json!({ "i": 100 }), None), true)
         .unwrap();
     assert_eq!(
-        engine.box_state("cache", false).unwrap().head_seq,
+        engine.topic_state("cache", false).unwrap().head_seq,
         before + 1,
         "a post-restart write advances head by 1"
     );
 }
 
-/// A `disk`-class box (today's durable:false) survives a CLEAN restart (the WAL
+/// A `disk`-class topic (today's durable:false) survives a CLEAN restart (the WAL
 /// writer drains + fsyncs on a clean teardown). It reports `fsync_ms == 0` (no
 /// per-write fsync), and resolves to `durable:false` for back-compat.
 #[test]
-fn disk_box_survives_clean_restart_and_is_not_fsync_gated() {
+fn disk_topic_survives_clean_restart_and_is_not_fsync_gated() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_box("evts", class_box(Durability::Disk)).unwrap();
+        engine.put_topic("evts", class_topic(Durability::Disk)).unwrap();
         for i in 1..=4 {
             let resp = engine
                 .write("evts", one(json!({ "i": i }), None), true)
@@ -2241,14 +2241,14 @@ fn disk_box_survives_clean_restart_and_is_not_fsync_gated() {
                 "disk write is not fsync-gated"
             );
         }
-        let st = engine.box_state("evts", false).unwrap();
+        let st = engine.topic_state("evts", false).unwrap();
         assert_eq!(st.config.durability, Some(Durability::Disk));
         assert!(!st.config.durable, "disk ⇒ durable:false");
     }
     // Clean teardown drained + fsynced the WAL ⇒ the disk records are recovered.
     let engine = engine_at(dir.path());
-    let st = engine.box_state("evts", false).unwrap();
-    // All 4 acked records survive (exact `count`). For a `disk` box `head_seq` may
+    let st = engine.topic_state("evts", false).unwrap();
+    // All 4 acked records survive (exact `count`). For a `disk` topic `head_seq` may
     // sit at the durable head RESERVATION (R3: a head ceiling fsynced ahead of use
     // to prevent seq reuse across a power loss) — `>= 4` and within the reservation
     // block; the reserved-but-unwritten seqs are silent gaps.
@@ -2280,36 +2280,36 @@ fn durability_resolution_and_back_compat_reporting() {
 
     // Legacy durable:true (no `durability`) ⇒ resolves to fsync.
     engine
-        .put_box(
+        .put_topic(
             "a",
-            BoxConfig {
+            TopicConfig {
                 durable: true,
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             },
         )
         .unwrap();
-    let a = engine.box_state("a", false).unwrap().config;
+    let a = engine.topic_state("a", false).unwrap().config;
     assert_eq!(a.durability, Some(Durability::Fsync));
     assert!(a.durable);
 
     // Legacy durable:false (no `durability`) ⇒ resolves to disk.
-    engine.put_box("b", BoxConfig::default()).unwrap();
-    let b = engine.box_state("b", false).unwrap().config;
+    engine.put_topic("b", TopicConfig::default()).unwrap();
+    let b = engine.topic_state("b", false).unwrap().config;
     assert_eq!(b.durability, Some(Durability::Disk));
     assert!(!b.durable);
 
     // Explicit `durability` WINS over a conflicting `durable` bool.
     engine
-        .put_box(
+        .put_topic(
             "c",
-            BoxConfig {
+            TopicConfig {
                 durable: true,
                 durability: Some(Durability::Disk),
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             },
         )
         .unwrap();
-    let c = engine.box_state("c", false).unwrap().config;
+    let c = engine.topic_state("c", false).unwrap().config;
     assert_eq!(
         c.durability,
         Some(Durability::Disk),
@@ -2318,8 +2318,8 @@ fn durability_resolution_and_back_compat_reporting() {
     assert!(!c.durable, "durable normalized to match the resolved class");
 
     // Explicit memory ⇒ durable:false; is_durable()==false.
-    engine.put_box("d", class_box(Durability::Memory)).unwrap();
-    let d = engine.box_state("d", false).unwrap().config;
+    engine.put_topic("d", class_topic(Durability::Memory)).unwrap();
+    let d = engine.topic_state("d", false).unwrap().config;
     assert_eq!(d.durability, Some(Durability::Memory));
     assert!(!d.durable);
 }
@@ -2333,10 +2333,10 @@ fn router_into_memory_dest_best_effort() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        // A durable source; a memory destination box.
-        engine.put_box("src", durable_box()).unwrap();
+        // A durable source; a memory destination topic.
+        engine.put_topic("src", durable_topic()).unwrap();
         engine
-            .put_box("mem_dst", class_box(Durability::Memory))
+            .put_topic("mem_dst", class_topic(Durability::Memory))
             .unwrap();
         engine
             .put_router(
@@ -2346,7 +2346,7 @@ fn router_into_memory_dest_best_effort() {
                     dest: "mem_dst".into(),
                     preserve_node: true,
                     preserve_tag: true,
-                    create_dest: false, // dest already exists as a memory box.
+                    create_dest: false, // dest already exists as a memory topic.
                     filter: None,
                     allow_cycle: false,
                 },
@@ -2367,11 +2367,11 @@ fn router_into_memory_dest_best_effort() {
     // always survives. Its records are best-effort — assert only the weak contract.
     let engine = engine_at(dir.path());
     assert_eq!(
-        engine.box_state("src", false).unwrap().head_seq,
+        engine.topic_state("src", false).unwrap().head_seq,
         1,
         "durable source survives"
     );
-    let dst = engine.box_state("mem_dst", false).unwrap();
+    let dst = engine.topic_state("mem_dst", false).unwrap();
     assert_eq!(
         dst.config.durability,
         Some(Durability::Memory),

@@ -1,44 +1,44 @@
 ---
 title: Scheduler & Backpressure
-description: How streams schedules post-write delivery work — a banded weighted-fair queue over dirty boxes with aging and recency-based priority — and how the elastic governor sheds latency under CPU pressure while never sacrificing correctness.
+description: How streams schedules post-write delivery work — a banded weighted-fair queue over dirty topics with aging and recency-based priority — and how the elastic governor sheds latency under CPU pressure while never sacrificing correctness.
 ---
 
 import { Callout } from 'nextra/components'
 
 # Scheduler & Backpressure
 
-After a write commits, streams still has to *propagate* it — wake the box's SSE watchers,
+After a write commits, streams still has to *propagate* it — wake the topic's SSE watchers,
 run its routers, flush its commit batch. That post-write work is what the scheduler
 governs, and it is what has to hit the 1–5 ms delivery target. The scheduler is a banded
-weighted-fair queue over **dirty boxes**, with aging to prevent starvation and a
-recency-based priority so recently-consumed boxes are served first. When the machine is
+weighted-fair queue over **dirty topics**, with aging to prevent starvation and a
+recency-based priority so recently-consumed topics are served first. When the machine is
 under CPU pressure, an elastic governor degrades latency along a defined ladder — and the
 cardinal rule is that it **degrades latency, never correctness**.
 
 <Callout type="info">
   Scheduling affects **delivery only** — never `seq` order, retention, which records are
-  visible, or whether a write is durable. A deprioritized or deferred box stays fully
+  visible, or whether a write is durable. A deprioritized or deferred topic stays fully
   consistent: its records are durably stored and immediately readable with
-  [`POST /v0/boxes/:box/diff`](/api/reading). Priority changes *when the push happens*,
+  [`POST /v0/topics/:topic/diff`](/api/reading). Priority changes *when the push happens*,
   nothing else.
 </Callout>
 
-## The schedulable unit is a dirty box
+## The schedulable unit is a dirty topic
 
-The schedulable entity is a **box, not a record or a watcher**. A write (or a router
-forward) marks its box *dirty* and inserts it into its shard's ready set — at most once; a
-membership bit prevents duplicates. This bounds the queue to the number of dirty boxes and
-coalesces a burst of writes to one box into a single unit of work.
+The schedulable entity is a **topic, not a record or a watcher**. A write (or a router
+forward) marks its topic *dirty* and inserts it into its shard's ready set — at most once; a
+membership bit prevents duplicates. This bounds the queue to the number of dirty topics and
+coalesces a burst of writes to one topic into a single unit of work.
 
-A worker that picks up box B **drains B fully** — wakes all its SSE watchers, forwards to
-all its router destinations, flushes its commit batch — before moving on. Draining one box
-at a time under its own lock preserves per-box ordering and amortizes the lock acquisition.
-Under unsaturated load the ready set is near-empty, so a box is serviced within microseconds
+A worker that picks up topic B **drains B fully** — wakes all its SSE watchers, forwards to
+all its router destinations, flushes its commit batch — before moving on. Draining one topic
+at a time under its own lock preserves per-topic ordering and amortizes the lock acquisition.
+Under unsaturated load the ready set is near-empty, so a topic is serviced within microseconds
 of being marked dirty.
 
 ## Banded weighted-fair queue (DWRR)
 
-A plain max-heap on priority would starve low-priority boxes. Instead, effective priority
+A plain max-heap on priority would starve low-priority topics. Instead, effective priority
 buckets into five **bands**, drained by deficit weighted round-robin (DWRR):
 
 | Band | Effective priority | Weight |
@@ -49,28 +49,28 @@ buckets into five **bands**, drained by deficit weighted round-robin (DWRR):
 | `B1` | `0..249` | 1 |
 | `B0` | `< 0` (explicitly deprioritized) | 1 |
 
-Within a band, boxes are served FIFO by enqueue time. Across bands, each round grants
-credit proportional to weight: with these defaults, for every one `B1`/`B0` box serviced,
-up to eight top-band boxes may be. High priority is strongly favored, but `B1` and `B0`
+Within a band, topics are served FIFO by enqueue time. Across bands, each round grants
+credit proportional to weight: with these defaults, for every one `B1`/`B0` topic serviced,
+up to eight top-band topics may be. High priority is strongly favored, but `B1` and `B0`
 always make forward progress every round — no band is ever frozen out.
 
 ### Aging prevents starvation
 
-A box stuck at the bottom of a busy band shouldn't wait forever, so it climbs over time:
+A topic stuck at the bottom of a busy band shouldn't wait forever, so it climbs over time:
 
 ```text
 age_boost = +100 per second waited, capped at +1000 after 10 seconds
 ```
 
-A 50 ms aging tick promotes boxes across band boundaries, and `enqueued_at` resets only when
-the box is actually serviced — so a continuously-rewritten box still ages. The combined
-guarantee: **no box waits more than 10 s before reaching the top band**, and DWRR drains the
+A 50 ms aging tick promotes topics across band boundaries, and `enqueued_at` resets only when
+the topic is actually serviced — so a continuously-rewritten topic still ages. The combined
+guarantee: **no topic waits more than 10 s before reaching the top band**, and DWRR drains the
 top band every round, so worst-case scheduling latency is bounded even under sustained
 high-priority load.
 
 ## Effective priority
 
-Every box has an effective priority combining a manual component, an automatic recency
+Every topic has an effective priority combining a manual component, an automatic recency
 component, and the aging boost above:
 
 ```text
@@ -82,12 +82,12 @@ auto_recency = 500 * 2^( -(now - last_consumed_ms) / 30000 ) # 0 after a 5-min f
 ```
 
 - **Manual** (`priority` set) — clamped to `[-1000, 1000]` and **overrides** the auto term.
-  An operator can force a box above all auto traffic with `priority: 1000` (or below it with
+  An operator can force a topic above all auto traffic with `priority: 1000` (or below it with
   `-1000`).
 - **Auto recency** (`priority: null`, the default with `auto_priority: true`) — a
-  freshly-consumed box scores ~`500` (≈ a `+500` manual box); the bonus **halves every 30 s**
-  of inactivity, so an actively-polling consumer keeps its box "hot" with negligible upkeep
-  while a quiet box sheds priority within a couple of minutes. After a **5-minute floor**
+  freshly-consumed topic scores ~`500` (≈ a `+500` manual topic); the bonus **halves every 30 s**
+  of inactivity, so an actively-polling consumer keeps its topic "hot" with negligible upkeep
+  while a quiet topic sheds priority within a couple of minutes. After a **5-minute floor**
   (300 s untouched) the auto term is forced to `0` — the math is skipped entirely.
 
 `P_eff` is never stored as ground truth; it is computed on demand at enqueue time and on the
@@ -103,16 +103,16 @@ lock-free atomic and drives an escalating, composable ladder:
 
 | Trigger | What the governor does | Loss? |
 |---|---|---|
-| `pressure > 0.2` | **Coalesce batches.** Stop waking watchers per-record; pack a box's pending records into one multi-record frame/diff. Cheap, lossless, often *improves* throughput. Window grows 0–20 ms with pressure. | No |
+| `pressure > 0.2` | **Coalesce batches.** Stop waking watchers per-record; pack a topic's pending records into one multi-record frame/diff. Cheap, lossless, often *improves* throughput. Window grows 0–20 ms with pressure. | No |
 | `pressure > 0.4` | **Widen the group-commit window.** `commit_window_ms` lerps from 0.5 ms up toward 10 ms — fewer fsyncs/sec, more headroom; the cost is up to +9.5 ms write-ack latency, observed as latency, never loss. | No |
-| `pressure > 0.8` (sustained) | **Defer the lowest-value work.** Routers are enqueued one band lower; `B0`/negative-priority boxes stop receiving DWRR credit (hysteresis releases at `pressure < 0.6`) — their data is still durably stored and fully pollable, only the *push* is paused. At `pressure ≈ 1.0` with a full ingest channel, the write endpoint returns **`429` + `Retry-After`**. | No |
+| `pressure > 0.8` (sustained) | **Defer the lowest-value work.** Routers are enqueued one band lower; `B0`/negative-priority topics stop receiving DWRR credit (hysteresis releases at `pressure < 0.6`) — their data is still durably stored and fully pollable, only the *push* is paused. At `pressure ≈ 1.0` with a full ingest channel, the write endpoint returns **`429` + `Retry-After`**. | No |
 
 <Callout type="important">
   **The cardinal rule: throttling degrades latency and push-eagerness, never correctness.**
-  A deferred box is always fully consistent on the next
+  A deferred topic is always fully consistent on the next
   [`diff`](/api/reading). All data loss remains the explicit, configured cap/TTL path with
   in-band [tombstones](/guarantees/tombstones); a full-write rejection is synchronous
-  (`422 box_full` / `429 throttled`), never ack-then-drop.
+  (`422 topic_full` / `429 throttled`), never ack-then-drop.
 </Callout>
 
 ### What a client sees, by pressure level
@@ -132,10 +132,10 @@ on the write. The `429` carries `detail.retry_after_ms` for CPU pressure (and
 ## Slow-consumer isolation
 
 Each SSE connection has a bounded outbound channel. If a worker can't enqueue a frame, it
-does **not** block the box drain: the connection is marked **lagged**, the server stops
+does **not** block the topic drain: the connection is marked **lagged**, the server stops
 buffering for it, and on the next successful send it emits a tombstone for the skipped range
-(on lossy boxes) so the client catches up via `diff`. One slow client is contained to its
-own connection — the box and every other watcher proceed at full speed. This is the same
+(on lossy topics) so the client catches up via `diff`. One slow client is contained to its
+own connection — the topic and every other watcher proceed at full speed. This is the same
 boundedness that lets the governor trade latency for throughput without unbounded memory
 growth.
 
@@ -145,5 +145,5 @@ growth.
   governor widens under pressure.
 - [Performance](/how-it-works/performance) — measured delivery latency and the throughput
   ceilings the scheduler operates within.
-- [Watch (SSE)](/api/watch) — the live-delivery surface the scheduler drains boxes into.
+- [Watch (SSE)](/api/watch) — the live-delivery surface the scheduler drains topics into.
 - [Errors](/api/errors) — the `429 throttled` body and its `Retry-After` / `detail` fields.

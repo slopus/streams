@@ -26,14 +26,14 @@ ordered, immutable log with its own 64-bit **offset**, and ordering is guarantee
 within a partition** — across partitions there is no global order. Consumer groups commit
 offsets to track progress, and partition count is the unit of both parallelism and ordering.
 
-streams has no partitions. Each **box** is a single ordered log with a monotonic `$seq` (a
-`u64`), and that `$seq` **is** the cursor: you read with `POST /v0/boxes/:box/diff` from a
+streams has no partitions. Each **topic** is a single ordered log with a monotonic `$seq` (a
+`u64`), and that `$seq` **is** the cursor: you read with `POST /v0/topics/:topic/diff` from a
 `from_seq` and advance your stored cursor to ack — there is no separate offset-commit
-protocol. Ordering is total within a box. The trade is direct: Kafka buys parallelism and
+protocol. Ordering is total within a topic. The trade is direct: Kafka buys parallelism and
 capacity by adding partitions (at the cost of cross-partition ordering); streams gives you
-total per-box order but scales only vertically.
+total per-topic order but scales only vertically.
 
-## Durability: replication vs per-box fsync
+## Durability: replication vs per-topic fsync
 
 Kafka's durability comes from **replication**, not per-write disk sync. A topic has a
 `replication.factor`; producers choose `acks=0|1|all`; and `min.insync.replicas` sets how
@@ -41,7 +41,7 @@ many replicas must hold a record before an `acks=all` write is acknowledged. Kaf
 the OS page cache plus replication rather than fsync-ing every write — durability is a
 function of how many machines hold the data, so a single broker can fail without data loss.
 
-streams' durability is **per-box and single-machine**, expressed as a
+streams' durability is **per-topic and single-machine**, expressed as a
 [durability class](/guarantees/durability):
 
 - **`memory`** — same group-committed WAL path as `disk`, but best-effort: not fsync-gated and no durability guarantee (records may survive or be lost on restart).
@@ -52,8 +52,8 @@ streams' durability is **per-box and single-machine**, expressed as a
 
 <Callout type="warning">
   This is the headline trade in Kafka's favor: Kafka's replicated durability tolerates the
-  loss of a whole machine; a streams `fsync` write tolerates a crash **of that one box** but
-  not its destruction. streams has **no replication, no HA, no failover** — one NVMe box is
+  loss of a whole machine; a streams `fsync` write tolerates a crash **of its host machine** but
+  not the machine's destruction. streams has **no replication, no HA, no failover** — one NVMe-backed machine is
   the entire durability and failure domain. If you need machine-loss tolerance, use Kafka.
 </Callout>
 
@@ -112,7 +112,7 @@ streams ships production **[lease queues](/api/queues)** today: `claim` returns 
 jobs with a `lease_id` and `deadline`; `ack` permanently removes a job (the ack **is** the
 delete); `nack` and `extend` control redelivery and visibility; and parallelism is bounded
 by your workers, not by a partition count. A built-in **dead-letter move** relocates a job to
-a configured box after `max_deliveries` rather than redelivering it forever.
+a configured topic after `max_deliveries` rather than redelivering it forever.
 
 ## Ops footprint
 
@@ -130,8 +130,8 @@ cluster to scale or fail over to.
 
 Kafka scales **horizontally** to very high volumes — add brokers and partitions; large
 clusters sustain 15M+ messages/sec. streams scales **vertically only**: its ~1M events/sec
-figure is an *aggregate* design target reached by batching and sharding across many boxes and
-connections on one NVMe box, and a single HTTP origin tops out around 0.5M records/sec
+figure is an *aggregate* design target reached by batching and sharding across many topics and
+connections on one NVMe-backed machine, and a single HTTP origin tops out around 0.5M records/sec
 disk-class. See [Performance](/how-it-works/performance) for measured numbers. If you need
 throughput beyond one machine, Kafka is built for it and streams is not.
 
@@ -157,7 +157,7 @@ multiplexed SSE, and lease queues, all on one substrate reachable with `curl`.
       <li>You need an <strong>explicit, in-band gap signal</strong> at delivery time, not silent offset resets.</li>
       <li>You want <strong>production lease queues</strong> today (per-message ack, dead-letter move) without KIP-932 preview caveats.</li>
       <li>You need <strong>targeted, permanent deletes</strong> by seq range or tag, not just key compaction.</li>
-      <li>You want <strong>per-box durability classes</strong> and built-in routers with loop-prevention on one substrate.</li>
+      <li>You want <strong>per-topic durability classes</strong> and built-in routers with loop-prevention on one substrate.</li>
     </ul>
   </div>
   <div className="verdict lose">
@@ -176,5 +176,5 @@ multiplexed SSE, and lease queues, all on one substrate reachable with `curl`.
 
 - [Comparisons overview](/comparisons) — the full capability matrix.
 - [Tombstones](/guarantees/tombstones) — the gap signal Kafka does not emit.
-- [Durability classes](/guarantees/durability) — per-box `memory` / `disk` / `fsync`.
+- [Durability classes](/guarantees/durability) — per-topic `memory` / `disk` / `fsync`.
 - [Performance](/how-it-works/performance) — how to frame the throughput numbers.

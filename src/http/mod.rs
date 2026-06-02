@@ -2,7 +2,7 @@
 //! content-type / body-size guards, the `Error` → HTTP envelope mapping, and
 //! the per-response `performance` block plumbing.
 
-pub mod boxes;
+pub mod topics;
 pub mod delete;
 pub mod health;
 pub mod queue;
@@ -33,15 +33,15 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     /// In-memory watch-session registry (API §7.1).
     pub sessions: Arc<SessionStore>,
-    /// Per-box coalescing-window claim coordinator + `/work` conn ids (API §10).
+    /// Per-topic coalescing-window claim coordinator + `/work` conn ids (API §10).
     pub coordinator: Arc<ClaimCoordinator>,
-    /// Hashed, constant-time API-key store (scopes + box-name prefix allowlist).
+    /// Hashed, constant-time API-key store (scopes + topic-name prefix allowlist).
     /// Parsed **once** here from `STREAMS_API_KEYS`; the auth middleware reuses it
     /// per request. Empty ⇒ auth disabled (dev mode).
     pub keys: Arc<KeyStore>,
     /// Live, mutable per-instance resource counters for the concurrency limits
     /// (SSE connections, per-key in-flight requests; see [`crate::limits`]). The
-    /// box/router/session caps are checked against the registries directly.
+    /// topic/router/session caps are checked against the registries directly.
     pub live: Arc<crate::limits::LiveCounts>,
     /// Graceful-shutdown coordination shared with the serve loop (M11): on
     /// shutdown the serve loop triggers this and every open SSE stream winds down
@@ -91,23 +91,23 @@ pub fn build_router_with_shutdown(
     };
 
     let v0 = Router::new()
-        // Boxes
-        .route("/boxes", get(boxes::list_boxes))
+        // Topics
+        .route("/topics", get(topics::list_topics))
         .route(
-            "/boxes/{box}",
-            put(boxes::put_box)
-                .get(boxes::get_box)
-                .delete(boxes::delete_box)
-                .post(boxes::write),
+            "/topics/{topic}",
+            put(topics::put_topic)
+                .get(topics::get_topic)
+                .delete(topics::delete_topic)
+                .post(topics::write),
         )
-        .route("/boxes/{box}/diff", post(boxes::diff))
-        .route("/boxes/{box}/delete", post(delete::delete))
+        .route("/topics/{topic}/diff", post(topics::diff))
+        .route("/topics/{topic}/delete", post(delete::delete))
         // Queue lifecycle (API §10)
-        .route("/boxes/{box}/claim", post(queue::claim))
-        .route("/boxes/{box}/ack", post(queue::ack))
-        .route("/boxes/{box}/nack", post(queue::nack))
-        .route("/boxes/{box}/extend", post(queue::extend))
-        .route("/boxes/{box}/work", get(queue::work))
+        .route("/topics/{topic}/claim", post(queue::claim))
+        .route("/topics/{topic}/ack", post(queue::ack))
+        .route("/topics/{topic}/nack", post(queue::nack))
+        .route("/topics/{topic}/extend", post(queue::extend))
+        .route("/topics/{topic}/work", get(queue::work))
         // Routers
         .route("/routers", get(routers::list_routers))
         .route(
@@ -145,7 +145,7 @@ pub fn build_router_with_shutdown(
 ///
 /// When auth is enabled it (1) authenticates the bearer against the hashed
 /// [`KeyStore`] in constant time, (2) enforces the route's required
-/// [`Scope`] and the key's box-name **prefix allowlist**, then (3) stashes the
+/// [`Scope`] and the key's topic-name **prefix allowlist**, then (3) stashes the
 /// matched [`Principal`] (scopes + prefixes, *no secret*) in request extensions
 /// so a handler can bind a created resource (e.g. a watch session) to its
 /// creator and scope. A key with no scopes / no prefixes is full-access
@@ -228,14 +228,14 @@ async fn auth_middleware(
             .into_response();
         }
     };
-    // The SSE stream GETs (`/v0/boxes/:q/work`) are long-lived; do not pin an
+    // The SSE stream GETs (`/v0/topics/:q/work`) are long-lived; do not pin an
     // in-flight slot for the whole stream (the per-key SSE-connection cap covers
     // them). They are bounded separately in their handlers.
     if req.method() == Method::GET && is_sse_stream_path(path) {
         drop(inflight_guard);
     }
 
-    // Enforce the route's required scope + the key's box-name prefix allowlist.
+    // Enforce the route's required scope + the key's topic-name prefix allowlist.
     // A full-access key (Scope::ALL, no prefixes) passes both unconditionally, so
     // this is transparent for the back-compat single-key case.
     if let Some((needed, name)) = route_requirement(req.method(), path) {
@@ -250,7 +250,7 @@ async fn auth_middleware(
             if !principal.allows_name(name) {
                 return Error::new(
                     ErrorCode::Forbidden,
-                    "api key is not allowed to access this box/router name",
+                    "api key is not allowed to access this topic/router name",
                 )
                 .into_response();
             }
@@ -261,41 +261,41 @@ async fn auth_middleware(
     next.run(req).await
 }
 
-/// The scope a request requires plus the box/router name it touches (for the
+/// The scope a request requires plus the topic/router name it touches (for the
 /// prefix-allowlist check), derived from the method + `/v0` path. `None` means
 /// the route is unguarded by scope (e.g. probes, or `GET /v0/watch/:wid` which is
 /// capability-gated and handled separately). The name is `None` for collection
-/// routes (`/v0/boxes`, `/v0/routers`, `POST /v0/watch`) where no single name is
-/// addressed at the path; per-box prefix filtering of *list* results is a future
+/// routes (`/v0/topics`, `/v0/routers`, `POST /v0/watch`) where no single name is
+/// addressed at the path; per-topic prefix filtering of *list* results is a future
 /// refinement and not required for the security boundary (a list cannot mutate).
 fn route_requirement<'a>(method: &Method, path: &'a str) -> Option<(Scope, Option<&'a str>)> {
     // Strip the `/v0` prefix; root probes (`/healthz`, `/readyz`) are unguarded.
     let rest = path.strip_prefix("/v0")?;
 
-    // /boxes ...
-    if let Some(seg) = rest.strip_prefix("/boxes") {
-        // Collection: GET /v0/boxes (list) needs read; no single name.
+    // /topics ...
+    if let Some(seg) = rest.strip_prefix("/topics") {
+        // Collection: GET /v0/topics (list) needs read; no single name.
         if seg.is_empty() || seg == "/" {
             return Some((Scope::READ, None));
         }
         let seg = seg.strip_prefix('/')?;
-        // seg is `:box` or `:box/<action>`.
-        let (box_name, action) = match seg.split_once('/') {
+        // seg is `:topic` or `:topic/<action>`.
+        let (topic_name, action) = match seg.split_once('/') {
             Some((b, a)) => (b, Some(a)),
             None => (seg, None),
         };
         let scope = match (method, action) {
-            // PUT /v0/boxes/:box — control-plane (create/configure).
+            // PUT /v0/topics/:topic — control-plane (create/configure).
             (&Method::PUT, None) => Scope::ADMIN,
-            // GET /v0/boxes/:box — read state.
+            // GET /v0/topics/:topic — read state.
             (&Method::GET, None) => Scope::READ,
-            // DELETE /v0/boxes/:box — delete.
+            // DELETE /v0/topics/:topic — delete.
             (&Method::DELETE, None) => Scope::DELETE,
-            // POST /v0/boxes/:box — write records.
+            // POST /v0/topics/:topic — write records.
             (&Method::POST, None) => Scope::WRITE,
-            // POST /v0/boxes/:box/diff — read.
+            // POST /v0/topics/:topic/diff — read.
             (&Method::POST, Some("diff")) => Scope::READ,
-            // POST /v0/boxes/:box/delete — delete.
+            // POST /v0/topics/:topic/delete — delete.
             (&Method::POST, Some("delete")) => Scope::DELETE,
             // Queue claim / work: lease (mutate) + return ⇒ read+write.
             (&Method::POST, Some("claim")) | (&Method::GET, Some("work")) => {
@@ -305,13 +305,13 @@ fn route_requirement<'a>(method: &Method, path: &'a str) -> Option<(Scope, Optio
             (&Method::POST, Some("ack"))
             | (&Method::POST, Some("nack"))
             | (&Method::POST, Some("extend")) => Scope::WRITE,
-            // Anything else under /boxes/:box: require write as a safe default so
+            // Anything else under /topics/:topic: require write as a safe default so
             // an unknown future mutating sub-route is never under-guarded. (A
             // method-not-allowed path still gets here but the scope check on a
             // full-access key is a no-op, and a scoped key fails closed.)
             _ => Scope::WRITE,
         };
-        return Some((scope, Some(box_name)));
+        return Some((scope, Some(topic_name)));
     }
 
     // /routers ...
@@ -332,13 +332,13 @@ fn route_requirement<'a>(method: &Method, path: &'a str) -> Option<(Scope, Optio
     }
 
     // POST /v0/watch — create a watch session (a read subscription). The bound
-    // boxes are validated/scoped at session creation in the handler (it knows the
-    // body's box map); the GET stream is capability-gated. Require read here.
+    // topics are validated/scoped at session creation in the handler (it knows the
+    // body's topic map); the GET stream is capability-gated. Require read here.
     if rest == "/watch" {
         return Some((Scope::READ, None));
     }
 
-    // GET /v0/metrics — operational telemetry (box count). Gated behind auth by
+    // GET /v0/metrics — operational telemetry (topic count). Gated behind auth by
     // default (codex LOW #12); a read-scoped monitoring key suffices.
     if rest == "/metrics" {
         return Some((Scope::READ, None));
@@ -351,22 +351,22 @@ fn route_requirement<'a>(method: &Method, path: &'a str) -> Option<(Scope, Optio
 
 /// True for a long-lived SSE stream GET that should NOT hold a per-key in-flight
 /// slot for its whole lifetime (it is bounded by the SSE-connection caps instead):
-/// the watch stream `GET /v0/watch/:wid` and the queue `GET /v0/boxes/:q/work`.
+/// the watch stream `GET /v0/watch/:wid` and the queue `GET /v0/topics/:q/work`.
 fn is_sse_stream_path(path: &str) -> bool {
     if is_watch_stream_path(path) {
         return true;
     }
-    // /v0/boxes/:box/work
+    // /v0/topics/:topic/work
     matches!(
-        path.strip_prefix("/v0/boxes/")
+        path.strip_prefix("/v0/topics/")
             .and_then(|rest| rest.split_once('/')),
-        Some((_box, "work"))
+        Some((_topic, "work"))
     )
 }
 
 /// The unauthenticated probe set: only the **minimal liveness/readiness** checks
 /// (`/healthz`, `/readyz`, `/v0/health`, `/v0/ready`) so a load balancer can poll
-/// them without a key. `/v0/metrics` is deliberately NOT here — it exposes the box
+/// them without a key. `/v0/metrics` is deliberately NOT here — it exposes the topic
 /// count and is gated behind auth by default (codex LOW #12); set
 /// `STREAMS_PROBE_AUTH` to additionally require auth on the liveness/readiness
 /// probes, or scrape `/v0/metrics` with a read-scoped key.
@@ -580,6 +580,6 @@ mod tests {
         assert!(!is_watch_stream_path("/v0/watch/"));
         // Extra segments must not match (no path traversal past the wid).
         assert!(!is_watch_stream_path("/v0/watch/wid/extra"));
-        assert!(!is_watch_stream_path("/v0/boxes/jobs"));
+        assert!(!is_watch_stream_path("/v0/topics/jobs"));
     }
 }

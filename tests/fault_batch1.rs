@@ -37,7 +37,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
 use streams::storage::{Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs and src/storage/testfs.rs)
@@ -79,7 +79,7 @@ fn sync_wal_dir(disk: &FakeDisk) {
     let _ = fs.sync_dir(&PathBuf::from(DATA_DIR).join("meta"));
 }
 
-/// A single-record durable write request for box `name` carrying `data`.
+/// A single-record durable write request for topic `name` carrying `data`.
 fn one_write(data: &str) -> WriteRequest {
     WriteRequest {
         records: vec![RecordIn {
@@ -96,21 +96,21 @@ fn one_write(data: &str) -> WriteRequest {
     }
 }
 
-fn put_durable_box(engine: &Engine, name: &str) {
+fn put_durable_topic(engine: &Engine, name: &str) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 cap_records: 0,
                 ..Default::default()
             },
         )
-        .expect("put_box");
+        .expect("put_topic");
 }
 
-/// Append `n` durable records "1".."n" to box `name`, each blocking on the group
+/// Append `n` durable records "1".."n" to topic `name`, each blocking on the group
 /// fsync (so it is acked ⇒ durable). Returns the seqs assigned.
 fn append_durable(engine: &Engine, name: &str, n: usize) -> Vec<u64> {
     let mut seqs = Vec::new();
@@ -123,11 +123,11 @@ fn append_durable(engine: &Engine, name: &str, n: usize) -> Vec<u64> {
     seqs
 }
 
-/// Read back the live records of box `name` (seq → data string) through the
-/// engine's diff path; `None` if the box is absent.
+/// Read back the live records of topic `name` (seq → data string) through the
+/// engine's diff path; `None` if the topic is absent.
 fn dump_records(engine: &Engine, name: &str) -> Option<BTreeMap<u64, String>> {
     use streams::types::DiffRequest;
-    let st = engine.box_state(name, false).ok()?;
+    let st = engine.topic_state(name, false).ok()?;
     let _ = st;
     let mut out = BTreeMap::new();
     let mut from = 0u64;
@@ -163,7 +163,7 @@ fn dump_records(engine: &Engine, name: &str) -> Option<BTreeMap<u64, String>> {
     Some(out)
 }
 
-/// A flat, comparable dump of one box's recovered state (head/earliest/count +
+/// A flat, comparable dump of one topic's recovered state (head/earliest/count +
 /// records + tombstone), for the idempotent-recovery byte-identity check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FullDump {
@@ -176,7 +176,7 @@ struct FullDump {
 
 fn full_dump(engine: &Engine, name: &str) -> Option<FullDump> {
     use streams::types::DiffRequest;
-    let st = engine.box_state(name, false).ok()?;
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone = None;
     let mut from = 0u64;
@@ -285,7 +285,7 @@ fn fast_cfg() -> WalConfig {
 
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -323,7 +323,7 @@ fn durable_wal_bytes(disk: &FakeDisk, path: &Path) -> Vec<u8> {
 }
 
 // WAL frame layout (src/storage/wal.rs): [frame_len:u32 @0..4][type:u8 @4]
-// [flags:u8 @5][box_id:u32 @6..10][seq:u64 @10..18][ts:u64 @18..26]
+// [flags:u8 @5][topic_id:u32 @6..10][seq:u64 @10..18][ts:u64 @18..26]
 // [node_len:u16][tag_len:u16][data_len:u32]...[body]...[crc:u64 last 8 bytes].
 const FRAME_LEN_PREFIX: usize = 4;
 
@@ -426,7 +426,7 @@ fn f_wal_eio_fsync() {
     // Phase 1: a clean durable prefix so we can prove "prior intact".
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "p");
+        put_durable_topic(&engine, "p");
         append_durable(&engine, "p", 2);
         sync_wal_dir(&disk);
         assert!(!dump_records(&engine, "p").unwrap().is_empty());
@@ -452,7 +452,7 @@ fn f_wal_eio_fsync() {
 
     // Recovery: exactly the 2 prior durable frames; the EIO'd batch left no trace.
     let engine = open_engine(&disk);
-    let recs = dump_records(&engine, "p").expect("box survives");
+    let recs = dump_records(&engine, "p").expect("topic survives");
     assert_eq!(
         recs.keys().copied().collect::<Vec<_>>(),
         vec![1, 2],
@@ -473,7 +473,7 @@ fn f_compound_fsync_fail_then_crash() {
     // Phase 1: 3 durable acked writes on a clean disk.
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "c");
+        put_durable_topic(&engine, "c");
         append_durable(&engine, "c", 3);
         sync_wal_dir(&disk);
         drop(engine);
@@ -498,7 +498,7 @@ fn f_compound_fsync_fail_then_crash() {
     disk.reset_power();
 
     let engine = open_engine(&disk);
-    let recs = dump_records(&engine, "c").expect("box survives");
+    let recs = dump_records(&engine, "c").expect("topic survives");
     assert_eq!(
         recs.keys().copied().collect::<Vec<_>>(),
         vec![1, 2, 3],
@@ -627,11 +627,11 @@ fn f_rec_run_twice_identical() {
     use streams::types::DeleteRequest;
     let disk = FakeDisk::new();
 
-    // A non-trivial durable workload: appends + a prefix delete + a cap box that
+    // A non-trivial durable workload: appends + a prefix delete + a cap topic that
     // evicts (so floors and tombstones are exercised across recovery).
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "b");
+        put_durable_topic(&engine, "b");
         append_durable(&engine, "b", 5);
         engine
             .delete(
@@ -642,12 +642,12 @@ fn f_rec_run_twice_identical() {
                 },
             )
             .expect("prefix delete acked");
-        // A capped durable box that overflows ⇒ involuntary evict floor + tombstone.
+        // A capped durable topic that overflows ⇒ involuntary evict floor + tombstone.
         engine
-            .put_box(
+            .put_topic(
                 "cap",
-                BoxConfig {
-                    r#type: BoxType::Log,
+                TopicConfig {
+                    r#type: TopicType::Log,
                     durable: true,
                     cap_records: 2,
                     ..Default::default()
@@ -682,11 +682,11 @@ fn f_rec_run_twice_identical() {
 
     assert_eq!(
         first_b, second_b,
-        "recover(recover(x)) == recover(x) for box b"
+        "recover(recover(x)) == recover(x) for topic b"
     );
     assert_eq!(
         first_cap, second_cap,
-        "recover(recover(x)) == recover(x) for the capped box"
+        "recover(recover(x)) == recover(x) for the capped topic"
     );
     // Spot-check the concrete state: prefix delete removed 1,2; 3,4,5 remain.
     assert_eq!(
@@ -721,7 +721,7 @@ fn f_snap_crash_after_tmp_before_rename() {
     let mk = |id: u64, seq: u64| Snapshot {
         id,
         ts: 1,
-        next_box_id: 1,
+        next_topic_id: 1,
         checkpoint: Checkpoint {
             wal_idx: 1,
             wal_offset: 0,
@@ -729,7 +729,7 @@ fn f_snap_crash_after_tmp_before_rename() {
             shards: vec![(1, 0)],
             shard_keys: vec![String::new()],
         },
-        boxes: vec![],
+        topics: vec![],
         routers: vec![],
     };
 
@@ -794,7 +794,7 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     let mk = |id: u64, seq: u64| Snapshot {
         id,
         ts: 1,
-        next_box_id: 1,
+        next_topic_id: 1,
         checkpoint: Checkpoint {
             wal_idx: 1,
             wal_offset: 0,
@@ -802,7 +802,7 @@ fn f_snap_crash_after_rename_before_dirfsync() {
             shards: vec![(1, 0)],
             shard_keys: vec![String::new()],
         },
-        boxes: vec![],
+        topics: vec![],
         routers: vec![],
     };
 
@@ -932,14 +932,14 @@ fn f_seg_crash_after_data_before_idx() {
 // ===========================================================================
 // F-COLD-CRASH-AFTER-COPY-BEFORE-FLIP
 // crash after the cold.put fsync but before the (in-memory) tier-pointer flip ⇒
-// both the hot and cold copies exist; BoxTier::resolve prefers HOT; the record is
+// both the hot and cold copies exist; TopicTier::resolve prefers HOT; the record is
 // fully readable; the relocator can re-run the idempotent copy+flip+drop with no
 // loss.
 // ===========================================================================
 #[test]
 fn f_cold_crash_after_copy_before_flip() {
     use streams::storage::segment::{data_name, idx_name, SegmentBuilder, SegmentRecord};
-    use streams::storage::{BoxTier, LocalSegmentStore, SegmentPart, SegmentStore, Tier};
+    use streams::storage::{TopicTier, LocalSegmentStore, SegmentPart, SegmentStore, Tier};
 
     let disk = FakeDisk::new();
     let hot_root = PathBuf::from(DATA_DIR).join("hot");
@@ -974,7 +974,7 @@ fn f_cold_crash_after_copy_before_flip() {
         Box::new(LocalSegmentStore::open_with(&hot_root, disk.arc()).unwrap());
     let cold2: Box<dyn SegmentStore> =
         Box::new(LocalSegmentStore::open_with(&cold_root, disk.arc()).unwrap());
-    let tier = BoxTier::new(hot2, Some(cold2));
+    let tier = TopicTier::new(hot2, Some(cold2));
 
     // Both copies exist (the flip never persisted ⇒ hot was never dropped).
     assert!(tier.hot().exists(1, SegmentPart::Data), "hot copy survives");

@@ -49,11 +49,11 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Reference model (the oracle) — copied from tests/crash_oracle.rs, trimmed to
-// the append/box surface these wal-fsync strategies exercise.
+// the append/topic surface these wal-fsync strategies exercise.
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,9 +64,9 @@ struct ModelRecord {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ModelBox {
+struct ModelTopic {
     durable: bool,
-    /// Every acked record by seq (the must-survive set for a durable box).
+    /// Every acked record by seq (the must-survive set for a durable topic).
     acked: BTreeMap<u64, ModelRecord>,
     /// Every record ever acked — the universe recovery may ever surface (no
     /// fabrication is `survivors ⊆ ever_acked`).
@@ -74,7 +74,7 @@ struct ModelBox {
     head: u64,
 }
 
-impl ModelBox {
+impl ModelTopic {
     fn live_seqs(&self) -> Vec<u64> {
         self.acked.keys().copied().collect()
     }
@@ -85,19 +85,19 @@ impl ModelBox {
 
 #[derive(Debug, Default)]
 struct RefModel {
-    boxes: BTreeMap<String, ModelBox>,
+    topics: BTreeMap<String, ModelTopic>,
 }
 
 impl RefModel {
-    fn ensure_box(&mut self, name: &str, durable: bool) {
-        self.boxes.entry(name.to_string()).or_insert(ModelBox {
+    fn ensure_topic(&mut self, name: &str, durable: bool) {
+        self.topics.entry(name.to_string()).or_insert(ModelTopic {
             durable,
             ..Default::default()
         });
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], rec: &ModelRecord) {
-        let b = self.boxes.get_mut(name).expect("box modeled before append");
+        let b = self.topics.get_mut(name).expect("topic modeled before append");
         for s in seqs {
             b.acked.insert(*s, rec.clone());
             b.ever_acked.insert(*s, rec.clone());
@@ -112,7 +112,7 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox {
+    PutTopic {
         name: String,
         durable: bool,
     },
@@ -130,14 +130,14 @@ enum Op {
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
     for op in ops {
         match op {
-            Op::PutBox { name, durable } => {
-                let cfg = BoxConfig {
-                    r#type: BoxType::Log,
+            Op::PutTopic { name, durable } => {
+                let cfg = TopicConfig {
+                    r#type: TopicType::Log,
                     durable: *durable,
                     ..Default::default()
                 };
-                if engine.put_box(name, cfg).is_ok() {
-                    model.ensure_box(name, *durable);
+                if engine.put_topic(name, cfg).is_ok() {
+                    model.ensure_topic(name, *durable);
                 }
             }
             Op::Append {
@@ -146,8 +146,8 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                 tag,
                 node,
             } => {
-                if !model.boxes.contains_key(name) {
-                    model.ensure_box(name, false);
+                if !model.topics.contains_key(name) {
+                    model.ensure_topic(name, false);
                 }
                 let req = WriteRequest {
                     records: vec![RecordIn {
@@ -209,7 +209,7 @@ fn stop(engine: Arc<Engine>) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -217,8 +217,8 @@ struct BoxDump {
     tombstone_reason: Option<String>,
 }
 
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone_reason = None;
     let mut from = 0u64;
@@ -261,7 +261,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -274,10 +274,10 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
 // The oracle (crash-consistency contract) — from tests/crash_oracle.rs.
 // ===========================================================================
 
-/// Assert the contract for one box. `whole_tail_durable=true` ⇒ the survivor set
+/// Assert the contract for one topic. `whole_tail_durable=true` ⇒ the survivor set
 /// must equal the model's live set; `false` ⇒ a clean dense prefix is allowed
 /// (an acked-but-unflushed/in-window tail may be missing).
-fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_durable: bool) {
+fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 
@@ -335,9 +335,9 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box (`model.durable`) has
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` topic (`model.durable`) has
     //     no head reservation: its head matches the acked head exactly (never a
-    //     future seq). A `disk` box (acked before fsync) recovers at its durable
+    //     future seq). A `disk` topic (acked before fsync) recovers at its durable
     //     head RESERVATION, so its head may sit ABOVE the acked head by up to
     //     `DISK_HEAD_RESERVE_AHEAD` (dropped un-fsynced seqs become silent gaps) and
     //     never regresses below an acked seq when the whole tail was durable.
@@ -389,17 +389,17 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
 }
 
 fn assert_recovered_matches_model(engine: &Engine, model: &RefModel, whole_tail_durable: bool) {
-    for (name, mbox) in &model.boxes {
+    for (name, mbox) in &model.topics {
         if mbox.acked.is_empty() && mbox.head == 0 {
             continue;
         }
-        let Some(dump) = dump_box(engine, name) else {
+        let Some(dump) = dump_topic(engine, name) else {
             if mbox.durable && !mbox.live_seqs().is_empty() && whole_tail_durable {
-                panic!("{name}: durable box with acked records vanished after recovery");
+                panic!("{name}: durable topic with acked records vanished after recovery");
             }
             continue;
         };
-        assert_box_contract(name, mbox, &dump, whole_tail_durable);
+        assert_topic_contract(name, mbox, &dump, whole_tail_durable);
     }
 }
 
@@ -687,7 +687,7 @@ fn f_wal_crash_during_shutdown_drain() {
     // non-durable burst that is only queued (its durability rides the shutdown
     // drain — which the crash interrupts).
     let mut ops = vec![
-        Op::PutBox {
+        Op::PutTopic {
             name: "drain".into(),
             durable: true,
         },
@@ -710,8 +710,8 @@ fn f_wal_crash_during_shutdown_drain() {
             node: None,
         },
     ];
-    // A non-durable box whose tail is only flushed (if at all) by the drain.
-    ops.push(Op::PutBox {
+    // A non-durable topic whose tail is only flushed (if at all) by the drain.
+    ops.push(Op::PutTopic {
         name: "fast".into(),
         durable: false,
     });
@@ -737,19 +737,19 @@ fn f_wal_crash_during_shutdown_drain() {
     disk.reset_power();
 
     let engine = open_engine(&disk);
-    // The durable box's acked writes all survived the drain crash.
-    let dump_d = dump_box(&engine, "drain").expect("durable box survives drain crash");
-    assert_box_contract("drain", &model.boxes["drain"], &dump_d, true);
+    // The durable topic's acked writes all survived the drain crash.
+    let dump_d = dump_topic(&engine, "drain").expect("durable topic survives drain crash");
+    assert_topic_contract("drain", &model.topics["drain"], &dump_d, true);
     assert_eq!(
         dump_d.records.len(),
         3,
         "all 3 acked durable frames survive the shutdown-drain crash"
     );
 
-    // The non-durable box: whatever survived is a clean dense prefix — no torn
+    // The non-durable topic: whatever survived is a clean dense prefix — no torn
     // tail, no fabricated frame. (Its queued tail may legitimately be gone.)
-    if let Some(dump_f) = dump_box(&engine, "fast") {
-        assert_box_contract("fast", &model.boxes["fast"], &dump_f, false);
+    if let Some(dump_f) = dump_topic(&engine, "fast") {
+        assert_topic_contract("fast", &model.topics["fast"], &dump_f, false);
     }
     stop(engine);
 }
@@ -772,7 +772,7 @@ fn f_snap_checkpoint_flush_crash() {
     // small so the bounded crash-point sweep stays well under a minute (each
     // durable append blocks on a real group fsync).
     let ops = vec![
-        Op::PutBox {
+        Op::PutTopic {
             name: "snap".into(),
             durable: true,
         },
@@ -856,7 +856,7 @@ fn f_snap_checkpoint_flush_crash() {
         // (all acked durable frames present, contiguous, no half-snapshot loaded).
         let engine = open_engine(&disk);
         assert_recovered_matches_model(&engine, &model, true);
-        let dump = dump_box(&engine, "snap").expect("box survives snapshot-flush crash");
+        let dump = dump_topic(&engine, "snap").expect("topic survives snapshot-flush crash");
         assert_eq!(
             dump.records.keys().copied().collect::<Vec<_>>(),
             vec![1, 2, 3],
@@ -865,7 +865,7 @@ fn f_snap_checkpoint_flush_crash() {
         // Idempotent recovery at a couple of points.
         if crash_point % 5 == 0 {
             let again = open_engine(&disk);
-            let d2 = dump_box(&again, "snap");
+            let d2 = dump_topic(&again, "snap");
             assert_eq!(
                 Some(dump.clone()),
                 d2,
@@ -903,7 +903,7 @@ fn f_nfs_fsync_lies() {
             &engine,
             &mut model,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "nfs".into(),
                     durable: true,
                 },
@@ -924,7 +924,7 @@ fn f_nfs_fsync_lies() {
         sync_dirs(&disk.arc());
         stop(engine);
     }
-    let honest_prefix = model.boxes["nfs"].acked.len();
+    let honest_prefix = model.topics["nfs"].acked.len();
     assert_eq!(
         honest_prefix, 2,
         "two honest-durable frames form the guaranteed prefix"
@@ -969,11 +969,11 @@ fn f_nfs_fsync_lies() {
     disk.set_lying_fsync(false);
 
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "nfs").expect("box survives with at least the honest prefix");
+    let dump = dump_topic(&engine, "nfs").expect("topic survives with at least the honest prefix");
 
     // Contract (relaxed, whole_tail_durable=false): no fabrication, dense prefix,
     // monotone, no resurrection. The lie may have lost the l3..l5 tail.
-    assert_box_contract("nfs", &model.boxes["nfs"], &dump, false);
+    assert_topic_contract("nfs", &model.topics["nfs"], &dump, false);
     // The genuinely-durable prefix [1,2] MUST survive (those fsyncs were honest).
     assert!(
         dump.records.contains_key(&1) && dump.records.contains_key(&2),
@@ -1009,7 +1009,7 @@ fn f_nfs_delayed_durability() {
     let mut model = RefModel::default();
 
     let ops = vec![
-        Op::PutBox {
+        Op::PutTopic {
             name: "dly".into(),
             durable: true,
         },
@@ -1059,10 +1059,10 @@ fn f_nfs_delayed_durability() {
     disk.set_lying_fsync(false);
 
     let engine = open_engine(&disk);
-    if let Some(dump) = dump_box(&engine, "dly") {
+    if let Some(dump) = dump_topic(&engine, "dly") {
         // Relaxed contract: the in-window tail may be truncated, but survivors are
         // a dense prefix with no fabrication / no gap / monotone.
-        assert_box_contract("dly", &model.boxes["dly"], &dump, false);
+        assert_topic_contract("dly", &model.topics["dly"], &dump, false);
         let surv: Vec<u64> = dump.records.keys().copied().collect();
         for (i, s) in surv.iter().enumerate() {
             assert_eq!(
@@ -1085,7 +1085,7 @@ fn f_nfs_delayed_durability() {
 /// rolled back and the write returns Err (NOT acked, NOT published). Then a power
 /// loss happens before any further batch.
 ///
-/// ORACLE: the failed batch was never acked nor published; the box is left clean
+/// ORACLE: the failed batch was never acked nor published; the topic is left clean
 /// by the rollback; the crash loses nothing acked; recovery is contiguous and
 /// reproduces the model exactly (the failed frame leaves no trace).
 #[test]
@@ -1100,7 +1100,7 @@ fn f_compound_fsync_fail_then_crash() {
             &engine,
             &mut model,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "cmp".into(),
                     durable: true,
                 },
@@ -1164,7 +1164,7 @@ fn f_compound_fsync_fail_then_crash() {
     // 4th batch left no trace, nothing acked was lost, survivors contiguous.
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
-    let dump = dump_box(&engine, "cmp").expect("box survives the fsync-fail-then-crash");
+    let dump = dump_topic(&engine, "cmp").expect("topic survives the fsync-fail-then-crash");
     assert_eq!(
         dump.records.keys().copied().collect::<Vec<_>>(),
         vec![1, 2, 3],

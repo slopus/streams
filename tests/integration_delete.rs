@@ -1,11 +1,11 @@
 //! Integration tests for the deletion model over real HTTP (API §5):
-//! `POST /v0/boxes/:box/delete` with `before_seq` and/or tag `match`.
+//! `POST /v0/topics/:topic/delete` with `before_seq` and/or tag `match`.
 //!
 //! Deletion is permanent, effective-immediately, **silent** (never a tombstone),
 //! and **point-in-time** (not a standing filter). A delete advances `earliest_seq`
 //! but never `evict_floor`, so reading across a purely-deleted gap is silent while
-//! a separate cap/TTL eviction on the same box still yields a `reason:"cap"`
-//! tombstone (the dual watermark). These flows mirror the engine white-box unit
+//! a separate cap/TTL eviction on the same topic still yields a `reason:"cap"`
+//! tombstone (the dual watermark). These flows mirror the engine white-topic unit
 //! tests but assert the documented wire contract end-to-end through axum.
 //!
 //! Each test boots its own `Harness` (real bound server, `SystemClock`), so the
@@ -17,32 +17,32 @@ mod common;
 use common::{Harness, StatusCode};
 use serde_json::{json, Value};
 
-/// Append `records` to `box_name`, asserting the write succeeded (`200`/`201`),
+/// Append `records` to `topic_name`, asserting the write succeeded (`200`/`201`),
 /// and return the parsed response body.
-fn write(h: &Harness, box_name: &str, records: Value) -> Value {
+fn write(h: &Harness, topic_name: &str, records: Value) -> Value {
     let (status, body) = h.post(
-        &format!("/v0/boxes/{box_name}"),
+        &format!("/v0/topics/{topic_name}"),
         json!({ "records": records }),
     );
     assert!(
         status == StatusCode::OK || status == StatusCode::CREATED,
-        "write to {box_name} should succeed, got {status}: {body}"
+        "write to {topic_name} should succeed, got {status}: {body}"
     );
     body
 }
 
 /// `POST .../delete`, asserting `200`, and return the parsed response body.
-fn delete_ok(h: &Harness, box_name: &str, sel: Value) -> Value {
-    let (status, body) = h.post(&format!("/v0/boxes/{box_name}/delete"), sel);
+fn delete_ok(h: &Harness, topic_name: &str, sel: Value) -> Value {
+    let (status, body) = h.post(&format!("/v0/topics/{topic_name}/delete"), sel);
     assert_eq!(status, StatusCode::OK, "delete should be 200, got {body}");
     body
 }
 
 /// `POST .../diff` from `from_seq` as an unrelated node so loop-prevention never
 /// hides records; include tags so tag-based assertions can read `$tag`.
-fn diff(h: &Harness, box_name: &str, from_seq: u64) -> Value {
+fn diff(h: &Harness, topic_name: &str, from_seq: u64) -> Value {
     let (status, body) = h.post(
-        &format!("/v0/boxes/{box_name}/diff"),
+        &format!("/v0/topics/{topic_name}/diff"),
         json!({ "from_seq": from_seq, "limit": 1000, "node": "reader", "include_tags": true }),
     );
     assert_eq!(status, StatusCode::OK, "diff should be 200, got {body}");
@@ -63,13 +63,13 @@ fn seqs(diff_body: &Value) -> Vec<u64> {
 /// the expected scalar values for `deleted`/`earliest_seq`/`head_seq`/`count`.
 fn assert_delete_shape(
     body: &Value,
-    box_name: &str,
+    topic_name: &str,
     deleted: u64,
     earliest_seq: u64,
     head_seq: u64,
     count: u64,
 ) {
-    assert_eq!(body["box"], box_name, "box echoed: {body}");
+    assert_eq!(body["topic"], topic_name, "topic echoed: {body}");
     assert_eq!(body["deleted"], deleted, "deleted: {body}");
     assert_eq!(body["earliest_seq"], earliest_seq, "earliest_seq: {body}");
     assert_eq!(body["head_seq"], head_seq, "head_seq: {body}");
@@ -213,7 +213,7 @@ fn delete_is_point_in_time() {
 
     // Revoke everything currently tagged chat-42:* (just seq 1).
     let r = delete_ok(&h, "chat", json!({ "match": ["tag", "Glob", "chat-42:*"] }));
-    assert_delete_shape(&r, "chat", 1, 2, 1, 0); // box now empty, earliest=head+1.
+    assert_delete_shape(&r, "chat", 1, 2, 1, 0); // topic now empty, earliest=head+1.
 
     // A LATER write with the same matching tag is unaffected by the prior delete.
     write(&h, "chat", json!([{ "data": "v2", "tag": "chat-42:msg" }])); // seq 2
@@ -268,15 +268,15 @@ fn match_and_before_seq_keeps_newer_same_tag() {
 
 // ---------------------------------------------------------------------------
 // (e) DUAL WATERMARK: a delete is silent (advances earliest_seq, not
-//     evict_floor) while a cap eviction on the SAME box still yields a
+//     evict_floor) while a cap eviction on the SAME topic still yields a
 //     `reason:"cap"` tombstone.
 // ---------------------------------------------------------------------------
 #[test]
 fn delete_silent_but_cap_eviction_still_tombstones() {
     let h = Harness::start();
-    // Bounded box: cap_records = 4, discard old (evicts oldest on overflow).
+    // Bounded topic: cap_records = 4, discard old (evicts oldest on overflow).
     let (status, _) = h.put(
-        "/v0/boxes/dual",
+        "/v0/topics/dual",
         json!({ "cap_records": 4, "discard": "old" }),
     );
     assert!(status == StatusCode::CREATED || status == StatusCode::OK);
@@ -330,7 +330,7 @@ fn empty_body_is_invalid_request() {
     let h = Harness::start();
     write(&h, "b", json!([{ "data": 1 }]));
 
-    let (status, body) = h.post("/v0/boxes/b/delete", json!({}));
+    let (status, body) = h.post("/v0/topics/b/delete", json!({}));
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
@@ -340,19 +340,19 @@ fn empty_body_is_invalid_request() {
 }
 
 // ---------------------------------------------------------------------------
-// (f') 404 box_not_found: deleting from a box that does not exist (delete never
+// (f') 404 topic_not_found: deleting from a topic that does not exist (delete never
 //      auto-creates). The selector is valid, so this is a 404 not a 400.
 // ---------------------------------------------------------------------------
 #[test]
-fn delete_on_absent_box_is_not_found() {
+fn delete_on_absent_topic_is_not_found() {
     let h = Harness::start();
-    let (status, body) = h.post("/v0/boxes/ghost/delete", json!({ "before_seq": 10 }));
+    let (status, body) = h.post("/v0/topics/ghost/delete", json!({ "before_seq": 10 }));
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "delete never auto-creates: {body}"
     );
-    assert_eq!(body["error"]["code"], "box_not_found");
+    assert_eq!(body["error"]["code"], "topic_not_found");
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +364,7 @@ fn get_on_delete_path_is_method_not_allowed() {
     let h = Harness::start();
     write(&h, "jobs", json!([{ "data": 1 }]));
 
-    let (status, body) = h.get("/v0/boxes/jobs/delete");
+    let (status, body) = h.get("/v0/topics/jobs/delete");
     assert_eq!(
         status,
         StatusCode::METHOD_NOT_ALLOWED,

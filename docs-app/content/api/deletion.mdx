@@ -1,13 +1,13 @@
 ---
 title: Deletion
-description: Permanently remove records by seq range and/or tag match with POST /v0/boxes/:box/delete — permanent, immediate, silent, and point-in-time.
+description: Permanently remove records by seq range and/or tag match with POST /v0/topics/:topic/delete — permanent, immediate, silent, and point-in-time.
 ---
 
 import { Callout } from 'nextra/components'
 
 # Deletion
 
-Permanently remove records from a box by **seq range** (`before_seq`) and/or by **tag
+Permanently remove records from a topic by **seq range** (`before_seq`) and/or by **tag
 match** (`match`). A delete removes records that exist **right now**: it is permanent,
 effective immediately for every reader, silent (never a tombstone), and **point-in-time** —
 future records with the same tag are never affected.
@@ -17,14 +17,14 @@ combination, the response, and the errors. Deletion is the voluntary-removal hal
 data model; for why it never produces a tombstone, see
 [the deletion guarantee](/guarantees/deletion).
 
-## POST /v0/boxes/:box/delete — remove records
+## POST /v0/topics/:topic/delete — remove records
 
-<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:box/delete</span></div>
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/topics/:topic/delete</span></div>
 
 Permanently remove records by seq range, tag match, or both. Deletion is:
 
 - **Permanent** — deleted records are gone for good; there is no un-delete in `/v0`.
-- **Effective immediately** — invisible to all reads at once (diff, box-state `count`/`bytes`,
+- **Effective immediately** — invisible to all reads at once (diff, topic-state `count`/`bytes`,
   and SSE); the reader's cursor simply advances past the deleted seqs.
 - **Asynchronous, no compaction / no reclaim** — records are logically gone instantly (work
   runs off the call path), but a deleted record **stays on disk, just marked**: on disk a
@@ -35,7 +35,7 @@ Permanently remove records by seq range, tag match, or both. Deletion is:
 - **Point-in-time** — it is **not** a standing filter. It removes only records present at
   call time; future records, even with a matching tag, are never affected.
 
-A delete advances the box's `earliest_seq` (its first live seq) but **not** its
+A delete advances the topic's `earliest_seq` (its first live seq) but **not** its
 `evict_floor` (the involuntary cap/TTL floor), so reading across a purely-deleted gap is
 silent — there is no way for a lagging consumer to "miss a deletion," because the record is
 gone for all readers at the same instant.
@@ -47,14 +47,14 @@ both to AND them.
 
 ```bash
 # Cancel one job by exact tag match.
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
 ```
 
 ```json
 # → 200 OK
-{ "box": "jobs", "deleted": 1, "earliest_seq": 480001, "head_seq": 480234,
+{ "topic": "jobs", "deleted": 1, "earliest_seq": 480001, "head_seq": 480234,
   "count": 233, "bytes": 478342,
   "performance": { "server_total_ms": 0.12 } }
 ```
@@ -67,7 +67,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/delete \
 <Callout type="info">
   `Glob` is deliberately limited to a trailing `*` — a literal prefix plus one `*`. Full
   glob/regex is excluded so a tag delete is always either a point lookup or a bounded
-  range scan over the per-box tag index, never a full-log scan. Records with **no tag** are
+  range scan over the per-topic tag index, never a full-log scan. Records with **no tag** are
   never matched by `match`.
 </Callout>
 
@@ -82,7 +82,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/delete \
 ### Response
 
 ```json
-{ "box": "jobs",
+{ "topic": "jobs",
   "deleted": 14,
   "earliest_seq": 480001,
   "head_seq": 480234,
@@ -93,10 +93,10 @@ curl -X POST localhost:4000/v0/boxes/jobs/delete \
 
 | Field | Type | Meaning |
 |---|---|---|
-| `box` | string | The box name. |
+| `topic` | string | The topic name. |
 | `deleted` | int | Count of records removed by this call. |
 | `earliest_seq` | `u64` | New first live seq (advanced past any deleted prefix). |
-| `head_seq` | `u64` | Box log end (unchanged by a delete). |
+| `head_seq` | `u64` | Topic log end (unchanged by a delete). |
 | `count` | int | Records currently retained, already excluding the deleted ones. |
 | `bytes` | int | Currently retained payload bytes, already excluding the deleted ones. |
 | `performance` | object | Timing block. |
@@ -106,7 +106,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/delete \
 | `error.code` | HTTP | When |
 |---|---|---|
 | `invalid_request` | `400` | Neither `before_seq` nor `match` supplied; a malformed `match` tuple; a `match` op outside `{Eq, Glob}`; or a `Glob` pattern without a trailing `*`. |
-| `box_not_found` | `404` | The box does not exist (delete never auto-creates). |
+| `topic_not_found` | `404` | The topic does not exist (delete never auto-creates). |
 
 ## See also
 

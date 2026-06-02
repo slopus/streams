@@ -49,11 +49,11 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::snapshot::{
-    load_latest_with, write_snapshot_with, Checkpoint, Snapshot, SnapshotBox, SnapshotRecord,
+    load_latest_with, write_snapshot_with, Checkpoint, Snapshot, SnapshotTopic, SnapshotRecord,
 };
 use streams::storage::testfs::FakeDisk;
 use streams::storage::{Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ---------------------------------------------------------------------------
 // On-disk snapshot framing layout (mirrors src/storage/snapshot.rs; the
@@ -88,14 +88,14 @@ fn snapshot_path(id: u64) -> PathBuf {
     meta_dir().join(format!("snapshot-{id:016}.bin"))
 }
 
-/// A small but non-empty snapshot (a single box with two live records) so the
+/// A small but non-empty snapshot (a single topic with two live records) so the
 /// body is a real postcard payload, not an empty vec — corruption then has a
 /// meaningful body to overrun/mis-decode.
 fn sample(id: u64, last_seq: u64) -> Snapshot {
     Snapshot {
         id,
         ts: 1_700_000_000_000,
-        next_box_id: 2,
+        next_topic_id: 2,
         checkpoint: Checkpoint {
             wal_idx: 1,
             wal_offset: 0,
@@ -103,9 +103,9 @@ fn sample(id: u64, last_seq: u64) -> Snapshot {
             shards: vec![(1, 0)],
             shard_keys: vec![String::new()],
         },
-        boxes: vec![SnapshotBox {
+        topics: vec![SnapshotTopic {
             name: "jobs".into(),
-            box_id: 1,
+            topic_id: 1,
             epoch: 1,
             config_json: b"{\"durable\":true}".to_vec(),
             base_seq: 1,
@@ -266,7 +266,7 @@ fn f_snap_bad_magic() {
 // snapshot / WAL, never misparses a future-format body as the current one. We
 // poke the u32 version to VERSION+1 (and also to a wildly different value) and
 // assert the snapshot is skipped — AND prove an end-to-end engine recovery still
-// reconstructs the durable box from the WAL when its only snapshot is a future
+// reconstructs the durable topic from the WAL when its only snapshot is a future
 // version.
 #[test]
 fn f_snap_version_mismatch() {
@@ -293,12 +293,12 @@ fn f_snap_version_mismatch() {
     {
         let engine = Engine::with_data_dir_fs(cfg(), clock(), disk.arc())
             .expect("engine opens through FakeDisk");
-        let bcfg = BoxConfig {
-            r#type: BoxType::Log,
+        let bcfg = TopicConfig {
+            r#type: TopicType::Log,
             durable: true,
             ..Default::default()
         };
-        engine.put_box("jobs", bcfg).unwrap();
+        engine.put_topic("jobs", bcfg).unwrap();
         for v in ["a", "b", "c"] {
             let req = WriteRequest {
                 records: vec![RecordIn {
@@ -351,7 +351,7 @@ fn f_snap_version_mismatch() {
     let engine = Engine::with_data_dir_fs(cfg(), clock(), disk.arc())
         .expect("recovery falls back to WAL when the snapshot is a bad version");
     let st = engine
-        .box_state("jobs", false)
+        .topic_state("jobs", false)
         .expect("jobs recovered from WAL");
     assert_eq!(st.head_seq, 3, "all 3 durable seqs recovered from the WAL");
     assert_eq!(

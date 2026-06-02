@@ -1,6 +1,6 @@
 ---
 title: Reading (diff)
-description: Consume a box from a seq cursor with POST /v0/boxes/:box/diff — the cursor is the ack, skipped records still advance, and involuntary loss surfaces as a tombstone.
+description: Consume a topic from a seq cursor with POST /v0/topics/:topic/diff — the cursor is the ack, skipped records still advance, and involuntary loss surfaces as a tombstone.
 ---
 
 import { Callout } from 'nextra/components'
@@ -18,18 +18,18 @@ cursor model work (the cursor is the ack; skipped records still advance), and th
 shape. It is a `POST` because the operation is described by the JSON body; it is read-only
 and safe to retry.
 
-## POST /v0/boxes/:box/diff — read from a cursor
+## POST /v0/topics/:topic/diff — read from a cursor
 
-<div className="route"><span className="verb post">POST</span><span className="path">/v0/boxes/:box/diff</span></div>
+<div className="route"><span className="verb post">POST</span><span className="path">/v0/topics/:topic/diff</span></div>
 
 Return records with `$seq > from_seq`, ascending, bounded to `limit`, after skipping
-TTL-expired, deleted, and own-node records at read time. Bumps the box's auto-priority
+TTL-expired, deleted, and own-node records at read time. Bumps the topic's auto-priority
 recency clock.
 
 ### Request body
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs/diff \
+curl -X POST localhost:4000/v0/topics/jobs/diff \
   -H 'content-type: application/json' \
   -d '{
         "from_seq": 479100,
@@ -44,7 +44,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/diff \
 ```json
 # → 200 OK
 {
-  "box": "jobs",
+  "topic": "jobs",
   "records": [
     { "$seq": 479101, "$ts": 1748450001000, "$node": "worker-us-2",
       "data": { "type": "resize", "url": "s3://b/x.png" }, "meta": { "trace": "z9" } },
@@ -77,7 +77,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/diff \
 | `records` | array | Up to `limit` records with `$seq > from_seq`, ascending, after skipping TTL-expired, deleted, and own-node records. `$tag` appears only if `include_tags`; `meta` only if `include_meta`; `$node` only when set on the record. |
 | `next_from_seq` | `u64` | Pass back as `from_seq`. Equals the `$seq` of the last **examined** record (filtered records still advance it), so filtered records are never re-scanned. |
 | `head_seq` | `u64` | Highest assigned seq (the log end). For lag math. |
-| `earliest_seq` | `u64` | First currently-live seq (the retained floor) — for fall-off detection. `head_seq + 1` when the box is empty. |
+| `earliest_seq` | `u64` | First currently-live seq (the retained floor) — for fall-off detection. `head_seq + 1` when the topic is empty. |
 | `caught_up` | bool | `true` when `next_from_seq == head_seq`. The reliable "no more right now" signal. |
 | `tombstone` | object \| `null` | A gap marker (see below) for involuntary cap/TTL loss, or `null`. |
 | `lag` | `u64` | `head_seq - next_from_seq` — records still behind your cursor. |
@@ -92,14 +92,14 @@ token to manage and no separate ack call — you persist `next_from_seq` and pas
 
 <Callout type="info">
   Per-message explicit-ack with leases and visibility timeouts is a different model. For
-  that, use a [queue box](/api/queues) (`type:"queue"`) and the claim/ack/nack/extend
+  that, use a [queue topic](/api/queues) (`type:"queue"`) and the claim/ack/nack/extend
   endpoints, which layer lease-based at-least-once delivery on the same log.
 </Callout>
 
 ## Skipped records still advance the cursor
 
 Node-filtered, deleted, and TTL-expired records are **omitted from `records`** but
-`next_from_seq` advances **past** them. Otherwise a consumer reading a box full of its own
+`next_from_seq` advances **past** them. Otherwise a consumer reading a topic full of its own
 (node-filtered) events would loop forever.
 
 So `records.length` may be less than the number of seqs traversed, and may even be `0` while
@@ -122,7 +122,7 @@ contiguous range).
 
 ```json
 {
-  "box": "jobs",
+  "topic": "jobs",
   "records": [ { "$seq": 479101, "$ts": 1748450001000, "data": { "...": "..." } } ],
   "tombstone": {
     "gap_from": 478501,
@@ -143,7 +143,7 @@ contiguous range).
 |---|---|
 | `gap_from` | First missing seq (= the stale `from_seq + 1`). |
 | `gap_to` | Last missing seq (= `earliest_seq - 1`). The lost range `[gap_from, gap_to]` is inclusive at both ends. |
-| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), `"recreated"` (box was deleted then recreated), or `"source_trim"` (a derived-router dest reflecting source-side eviction). Best-effort/informational — the **range is authoritative**. |
+| `reason` | `"cap"` (evicted for capacity), `"ttl"` (expired), `"mixed"` (both), `"recreated"` (topic was deleted then recreated), or `"source_trim"` (a derived-router dest reflecting source-side eviction). Best-effort/informational — the **range is authoritative**. |
 | `missed_estimate` | Approximate count of dropped records (approximate because eviction is segment-granular). |
 | `earliest_seq` / `head_seq` | Current watermarks, echoed for convenience. |
 
@@ -163,7 +163,7 @@ The same gap is emitted over a live stream as an `event: tombstone` frame — se
 | `error.code` | HTTP | When |
 |---|---|---|
 | `invalid_request` | `400` | Type errors only. `wait_ms` and `limit` over their max are **clamped**, not errored. |
-| `box_not_found` | `404` | The box does not exist (diff never auto-creates). |
+| `topic_not_found` | `404` | The topic does not exist (diff never auto-creates). |
 | `throttled` | `429` | Elastic throttle under CPU pressure (carries `Retry-After`). See [Errors](/api/errors). |
 
 ## See also

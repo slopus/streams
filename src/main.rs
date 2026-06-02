@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the defaults are generous. Logged so an operator can see the active caps.
     let lim = &config.limits;
     info!(
-        max_boxes = lim.max_boxes,
+        max_topics = lim.max_topics,
         max_routers = lim.max_routers,
         max_watch_sessions = lim.max_watch_sessions,
         max_sse_connections = lim.max_sse_connections,
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::with_data_dir(config.clone(), clock)?;
     info!(
         ready = engine.is_ready(),
-        boxes = engine.box_count(),
+        topics = engine.topic_count(),
         recover_ms = recover_started.elapsed().as_millis() as u64,
         "recovery complete; readiness gate open (/v0/ready -> 200)"
     );
@@ -139,9 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Background relocator (Phase 6): when a cold tier is configured, periodically
-    // sweep boxes for sealed segments beyond the hot-retention bound and relocate
+    // sweep topics for sealed segments beyond the hot-retention bound and relocate
     // them HOT → COLD. The copy is blocking I/O, so it runs on the blocking pool —
-    // off the hot path, never holding a box write lock or blocking SSE delivery
+    // off the hot path, never holding a topic write lock or blocking SSE delivery
     // (the HARD INVARIANT). Disabled (the task simply never relocates) when no
     // cold dir is set, so the default path is unchanged.
     let relocator = if config.cold_dir.is_some() {

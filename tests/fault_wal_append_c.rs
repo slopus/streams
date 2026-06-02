@@ -43,7 +43,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
 use streams::storage::{Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_batch1.rs)
@@ -79,7 +79,7 @@ fn sync_wal_dir(disk: &FakeDisk) {
     let _ = fs.sync_dir(&PathBuf::from(DATA_DIR).join("meta"));
 }
 
-/// A single-record durable write request for box `name` carrying `data`.
+/// A single-record durable write request for topic `name` carrying `data`.
 fn one_write(data: &str) -> WriteRequest {
     WriteRequest {
         records: vec![RecordIn {
@@ -96,21 +96,21 @@ fn one_write(data: &str) -> WriteRequest {
     }
 }
 
-fn put_durable_box(engine: &Engine, name: &str) {
+fn put_durable_topic(engine: &Engine, name: &str) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 cap_records: 0,
                 ..Default::default()
             },
         )
-        .expect("put_box");
+        .expect("put_topic");
 }
 
-/// Append `n` durable records "1".."n" to box `name`, each blocking on the group
+/// Append `n` durable records "1".."n" to topic `name`, each blocking on the group
 /// fsync (so it is acked ⇒ durable). Returns the seqs assigned.
 fn append_durable(engine: &Engine, name: &str, n: usize) -> Vec<u64> {
     let mut seqs = Vec::new();
@@ -123,10 +123,10 @@ fn append_durable(engine: &Engine, name: &str, n: usize) -> Vec<u64> {
     seqs
 }
 
-/// Read back the live records of box `name` (seq → data string) through the
-/// engine's diff path; `None` if the box is absent.
+/// Read back the live records of topic `name` (seq → data string) through the
+/// engine's diff path; `None` if the topic is absent.
 fn dump_records(engine: &Engine, name: &str) -> Option<BTreeMap<u64, String>> {
-    let st = engine.box_state(name, false).ok()?;
+    let st = engine.topic_state(name, false).ok()?;
     let _ = st;
     let mut out = BTreeMap::new();
     let mut from = 0u64;
@@ -226,7 +226,7 @@ fn fast_cfg() -> WalConfig {
 
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -264,7 +264,7 @@ fn durable_wal_bytes(disk: &FakeDisk, path: &Path) -> Vec<u8> {
 }
 
 // WAL frame layout (src/storage/wal.rs): [frame_len:u32 @0..4][type:u8 @4]
-// [flags:u8 @5][box_id:u32 @6..10][seq:u64 @10..18][ts:u64 @18..26]
+// [flags:u8 @5][topic_id:u32 @6..10][seq:u64 @10..18][ts:u64 @18..26]
 // [node_len:u16][tag_len:u16][data_len:u32]...[body]...[crc:u64 last 8 bytes].
 const FRAME_LEN_PREFIX: usize = 4;
 const FRAME_HEADER_LEN: usize = 30;
@@ -321,7 +321,7 @@ fn f_nfs_eagain_retry() {
     // state intact" across the transient glitch.
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "q");
+        put_durable_topic(&engine, "q");
         append_durable(&engine, "q", 2);
         sync_wal_dir(&disk);
         assert_eq!(
@@ -363,7 +363,7 @@ fn f_nfs_eagain_retry() {
     // durable frames — the refused batch left no trace, no gap, no fabrication.
     {
         let engine = open_engine(&disk);
-        let recs = dump_records(&engine, "q").expect("box survives");
+        let recs = dump_records(&engine, "q").expect("topic survives");
         assert_eq!(
             recs.keys().copied().collect::<Vec<_>>(),
             vec![1, 2],
@@ -389,7 +389,7 @@ fn f_nfs_eagain_retry() {
     disk.crash(TornDamage::None);
     disk.reset_power();
     let engine = open_engine(&disk);
-    let recs = dump_records(&engine, "q").expect("box survives final crash");
+    let recs = dump_records(&engine, "q").expect("topic survives final crash");
     assert_eq!(
         recs.keys().copied().collect::<Vec<_>>(),
         vec![1, 2, 3],

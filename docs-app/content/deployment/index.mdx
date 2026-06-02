@@ -43,7 +43,7 @@ files, and snapshots. A missing or empty directory is a clean first start.
 
 ### Loads the latest snapshot
 
-A snapshot is a checkpointed image of all box state. Loading it lets recovery skip
+A snapshot is a checkpointed image of all topic state. Loading it lets recovery skip
 replaying the entire WAL from the beginning.
 
 ### Replays the WAL forward
@@ -57,7 +57,7 @@ frame for an acknowledged durable write is never lost.
 
 Until recovery finishes, `GET /v0/ready` returns **503 `not_ready`** with a
 `Retry-After` header and a `detail.replay_progress` value in `[0.0, 1.0]`. Once recovery
-completes it returns **200** `{ "status": "ready", "wal_replay_complete": true, "boxes": N }`.
+completes it returns **200** `{ "status": "ready", "wal_replay_complete": true, "topics": N }`.
 
 </Steps>
 
@@ -100,7 +100,7 @@ draining, `GET /v0/ready` returns **503 `shutting_down`**.
 Because durability is WAL-first, you don't depend on the shutdown snapshot for correctness:
 an acknowledged durable (`disk`/`fsync`) write is already in the WAL and is recovered by
 replay even after an abrupt kill. The final snapshot is a recovery-speed optimization, not
-a correctness requirement. (A `memory`-class box takes the same group-committed WAL path as
+a correctness requirement. (A `memory`-class topic takes the same group-committed WAL path as
 `disk` but is best-effort — after a restart its records may survive or be lost, with no
 guarantee either way; its config always survives — see [Durability](/guarantees/durability).)
 
@@ -114,7 +114,7 @@ guarantee either way; its config always survives — see [Durability](/guarantee
     Every `STREAMS_*` environment variable, its exact default, and what it controls.
   </Cards.Card>
   <Cards.Card title="Security" href="/deployment/security" arrow>
-    Bearer keys hashed at rest, per-key scopes, the box-name prefix allowlist, and resource limits.
+    Bearer keys hashed at rest, per-key scopes, the topic-name prefix allowlist, and resource limits.
   </Cards.Card>
   <Cards.Card title="Storage & Tiering" href="/deployment/storage-and-tiering" arrow>
     The data directory layout and optional hot→cold segment relocation.

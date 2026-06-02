@@ -1,17 +1,17 @@
 ---
 title: Routers
-description: Server-side fan-out rules that forward every record from one box into another — at-least-once, per-source FIFO, DAG-by-default.
+description: Server-side fan-out rules that forward every record from one topic into another — at-least-once, per-source FIFO, DAG-by-default.
 ---
 
 import { Callout, Tabs } from 'nextra/components'
 
 # Routers
 
-A **router** is a server-side forwarding rule: every record appended to a `source` box is
-also appended to a `dest` box. Routers make pub/sub and multi-master fan-out safe because
+A **router** is a server-side forwarding rule: every record appended to a `source` topic is
+also appended to a `dest` topic. Routers make pub/sub and multi-master fan-out safe because
 the forwarded copy keeps its origin `$node`, and [node loop-prevention](/guarantees/node-loop-prevention)
 stops a node from receiving back what it produced. Routers live in their own namespace at
-`/v0/routers` and are managed with the same idempotent `PUT`/`GET`/`DELETE` shape as boxes.
+`/v0/routers` and are managed with the same idempotent `PUT`/`GET`/`DELETE` shape as topics.
 
 ## Forwarding semantics
 
@@ -28,7 +28,7 @@ design against.
   per-copy WAL frames.
 - **Single-source per derived dest.** A derived `dest` has exactly one `source`. A second
   router with a *different* `source` into the same `dest` is rejected `409
-  box_exists_incompatible` with `error.detail.reason: "router_dest_fan_in"`. (Direct writes
+  topic_exists_incompatible` with `error.detail.reason: "router_dest_fan_in"`. (Direct writes
   to a dest, or a mixed direct+derived graph under `allow_cycle`, remain best-effort
   interleavings.)
 - **At-least-once.** The router is driven off the committed `source` log, so it never
@@ -45,14 +45,14 @@ design against.
 - **What carries through.** `$node` (verbatim, never rewritten when `preserve_node` — this
   is what makes loop-prevention work across the route), `$tag` (when `preserve_tag`), `meta`,
   and `data` pass through unchanged. Original source seq/ts are optionally preserved in
-  reserved meta `$src_box`/`$src_seq` for traceability (off by default to keep payloads lean).
+  reserved meta `$src_topic`/`$src_seq` for traceability (off by default to keep payloads lean).
 - **The destination's config governs how the copy is retained.** Because forwarding is async
   and the copies are derived (not WAL-logged), the source ack never waits on the destination.
   The `dest`'s [durability class](/guarantees/durability) governs how/whether the re-derived
   copy is retained and recovered — including a `memory` dest, which retains a best-effort copy
-  (it may survive or be lost, exactly like a direct write to that box). `dest`'s caps and TTL
+  (it may survive or be lost, exactly like a direct write to that topic). `dest`'s caps and TTL
   apply too — TTL is measured by `dest.$ts` (forward time), not source time.
-- **Deletes and node filters are per-box.** They do not propagate through a router. A
+- **Deletes and node filters are per-topic.** They do not propagate through a router. A
   delete on `source` removes records from `source`, but a copy may already have been
   forwarded to `dest`; to remove it there too, [delete](/api/deletion) on `dest`.
 - **DAG-by-default, with a hop-capped escape hatch.** Creating a router that would
@@ -64,7 +64,7 @@ design against.
   always terminates. An `allow_cycle` graph mixing direct and derived routers is best-effort.
   Node-filtering prevents *delivery* of your own events (correctness); the DAG/hop-cap
   prevents *unbounded forwarding* (resource safety).
-- **Cascade on box delete.** [Deleting a box](/api/boxes) removes every router that names
+- **Cascade on topic delete.** [Deleting a topic](/api/topics) removes every router that names
   it as `source` or `dest` — a router referencing a missing endpoint cannot exist. The
   delete response echoes the removed router names in `routers_removed`.
 
@@ -92,10 +92,10 @@ design against.
 <div className="route"><span className="verb put">PUT</span><span className="path">/v0/routers/:router</span></div>
 
 Create a router, or update an existing one. Idempotent and upsertable, exactly like
-[box create](/api/boxes): an identical `PUT` is a no-op `200`, a changed `PUT` applies the
+[topic create](/api/topics): an identical `PUT` is a no-op `200`, a changed `PUT` applies the
 diff, a new one returns `201`.
 
-**Path** — `:router`, same charset as box names (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$`, plus
+**Path** — `:router`, same charset as topic names (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$`, plus
 `>` is allowed for the `"<source>-><dest>"` convention). Case-sensitive, byte-exact.
 
 **Request body**
@@ -108,8 +108,8 @@ diff, a new one returns `201`.
 
 | Field | Type | Req? | Default | Meaning |
 |---|---|---|---|---|
-| `source` | string | yes | — | Source box; records appended here are forwarded. |
-| `dest` | string | yes | — | Destination box; must differ from `source`. |
+| `source` | string | yes | — | Source topic; records appended here are forwarded. |
+| `dest` | string | yes | — | Destination topic; must differ from `source`. |
 | `preserve_node` | bool | no | `true` | Keep the original `$node` on forwarded records (required for loop prevention across the fan-out). `false` clears it. |
 | `preserve_tag` | bool | no | `true` | Keep `$tag` (so a tag delete can be applied at the dest too). |
 | `create_dest` | bool | no | `true` | Auto-create `dest` if absent. `false` ⇒ `404` if missing. |
@@ -137,7 +137,7 @@ diff, a new one returns `201`.
 | `error.code` | When |
 |---|---|
 | `invalid_request` | Missing `source`/`dest`, `source == dest`, or a malformed `filter` tuple (`400`). |
-| `box_not_found` | `create_dest:false` and `dest` is absent (`404`). |
+| `topic_not_found` | `create_dest:false` and `dest` is absent (`404`). |
 | `router_cycle` | The router would close a directed cycle and `allow_cycle` is `false`; `error.detail.cycle` carries the path, e.g. `["A","B","A"]` (`409`). |
 | `forbidden` | The key lacks the `admin` scope, or `source`/`dest` falls outside its prefix allowlist (`403`). |
 
@@ -204,8 +204,8 @@ Stop forwarding immediately and remove the router. Idempotent. Already-forwarded
 Deleting an absent router returns `200` with `"deleted": false`.
 
 <Callout type="info">
-  You rarely delete routers by hand to tear down a topology. [Deleting a box](/api/boxes)
-  cascades to every router that references it as `source` or `dest`, and the box-delete
+  You rarely delete routers by hand to tear down a topology. [Deleting a topic](/api/topics)
+  cascades to every router that references it as `source` or `dest`, and the topic-delete
   response lists the removed routers in `routers_removed`.
 </Callout>
 
@@ -239,4 +239,4 @@ curl -X PUT localhost:4000/v0/routers/jobs-to-audit \
 - [Pub/Sub guide](/guides/pubsub) — fan one feed out to many consumers with routers.
 - [Multi-master guide](/guides/multi-master) — symmetric N-node topologies that don't echo.
 - [Node loop-prevention](/guarantees/node-loop-prevention) — why preserving `$node` is what makes fan-out safe.
-- [Boxes API](/api/boxes) — the `dest` config that governs a forward.
+- [Topics API](/api/topics) — the `dest` config that governs a forward.

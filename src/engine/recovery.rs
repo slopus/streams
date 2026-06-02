@@ -9,8 +9,8 @@
 //! see [`crate::storage::sharded_wal`]). Recovery is driven by the WAL FILES on
 //! disk, NOT by the configured shard count: it discovers and replays the flat
 //! layout (`wal/wal-<idx>.log`, the single-shard / legacy layout) AND every
-//! `wal/shard-NN/` subdir, dispatching each frame to its box by `box_id` (never
-//! assuming a box lives in `box_id % N`). This lets `STREAMS_WAL_SHARDS` be
+//! `wal/shard-NN/` subdir, dispatching each frame to its topic by `topic_id` (never
+//! assuming a topic lives in `topic_id % N`). This lets `STREAMS_WAL_SHARDS` be
 //! reconfigured between restarts with no data loss — a dir written with K shards
 //! recovers correctly when reopened with any N. The NEW writers use the current
 //! layout; previous-layout files are absorbed + dropped at the next snapshot.
@@ -18,18 +18,18 @@
 //! Recovery order (ARCHITECTURE §4):
 //!
 //! 1. Load the latest valid snapshot under `<data_dir>/meta` (if any) and restore
-//!    the box registry, per-box materialized state + floors, routers, and
-//!    `next_box_id`. The snapshot's checkpoint carries a PER-SHARD `(wal_idx,
+//!    the topic registry, per-topic materialized state + floors, routers, and
+//!    `next_topic_id`. The snapshot's checkpoint carries a PER-SHARD `(wal_idx,
 //!    wal_offset)`; replay resumes each shard from its own offset. A missing/torn
 //!    snapshot ⇒ start empty and replay every WAL file from frame zero.
 //! 2. Replay frames **after each shard's checkpoint**, in-stream, dispatched by
-//!    `box_id`. Files below a shard's checkpoint index are absorbed (skipped):
+//!    `topic_id`. Files below a shard's checkpoint index are absorbed (skipped):
 //!
 //!    - `Append`  → re-insert at its logged seq, unless `seq <= head` (snapshot
 //!      overlap ⇒ skipped, idempotent). An out-of-contiguity append from a
 //!      shard-count reconfigure is deferred + re-applied seq-sorted.
 //!    - `Delete`  → re-apply the `before_seq`/`match` selector (idempotent).
-//!    - `BoxConfig` (create/update / tombstone) → create/update or remove a box.
+//!    - `TopicConfig` (create/update / tombstone) → create/update or remove a topic.
 //!    - `RouterCreate`/`RouterDelete` → rebuild the router graph.
 //!    - `EvictWatermark` → restore the cap/TTL floor.
 //!
@@ -47,7 +47,7 @@ use crate::storage::{
     shard_wal_dir, Fs, OpenOpts, RealFs, ShardedWal, ShardedWalWriter, WalConfig, WalReader,
     WalRecord,
 };
-use crate::types::BoxConfig;
+use crate::types::TopicConfig;
 
 /// The parsed numeric suffix + path of a `wal-<n>.log` file.
 struct WalFile {
@@ -206,12 +206,12 @@ pub(crate) fn discover_group_tails(fs: &Arc<dyn Fs>, data_dir: &Path) -> Vec<(St
     out
 }
 
-/// Pre-scan: the set of `box_id`s whose (post-checkpoint) frames appear in MORE
-/// THAN ONE discovered WAL group — i.e. boxes split across groups by a shard-count
+/// Pre-scan: the set of `topic_id`s whose (post-checkpoint) frames appear in MORE
+/// THAN ONE discovered WAL group — i.e. topics split across groups by a shard-count
 /// reconfigure. Only these need ordered buffering on replay; everything else applies
-/// in-stream. A cheap framing scan (no payload decode). `box_id == 0` (box-agnostic
+/// in-stream. A cheap framing scan (no payload decode). `topic_id == 0` (topic-agnostic
 /// control frames) is excluded — those replay shard-independently in stream order.
-fn find_split_boxes<F>(
+fn find_split_topics<F>(
     fs: &Arc<dyn Fs>,
     groups: &[WalShardGroup],
     ckpt_for: &F,
@@ -219,8 +219,8 @@ fn find_split_boxes<F>(
 where
     F: Fn(&WalShardGroup) -> (u64, u64),
 {
-    // box_id → count of distinct groups it appears in.
-    let mut groups_per_box: std::collections::HashMap<u32, usize> =
+    // topic_id → count of distinct groups it appears in.
+    let mut groups_per_topic: std::collections::HashMap<u32, usize> =
         std::collections::HashMap::new();
     for g in groups {
         let (ckpt_idx, ckpt_offset) = ckpt_for(g);
@@ -235,7 +235,7 @@ where
             };
             while let Some(frame) = r.next() {
                 if (r.valid_len() as u64) > start_offset {
-                    let bid = frame.record.box_id();
+                    let bid = frame.record.topic_id();
                     if bid != 0 {
                         seen_here.insert(bid);
                     }
@@ -243,30 +243,30 @@ where
             }
         }
         for bid in seen_here {
-            *groups_per_box.entry(bid).or_default() += 1;
+            *groups_per_topic.entry(bid).or_default() += 1;
         }
     }
-    groups_per_box
+    groups_per_topic
         .into_iter()
         .filter(|&(_, c)| c > 1)
         .map(|(bid, _)| bid)
         .collect()
 }
 
-/// Replay each split box's buffered frames in reconstructed logged order. For each
-/// box we order its GROUPS by the lowest `Append` seq each group holds for that box
-/// (the older run has the lower seqs — a box's seqs increase monotonically across
+/// Replay each split topic's buffered frames in reconstructed logged order. For each
+/// topic we order its GROUPS by the lowest `Append` seq each group holds for that topic
+/// (the older run has the lower seqs — a topic's seqs increase monotonically across
 /// runs and never reset), then concatenate each group's frames preserving in-group
-/// order. That is the box's true logged order across the reconfigure, so its
+/// order. That is the topic's true logged order across the reconfigure, so its
 /// create → config-update → append → delete frames apply in order (codex P0 #3). A
-/// group that holds no `Append` for the box (e.g. a control-only fragment) sorts by
+/// group that holds no `Append` for the topic (e.g. a control-only fragment) sorts by
 /// its on-disk group order as a stable fallback.
-fn replay_split_boxes(
+fn replay_split_topics(
     engine: &Engine,
     split_frames: std::collections::HashMap<u32, Vec<(usize, usize, WalRecord)>>,
 ) {
-    for (_box_id, mut frames) in split_frames {
-        // Per group_order, the minimum Append seq for this box (None ⇒ no appends).
+    for (_topic_id, mut frames) in split_frames {
+        // Per group_order, the minimum Append seq for this topic (None ⇒ no appends).
         let mut min_seq: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
         for (go, _idx, rec) in &frames {
             if let WalRecord::Append { seq, .. } = rec {
@@ -325,7 +325,7 @@ pub fn recover_and_open_with(
             Ok(Some(snap)) => {
                 tracing::info!(
                     snapshot_id = snap.id,
-                    boxes = snap.boxes.len(),
+                    topics = snap.topics.len(),
                     routers = snap.routers.len(),
                     shards = snap.checkpoint.shards.len(),
                     "restored snapshot"
@@ -358,14 +358,14 @@ pub fn recover_and_open_with(
     //
     //    Order groups so the CURRENT layout's groups replay LAST. After a shard-count
     //    reconfigure, the previous layout's WAL files coexist with the current one
-    //    until the next snapshot absorbs + drops them. A box's frames live in one
+    //    until the next snapshot absorbs + drops them. A topic's frames live in one
     //    group per run, but across the reconfigure its OLD frames (create + earlier
     //    seqs) sit in a previous-layout group while NEW frames (later seqs, written
     //    after reopen) sit in a current-layout group. Replaying previous-layout
-    //    groups first keeps each box's frames in seq order (older seqs before newer),
-    //    so the per-box contiguity holds (`seq == head + 1`) and nothing is dropped.
+    //    groups first keeps each topic's frames in seq order (older seqs before newer),
+    //    so the per-topic contiguity holds (`seq == head + 1`) and nothing is dropped.
     //    Within a single layout the groups are ordered by shard_idx (irrelevant to
-    //    correctness — different boxes — but deterministic).
+    //    correctness — different topics — but deterministic).
     let mut groups = discover_shard_groups(&fs, &wal_dir)?;
     // The set of physical dirs the CURRENT layout (count `n_shards`) writes to. A
     // group whose dir is in this set is "current"; one in a leftover dir from a
@@ -390,40 +390,40 @@ pub fn recover_and_open_with(
     engine.set_replay_total(total_frames);
 
     // 3) Replay frames after each group's checkpoint, dispatching every frame to
-    //    its box by `box_id` (NEVER assuming a box lives in `box_id % N`). Frames
-    //    apply IN-STREAM in group order, so a box's appends, deletes, config updates,
+    //    its topic by `topic_id` (NEVER assuming a topic lives in `topic_id % N`). Frames
+    //    apply IN-STREAM in group order, so a topic's appends, deletes, config updates,
     //    and watermarks keep their logged relative order — a selector `Delete`
     //    re-derives its matched seqs from the records appended BEFORE it, exactly as
-    //    logged, and a config UPDATE replays after the box's create.
+    //    logged, and a config UPDATE replays after the topic's create.
     //
-    //    A box's frames live in ONE shard per run, so within a run (within a group)
+    //    A topic's frames live in ONE shard per run, so within a run (within a group)
     //    they are already in logged order. A shard-count RECONFIGURE, however, splits
-    //    a box's frames across the previous-layout group and the current-layout group
-    //    — and after a NON-multiple reconfigure (e.g. 3→7) the box's NEW group can
+    //    a topic's frames across the previous-layout group and the current-layout group
+    //    — and after a NON-multiple reconfigure (e.g. 3→7) the topic's NEW group can
     //    sort BEFORE its OLD group, so a naive in-stream pass would replay a NEW
-    //    `Delete`/`BoxConfig`-update/append BEFORE the box's OLD create + earlier
-    //    appends. That regresses delete/config durability and breaks per-box
+    //    `Delete`/`TopicConfig`-update/append BEFORE the topic's OLD create + earlier
+    //    appends. That regresses delete/config durability and breaks per-topic
     //    contiguity (codex P0 #3).
     //
-    //    Fix: a box whose frames appear in MORE THAN ONE group is "split". For split
-    //    boxes we BUFFER every frame and replay them in a final per-box pass that
-    //    orders the box's groups by the LOWEST append seq each group holds for it
-    //    (the older run has the lower seqs, since a box's seqs increase monotonically
+    //    Fix: a topic whose frames appear in MORE THAN ONE group is "split". For split
+    //    topics we BUFFER every frame and replay them in a final per-topic pass that
+    //    orders the topic's groups by the LOWEST append seq each group holds for it
+    //    (the older run has the lower seqs, since a topic's seqs increase monotonically
     //    across runs and never reset), preserving each group's in-group order. That
     //    reconstructs the true logged order regardless of how the groups sort on disk,
-    //    so create→update→append→delete all replay in order. Non-split boxes (the
-    //    common case, incl. every box in a single-layout multi-shard run where each
-    //    box is in exactly one group) apply IN-STREAM with zero buffering.
+    //    so create→update→append→delete all replay in order. Non-split topics (the
+    //    common case, incl. every topic in a single-layout multi-shard run where each
+    //    topic is in exactly one group) apply IN-STREAM with zero buffering.
     let maybe_split = groups.len() > 1;
-    // Pre-scan: which box_ids appear in more than one group (post-checkpoint)? Only
-    // these need ordered buffering. Cheap framing scan (no payload decode). box_id 0
-    // (box-agnostic control frames) is never "split" — those frames replay in stream.
-    let split_boxes: std::collections::HashSet<u32> = if maybe_split {
-        find_split_boxes(&fs, &groups, &ckpt_for)
+    // Pre-scan: which topic_ids appear in more than one group (post-checkpoint)? Only
+    // these need ordered buffering. Cheap framing scan (no payload decode). topic_id 0
+    // (topic-agnostic control frames) is never "split" — those frames replay in stream.
+    let split_topics: std::collections::HashSet<u32> = if maybe_split {
+        find_split_topics(&fs, &groups, &ckpt_for)
     } else {
         std::collections::HashSet::new()
     };
-    // Buffered frames for split boxes: box_id → list of (group_order, in_group_idx,
+    // Buffered frames for split topics: topic_id → list of (group_order, in_group_idx,
     // record). `group_order` is the index of the group in the replay-sorted `groups`.
     let mut split_frames: std::collections::HashMap<u32, Vec<(usize, usize, WalRecord)>> =
         std::collections::HashMap::new();
@@ -442,9 +442,9 @@ pub fn recover_and_open_with(
             while let Some(frame) = r.next() {
                 let end = r.valid_len() as u64;
                 if end > start_offset {
-                    let bid = frame.record.box_id();
-                    if !split_boxes.is_empty() && split_boxes.contains(&bid) {
-                        // A split box: buffer for the final ordered pass.
+                    let bid = frame.record.topic_id();
+                    if !split_topics.is_empty() && split_topics.contains(&bid) {
+                        // A split topic: buffer for the final ordered pass.
                         split_frames.entry(bid).or_default().push((
                             group_order,
                             in_group_idx,
@@ -474,10 +474,10 @@ pub fn recover_and_open_with(
             group_tails.push((g.dir.clone(), active_idx, active_valid_len));
         }
     }
-    // Final pass: replay each split box's frames in reconstructed logged order. Empty
+    // Final pass: replay each split topic's frames in reconstructed logged order. Empty
     // in the common (no-reconfigure / no-split) path, so zero-cost there.
     if !split_frames.is_empty() {
-        replay_split_boxes(engine, split_frames);
+        replay_split_topics(engine, split_frames);
     }
 
     // 4) Truncate each discovered group's active-file torn tail (idempotent on a
@@ -508,7 +508,7 @@ pub fn recover_and_open_with(
     }
 
     // 6) Apply durable head reservations (R3). Every Append has now replayed, so
-    //    any box whose fsynced `HeadWatermark` reserved a seq BEYOND its replayed
+    //    any topic whose fsynced `HeadWatermark` reserved a seq BEYOND its replayed
     //    head lost the un-fsynced `disk` tail to the crash: advance its head to the
     //    reservation and pad the reserved-but-unwritten seqs as silent deleted gaps
     //    so the seq counter never regresses and an already-acked `disk` seq is
@@ -520,13 +520,13 @@ pub fn recover_and_open_with(
     //    (segment registered-dead, or its unlink never completed) is re-run here,
     //    so a reclaimed segment never resurfaces and a half-dropped one never
     //    leaks. Runs after the full index/floors/registry are rebuilt; a no-op when
-    //    there are no segments (pure in-memory boxes carry no writer).
+    //    there are no segments (pure in-memory topics carry no writer).
     engine.reclaim_segments_on_recovery();
 
-    // Seed every box's lock-free `is_router_source` flag from the recovered router
+    // Seed every topic's lock-free `is_router_source` flag from the recovered router
     // graph (codex P1), so the post-recovery write hot path forwards without taking
     // the global graph lock per append. Covers a snapshot-restored router whose
-    // source box was materialized separately, regardless of replay order.
+    // source topic was materialized separately, regardless of replay order.
     engine.refresh_router_source_flags();
 
     // Derived-router re-materialization (`forward_v2`): forwarded dest records were
@@ -639,25 +639,25 @@ fn truncate_active(fs: &Arc<dyn Fs>, path: &Path, valid_len: u64) -> std::io::Re
 fn replay_frame(engine: &Engine, record: WalRecord) {
     match record {
         WalRecord::Append {
-            box_id,
+            topic_id,
             seq,
             ts,
             node,
             tag,
             data,
         } => {
-            // The box must exist (its BoxConfig create frame preceded this in WAL
+            // The topic must exist (its TopicConfig create frame preceded this in WAL
             // order, or it came from the snapshot). If somehow absent, lazily
             // materialize it with defaults.
-            let b = engine.get_box_by_id(box_id).unwrap_or_else(|| {
-                let (_c, _id) = engine.apply_put_box_for_recovery(
-                    &format!("box-{box_id}"),
-                    BoxConfig::default(),
-                    Some(box_id),
+            let b = engine.get_topic_by_id(topic_id).unwrap_or_else(|| {
+                let (_c, _id) = engine.apply_put_topic_for_recovery(
+                    &format!("topic-{topic_id}"),
+                    TopicConfig::default(),
+                    Some(topic_id),
                 );
                 engine
-                    .get_box_by_id(box_id)
-                    .expect("box materialized for replay")
+                    .get_topic_by_id(topic_id)
+                    .expect("topic materialized for replay")
             });
             // Idempotent overlap: a frame whose seq is already covered by the
             // snapshot (<= head) was materialized — skip it (ARCHITECTURE §4).
@@ -666,10 +666,10 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // (`head + 1`). A *misdirected* frame whose logged seq jumps ahead
             // (`seq > head + 1`) would either open a phantom gap or (caught by the
             // debug_assert in `apply_append_for_recovery`) abort recovery. Such a
-            // frame is not a record this box legitimately produced at this point in
+            // frame is not a record this topic legitimately produced at this point in
             // the log, so treat it as torn and ignore it: never panic, never adopt
             // a future seq as head, never punch a non-contiguous gap. The single
-            // ordered WAL writer only ever appends dense per-box seqs, so under
+            // ordered WAL writer only ever appends dense per-topic seqs, so under
             // normal operation `seq == head + 1` always holds; this guard only
             // fires on a corrupted/misdirected frame.
             let head = b.head_seq();
@@ -693,14 +693,14 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             );
         }
         WalRecord::Delete {
-            box_id,
+            topic_id,
             before_seq,
             match_,
             seqs,
             bound_head,
             ts,
         } => {
-            if let Some(b) = engine.get_box_by_id(box_id) {
+            if let Some(b) = engine.get_topic_by_id(topic_id) {
                 if !seqs.is_empty() {
                     // Explicit seq set (queue ack / dead-letter delete): remove
                     // exactly these seqs (deterministic replay, DESIGN §10.4).
@@ -717,17 +717,17 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
                 }
             }
         }
-        WalRecord::BoxConfig {
-            box_id,
+        WalRecord::TopicConfig {
+            topic_id,
             op,
             tombstone,
             ..
         } => {
             if tombstone {
-                engine.remove_box_for_recovery(&op.name);
+                engine.remove_topic_for_recovery(&op.name);
             } else {
-                let config: BoxConfig = serde_json::from_slice(&op.config).unwrap_or_default();
-                engine.apply_put_box_for_recovery(&op.name, config, Some(box_id));
+                let config: TopicConfig = serde_json::from_slice(&op.config).unwrap_or_default();
+                engine.apply_put_topic_for_recovery(&op.name, config, Some(topic_id));
             }
         }
         WalRecord::RouterCreate { op, .. } => {
@@ -737,7 +737,7 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             engine.apply_router_delete_for_recovery(&name);
         }
         WalRecord::EvictWatermark {
-            box_id,
+            topic_id,
             evict_floor,
             expiry_floor,
             ..
@@ -751,7 +751,7 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // regresses, regardless of replay order. A legacy frame carries
             // `expiry_floor: 0` (folds into `evict_floor` only — the prior
             // best-effort behavior, reason fidelity not preserved for old logs).
-            if let Some(b) = engine.get_box_by_id(box_id) {
+            if let Some(b) = engine.get_topic_by_id(topic_id) {
                 let mut floors = b.floors.write();
                 if evict_floor > floors.evict_floor {
                     floors.evict_floor = evict_floor;
@@ -762,7 +762,7 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             }
         }
         WalRecord::Lease {
-            box_id,
+            topic_id,
             seq,
             event,
             node,
@@ -771,7 +771,7 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             deliveries,
             ..
         } => {
-            // Replay a durable leases-log event into the box's lease projection
+            // Replay a durable leases-log event into the topic's lease projection
             // (DESIGN §10.1). Only durable lease frames survive a crash; with the
             // default non-durable leases log nothing replays here and every
             // in-flight job is claimable again (self-healing, DESIGN §10.6).
@@ -781,7 +781,7 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // longer necessarily a ghost — replay it generically with no class
             // special-casing (the self-healing visibility timeout, DESIGN §10.6,
             // still makes any genuinely-orphaned lease claimable again).
-            if let Some(b) = engine.get_box_by_id(box_id) {
+            if let Some(b) = engine.get_topic_by_id(topic_id) {
                 if let Some(q) = &b.queue {
                     let mut q = q.lock();
                     q.apply_lease_event(event, seq, node, lease_id, deadline as i64, deliveries);
@@ -789,7 +789,7 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             }
         }
         WalRecord::HeadWatermark {
-            box_id, head_seq, ..
+            topic_id, head_seq, ..
         } => {
             // Record the durable head reservation (R3). We DON'T pad the index
             // here: a later Append frame in the log may legitimately fill seqs
@@ -798,10 +798,10 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // only raise the (monotone) reservation ceiling; the final
             // `apply_head_watermarks` pass (after every Append replayed) pads any
             // reserved-but-unwritten tail as deleted gaps and advances head, so an
-            // already-acked `disk` seq is never re-handed. (A `memory` box never
+            // already-acked `disk` seq is never re-handed. (A `memory` topic never
             // logs a HeadWatermark — it forgoes the seq-ceiling fsync, §0.10 — but
             // recovery applies any frame generically, no class special-casing.)
-            if let Some(b) = engine.get_box_by_id(box_id) {
+            if let Some(b) = engine.get_topic_by_id(topic_id) {
                 b.set_reserved_head(head_seq);
             }
         }

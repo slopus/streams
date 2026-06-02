@@ -48,7 +48,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
 use streams::types::{
-    BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
 };
 
 // ===========================================================================
@@ -65,7 +65,7 @@ struct ModelRecord {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ModelBox {
+struct ModelTopic {
     durable: bool,
     /// Acked + still-live records (delete removes from here).
     acked: BTreeMap<u64, ModelRecord>,
@@ -77,7 +77,7 @@ struct ModelBox {
     delete_floor: u64,
 }
 
-impl ModelBox {
+impl ModelTopic {
     /// Seqs the model says must be present (acked, not deleted below the floor).
     fn live_seqs(&self) -> Vec<u64> {
         self.acked
@@ -93,19 +93,19 @@ impl ModelBox {
 
 #[derive(Debug, Default)]
 struct RefModel {
-    boxes: BTreeMap<String, ModelBox>,
+    topics: BTreeMap<String, ModelTopic>,
 }
 
 impl RefModel {
-    fn ensure_box(&mut self, name: &str, durable: bool) {
-        self.boxes.entry(name.to_string()).or_insert(ModelBox {
+    fn ensure_topic(&mut self, name: &str, durable: bool) {
+        self.topics.entry(name.to_string()).or_insert(ModelTopic {
             durable,
             ..Default::default()
         });
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], rec: &ModelRecord) {
-        let b = self.boxes.get_mut(name).expect("box modeled before append");
+        let b = self.topics.get_mut(name).expect("topic modeled before append");
         for s in seqs {
             b.acked.insert(*s, rec.clone());
             b.ever_acked.insert(*s, rec.clone());
@@ -114,7 +114,7 @@ impl RefModel {
     }
 
     fn ack_delete(&mut self, name: &str, before_seq: Option<u64>, tag_eq: Option<&str>) {
-        let Some(b) = self.boxes.get_mut(name) else {
+        let Some(b) = self.topics.get_mut(name) else {
             return;
         };
         if let Some(bs) = before_seq {
@@ -135,7 +135,7 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox {
+    PutTopic {
         name: String,
         durable: bool,
     },
@@ -155,15 +155,15 @@ enum Op {
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
     for op in ops {
         match op {
-            Op::PutBox { name, durable } => {
-                let cfg = BoxConfig {
-                    r#type: BoxType::Log,
+            Op::PutTopic { name, durable } => {
+                let cfg = TopicConfig {
+                    r#type: TopicType::Log,
                     durable: *durable,
                     cap_records: 0,
                     ..Default::default()
                 };
-                if engine.put_box(name, cfg).is_ok() {
-                    model.ensure_box(name, *durable);
+                if engine.put_topic(name, cfg).is_ok() {
+                    model.ensure_topic(name, *durable);
                 }
             }
             Op::Append {
@@ -185,8 +185,8 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     config: None,
                     disable_backpressure: true,
                 };
-                if !model.boxes.contains_key(name) {
-                    model.ensure_box(name, false);
+                if !model.topics.contains_key(name) {
+                    model.ensure_topic(name, false);
                 }
                 if let Ok(resp) = engine.write(name, req, true) {
                     let seqs = resp.seqs.clone().unwrap_or_else(|| vec![resp.last_seq]);
@@ -250,7 +250,7 @@ fn sync_dirs(disk: &FakeDisk) {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -258,8 +258,8 @@ struct BoxDump {
     tombstone_reason: Option<String>,
 }
 
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone_reason = None;
     let mut from = 0u64;
@@ -302,7 +302,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -311,10 +311,10 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
     })
 }
 
-/// Assert the crash-consistency contract for one box. `whole_tail_durable` is
+/// Assert the crash-consistency contract for one topic. `whole_tail_durable` is
 /// true only when every acked write's fsync was guaranteed to have returned
 /// (a clean stop / all-durable crash).
-fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_durable: bool) {
+fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 
@@ -359,8 +359,8 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box's head matches the
-    //     acked head exactly; a `disk` box (acked before fsync) recovers at its
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` topic's head matches the
+    //     acked head exactly; a `disk` topic (acked before fsync) recovers at its
     //     durable head RESERVATION — its head may sit ABOVE the acked head by up to
     //     `DISK_HEAD_RESERVE_AHEAD` (dropped un-fsynced seqs become silent gaps) and
     //     never regresses below an acked seq when the whole tail was durable.
@@ -408,18 +408,18 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
 }
 
 fn assert_recovered_matches_model(engine: &Engine, model: &RefModel, whole_tail_durable: bool) {
-    for (name, mbox) in &model.boxes {
-        let dump = dump_box(engine, name);
+    for (name, mbox) in &model.topics {
+        let dump = dump_topic(engine, name);
         if mbox.acked.is_empty() && mbox.head == 0 {
             continue;
         }
         let Some(dump) = dump else {
             if mbox.durable && !mbox.live_seqs().is_empty() && whole_tail_durable {
-                panic!("{name}: durable box with acked records vanished after recovery");
+                panic!("{name}: durable topic with acked records vanished after recovery");
             }
             continue;
         };
-        assert_box_contract(name, mbox, &dump, whole_tail_durable);
+        assert_topic_contract(name, mbox, &dump, whole_tail_durable);
     }
 }
 
@@ -554,7 +554,7 @@ fn f_rec_delete_before_append_order() {
     // after the durable Delete commits but (likely) before the trailing Append's
     // fsync lands — placing the lost Append *after* a surviving Delete in WAL order.
     let ops = vec![
-        Op::PutBox {
+        Op::PutTopic {
             name: "q".into(),
             durable: true,
         },
@@ -644,10 +644,10 @@ fn f_rec_delete_before_append_order() {
         // Determinism / idempotence: re-recovering the same image yields the
         // identical state (the Delete re-applies idempotently, the lost Append
         // never resurrects).
-        let d1 = dump_box(&engine, "q");
+        let d1 = dump_topic(&engine, "q");
         drop(engine);
         let engine2 = open_engine(&disk);
-        let d2 = dump_box(&engine2, "q");
+        let d2 = dump_topic(&engine2, "q");
         assert_eq!(d1, d2, "recovery idempotent at crash_point {crash_point}");
         // Once the durable Delete frame has committed, seq 1 must stay gone — and
         // by WAL ordering, if ANY later append (seq >= 4, which the Delete frame
@@ -692,7 +692,7 @@ fn f_recdir_eio_create() {
             &engine,
             &mut model,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "d".into(),
                     durable: true,
                 },
@@ -728,7 +728,7 @@ fn f_recdir_eio_create() {
     // And the durable data is untouched: a clean reopen still recovers it fully.
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
-    let dump = dump_box(&engine, "d").expect("d survives the failed-then-clean reopen");
+    let dump = dump_topic(&engine, "d").expect("d survives the failed-then-clean reopen");
     assert_eq!(
         dump.records.len(),
         2,
@@ -872,7 +872,7 @@ fn f_nfs_cto_snapshot_read() {
             &engine,
             &mut model,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "s".into(),
                     durable: true,
                 },
@@ -974,7 +974,7 @@ fn f_nfs_cto_snapshot_read() {
             &engine,
             &mut model2,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "s".into(),
                     durable: true,
                 },
@@ -1006,7 +1006,7 @@ fn f_nfs_cto_snapshot_read() {
     // Recover a FRESH engine through the CTO fs: fresh opens see current bytes.
     let engine = Engine::with_data_dir_fs(cfg(), clock(), cto2.clone()).expect("recover via CtoFs");
     assert_recovered_matches_model(&engine, &model2, true);
-    let dump = dump_box(&engine, "s").expect("s recovered through fresh CTO opens");
+    let dump = dump_topic(&engine, "s").expect("s recovered through fresh CTO opens");
     assert_eq!(
         dump.records.len(),
         3,
@@ -1041,7 +1041,7 @@ fn f_compound_crash_snap_then_wal() {
             &engine,
             &mut model,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "c".into(),
                     durable: true,
                 },
@@ -1121,7 +1121,7 @@ fn f_compound_crash_snap_then_wal() {
     // resurrection.
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
-    let dump = dump_box(&engine, "c").expect("c converges after the compound crash");
+    let dump = dump_topic(&engine, "c").expect("c converges after the compound crash");
     assert_eq!(
         dump.records.keys().copied().collect::<Vec<_>>(),
         vec![1, 2, 3, 4],
@@ -1131,10 +1131,10 @@ fn f_compound_crash_snap_then_wal() {
     // Idempotent: a second recovery is byte-identical.
     drop(engine);
     let engine2 = open_engine(&disk);
-    let d2 = dump_box(&engine2, "c");
+    let d2 = dump_topic(&engine2, "c");
     drop(engine2);
     let engine3 = open_engine(&disk);
-    let d3 = dump_box(&engine3, "c");
+    let d3 = dump_topic(&engine3, "c");
     assert_eq!(
         d2, d3,
         "recovery converges (idempotent) after the compound crash"
@@ -1164,7 +1164,7 @@ fn f_compound_oom_in_error_path() {
             &engine,
             &mut model,
             &[
-                Op::PutBox {
+                Op::PutTopic {
                     name: "o".into(),
                     durable: true,
                 },
@@ -1208,7 +1208,7 @@ fn f_compound_oom_in_error_path() {
             // Now a CLEAN re-run on the untouched durable image must converge.
             let engine = open_engine(&disk);
             assert_recovered_matches_model(&engine, &model, true);
-            let dump = dump_box(&engine, "o").expect("o recovered after the failed attempt");
+            let dump = dump_topic(&engine, "o").expect("o recovered after the failed attempt");
             assert_eq!(
                 dump.records.len(),
                 3,
@@ -1227,7 +1227,7 @@ fn f_compound_oom_in_error_path() {
     // a final clean recovery converges to the full model.
     let engine = open_engine(&disk);
     assert_recovered_matches_model(&engine, &model, true);
-    let dump = dump_box(&engine, "o").expect("o present after a clean recovery");
+    let dump = dump_topic(&engine, "o").expect("o present after a clean recovery");
     assert_eq!(
         dump.records.len(),
         3,

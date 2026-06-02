@@ -1,7 +1,7 @@
 //! The per-record read filter pipeline (DESIGN §7.3).
 //!
 //! Deletion is no longer a standing read-time filter — it is applied eagerly by
-//! [`crate::engine::box_state::BoxState::apply_delete`], which marks slots
+//! [`crate::engine::topic_state::TopicState::apply_delete`], which marks slots
 //! `deleted`. The read pipeline therefore only composes three gates per
 //! candidate record: the **TTL** gate (involuntary expiry), the **deleted**
 //! check (voluntary, silent), and **node loop-prevention** (silent). A skipped

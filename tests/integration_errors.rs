@@ -1,6 +1,6 @@
 //! Phase-3 §2 — conventions + error model over real HTTP (API §0).
 //!
-//! Black-box wire-contract coverage of the cross-cutting conventions every
+//! Black-topic wire-contract coverage of the cross-cutting conventions every
 //! endpoint shares:
 //!
 //!   * the canonical error envelope `{"error":{code,message,detail?}}` on a
@@ -11,7 +11,7 @@
 //!   * `415` on a missing/wrong `Content-Type`,
 //!   * `413` on an over-limit body (pre-parse hard guard),
 //!   * the `batch_too_large` / `record_too_large` write limits,
-//!   * `404 box_not_found` / `router_not_found`,
+//!   * `404 topic_not_found` / `router_not_found`,
 //!   * bearer auth on a *second* server booted **with** `STREAMS_API_KEYS`
 //!     (the default elsewhere is the no-keys dev mode): `401` with no token and
 //!     with a bad token, success with a good token,
@@ -131,7 +131,7 @@ fn assert_bare_success_with_perf(body: &Value) {
 fn malformed_json_body_is_400_invalid_request() {
     let h = Harness::start();
     // Valid content-type but a syntactically broken body parses to 400.
-    let (status, body) = post_raw_json(&h, "/v0/boxes/jobs", b"{ not valid json ");
+    let (status, body) = post_raw_json(&h, "/v0/topics/jobs", b"{ not valid json ");
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(assert_error_envelope(&body), "invalid_request");
 }
@@ -140,12 +140,12 @@ fn malformed_json_body_is_400_invalid_request() {
 fn empty_write_body_is_400_invalid_request() {
     let h = Harness::start();
     // `{}` is well-formed JSON but a write needs >=1 record.
-    let (status, body) = h.post("/v0/boxes/jobs", json!({}));
+    let (status, body) = h.post("/v0/topics/jobs", json!({}));
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(assert_error_envelope(&body), "invalid_request");
 
     // Empty `records` array — same code.
-    let (status, body) = h.post("/v0/boxes/jobs", json!({ "records": [] }));
+    let (status, body) = h.post("/v0/topics/jobs", json!({ "records": [] }));
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(assert_error_envelope(&body), "invalid_request");
 }
@@ -153,11 +153,11 @@ fn empty_write_body_is_400_invalid_request() {
 #[test]
 fn delete_without_selector_is_400_invalid_request() {
     let h = Harness::start();
-    // Box must exist first (delete on an absent box is 404 — covered elsewhere).
-    let (status, _) = h.post("/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }));
+    // Topic must exist first (delete on an absent topic is 404 — covered elsewhere).
+    let (status, _) = h.post("/v0/topics/jobs", json!({ "records": [{ "data": 1 }] }));
     assert_eq!(status, StatusCode::CREATED);
     // Neither before_seq nor match -> 400.
-    let (status, body) = h.post("/v0/boxes/jobs/delete", json!({}));
+    let (status, body) = h.post("/v0/topics/jobs/delete", json!({}));
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(assert_error_envelope(&body), "invalid_request");
 }
@@ -165,11 +165,11 @@ fn delete_without_selector_is_400_invalid_request() {
 #[test]
 fn glob_without_trailing_star_is_400() {
     let h = Harness::start();
-    let (status, _) = h.post("/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }));
+    let (status, _) = h.post("/v0/topics/jobs", json!({ "records": [{ "data": 1 }] }));
     assert_eq!(status, StatusCode::CREATED);
     // A Glob predicate must end with a single trailing `*` (API §5); reject otherwise.
     let (status, body) = h.post(
-        "/v0/boxes/jobs/delete",
+        "/v0/topics/jobs/delete",
         json!({ "match": ["tag", "Glob", "no-star"] }),
     );
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -177,7 +177,7 @@ fn glob_without_trailing_star_is_400() {
 
     // A malformed predicate op is likewise a 400.
     let (status, body) = h.post(
-        "/v0/boxes/jobs/delete",
+        "/v0/topics/jobs/delete",
         json!({ "match": ["tag", "Regex", ".*"] }),
     );
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -185,10 +185,10 @@ fn glob_without_trailing_star_is_400() {
 }
 
 #[test]
-fn invalid_box_name_on_create_is_400() {
+fn invalid_topic_name_on_create_is_400() {
     let h = Harness::start();
     // A name that does not start alphanumeric is invalid (API §1.1 charset).
-    let (status, body) = h.put("/v0/boxes/-bad", json!({}));
+    let (status, body) = h.put("/v0/topics/-bad", json!({}));
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(assert_error_envelope(&body), "invalid_request");
 }
@@ -211,48 +211,48 @@ fn router_source_equals_dest_is_400() {
 }
 
 // ---------------------------------------------------------------------------
-// 404 box_not_found / router_not_found
+// 404 topic_not_found / router_not_found
 // ---------------------------------------------------------------------------
 
 #[test]
-fn box_state_on_absent_box_is_404_box_not_found() {
+fn topic_state_on_absent_topic_is_404_topic_not_found() {
     let h = Harness::start();
     // State read never auto-creates (API §1.2).
-    let (status, body) = h.get("/v0/boxes/ghost");
+    let (status, body) = h.get("/v0/topics/ghost");
     assert_eq!(status, StatusCode::NOT_FOUND);
     let code = assert_error_envelope(&body);
-    assert_eq!(code, "box_not_found");
-    // The detail carries the offending box name (API §0.5 example).
-    assert_eq!(body["error"]["detail"]["box"], "ghost");
+    assert_eq!(code, "topic_not_found");
+    // The detail carries the offending topic name (API §0.5 example).
+    assert_eq!(body["error"]["detail"]["topic"], "ghost");
 }
 
 #[test]
-fn diff_on_absent_box_is_404_box_not_found() {
+fn diff_on_absent_topic_is_404_topic_not_found() {
     let h = Harness::start();
     // Diff never auto-creates (API §3).
-    let (status, body) = h.post("/v0/boxes/ghost/diff", json!({ "from_seq": 0 }));
+    let (status, body) = h.post("/v0/topics/ghost/diff", json!({ "from_seq": 0 }));
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(assert_error_envelope(&body), "box_not_found");
+    assert_eq!(assert_error_envelope(&body), "topic_not_found");
 }
 
 #[test]
-fn delete_records_on_absent_box_is_404_box_not_found() {
+fn delete_records_on_absent_topic_is_404_topic_not_found() {
     let h = Harness::start();
-    let (status, body) = h.post("/v0/boxes/ghost/delete", json!({ "before_seq": 5 }));
+    let (status, body) = h.post("/v0/topics/ghost/delete", json!({ "before_seq": 5 }));
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(assert_error_envelope(&body), "box_not_found");
+    assert_eq!(assert_error_envelope(&body), "topic_not_found");
 }
 
 #[test]
-fn write_with_create_false_on_absent_box_is_404() {
+fn write_with_create_false_on_absent_topic_is_404() {
     let h = Harness::start();
     // `create:false` refuses lazy create (Redis NOMKSTREAM, API §2).
     let (status, body) = h.post(
-        "/v0/boxes/ghost",
+        "/v0/topics/ghost",
         json!({ "create": false, "records": [{ "data": 1 }] }),
     );
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(assert_error_envelope(&body), "box_not_found");
+    assert_eq!(assert_error_envelope(&body), "topic_not_found");
 }
 
 #[test]
@@ -268,13 +268,13 @@ fn get_absent_router_is_404_router_not_found() {
 #[test]
 fn router_create_dest_false_missing_dest_is_404() {
     let h = Harness::start();
-    // create_dest:false + an absent dest box -> 404 box_not_found (API §6.1).
+    // create_dest:false + an absent dest topic -> 404 topic_not_found (API §6.1).
     let (status, body) = h.put(
         "/v0/routers/r1",
         json!({ "source": "src", "dest": "missingdst", "create_dest": false }),
     );
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(assert_error_envelope(&body), "box_not_found");
+    assert_eq!(assert_error_envelope(&body), "topic_not_found");
 }
 
 // ---------------------------------------------------------------------------
@@ -284,8 +284,8 @@ fn router_create_dest_false_missing_dest_is_404() {
 #[test]
 fn wrong_method_is_405_method_not_allowed() {
     let h = Harness::start();
-    // `/v0/boxes/:box/diff` is POST-only; a GET is the wrong method.
-    let (status, body) = h.get("/v0/boxes/jobs/diff");
+    // `/v0/topics/:topic/diff` is POST-only; a GET is the wrong method.
+    let (status, body) = h.get("/v0/topics/jobs/diff");
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(assert_error_envelope(&body), "method_not_allowed");
 }
@@ -293,25 +293,25 @@ fn wrong_method_is_405_method_not_allowed() {
 #[test]
 fn delete_on_diff_path_is_405() {
     let h = Harness::start();
-    // `/v0/boxes/:box/delete` is POST-only; DELETE is the wrong method.
-    let (status, body) = h.delete("/v0/boxes/jobs/delete");
+    // `/v0/topics/:topic/delete` is POST-only; DELETE is the wrong method.
+    let (status, body) = h.delete("/v0/topics/jobs/delete");
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(assert_error_envelope(&body), "method_not_allowed");
 }
 
 // ---------------------------------------------------------------------------
-// 409 conflict (box_not_empty, router_cycle)
+// 409 conflict (topic_not_empty, router_cycle)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn delete_non_empty_box_if_empty_is_409_box_not_empty() {
+fn delete_non_empty_topic_if_empty_is_409_topic_not_empty() {
     let h = Harness::start();
-    let (status, _) = h.post("/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }));
+    let (status, _) = h.post("/v0/topics/jobs", json!({ "records": [{ "data": 1 }] }));
     assert_eq!(status, StatusCode::CREATED);
-    // `?if_empty=true` against a non-empty box -> 409 box_not_empty (API §1.4).
-    let (status, body) = h.delete("/v0/boxes/jobs?if_empty=true");
+    // `?if_empty=true` against a non-empty topic -> 409 topic_not_empty (API §1.4).
+    let (status, body) = h.delete("/v0/topics/jobs?if_empty=true");
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(assert_error_envelope(&body), "box_not_empty");
+    assert_eq!(assert_error_envelope(&body), "topic_not_empty");
 }
 
 #[test]
@@ -342,7 +342,7 @@ fn oversized_body_is_413_payload_too_large() {
     // A ~4 KiB JSON body exceeds the 1 KiB cap; rejected before parse.
     let big = "x".repeat(4096);
     let body = json!({ "records": [{ "data": big }] });
-    let (status, env) = h.post("/v0/boxes/jobs", body);
+    let (status, env) = h.post("/v0/topics/jobs", body);
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(assert_error_envelope(&env), "payload_too_large");
 }
@@ -355,7 +355,7 @@ fn oversized_body_is_413_payload_too_large() {
 fn missing_content_type_is_415() {
     let h = Harness::start();
     // A POST with a body but no Content-Type header -> 415 (API §0.3).
-    let (status, body) = post_raw(&h, "/v0/boxes/jobs", b"{\"records\":[{\"data\":1}]}", None);
+    let (status, body) = post_raw(&h, "/v0/topics/jobs", b"{\"records\":[{\"data\":1}]}", None);
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(assert_error_envelope(&body), "unsupported_media_type");
 }
@@ -364,7 +364,7 @@ fn missing_content_type_is_415() {
 fn wrong_content_type_is_415() {
     let h = Harness::start();
     // A non-JSON content type on a body endpoint -> 415.
-    let (status, body) = post_raw(&h, "/v0/boxes/jobs", b"<xml/>", Some("application/xml"));
+    let (status, body) = post_raw(&h, "/v0/topics/jobs", b"<xml/>", Some("application/xml"));
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(assert_error_envelope(&body), "unsupported_media_type");
 }
@@ -375,7 +375,7 @@ fn diff_wrong_content_type_is_415() {
     // The 415 guard is shared by every body endpoint; verify on diff too.
     let (status, body) = post_raw(
         &h,
-        "/v0/boxes/jobs/diff",
+        "/v0/topics/jobs/diff",
         b"{\"from_seq\":0}",
         Some("text/plain"),
     );
@@ -393,7 +393,7 @@ fn batch_over_limit_is_400_batch_too_large() {
     // MAX_BATCH_RECORDS is 10_000; one more trips batch_too_large (API §2).
     let n = streams::config::MAX_BATCH_RECORDS + 1;
     let records: Vec<Value> = (0..n).map(|_| json!({ "data": 0 })).collect();
-    let (status, body) = h.post("/v0/boxes/jobs", json!({ "records": records }));
+    let (status, body) = h.post("/v0/topics/jobs", json!({ "records": records }));
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(assert_error_envelope(&body), "batch_too_large");
 }
@@ -402,35 +402,35 @@ fn batch_over_limit_is_400_batch_too_large() {
 fn record_over_byte_limit_is_400_record_too_large() {
     let h = Harness::start();
     // A single record whose data exceeds MAX_RECORD_BYTES (1 MiB) is rejected
-    // with record_too_large (distinct from a retryable 422 box_full).
+    // with record_too_large (distinct from a retryable 422 topic_full).
     let big = "y".repeat(streams::config::MAX_RECORD_BYTES + 1024);
-    let (status, body) = h.post("/v0/boxes/jobs", json!({ "records": [{ "data": big }] }));
+    let (status, body) = h.post("/v0/topics/jobs", json!({ "records": [{ "data": big }] }));
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(assert_error_envelope(&body), "record_too_large");
 }
 
 // ---------------------------------------------------------------------------
-// 422 box_full (discard:"reject")
+// 422 topic_full (discard:"reject")
 // ---------------------------------------------------------------------------
 
 #[test]
-fn full_reject_box_is_422_box_full() {
+fn full_reject_topic_is_422_topic_full() {
     let h = Harness::start();
-    // A capacity-1 reject box: the second record overflows -> 422 box_full,
+    // A capacity-1 reject topic: the second record overflows -> 422 topic_full,
     // nothing appended (all-or-nothing). (API §2 / §0.10 discard:"reject".)
     let (status, _) = h.put(
-        "/v0/boxes/q",
+        "/v0/topics/q",
         json!({ "cap_records": 1, "discard": "reject" }),
     );
     assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = h.post("/v0/boxes/q", json!({ "records": [{ "data": 1 }] }));
+    let (status, _) = h.post("/v0/topics/q", json!({ "records": [{ "data": 1 }] }));
     assert_eq!(status, StatusCode::OK);
-    let (status, body) = h.post("/v0/boxes/q", json!({ "records": [{ "data": 2 }] }));
+    let (status, body) = h.post("/v0/topics/q", json!({ "records": [{ "data": 2 }] }));
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(assert_error_envelope(&body), "box_full");
+    assert_eq!(assert_error_envelope(&body), "topic_full");
 
     // The rejected write appended nothing: head_seq unchanged at 1.
-    let (status, st) = h.get("/v0/boxes/q");
+    let (status, st) = h.get("/v0/topics/q");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(st["head_seq"], 1, "rejected write must not append");
     assert_eq!(st["count"], 1);
@@ -445,14 +445,14 @@ fn success_bodies_are_bare_data_with_performance() {
     let h = Harness::start();
 
     // PUT create (201).
-    let (status, body) = h.put("/v0/boxes/jobs", json!({ "durable": true }));
+    let (status, body) = h.put("/v0/topics/jobs", json!({ "durable": true }));
     assert_eq!(status, StatusCode::CREATED);
     assert_bare_success_with_perf(&body);
     assert_eq!(body["created"], true);
 
-    // POST write (200, box already exists).
+    // POST write (200, topic already exists).
     let (status, body) = h.post(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": { "v": 1 } }, { "data": { "v": 2 } }] }),
     );
     assert_eq!(status, StatusCode::OK);
@@ -460,28 +460,28 @@ fn success_bodies_are_bare_data_with_performance() {
     assert_eq!(body["seqs"], json!([1, 2]));
 
     // GET state.
-    let (status, body) = h.get("/v0/boxes/jobs");
+    let (status, body) = h.get("/v0/topics/jobs");
     assert_eq!(status, StatusCode::OK);
     assert_bare_success_with_perf(&body);
 
     // POST diff.
-    let (status, body) = h.post("/v0/boxes/jobs/diff", json!({ "from_seq": 0 }));
+    let (status, body) = h.post("/v0/topics/jobs/diff", json!({ "from_seq": 0 }));
     assert_eq!(status, StatusCode::OK);
     assert_bare_success_with_perf(&body);
     assert_eq!(body["records"].as_array().unwrap().len(), 2);
 
-    // GET list boxes.
-    let (status, body) = h.get("/v0/boxes");
+    // GET list topics.
+    let (status, body) = h.get("/v0/topics");
     assert_eq!(status, StatusCode::OK);
     assert_bare_success_with_perf(&body);
 
     // POST delete records.
-    let (status, body) = h.post("/v0/boxes/jobs/delete", json!({ "before_seq": 2 }));
+    let (status, body) = h.post("/v0/topics/jobs/delete", json!({ "before_seq": 2 }));
     assert_eq!(status, StatusCode::OK);
     assert_bare_success_with_perf(&body);
 
-    // DELETE box.
-    let (status, body) = h.delete("/v0/boxes/jobs");
+    // DELETE topic.
+    let (status, body) = h.delete("/v0/topics/jobs");
     assert_eq!(status, StatusCode::OK);
     assert_bare_success_with_perf(&body);
     assert_eq!(body["deleted"], true);
@@ -505,12 +505,12 @@ fn auth_harness(key: &str) -> Harness {
 fn auth_required_no_token_is_401() {
     let h = auth_harness("s3cr3t");
     // No Authorization header on a data endpoint -> 401 unauthorized.
-    let (status, body) = h.post("/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }));
+    let (status, body) = h.post("/v0/topics/jobs", json!({ "records": [{ "data": 1 }] }));
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(assert_error_envelope(&body), "unauthorized");
 
     // GET state likewise requires a key.
-    let (status, body) = h.get("/v0/boxes/jobs");
+    let (status, body) = h.get("/v0/topics/jobs");
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(assert_error_envelope(&body), "unauthorized");
 }
@@ -519,7 +519,7 @@ fn auth_required_no_token_is_401() {
 fn auth_bad_token_is_401() {
     let h = auth_harness("s3cr3t");
     let (status, body) = h.post_auth(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": 1 }] }),
         "wrong-key",
     );
@@ -532,7 +532,7 @@ fn auth_good_token_succeeds() {
     let h = auth_harness("s3cr3t");
     // A valid bearer key grants full access: first write creates -> 201.
     let (status, body) = h.post_auth(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": 1 }] }),
         "s3cr3t",
     );
@@ -541,7 +541,7 @@ fn auth_good_token_succeeds() {
     assert_eq!(body["created"], true);
 
     // A subsequent authed read works and shows the record landed.
-    let (status, st) = h.get_auth("/v0/boxes/jobs", "s3cr3t");
+    let (status, st) = h.get_auth("/v0/topics/jobs", "s3cr3t");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(st["head_seq"], 1);
 }

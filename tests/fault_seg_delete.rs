@@ -6,8 +6,8 @@
 //! records + ordering; the in-memory mark, the WAL frame, and the on-disk flag must
 //! agree, and recovery re-derives the deletion from the on-disk flag.
 //!
-//! These oracles live at the segment-store + segment-writer + box-state seam, so
-//! each test drives the REAL `SegmentWriter` / `LocalSegmentStore` / `BoxState`
+//! These oracles live at the segment-store + segment-writer + topic-state seam, so
+//! each test drives the REAL `SegmentWriter` / `LocalSegmentStore` / `TopicState`
 //! through an in-memory `FakeDisk` / `FaultFs` (the Phase-8A harness, injected via
 //! the `*_with` constructors). The engine's own `build_segment_writer` opens the
 //! hot store with `RealFs` (never the injected FS), so — exactly like
@@ -45,16 +45,16 @@ use serde_json::json;
 
 use streams::clock::{SharedClock, TestClock};
 use streams::config::SegmentConfig;
-use streams::engine::box_state::{BoxState, StoredRecord};
+use streams::engine::topic_state::{TopicState, StoredRecord};
 use streams::engine::segwriter::SegmentWriter;
 use streams::storage::testfs::FakeDisk;
 use streams::storage::{
-    decode_data_frame_full, frame_is_deleted, lookup, BoxTier, Fs, LocalSegmentStore, SegmentPart,
+    decode_data_frame_full, frame_is_deleted, lookup, TopicTier, Fs, LocalSegmentStore, SegmentPart,
     SegmentStore,
 };
-use streams::types::BoxConfig;
+use streams::types::TopicConfig;
 
-const SEG_ROOT: &str = "/data/boxes/00000001";
+const SEG_ROOT: &str = "/data/topics/00000001";
 
 fn test_clock(ms: i64) -> (SharedClock, Arc<TestClock>) {
     let tc = Arc::new(TestClock::new(ms));
@@ -67,7 +67,7 @@ fn test_clock(ms: i64) -> (SharedClock, Arc<TestClock>) {
 fn seg_writer(fs: Arc<dyn Fs>, clock: SharedClock, max_events: u64) -> SegmentWriter {
     let hot = LocalSegmentStore::open_with(PathBuf::from(SEG_ROOT), fs)
         .expect("hot segment store opens through the injected fs");
-    let tier = Arc::new(BoxTier::new(Box::new(hot), None));
+    let tier = Arc::new(TopicTier::new(Box::new(hot), None));
     let cfg = SegmentConfig {
         max_events,
         max_bytes: 0,
@@ -310,17 +310,17 @@ fn f_seg_delflip_crash_mid_flip() {
 }
 
 // ===========================================================================
-// Box-level: WHOLE-SEGMENT clear vs PARTIAL per-record flip + recovery scan.
-// Drives the real BoxState (writer-backed) through the injected FS.
+// Topic-level: WHOLE-SEGMENT clear vs PARTIAL per-record flip + recovery scan.
+// Drives the real TopicState (writer-backed) through the injected FS.
 // ===========================================================================
 
-/// Build a writer-backed `BoxState` whose segments live under `fs`, sealing every
+/// Build a writer-backed `TopicState` whose segments live under `fs`, sealing every
 /// `max_events`. (Mirrors `attach_segwriter`, but with the FS seam injected so the
 /// segment path is testable under the hostile FS.)
-fn writer_backed_box(fs: Arc<dyn Fs>, clock: SharedClock, max_events: u64) -> BoxState {
-    let mut state = BoxState::new("b".into(), 1, BoxConfig::default(), 1, 1);
+fn writer_backed_topic(fs: Arc<dyn Fs>, clock: SharedClock, max_events: u64) -> TopicState {
+    let mut state = TopicState::new("b".into(), 1, TopicConfig::default(), 1, 1);
     let hot = LocalSegmentStore::open_with(PathBuf::from(SEG_ROOT), fs).unwrap();
-    let tier = Arc::new(BoxTier::new(Box::new(hot), None));
+    let tier = Arc::new(TopicTier::new(Box::new(hot), None));
     let cfg = SegmentConfig {
         max_events,
         max_bytes: 0,
@@ -360,7 +360,7 @@ fn rec(seq: u64) -> StoredRecord {
 fn f_seg_delflip_whole_segment_clear() {
     let disk = FakeDisk::new();
     let fs = disk.arc();
-    let b = writer_backed_box(fs.clone(), test_clock(0).0, 2); // 2-per-segment.
+    let b = writer_backed_topic(fs.clone(), test_clock(0).0, 2); // 2-per-segment.
 
     // Append seqs 1..=6 (seg{1,2}, seg{3,4}, active{5,6 once 7 appends}).
     let now = 1_700_000_000_000;
@@ -416,7 +416,7 @@ fn f_seg_delflip_whole_segment_clear() {
 fn f_seg_delflip_partial_per_record() {
     let disk = FakeDisk::new();
     let fs = disk.arc();
-    let b = writer_backed_box(fs.clone(), test_clock(0).0, 4); // 4-per-segment.
+    let b = writer_backed_topic(fs.clone(), test_clock(0).0, 4); // 4-per-segment.
 
     let now = 1_700_000_000_000;
     for seq in 1..=5u64 {
@@ -453,17 +453,17 @@ fn f_seg_delflip_partial_per_record() {
         "per-record flips are exactly the deleted seqs"
     );
 
-    // RECOVERY: rebuild a fresh writer-backed box that pre-seeds its index with ALL
+    // RECOVERY: rebuild a fresh writer-backed topic that pre-seeds its index with ALL
     // sealed records as LIVE (as if a WAL trim lost the Delete frame AND a snapshot
     // had captured them live), then re-derive the deletions from the on-disk flags.
     let b2 = {
-        let mut state = BoxState::new("b".into(), 1, BoxConfig::default(), 1, 1);
+        let mut state = TopicState::new("b".into(), 1, TopicConfig::default(), 1, 1);
         // Seed the index with seqs 1..=5 all live (simulating a pre-delete snapshot).
         for seq in 1..=5u64 {
             state.append(vec![rec(seq)], now);
         }
         let hot = LocalSegmentStore::open_with(PathBuf::from(SEG_ROOT), fs.clone()).unwrap();
-        let tier = Arc::new(BoxTier::new(Box::new(hot), None));
+        let tier = Arc::new(TopicTier::new(Box::new(hot), None));
         let cfg = SegmentConfig {
             max_events: 4,
             max_bytes: 0,

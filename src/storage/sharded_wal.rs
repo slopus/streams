@@ -1,7 +1,7 @@
 //! Sharded write-ahead log (WAL sharding): N independent [`Wal`] shards, each
 //! with its own WAL file set + writer thread + mpsc ingest + adaptive group
 //! commit + per-shard rotation/backpressure/EIO handling, fronted by a stable
-//! box-id → shard router.
+//! topic-id → shard router.
 //!
 //! # Why shard
 //!
@@ -9,23 +9,23 @@
 //! durable writes — the write-throughput bottleneck. Splitting it into N shards
 //! removes the global contention on the per-write hot path: there is **no** single
 //! global seq allocator, registry lock, notify, or hot metrics atomic shared
-//! across shards. Each box is routed to exactly ONE shard for the lifetime of a
-//! run (a stable hash of its interned `box_id`), so every per-box ordering /
+//! across shards. Each topic is routed to exactly ONE shard for the lifetime of a
+//! run (a stable hash of its interned `topic_id`), so every per-topic ordering /
 //! durability guarantee still holds within that shard's single ordered writer:
 //!
-//! - **per-box seq order** — a box's frames all go to one shard's ordered writer,
+//! - **per-topic seq order** — a topic's frames all go to one shard's ordered writer,
 //!   so they are written in seq order exactly as before.
-//! - **commit sequencer / publish tickets** — per-box, unaffected by the shard
-//!   split (they coordinate writers of the same box, all on one shard).
+//! - **commit sequencer / publish tickets** — per-topic, unaffected by the shard
+//!   split (they coordinate writers of the same topic, all on one shard).
 //! - **R3 durable head watermark** — the `HeadWatermark` frame rides the same
-//!   shard as the box's appends, so its fsync still orders ahead of the acked seq.
-//! - **R5 atomic batch** — a caller batch is one box's records; `submit_batch`
-//!   lands it on that box's shard as one bounded-channel slot (all-or-none).
+//!   shard as the topic's appends, so its fsync still orders ahead of the acked seq.
+//! - **R5 atomic batch** — a caller batch is one topic's records; `submit_batch`
+//!   lands it on that topic's shard as one bounded-channel slot (all-or-none).
 //! - **durability classes** — the per-shard writer fsyncs (or not) exactly as the
 //!   single writer did.
-//! - **WAL-first delete** — a `Delete` frame rides the box's shard.
+//! - **WAL-first delete** — a `Delete` frame rides the topic's shard.
 //!
-//! Cross-box global order was never a guarantee, so spreading different boxes
+//! Cross-topic global order was never a guarantee, so spreading different topics
 //! across shards changes nothing observable.
 //!
 //! # On-disk layout (shard-count-agnostic recovery)
@@ -36,7 +36,7 @@
 //!
 //! Recovery (see [`crate::engine::recovery`]) replays **every** WAL file it finds
 //! — the flat files AND every `shard-*/` subdir — dispatching each frame to its
-//! box by `box_id`, never assuming a box lives in `box_id % N`. This is what lets
+//! topic by `topic_id`, never assuming a topic lives in `topic_id % N`. This is what lets
 //! `STREAMS_WAL_SHARDS` be reconfigured between restarts with no data loss: a dir
 //! written with 8 shards recovers correctly when reopened with 1 (or 4, or 16).
 
@@ -67,27 +67,27 @@ pub fn shard_group_key(s: usize, n: usize) -> String {
     }
 }
 
-/// Map an interned `box_id` to a shard index in `0..n`. A stable hash (XXH3) of
+/// Map an interned `topic_id` to a shard index in `0..n`. A stable hash (XXH3) of
 /// the id keeps the distribution even and the mapping deterministic within a run.
-/// `box_id == 0` (box-agnostic control frames: routers, checkpoints) is pinned to
-/// shard 0 so those frames always have a home; they are box-agnostic and replay
+/// `topic_id == 0` (topic-agnostic control frames: routers, checkpoints) is pinned to
+/// shard 0 so those frames always have a home; they are topic-agnostic and replay
 /// shard-independently, so their shard is irrelevant to recovery.
 #[inline]
-pub fn shard_for_box(box_id: u32, n: usize) -> usize {
+pub fn shard_for_topic(topic_id: u32, n: usize) -> usize {
     debug_assert!(n >= 1);
-    if n <= 1 || box_id == 0 {
-        // Single shard ⇒ everything on shard 0. box_id 0 (box-agnostic control
+    if n <= 1 || topic_id == 0 {
+        // Single shard ⇒ everything on shard 0. topic_id 0 (topic-agnostic control
         // frames: routers, checkpoints) is pinned to shard 0 — they replay
         // shard-independently, so a deterministic home keeps placement predictable.
         return 0;
     }
     // XXH3 of the 4 id bytes, modulo the shard count. Cheap, even, deterministic.
-    let h = xxhash_rust::xxh3::xxh3_64(&box_id.to_le_bytes());
+    let h = xxhash_rust::xxh3::xxh3_64(&topic_id.to_le_bytes());
     (h % n as u64) as usize
 }
 
 /// A handle the engine holds to submit records to the sharded WAL: it routes each
-/// record to its box's shard writer. Cloneable; all clones feed the same set of
+/// record to its topic's shard writer. Cloneable; all clones feed the same set of
 /// shard writers. The per-write hot path touches exactly ONE shard (its writer +
 /// its metrics), so there is no global contention across shards.
 #[derive(Clone)]
@@ -109,36 +109,36 @@ impl ShardedWalWriter {
         &self.writers[s]
     }
 
-    /// The writer for the shard `record` routes to (by its `box_id`).
+    /// The writer for the shard `record` routes to (by its `topic_id`).
     #[inline]
     fn writer_for(&self, record: &WalRecord) -> &WalWriter {
-        self.writer(shard_for_box(record.box_id(), self.writers.len()))
+        self.writer(shard_for_topic(record.topic_id(), self.writers.len()))
     }
 
-    /// Submit `record` to its box's shard with durability class `durable`. See
+    /// Submit `record` to its topic's shard with durability class `durable`. See
     /// [`WalWriter::submit`].
     pub fn submit(&self, record: WalRecord, durable: bool) -> Result<CommitToken, WalError> {
         let w = self.writer_for(&record);
         w.submit(record, durable)
     }
 
-    /// Submit an atomic caller batch (one box's records) to that box's shard.
-    /// Every record in a caller batch shares one `box_id`, so the whole batch
+    /// Submit an atomic caller batch (one topic's records) to that topic's shard.
+    /// Every record in a caller batch shares one `topic_id`, so the whole batch
     /// routes to a single shard and is accepted all-or-none on that shard's
-    /// bounded channel (R5). `box_id` selects the shard up front (the batch is
+    /// bounded channel (R5). `topic_id` selects the shard up front (the batch is
     /// non-empty for any real write; an empty batch routes to shard 0 and returns
     /// a pre-committed token, exactly like [`WalWriter::submit_batch`]).
     pub fn submit_batch(
         &self,
-        box_id: u32,
+        topic_id: u32,
         records: Vec<WalRecord>,
         durable: bool,
     ) -> Result<CommitToken, WalError> {
-        let s = shard_for_box(box_id, self.writers.len());
+        let s = shard_for_topic(topic_id, self.writers.len());
         self.writer(s).submit_batch(records, durable)
     }
 
-    /// Submit and block until commit, in one call (routes by `record.box_id()`).
+    /// Submit and block until commit, in one call (routes by `record.topic_id()`).
     pub fn append(&self, record: WalRecord, durable: bool) -> Result<(), WalError> {
         self.submit(record, durable)?.wait()
     }
@@ -306,7 +306,7 @@ impl ShardedWal {
         })
     }
 
-    /// A cloneable handle for submitting records (routes by box_id → shard).
+    /// A cloneable handle for submitting records (routes by topic_id → shard).
     pub fn writer(&self) -> ShardedWalWriter {
         self.writer.clone()
     }
@@ -344,9 +344,9 @@ mod tests {
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
-    fn append(box_id: u32, seq: u64) -> WalRecord {
+    fn append(topic_id: u32, seq: u64) -> WalRecord {
         WalRecord::Append {
-            box_id,
+            topic_id,
             seq,
             ts: 1_700_000_000_000 + seq,
             node: None,
@@ -355,37 +355,37 @@ mod tests {
         }
     }
 
-    /// Routing is deterministic and stable for a given (box_id, n).
+    /// Routing is deterministic and stable for a given (topic_id, n).
     #[test]
     fn routing_is_deterministic_and_in_range() {
         for n in [1usize, 2, 4, 8, 16] {
             for id in 0..1000u32 {
-                let s = shard_for_box(id, n);
+                let s = shard_for_topic(id, n);
                 assert!(s < n, "shard {s} in range for n={n}");
-                assert_eq!(s, shard_for_box(id, n), "stable");
+                assert_eq!(s, shard_for_topic(id, n), "stable");
             }
         }
         // n == 1 routes everything to shard 0.
         for id in 0..100u32 {
-            assert_eq!(shard_for_box(id, 1), 0);
+            assert_eq!(shard_for_topic(id, 1), 0);
         }
-        // box_id 0 (control frames) pins to shard 0.
+        // topic_id 0 (control frames) pins to shard 0.
         for n in [1usize, 2, 4, 8] {
-            assert_eq!(shard_for_box(0, n), 0);
+            assert_eq!(shard_for_topic(0, n), 0);
         }
     }
 
-    /// Across many box ids the hash spreads boxes over all shards (no shard is
+    /// Across many topic ids the hash spreads topics over all shards (no shard is
     /// starved) — the property that makes sharding scale.
     #[test]
     fn routing_spreads_across_all_shards() {
         let n = 8usize;
         let mut counts = vec![0usize; n];
         for id in 1..=10_000u32 {
-            counts[shard_for_box(id, n)] += 1;
+            counts[shard_for_topic(id, n)] += 1;
         }
         for (s, c) in counts.iter().enumerate() {
-            assert!(*c > 0, "shard {s} received some boxes (got {c})");
+            assert!(*c > 0, "shard {s} received some topics (got {c})");
         }
     }
 
@@ -404,7 +404,7 @@ mod tests {
         )
         .unwrap();
         let w = wal.writer();
-        // Write a handful of distinct boxes; record which shard each routes to.
+        // Write a handful of distinct topics; record which shard each routes to.
         let ids: Vec<u32> = (1..=12).collect();
         for &id in &ids {
             for seq in 1..=3u64 {
@@ -413,9 +413,9 @@ mod tests {
         }
         wal.shutdown();
 
-        // Each box's Append frames appear in exactly its routed shard subdir.
+        // Each topic's Append frames appear in exactly its routed shard subdir.
         for &id in &ids {
-            let expect = shard_for_box(id, n);
+            let expect = shard_for_topic(id, n);
             let mut found_in: Vec<usize> = Vec::new();
             for s in 0..n {
                 let sub = dir.path().join("wal").join(shard_subdir(s));
@@ -427,7 +427,7 @@ mod tests {
                 let mut seen = false;
                 for f in files {
                     for fr in WalReader::open(&f).unwrap() {
-                        if matches!(&fr.record, WalRecord::Append { box_id, .. } if *box_id == id) {
+                        if matches!(&fr.record, WalRecord::Append { topic_id, .. } if *topic_id == id) {
                             seen = true;
                         }
                     }
@@ -436,7 +436,7 @@ mod tests {
                     found_in.push(s);
                 }
             }
-            assert_eq!(found_in, vec![expect], "box {id} routed to shard {expect}");
+            assert_eq!(found_in, vec![expect], "topic {id} routed to shard {expect}");
         }
     }
 
@@ -541,15 +541,15 @@ mod tests {
     }
 
     /// Per-shard failure isolation: stalling shard 0's fsync must NOT block a
-    /// durable write to a box that routes to a DIFFERENT shard. We pick two box
+    /// durable write to a topic that routes to a DIFFERENT shard. We pick two topic
     /// ids that route to different shards, stall the first's shard, and prove the
     /// second's durable `append` still returns while the first is parked in fsync.
     #[test]
     fn a_stalled_shard_does_not_block_others() {
         let n = 4usize;
-        // Find two box ids on different shards (one of them shard 0).
-        let id_a = (1..1000u32).find(|&id| shard_for_box(id, n) == 0).unwrap();
-        let id_b = (1..1000u32).find(|&id| shard_for_box(id, n) != 0).unwrap();
+        // Find two topic ids on different shards (one of them shard 0).
+        let id_a = (1..1000u32).find(|&id| shard_for_topic(id, n) == 0).unwrap();
+        let id_b = (1..1000u32).find(|&id| shard_for_topic(id, n) != 0).unwrap();
         let stalled_sub = shard_subdir(0);
 
         let dir = tempfile::tempdir().unwrap();

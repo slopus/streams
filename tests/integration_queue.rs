@@ -2,7 +2,7 @@
 //! server (the harness in `tests/common`: a real socket, the exact
 //! `http::build_router` the binary serves).
 //!
-//! Wire-contract / black-box coverage of the documented queue surface (API §10):
+//! Wire-contract / black-topic coverage of the documented queue surface (API §10):
 //!
 //!   * `PUT type:"queue"` create → `GET` returns `type:"queue"` + a `queue`
 //!     sub-object (`ready`/`in_flight`/`dead_lettered`) (§1.2/§10.7).
@@ -16,7 +16,7 @@
 //!     bound server by an injected `TestClock` (`Harness::start_with_test_clock`),
 //!     so the timing is deterministic and the tests are NOT flaky / use no
 //!     wall-clock sleeps for correctness.
-//!   * a non-queue (log) box rejects every queue endpoint with `409 not_a_queue`.
+//!   * a non-queue (log) topic rejects every queue endpoint with `409 not_a_queue`.
 //!   * `GET /work` SSE auto-claims + pushes `event: job` frames, caps in-flight at
 //!     `max`, releases leases on disconnect, and `406`s a non-SSE Accept.
 //!   * the queue **type survives a restart** (durable jobs log) while the
@@ -30,25 +30,25 @@ use std::time::{Duration, Instant};
 use common::{Harness, StatusCode};
 use serde_json::json;
 
-/// Create a default (30 s lease) queue box and produce `n` numbered jobs.
+/// Create a default (30 s lease) queue topic and produce `n` numbered jobs.
 fn make_queue(h: &Harness, name: &str, n: usize) {
     make_queue_cfg(h, name, n, json!({ "type": "queue", "lease_ms": 30000 }));
 }
 
-/// Create a queue box from an explicit config object, then produce `n` jobs.
+/// Create a queue topic from an explicit config object, then produce `n` jobs.
 fn make_queue_cfg(h: &Harness, name: &str, n: usize, cfg: serde_json::Value) {
-    let (s, _) = h.put(&format!("/v0/boxes/{name}"), cfg);
+    let (s, _) = h.put(&format!("/v0/topics/{name}"), cfg);
     assert_eq!(s, StatusCode::CREATED);
     if n > 0 {
         let records: Vec<_> = (0..n).map(|i| json!({ "data": { "i": i } })).collect();
-        let (s, _) = h.post(&format!("/v0/boxes/{name}"), json!({ "records": records }));
+        let (s, _) = h.post(&format!("/v0/topics/{name}"), json!({ "records": records }));
         assert!(s.is_success());
     }
 }
 
-/// Fetch `queue.{ready,in_flight,dead_lettered}` for a queue box.
+/// Fetch `queue.{ready,in_flight,dead_lettered}` for a queue topic.
 fn queue_counters(h: &Harness, name: &str) -> (u64, u64, u64) {
-    let (_, st) = h.get(&format!("/v0/boxes/{name}"));
+    let (_, st) = h.get(&format!("/v0/topics/{name}"));
     let q = &st["queue"];
     (
         q["ready"].as_u64().unwrap(),
@@ -62,7 +62,7 @@ fn queue_state_exposes_type_and_counters() {
     let h = Harness::start();
     make_queue(&h, "jobs", 5);
 
-    let (s, body) = h.get("/v0/boxes/jobs");
+    let (s, body) = h.get("/v0/topics/jobs");
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["type"], json!("queue"));
     let q = &body["queue"];
@@ -70,10 +70,10 @@ fn queue_state_exposes_type_and_counters() {
     assert_eq!(q["in_flight"], json!(0));
     assert_eq!(q["dead_lettered"], json!(0));
 
-    // A plain log box omits the `queue` sub-object.
-    let (s, _) = h.put("/v0/boxes/plain", json!({}));
+    // A plain log topic omits the `queue` sub-object.
+    let (s, _) = h.put("/v0/topics/plain", json!({}));
     assert_eq!(s, StatusCode::CREATED);
-    let (_, body) = h.get("/v0/boxes/plain");
+    let (_, body) = h.get("/v0/topics/plain");
     assert_eq!(body["type"], json!("log"));
     assert!(body.get("queue").map(|v| v.is_null()).unwrap_or(true));
 }
@@ -84,7 +84,7 @@ fn claim_ack_full_lifecycle() {
     make_queue(&h, "jobs", 10);
 
     // Claim 4: leases the 4 lowest seqs ascending, deliveries==1.
-    let (s, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w1", "max": 4 }));
+    let (s, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w1", "max": 4 }));
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["count"], json!(4));
     assert_eq!(body["ready"], json!(6));
@@ -102,24 +102,24 @@ fn claim_ack_full_lifecycle() {
     assert!(claimed[0]["deadline"].as_i64().unwrap() > 0);
 
     // in_flight is now 4.
-    let (_, st) = h.get("/v0/boxes/jobs");
+    let (_, st) = h.get("/v0/topics/jobs");
     assert_eq!(st["queue"]["in_flight"], json!(4));
 
     // Ack 2 of them (ack-is-delete): they leave the jobs log.
     let (s, body) = h.post(
-        "/v0/boxes/jobs/ack",
+        "/v0/topics/jobs/ack",
         json!({ "node": "w1", "seqs": [1, 2] }),
     );
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["acked"], json!(2));
     assert_eq!(body["skipped"], json!([]));
-    let (_, st) = h.get("/v0/boxes/jobs");
+    let (_, st) = h.get("/v0/topics/jobs");
     assert_eq!(st["count"], json!(8), "2 acked jobs deleted from jobs log");
     assert_eq!(st["queue"]["in_flight"], json!(2)); // seqs 3,4 still leased.
 
     // Acking a seq not held by this node is silently skipped.
     let (_, body) = h.post(
-        "/v0/boxes/jobs/ack",
+        "/v0/topics/jobs/ack",
         json!({ "node": "w1", "seqs": [1, 99] }),
     );
     assert_eq!(body["acked"], json!(0));
@@ -131,7 +131,7 @@ fn nack_requeues_and_extend_heartbeats() {
     let h = Harness::start();
     make_queue(&h, "jobs", 2);
 
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w1", "max": 2 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w1", "max": 2 }));
     let seqs: Vec<u64> = body["claimed"]
         .as_array()
         .unwrap()
@@ -141,7 +141,7 @@ fn nack_requeues_and_extend_heartbeats() {
 
     // Extend the first lease (heartbeat) — returns the new deadline keyed by seq.
     let (s, body) = h.post(
-        "/v0/boxes/jobs/extend",
+        "/v0/topics/jobs/extend",
         json!({ "node": "w1", "seqs": [seqs[0]], "lease_ms": 60000 }),
     );
     assert_eq!(s, StatusCode::OK);
@@ -150,7 +150,7 @@ fn nack_requeues_and_extend_heartbeats() {
 
     // Nack both for immediate reclaim → claimable again.
     let (s, body) = h.post(
-        "/v0/boxes/jobs/nack",
+        "/v0/topics/jobs/nack",
         json!({ "node": "w1", "seqs": seqs, "delay_ms": 0 }),
     );
     assert_eq!(s, StatusCode::OK);
@@ -159,7 +159,7 @@ fn nack_requeues_and_extend_heartbeats() {
     assert_eq!(body["in_flight"], json!(0));
 
     // A fresh worker re-claims them; the delivery counter bumped to 2.
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 2 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w2", "max": 2 }));
     assert_eq!(body["count"], json!(2));
     assert!(body["claimed"]
         .as_array()
@@ -169,24 +169,24 @@ fn nack_requeues_and_extend_heartbeats() {
 }
 
 #[test]
-fn non_queue_box_rejects_queue_endpoints() {
+fn non_queue_topic_rejects_queue_endpoints() {
     let h = Harness::start();
-    let (s, _) = h.put("/v0/boxes/log", json!({}));
+    let (s, _) = h.put("/v0/topics/log", json!({}));
     assert_eq!(s, StatusCode::CREATED);
 
     for path in ["claim", "ack", "nack", "extend"] {
         let (s, body) = h.post(
-            &format!("/v0/boxes/log/{path}"),
+            &format!("/v0/topics/log/{path}"),
             json!({ "node": "w1", "seqs": [1], "lease_ms": 1000 }),
         );
-        assert_eq!(s, StatusCode::CONFLICT, "{path} on a log box is 409");
+        assert_eq!(s, StatusCode::CONFLICT, "{path} on a log topic is 409");
         assert_eq!(body["error"]["code"], json!("not_a_queue"));
     }
 
-    // A missing box is 404, not 409.
-    let (s, body) = h.post("/v0/boxes/nope/claim", json!({ "node": "w1" }));
+    // A missing topic is 404, not 409.
+    let (s, body) = h.post("/v0/topics/nope/claim", json!({ "node": "w1" }));
     assert_eq!(s, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"]["code"], json!("box_not_found"));
+    assert_eq!(body["error"]["code"], json!("topic_not_found"));
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn work_stream_pushes_job_frames() {
     // The harness SSE helper opens with Accept: text/event-stream and collects
     // named frames; the /work stream pushes up to `max` jobs as `event: job`.
     let frames = h.sse_frames(
-        "/v0/boxes/jobs/work?node=worker-1&max=2",
+        "/v0/topics/jobs/work?node=worker-1&max=2",
         2,
         Duration::from_secs(5),
     );
@@ -205,7 +205,7 @@ fn work_stream_pushes_job_frames() {
     for f in &frames {
         assert_eq!(f.event, "job");
         let data: serde_json::Value = serde_json::from_str(&f.data).unwrap();
-        assert_eq!(data["box"], json!("jobs"));
+        assert_eq!(data["topic"], json!("jobs"));
         assert!(data["$seq"].as_u64().unwrap() >= 1);
         assert!(data["lease_id"].as_str().unwrap().starts_with("lease_"));
         assert_eq!(data["deliveries"], json!(1));
@@ -225,7 +225,7 @@ fn work_stream_rejects_non_sse_accept() {
         .build()
         .unwrap();
     let resp = client
-        .get(format!("{}/v0/boxes/jobs/work?node=w1", h.base_url()))
+        .get(format!("{}/v0/topics/jobs/work?node=w1", h.base_url()))
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .unwrap();
@@ -246,7 +246,7 @@ fn work_stream_releases_leases_on_disconnect() {
             .build()
             .unwrap();
         let mut resp = client
-            .get(format!("{}/v0/boxes/jobs/work?node=w1&max=2", h.base_url()))
+            .get(format!("{}/v0/topics/jobs/work?node=w1&max=2", h.base_url()))
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send()
             .unwrap();
@@ -282,12 +282,12 @@ fn work_stream_releases_leases_on_disconnect() {
     // stream future, which happens just after our connection closes).
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let (_, st) = h.get("/v0/boxes/jobs");
+        let (_, st) = h.get("/v0/topics/jobs");
         if st["queue"]["in_flight"] == json!(0) && st["queue"]["ready"] == json!(2) {
             break;
         }
         if Instant::now() >= deadline {
-            let (_, st) = h.get("/v0/boxes/jobs");
+            let (_, st) = h.get("/v0/topics/jobs");
             panic!("leases not released on disconnect: {}", st["queue"]);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -309,7 +309,7 @@ fn claim_distributes_across_multiple_workers() {
     // greedy `claim_jitter_ms=0` path serves each claim immediately).
     let mut all = Vec::new();
     for node in ["w1", "w2", "w3"] {
-        let (s, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": node, "max": 3 }));
+        let (s, body) = h.post("/v0/topics/jobs/claim", json!({ "node": node, "max": 3 }));
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["count"], json!(3), "{node} gets 3 distinct jobs");
         let seqs: Vec<u64> = body["claimed"]
@@ -351,7 +351,7 @@ fn coalescing_window_even_split_when_supply_below_demand() {
     let base = h.base_url().to_string();
     let handles: Vec<_> = (0..4)
         .map(|i| {
-            let url = format!("{base}/v0/boxes/jobs/claim");
+            let url = format!("{base}/v0/topics/jobs/claim");
             std::thread::spawn(move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(10))
@@ -401,7 +401,7 @@ fn ack_does_not_redeliver() {
     let h = Harness::start();
     make_queue(&h, "jobs", 3);
 
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w1", "max": 3 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w1", "max": 3 }));
     let seqs: Vec<u64> = body["claimed"]
         .as_array()
         .unwrap()
@@ -410,14 +410,14 @@ fn ack_does_not_redeliver() {
         .collect();
 
     // Ack all three (ack-is-delete).
-    let (s, body) = h.post("/v0/boxes/jobs/ack", json!({ "node": "w1", "seqs": seqs }));
+    let (s, body) = h.post("/v0/topics/jobs/ack", json!({ "node": "w1", "seqs": seqs }));
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["acked"], json!(3));
 
     // The jobs left the jobs log; a subsequent claim never redelivers them.
     let (ready, in_flight, _dl) = queue_counters(&h, "jobs");
     assert_eq!((ready, in_flight), (0, 0), "acked jobs are gone");
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 10 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w2", "max": 10 }));
     assert_eq!(body["count"], json!(0), "no redelivery after ack");
 }
 
@@ -428,7 +428,7 @@ fn extend_prevents_expiry() {
     make_queue_cfg(&h, "jobs", 1, json!({ "type": "queue", "lease_ms": 1000 }));
 
     let (_, body) = h.post(
-        "/v0/boxes/jobs/claim",
+        "/v0/topics/jobs/claim",
         json!({ "node": "w1", "max": 1, "lease_ms": 1000 }),
     );
     let seq = body["claimed"][0]["$seq"].as_u64().unwrap();
@@ -436,7 +436,7 @@ fn extend_prevents_expiry() {
     // Heartbeat just before the 1 s deadline: extend by another 10 s.
     h.clock().advance(900);
     let (s, body) = h.post(
-        "/v0/boxes/jobs/extend",
+        "/v0/topics/jobs/extend",
         json!({ "node": "w1", "seqs": [seq], "lease_ms": 10000 }),
     );
     assert_eq!(s, StatusCode::OK);
@@ -445,7 +445,7 @@ fn extend_prevents_expiry() {
     // Past the ORIGINAL deadline but within the extended one ⇒ still leased; no
     // other worker can claim it.
     h.clock().advance(5000); // now +5.9 s; original was +1 s, extended is +10.9 s.
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w2", "max": 1 }));
     assert_eq!(body["count"], json!(0), "extend kept the lease alive");
     let (_, in_flight, _dl) = queue_counters(&h, "jobs");
     assert_eq!(in_flight, 1);
@@ -460,7 +460,7 @@ fn lease_expiry_redelivers_to_another_worker() {
     make_queue_cfg(&h, "jobs", 1, json!({ "type": "queue", "lease_ms": 1000 }));
 
     let (_, body) = h.post(
-        "/v0/boxes/jobs/claim",
+        "/v0/topics/jobs/claim",
         json!({ "node": "w1", "max": 1, "lease_ms": 1000 }),
     );
     assert_eq!(body["count"], json!(1));
@@ -468,12 +468,12 @@ fn lease_expiry_redelivers_to_another_worker() {
     assert_eq!(body["claimed"][0]["deliveries"], json!(1));
 
     // Before the deadline: not claimable by anyone else.
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w2", "max": 1 }));
     assert_eq!(body["count"], json!(0));
 
     // After the deadline passes: redelivered to w2 with deliveries==2.
     h.clock().advance(1001);
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w2", "max": 1 }));
     assert_eq!(body["count"], json!(1), "expired lease is reclaimable");
     assert_eq!(body["claimed"][0]["$seq"].as_u64().unwrap(), seq);
     assert_eq!(
@@ -488,12 +488,12 @@ fn nack_delayed_holds_until_elapsed() {
     let h = Harness::start_with_test_clock();
     make_queue_cfg(&h, "jobs", 1, json!({ "type": "queue", "lease_ms": 30000 }));
 
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w1", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w1", "max": 1 }));
     let seq = body["claimed"][0]["$seq"].as_u64().unwrap();
 
     // Delayed nack: invisible for 5 s.
     let (s, body) = h.post(
-        "/v0/boxes/jobs/nack",
+        "/v0/topics/jobs/nack",
         json!({ "node": "w1", "seqs": [seq], "delay_ms": 5000 }),
     );
     assert_eq!(s, StatusCode::OK);
@@ -501,12 +501,12 @@ fn nack_delayed_holds_until_elapsed() {
     assert_eq!(body["ready"], json!(0), "not yet claimable (delay pending)");
 
     // Not claimable before the delay elapses.
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w2", "max": 1 }));
     assert_eq!(body["count"], json!(0));
 
     // After 5 s it becomes claimable.
     h.clock().advance(5001);
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w2", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w2", "max": 1 }));
     assert_eq!(body["count"], json!(1));
     assert_eq!(body["claimed"][0]["$seq"].as_u64().unwrap(), seq);
 }
@@ -514,10 +514,10 @@ fn nack_delayed_holds_until_elapsed() {
 #[test]
 fn dead_letter_after_max_deliveries() {
     // After `max_deliveries` reclaims without an ack, the job is MOVED to the
-    // dead_letter box instead of being redelivered. Driven by the TestClock
+    // dead_letter topic instead of being redelivered. Driven by the TestClock
     // (expiry between deliveries) so the flow is deterministic over HTTP.
     let h = Harness::start_with_test_clock();
-    let (s, _) = h.put("/v0/boxes/dlq", json!({}));
+    let (s, _) = h.put("/v0/topics/dlq", json!({}));
     assert_eq!(s, StatusCode::CREATED);
     make_queue_cfg(
         &h,
@@ -527,36 +527,36 @@ fn dead_letter_after_max_deliveries() {
     );
 
     // Delivery 1, let it expire.
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w", "max": 1 }));
     assert_eq!(body["claimed"][0]["deliveries"], json!(1));
     h.clock().advance(1001);
     // Delivery 2, let it expire.
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w", "max": 1 }));
     assert_eq!(body["claimed"][0]["deliveries"], json!(2));
     h.clock().advance(1001);
     // The next claim would be delivery 3 > max_deliveries(2) ⇒ dead-lettered,
     // not redelivered. The claim returns empty (the job left the queue).
-    let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w", "max": 1 }));
+    let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w", "max": 1 }));
     assert_eq!(
         body["count"],
         json!(0),
         "job dead-lettered, not redelivered"
     );
 
-    // The source queue is empty with dead_lettered==1; the DL box holds the job
+    // The source queue is empty with dead_lettered==1; the DL topic holds the job
     // with provenance meta.
     let (ready, in_flight, dl) = queue_counters(&h, "jobs");
     assert_eq!((ready, in_flight, dl), (0, 0, 1));
-    let (s, st) = h.get("/v0/boxes/jobs");
+    let (s, st) = h.get("/v0/topics/jobs");
     assert_eq!(s, StatusCode::OK);
     assert_eq!(st["count"], json!(0), "job deleted from the jobs log");
 
     let (_, d) = h.post(
-        "/v0/boxes/dlq/diff",
+        "/v0/topics/dlq/diff",
         json!({ "from_seq": 0, "include_meta": true }),
     );
     let recs = d["records"].as_array().unwrap();
-    assert_eq!(recs.len(), 1, "the poison job landed in the DL box");
+    assert_eq!(recs.len(), 1, "the poison job landed in the DL topic");
     assert_eq!(recs[0]["meta"]["$dead_letter_from"], json!("jobs"));
     assert_eq!(recs[0]["meta"]["$dead_letter_src_seq"], json!("1"));
 }
@@ -586,7 +586,7 @@ fn work_stream_caps_in_flight_at_max() {
             .build()
             .unwrap();
         let mut resp = client
-            .get(format!("{base}/v0/boxes/jobs/work?node=w1&max=2"))
+            .get(format!("{base}/v0/topics/jobs/work?node=w1&max=2"))
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send()
             .unwrap();
@@ -641,14 +641,14 @@ fn queue_survives_restart_and_leases_self_heal() {
     {
         let mut h = Harness::start_persistent(dir.path());
         let (s, _) = h.put(
-            "/v0/boxes/jobs",
+            "/v0/topics/jobs",
             json!({ "type": "queue", "durable": true, "lease_ms": 30000 }),
         );
         assert_eq!(s, StatusCode::CREATED);
         let records: Vec<_> = (0..3).map(|i| json!({ "data": { "i": i } })).collect();
-        let (s, _) = h.post("/v0/boxes/jobs", json!({ "records": records }));
+        let (s, _) = h.post("/v0/topics/jobs", json!({ "records": records }));
         assert!(s.is_success());
-        let (s, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w1", "max": 1 }));
+        let (s, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w1", "max": 1 }));
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["count"], json!(1));
         let (ready, in_flight, _dl) = queue_counters(&h, "jobs");
@@ -665,7 +665,7 @@ fn queue_survives_restart_and_leases_self_heal() {
     // Boot 2: recovery rebuilds from the WAL on the same dir.
     {
         let h = Harness::start_persistent(dir.path());
-        let (s, st) = h.get("/v0/boxes/jobs");
+        let (s, st) = h.get("/v0/topics/jobs");
         assert_eq!(s, StatusCode::OK);
         assert_eq!(st["type"], json!("queue"), "queue type survives restart");
         assert_eq!(st["count"], json!(3), "durable jobs log preserved all jobs");
@@ -677,7 +677,7 @@ fn queue_survives_restart_and_leases_self_heal() {
             "non-durable leases self-heal: all jobs claimable after restart",
         );
         // And they can all be claimed.
-        let (_, body) = h.post("/v0/boxes/jobs/claim", json!({ "node": "w-new", "max": 3 }));
+        let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w-new", "max": 3 }));
         assert_eq!(body["count"], json!(3));
     }
 }

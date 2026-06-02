@@ -20,9 +20,9 @@ an `event: error` frame — carries this exact shape:
 ```json
 {
   "error": {
-    "code": "box_not_found",
-    "message": "box \"jobs\" does not exist",
-    "detail": { "box": "jobs" }
+    "code": "topic_not_found",
+    "message": "topic \"jobs\" does not exist",
+    "detail": { "topic": "jobs" }
   }
 }
 ```
@@ -31,7 +31,7 @@ an `event: error` frame — carries this exact shape:
 |---|---|---|
 | `error.code` | string | Stable, machine-readable snake_case string. **Branch on this.** |
 | `error.message` | string | Human-readable; may change between versions, never parse it. |
-| `error.detail` | object | Optional structured context (e.g. the offending box name, a `limit`, a `retry_after_ms`). May be absent. |
+| `error.detail` | object | Optional structured context (e.g. the offending topic name, a `limit`, a `retry_after_ms`). May be absent. |
 
 Success responses carry **bare data** — there is no `{"status":"ok"}` envelope. The
 presence of a top-level `error` key is the only success/failure discriminator.
@@ -52,17 +52,17 @@ message.
 | Code | Meaning | `error.code` |
 |---|---|---|
 | `200` | OK (read, idempotent write / create / delete) | — |
-| `201` | Created (box/router created on this call) | — |
+| `201` | Created (topic/router created on this call) | — |
 | `400` | Malformed request (bad JSON, bad type, value out of range) | `invalid_request`, `batch_too_large`, `record_too_large` |
 | `401` | Missing or invalid bearer token | `unauthorized` |
-| `403` | Authenticated, but the key lacks the required scope, or the box/router name is outside its prefix allowlist | `forbidden` |
-| `404` | Box/router does not exist (and was not auto-created) | `box_not_found`, `router_not_found` |
+| `403` | Authenticated, but the key lacks the required scope, or the topic/router name is outside its prefix allowlist | `forbidden` |
+| `404` | Topic/router does not exist (and was not auto-created) | `topic_not_found`, `router_not_found` |
 | `405` | Wrong method for the path | `method_not_allowed` |
 | `406` | `Accept` not `text/event-stream` on an SSE GET | `not_acceptable` |
-| `409` | Conflict: router cycle, config conflict, queue op on a non-queue box | `router_cycle`, `box_exists_incompatible`, `box_not_empty`, `not_a_queue` |
+| `409` | Conflict: router cycle, config conflict, queue op on a non-queue topic | `router_cycle`, `topic_exists_incompatible`, `topic_not_empty`, `not_a_queue` |
 | `413` | Body exceeds the server hard limit (rejected pre-parse) | `payload_too_large` |
 | `415` | Wrong or missing `Content-Type` | `unsupported_media_type` |
-| `422` | Semantically invalid — e.g. a write to a full `discard:"reject"` box | `box_full` |
+| `422` | Semantically invalid — e.g. a write to a full `discard:"reject"` topic | `topic_full` |
 | `429` | Elastic throttle under CPU pressure, **or** a resource cap reached | `throttled` |
 | `500` | Internal error (a bug) | `internal` |
 | `503` | Not ready (WAL replay on boot) or shutting down | `not_ready`, `shutting_down` |
@@ -70,15 +70,15 @@ message.
 A few codes are worth calling out:
 
 - **`401` vs `403`** — `401` means no/invalid token; `403` means the token authenticates
-  but lacks the required [scope](/deployment/security), or names a box/router outside its
+  but lacks the required [scope](/deployment/security), or names a topic/router outside its
   prefix allowlist (enforced on the path **and** relevant request-body names). On
   [watch](/api/watch): when the session was created **with auth enabled** it is bound to the
   creating key, so the SSE GET must present that **same** bearer (header or the dev-only
   `?token=`) — a wrong key *or* **no bearer at all** is `401` (a leaked `wid` alone is not a
   credential). Only an **unauthenticated** (dev-mode) session opens on the `wid` alone.
 - **`409 not_a_queue`** — a [queue](/api/queues) endpoint (`claim`/`ack`/`nack`/`extend`/
-  `work`) was called on a plain `"log"` box.
-- **`409 box_exists_incompatible`** — a `PUT` tried to change a box's immutable `type`
+  `work`) was called on a plain `"log"` topic.
+- **`409 topic_exists_incompatible`** — a `PUT` tried to change a topic's immutable `type`
   (`log` ↔ `queue`).
 - **`409 router_cycle`** — creating the router would introduce a directed cycle;
   `error.detail.cycle` lists the offending path, e.g. `["A","B","A"]`.
@@ -100,20 +100,20 @@ suggested wait:
 ```
 
 **Resource cap reached** — a configurable [resource limit](/deployment/configuration) (max
-boxes, routers, watch sessions, SSE connections, in-flight requests per key, or total
+topics, routers, watch sessions, SSE connections, in-flight requests per key, or total
 retained bytes) would be exceeded. The detail names the cap:
 
 ```json
 { "error": {
     "code": "throttled",
-    "message": "max boxes reached",
-    "detail": { "limit": "max_boxes", "max": 100000 } } }
+    "message": "max topics reached",
+    "detail": { "limit": "max_topics", "max": 100000 } } }
 ```
 
 | `error.detail` field | When | Meaning |
 |---|---|---|
 | `retry_after_ms` | CPU-pressure throttle | Suggested wait before retrying (ms). |
-| `limit` | Resource cap | Which cap was hit (e.g. `"max_boxes"`, `"max_total_bytes"`). |
+| `limit` | Resource cap | Which cap was hit (e.g. `"max_topics"`, `"max_total_bytes"`). |
 | `max` | Resource cap | The configured ceiling for that cap. |
 
 <Callout type="info">
@@ -168,16 +168,16 @@ is omitted when it does not apply.
 | Field | Always? | Meaning |
 |---|---|---|
 | `server_total_ms` | yes | Total server-side handling time for the request (ms). |
-| `wal_append_ms` | when relevant | Time spent enqueuing the WAL frame. A `memory` box still enters the WAL write path like `disk`, so this is **not** always `0` for `memory` (only the WAL-less in-memory test engine reports `0`). |
-| `fsync_ms` | when relevant | Time the ack was held for the group `fsync`. `0` for non-`fsync` boxes (the fast path). |
+| `wal_append_ms` | when relevant | Time spent enqueuing the WAL frame. A `memory` topic still enters the WAL write path like `disk`, so this is **not** always `0` for `memory` (only the WAL-less in-memory test engine reports `0`). |
+| `fsync_ms` | when relevant | Time the ack was held for the group `fsync`. `0` for non-`fsync` topics (the fast path). |
 | `records_scanned` | on reads | Records examined to build the response (includes filtered/skipped ones). |
 | `throttle_wait_ms` | when throttled | Time parked behind the elastic scheduler before handling. |
 | `cold_segments_read` | on cold reads | Cold-tier segments touched to satisfy a read (omitted when none). |
 
 <Callout type="info">
   `fsync_ms` is the clearest signal of which [durability class](/guarantees/durability) a
-  box is using: it is `0.0` on `memory` and `disk` boxes (whose ack is not fsync-gated) and
-  a real value on `fsync` boxes. `cold_segments_read > 0` tells you a read fell through to
+  topic is using: it is `0.0` on `memory` and `disk` topics (whose ack is not fsync-gated) and
+  a real value on `fsync` topics. `cold_segments_read > 0` tells you a read fell through to
   the [cold tier](/deployment/storage-and-tiering).
 </Callout>
 

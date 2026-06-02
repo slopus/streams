@@ -1,11 +1,11 @@
-//! Queue endpoints (API §10): POST `/v0/boxes/:q/claim`, `/ack`, `/nack`,
-//! `/extend`, and the SSE GET `/v0/boxes/:q/work` auto-claim/push stream.
+//! Queue endpoints (API §10): POST `/v0/topics/:q/claim`, `/ack`, `/nack`,
+//! `/extend`, and the SSE GET `/v0/topics/:q/work` auto-claim/push stream.
 //!
 //! These layer the lease lifecycle on top of the engine's queue API
-//! ([`Engine::claim`]/`ack`/`nack`/`extend`/`claim_cohort`). A non-queue box
-//! rejects every one with `409 not_a_queue`; an absent box is `404`.
+//! ([`Engine::claim`]/`ack`/`nack`/`extend`/`claim_cohort`). A non-queue topic
+//! rejects every one with `409 not_a_queue`; an absent topic is `404`.
 //!
-//! **Coalescing window.** When the box's `claim_jitter_ms > 0`, concurrent poll
+//! **Coalescing window.** When the topic's `claim_jitter_ms > 0`, concurrent poll
 //! claims (and `/work` refills) arriving within the window are gathered into one
 //! cohort by [`ClaimCoordinator`] and served in a single [`Engine::claim_cohort`]
 //! pass that divides the available jobs evenly (DESIGN §10.3). `claim_jitter_ms
@@ -53,7 +53,7 @@ struct PendingClaimer {
     reply: oneshot::Sender<Vec<LeasedJob>>,
 }
 
-/// A forming cohort for one box: the leader runs the pass after the window, all
+/// A forming cohort for one topic: the leader runs the pass after the window, all
 /// joiners wait on their oneshot. `closed` is flipped (under the cohort lock)
 /// when the leader drains it, so a late joiner racing the leader's drain sees the
 /// closed cohort and opens a fresh one instead of pushing into a dead vec.
@@ -63,7 +63,7 @@ struct FormingCohort {
     closed: bool,
 }
 
-/// Per-box, per-process coordinator for the coalescing window. A leader claim
+/// Per-topic, per-process coordinator for the coalescing window. A leader claim
 /// opens a cohort, sleeps the window so concurrent claims join, then runs ONE
 /// [`Engine::claim_cohort`] pass and fans the results back.
 #[derive(Default)]
@@ -83,13 +83,13 @@ impl ClaimCoordinator {
     }
 
     /// Serve a claim through the coalescing window: returns this claimer's leased
-    /// jobs. The leader (first claimer to open the cohort for this box) sleeps
+    /// jobs. The leader (first claimer to open the cohort for this topic) sleeps
     /// `jitter_ms`, then runs the single batched pass for the whole gathered
     /// cohort under the engine queue lock and replies to every joiner.
     async fn claim_coalesced(
         &self,
         engine: &Arc<Engine>,
-        box_name: &str,
+        topic_name: &str,
         claimer: Claimer,
         jitter_ms: u64,
         lease_ms: Option<u64>,
@@ -106,7 +106,7 @@ impl ClaimCoordinator {
         let (cohort, is_leader) = loop {
             let entry = self
                 .forming
-                .entry(box_name.to_string())
+                .entry(topic_name.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(FormingCohort::default())));
             let cohort = entry.clone();
             drop(entry); // release the DashMap shard lock before the cohort lock.
@@ -117,7 +117,7 @@ impl ClaimCoordinator {
                 // get a fresh Arc, or `or_insert_with` replaces the stale one.
                 drop(guard);
                 self.forming
-                    .remove_if(box_name, |_, v| Arc::ptr_eq(v, &cohort));
+                    .remove_if(topic_name, |_, v| Arc::ptr_eq(v, &cohort));
                 continue;
             }
             let is_leader = guard.claimers.is_empty();
@@ -139,10 +139,10 @@ impl ClaimCoordinator {
                 std::mem::take(&mut guard.claimers)
             };
             self.forming
-                .remove_if(box_name, |_, v| Arc::ptr_eq(v, &cohort));
+                .remove_if(topic_name, |_, v| Arc::ptr_eq(v, &cohort));
 
             let claimers: Vec<Claimer> = drained.iter().map(|p| p.claimer.clone()).collect();
-            let name = box_name.to_string();
+            let name = topic_name.to_string();
             let engine = engine.clone();
             // The batched pass takes the queue lock; run it on the blocking pool.
             let result =
@@ -157,7 +157,7 @@ impl ClaimCoordinator {
                     }
                 }
                 Err(e) => {
-                    // Pass failed (e.g. box deleted mid-window): every joiner gets
+                    // Pass failed (e.g. topic deleted mid-window): every joiner gets
                     // an empty result; the leader returns the error to its caller.
                     for p in drained {
                         let _ = p.reply.send(Vec::new());
@@ -172,24 +172,24 @@ impl ClaimCoordinator {
     }
 }
 
-/// Run a claim against a box, honoring the box's coalescing window. Returns the
+/// Run a claim against a topic, honoring the topic's coalescing window. Returns the
 /// leased jobs plus the post-pass `ready` count. With `claim_jitter_ms == 0` the
 /// greedy single-claimer engine path is used directly (lowest latency).
 async fn run_claim(
     state: &AppState,
-    box_name: &str,
+    topic_name: &str,
     node: String,
     max: u32,
     lease_ms: Option<u64>,
     work_conn: Option<u64>,
 ) -> Result<(Vec<LeasedJob>, u64)> {
-    // Resolve the jitter window from the box config (and validate it is a queue).
+    // Resolve the jitter window from the topic config (and validate it is a queue).
     let b = state
         .engine
-        .get_box(box_name)
-        .ok_or_else(|| Error::box_not_found(box_name))?;
+        .get_topic(topic_name)
+        .ok_or_else(|| Error::topic_not_found(topic_name))?;
     if !b.is_queue() {
-        return Err(Error::not_a_queue(box_name));
+        return Err(Error::not_a_queue(topic_name));
     }
     let jitter = b.config.read().claim_jitter_ms;
 
@@ -203,7 +203,7 @@ async fn run_claim(
             return Err(Error::invalid_request("node too long"));
         }
         let engine = state.engine.clone();
-        let name = box_name.to_string();
+        let name = topic_name.to_string();
         let claimer = Claimer {
             node,
             max: max.clamp(1, config::MAX_CLAIM),
@@ -230,10 +230,10 @@ async fn run_claim(
     };
     let jobs = state
         .coordinator
-        .claim_coalesced(&state.engine, box_name, claimer, jitter, lease_ms)
+        .claim_coalesced(&state.engine, topic_name, claimer, jitter, lease_ms)
         .await?;
     // Recompute `ready` after the pass for the response.
-    let st = state.engine.box_state(box_name, false)?;
+    let st = state.engine.topic_state(topic_name, false)?;
     let ready = st.queue.map(|q| q.ready).unwrap_or(0);
     Ok((jobs, ready))
 }
@@ -276,11 +276,11 @@ fn to_claimed_job(j: LeasedJob) -> ClaimedJob {
 // POST handlers: claim / ack / nack / extend
 // ===========================================================================
 
-/// `POST /v0/boxes/:q/claim` — lease up to `max` claimable jobs to `node`
-/// (API §10.2). Honors the box's coalescing window.
+/// `POST /v0/topics/:q/claim` — lease up to `max` claimable jobs to `node`
+/// (API §10.2). Honors the topic's coalescing window.
 pub async fn claim(
     State(state): State<AppState>,
-    Path(box_name): Path<String>,
+    Path(topic_name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ClaimResponse>> {
@@ -291,11 +291,11 @@ pub async fn claim(
         parse_json_body(&headers, &body)?
     };
 
-    let (jobs, ready) = run_claim(&state, &box_name, req.node, req.max, req.lease_ms, None).await?;
+    let (jobs, ready) = run_claim(&state, &topic_name, req.node, req.max, req.lease_ms, None).await?;
     let claimed: Vec<ClaimedJob> = jobs.into_iter().map(to_claimed_job).collect();
     let count = claimed.len() as u64;
     Ok(Json(ClaimResponse {
-        box_name,
+        topic_name,
         claimed,
         count,
         ready,
@@ -303,12 +303,12 @@ pub async fn claim(
     }))
 }
 
-/// `POST /v0/boxes/:q/ack` — complete (delete) jobs held by `node` (API §10.4).
-/// A durable queue fsyncs the delete before returning (ack durability == box
+/// `POST /v0/topics/:q/ack` — complete (delete) jobs held by `node` (API §10.4).
+/// A durable queue fsyncs the delete before returning (ack durability == topic
 /// `durable`), so run it on the blocking pool.
 pub async fn ack(
     State(state): State<AppState>,
-    Path(box_name): Path<String>,
+    Path(topic_name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<AckResponse>> {
@@ -316,16 +316,16 @@ pub async fn ack(
     let lease_ids = parse_lease_ids(&req.lease_ids)?;
     let engine = state.engine.clone();
     let resp =
-        super::run_blocking(move || engine.ack_fenced(&box_name, &req.node, &req.seqs, &lease_ids))
+        super::run_blocking(move || engine.ack_fenced(&topic_name, &req.node, &req.seqs, &lease_ids))
             .await?;
     Ok(Json(resp))
 }
 
-/// `POST /v0/boxes/:q/nack` — release leased jobs held by `node` for immediate
+/// `POST /v0/topics/:q/nack` — release leased jobs held by `node` for immediate
 /// or `delay_ms`-delayed reclaim (API §10.5).
 pub async fn nack(
     State(state): State<AppState>,
-    Path(box_name): Path<String>,
+    Path(topic_name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<NackResponse>> {
@@ -333,17 +333,17 @@ pub async fn nack(
     let lease_ids = parse_lease_ids(&req.lease_ids)?;
     let engine = state.engine.clone();
     let resp = super::run_blocking(move || {
-        engine.nack_fenced(&box_name, &req.node, &req.seqs, req.delay_ms, &lease_ids)
+        engine.nack_fenced(&topic_name, &req.node, &req.seqs, req.delay_ms, &lease_ids)
     })
     .await?;
     Ok(Json(resp))
 }
 
-/// `POST /v0/boxes/:q/extend` — push out the deadline of leases held by `node`
+/// `POST /v0/topics/:q/extend` — push out the deadline of leases held by `node`
 /// (heartbeat; API §10.6).
 pub async fn extend(
     State(state): State<AppState>,
-    Path(box_name): Path<String>,
+    Path(topic_name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ExtendResponse>> {
@@ -351,24 +351,24 @@ pub async fn extend(
     let lease_ids = parse_lease_ids(&req.lease_ids)?;
     let engine = state.engine.clone();
     let resp = super::run_blocking(move || {
-        engine.extend_fenced(&box_name, &req.node, &req.seqs, req.lease_ms, &lease_ids)
+        engine.extend_fenced(&topic_name, &req.node, &req.seqs, req.lease_ms, &lease_ids)
     })
     .await?;
     Ok(Json(resp))
 }
 
 // ===========================================================================
-// SSE GET /v0/boxes/:q/work — auto-claim / push (PUSH mode, API §10.8)
+// SSE GET /v0/topics/:q/work — auto-claim / push (PUSH mode, API §10.8)
 // ===========================================================================
 
-/// `GET /v0/boxes/:q/work?node=X&max=N` — keep up to `max` jobs leased+pushed to
+/// `GET /v0/topics/:q/work?node=X&max=N` — keep up to `max` jobs leased+pushed to
 /// this one connection (PUSH mode, API §10.8). Acks come out-of-band via §10.4;
 /// the server claims replacements as in-flight depth drops below `max`.
 /// On disconnect, all this connection's live leases are released immediately
 /// (instant failover); lease expiry still covers hard crashes.
 pub async fn work(
     State(state): State<AppState>,
-    Path(box_name): Path<String>,
+    Path(topic_name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     extensions: axum::http::Extensions,
     headers: HeaderMap,
@@ -390,14 +390,14 @@ pub async fn work(
         .clamp(1, config::MAX_CLAIM);
     let lease_ms = params.get("lease_ms").and_then(|v| v.parse::<u64>().ok());
 
-    // Validate the box is a queue before opening the stream (so the error body
+    // Validate the topic is a queue before opening the stream (so the error body
     // is readable; API §10.8 establishment errors).
     let b = state
         .engine
-        .get_box(&box_name)
-        .ok_or_else(|| Error::box_not_found(&box_name))?;
+        .get_topic(&topic_name)
+        .ok_or_else(|| Error::topic_not_found(&topic_name))?;
     if !b.is_queue() {
-        return Err(Error::not_a_queue(&box_name));
+        return Err(Error::not_a_queue(&topic_name));
     }
 
     // Resource limit: admit this SSE connection under the global + per-key
@@ -419,7 +419,7 @@ pub async fn work(
     let conn = state.coordinator.alloc_conn();
     let stream = build_work_stream(
         state.clone(),
-        box_name,
+        topic_name,
         node,
         max,
         lease_ms,
@@ -444,7 +444,7 @@ pub async fn work(
 /// `released` events so the jobs are instantly claimable again (API §10.8).
 struct WorkConnGuard {
     state: AppState,
-    box_name: String,
+    topic_name: String,
     conn: u64,
 }
 
@@ -452,17 +452,17 @@ impl Drop for WorkConnGuard {
     fn drop(&mut self) {
         self.state
             .engine
-            .release_work_conn(&self.box_name, self.conn);
+            .release_work_conn(&self.topic_name, self.conn);
     }
 }
 
 /// Build the `/work` SSE stream: claim up to `max` jobs onto this connection,
-/// push each as an `event: job` frame, then park on the box `Notify` and refill
+/// push each as an `event: job` frame, then park on the topic `Notify` and refill
 /// as in-flight depth drops (acks land out-of-band via §10.4). The
 /// [`WorkConnGuard`] releases the connection's leases on disconnect.
 fn build_work_stream(
     state: AppState,
-    box_name: String,
+    topic_name: String,
     node: String,
     max: u32,
     lease_ms: Option<u64>,
@@ -471,7 +471,7 @@ fn build_work_stream(
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
     let guard = WorkConnGuard {
         state: state.clone(),
-        box_name: box_name.clone(),
+        topic_name: topic_name.clone(),
         conn,
     };
     async_stream::stream! {
@@ -495,7 +495,7 @@ fn build_work_stream(
                 let data = serde_json::json!({
                     "code": "server_shutting_down",
                     "error": "server is shutting down; reconnect",
-                    "box": box_name
+                    "topic": topic_name
                 });
                 yield Ok(Event::default().event("error").data(data.to_string()));
                 break;
@@ -503,13 +503,13 @@ fn build_work_stream(
 
             // How many leases does this connection currently hold? Refill up to
             // `max`. We read it from a fresh claim attempt: claim the deficit.
-            let in_flight = state.engine.work_conn_in_flight(&box_name, conn);
+            let in_flight = state.engine.work_conn_in_flight(&topic_name, conn);
             let deficit = max.saturating_sub(in_flight);
 
             if deficit > 0 {
                 let jobs = match run_claim(
                     &state,
-                    &box_name,
+                    &topic_name,
                     node.clone(),
                     deficit,
                     lease_ms,
@@ -519,10 +519,10 @@ fn build_work_stream(
                 {
                     Ok((jobs, _ready)) => jobs,
                     Err(_) => {
-                        // Box ceased to be a queue / was deleted: terminal error.
+                        // Topic ceased to be a queue / was deleted: terminal error.
                         let data = serde_json::json!({
-                            "code": 409, "error": "box is no longer a queue",
-                            "box": box_name
+                            "code": 409, "error": "topic is no longer a queue",
+                            "topic": topic_name
                         });
                         yield Ok(Event::default().event("error").data(data.to_string()));
                         break;
@@ -530,7 +530,7 @@ fn build_work_stream(
                 };
 
                 for j in jobs {
-                    let frame = job_frame(&box_name, &j);
+                    let frame = job_frame(&topic_name, &j);
                     yield Ok(Event::default()
                         .id(j.seq.to_string())
                         .event("job")
@@ -541,8 +541,8 @@ fn build_work_stream(
             // Park until the queue changes (an append makes more claimable, or an
             // out-of-band ack frees an in-flight slot) or the heartbeat window
             // elapses, then re-check. `Notify` wakeups avoid busy polling.
-            let Some(b) = state.engine.get_box(&box_name) else {
-                break; // box gone.
+            let Some(b) = state.engine.get_topic(&topic_name) else {
+                break; // topic gone.
             };
             let notified = b.notify.notified();
             tokio::select! {
@@ -555,9 +555,9 @@ fn build_work_stream(
 }
 
 /// Project a leased job onto the `/work` `event: job` frame JSON (API §10.8).
-fn job_frame(box_name: &str, j: &LeasedJob) -> serde_json::Value {
+fn job_frame(topic_name: &str, j: &LeasedJob) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
-    obj.insert("box".into(), serde_json::json!(box_name));
+    obj.insert("topic".into(), serde_json::json!(topic_name));
     obj.insert("$seq".into(), serde_json::json!(j.seq));
     obj.insert(
         "lease_id".into(),
@@ -622,7 +622,7 @@ mod tests {
             meta: None,
         };
         let f = job_frame("jobs", &j);
-        assert_eq!(f["box"], serde_json::json!("jobs"));
+        assert_eq!(f["topic"], serde_json::json!("jobs"));
         assert_eq!(f["$seq"], serde_json::json!(480101));
         assert_eq!(f["lease_id"], serde_json::json!("lease_7f3a9c"));
         assert_eq!(f["$tag"], serde_json::json!("tenant42:job-8800"));

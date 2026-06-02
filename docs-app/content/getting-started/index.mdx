@@ -8,8 +8,8 @@ import { Callout, Cards } from 'nextra/components'
 # Introduction
 
 **streams** is a persistent event engine in a single binary. It is an append-only log
-service exposed over a clean, JSON-first HTTP API: you write events to named **boxes**,
-read them back by **sequence**, fan them out with **routers**, and watch many boxes at
+service exposed over a clean, JSON-first HTTP API: you write events to named **topics**,
+read them back by **sequence**, fan them out with **routers**, and watch many topics at
 once over a single Server-Sent Events connection — all from one static binary on one
 machine, backed by a write-ahead log on local NVMe.
 
@@ -17,10 +17,10 @@ It is the persistence layer for **job queues**, **pub/sub**, and **durable event
 streams**, with a design that makes data loss **always explicit, never silent**.
 
 <Callout type="info">
-  The full `/v0` API is implemented and durable: boxes, diff reads, deletes, routers,
+  The full `/v0` API is implemented and durable: topics, diff reads, deletes, routers,
   multiplexed SSE, and lease-based queues — backed by a write-ahead log with group
   commit, segments, snapshots, and crash-recovery replay on a single restartable
-  process. An `fsync` box's writes are fsync-gated: an acknowledged write is committed,
+  process. An `fsync` topic's writes are fsync-gated: an acknowledged write is committed,
   and a restart replays the WAL to recover it.
 </Callout>
 
@@ -34,9 +34,9 @@ metric, if you're watching, long after the fact.
 
 streams takes a different position:
 
-- **Durability is a per-box decision, not a server-wide mode.** A best-effort `memory` cache box, a
+- **Durability is a per-topic decision, not a server-wide mode.** A best-effort `memory` cache topic, a
   group-committed pub/sub feed, and an `fsync`-gated job queue coexist in one process.
-  Each box buys exactly the guarantee it needs without taxing the others.
+  Each topic buys exactly the guarantee it needs without taxing the others.
 - **Involuntary loss is never silent.** If records you wanted were evicted (cap) or
   expired (TTL) before you read them, the read returns an in-band **tombstone** with the
   exact `[gap_from, gap_to]` range — at HTTP 200, never as a silent skip.
@@ -52,7 +52,7 @@ One rule sits underneath everything:
 > **always produces a tombstone. Voluntary removal you did ask for** (a permanent
 > delete, your own node's events) **is silently filtered.**
 
-Mixing those would make the gap alarm useless. A delete advances a box's `earliest_seq`
+Mixing those would make the gap alarm useless. A delete advances a topic's `earliest_seq`
 (its first live seq) but never its `evict_floor` (the cap/TTL tombstone trigger), so
 reading across a purely-deleted gap is silent while reading below an evicted floor
 tombstones. The whole data model — the [dual watermark](/guarantees/tombstones), the
@@ -64,15 +64,15 @@ exists to keep that distinction crisp.
 streams is honest about maturity. The `/v0` contract is fully implemented; a few
 operational edges are partial or planned.
 
-- **Implemented** — the full `/v0` API (boxes, batched diff reads, permanent deletes,
+- **Implemented** — the full `/v0` API (topics, batched diff reads, permanent deletes,
   routers, multiplexed SSE, lease-based queues); the **sharded** WAL with adaptive group
   commit (`STREAMS_WAL_SHARDS`, default `min(num_cpus, 8)`, shard-count-agnostic recovery);
   **async + derived router forwarding** (off the write/ack path, forwarded copies not
   WAL-logged so one source append is one WAL write, durable per-router cursor with
   replay-from-cursor recovery, single-source-per-dest); the
   three durability classes (`memory`/`disk`/`fsync`); segments, snapshots, and crash
-  recovery; the per-box tag index; node loop-prevention; bearer auth with keys hashed at
-  rest, optional per-key scopes and a box-name prefix allowlist; DoS-hardening resource
+  recovery; the per-topic tag index; node loop-prevention; bearer auth with keys hashed at
+  rest, optional per-key scopes and a topic-name prefix allowlist; DoS-hardening resource
   limits; optional hot→cold segment tiering; and the loopback-default bind.
 - **Partial** — the cap-vs-TTL tombstone *reason* is best-effort across a restart (the gap
   *range* is always authoritative). Queue lease durability is best-effort
@@ -80,9 +80,9 @@ operational edges are partial or planned.
   the queue's baseline at-least-once rather than losing or duplicating work).
 - **Out of scope (by design, not on the roadmap)** — native TLS (terminate at a
   TLS-terminating reverse proxy), hard multi-tenant **namespace** isolation beyond the
-  per-key scope + box-name-prefix allowlist that ships today, multi-server / replication /
+  per-key scope + topic-name-prefix allowlist that ships today, multi-server / replication /
   HA / single-writer fencing, LSM / keyed log compaction, and durable consumer groups as a
-  server primitive (built instead as an app pattern: a box per consumer + delete).
+  server primitive (built instead as an app pattern: a topic per consumer + delete).
 
 <Callout type="warning">
   streams speaks **plain HTTP** — it does not terminate TLS. For any non-loopback
@@ -97,7 +97,7 @@ operational edges are partial or planned.
     Run the binary and write, read, watch, and delete your first events.
   </Cards.Card>
   <Cards.Card title="Mental Model" href="/getting-started/mental-model" arrow>
-    The five concepts — Box, Record, seq, Router, Tombstone — in depth.
+    The five concepts — Topic, Record, seq, Router, Tombstone — in depth.
   </Cards.Card>
   <Cards.Card title="Core Guarantees" href="/guarantees" arrow>
     Durability classes, explicit loss, deletion, ordering, and idempotency.

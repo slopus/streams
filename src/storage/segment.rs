@@ -1,4 +1,4 @@
-//! Sealed/active **segment** file format: the long-term, per-box materialization
+//! Sealed/active **segment** file format: the long-term, per-topic materialization
 //! of the WAL's `Append` records (ARCHITECTURE §3.2). A segment covers a
 //! contiguous seq range `[start_seq, end_seq]` and is two files:
 //!
@@ -409,7 +409,7 @@ pub fn lookup(idx_buf: &[u8], start_seq: u64, seq: u64) -> Option<IdxEntry> {
 
 /// Accumulates a contiguous run of records into the `.data` + `.idx` byte
 /// buffers of one segment. Records MUST be pushed in ascending, gapless seq order
-/// starting at `start_seq` (segments mirror the append order of a box).
+/// starting at `start_seq` (segments mirror the append order of a topic).
 #[derive(Debug)]
 pub struct SegmentBuilder {
     start_seq: u64,

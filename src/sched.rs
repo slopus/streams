@@ -3,7 +3,7 @@
 //! Phase 2 carries the *shape* of the scheduler — effective-priority
 //! computation (manual clamp or recency-based auto) and a banded ready-set —
 //! but with nothing to fsync and no real CPU throttling. The effective-priority
-//! math is exercised directly by `GET /v0/boxes/:box`'s `effective_priority`.
+//! math is exercised directly by `GET /v0/topics/:topic`'s `effective_priority`.
 
 use crate::clock::SharedClock;
 use crate::config::{
@@ -65,11 +65,11 @@ impl Band {
     }
 }
 
-/// The simplified scheduler. Holds the banded ready-set of dirty boxes; phase 2
+/// The simplified scheduler. Holds the banded ready-set of dirty topics; phase 2
 /// drains synchronously, so this is mostly priority bookkeeping.
 pub struct Scheduler {
     clock: SharedClock,
-    /// Banded ready-set of dirty box names (B4..B0). FIFO within a band.
+    /// Banded ready-set of dirty topic names (B4..B0). FIFO within a band.
     ready: Mutex<ReadySet>,
 }
 
@@ -90,7 +90,7 @@ impl Scheduler {
         }
     }
 
-    /// Compute the effective priority for a box (DESIGN §3.1). `manual` is the
+    /// Compute the effective priority for a topic (DESIGN §3.1). `manual` is the
     /// configured `priority` (`None` ⇒ auto-only); `last_consumed_ms`/
     /// `enqueued_ms` drive the recency and aging terms.
     pub fn effective_priority(
@@ -104,28 +104,28 @@ impl Scheduler {
         effective_priority_at(now, manual, auto_priority, last_consumed_ms, enqueued_ms)
     }
 
-    /// Mark a box dirty at the given effective priority (insert into its band
+    /// Mark a topic dirty at the given effective priority (insert into its band
     /// if not already present). Phase 2 drains inline so this is advisory.
-    pub fn mark_dirty(&self, box_name: &str, eff_priority: i64) {
+    pub fn mark_dirty(&self, topic_name: &str, eff_priority: i64) {
         let mut ready = self.ready.lock();
         let band = Band::of(eff_priority);
         let q = band.queue_mut(&mut ready);
-        if !q.iter().any(|b| b == box_name) {
-            q.push_back(box_name.to_string());
+        if !q.iter().any(|b| b == topic_name) {
+            q.push_back(topic_name.to_string());
         }
     }
 
-    /// Mark a box dirty on the WRITE HOT PATH without taking the global ready-set
-    /// mutex once the box is already dirty (codex P1). `already_dirty` is the box's
+    /// Mark a topic dirty on the WRITE HOT PATH without taking the global ready-set
+    /// mutex once the topic is already dirty (codex P1). `already_dirty` is the topic's
     /// `sched_dirty` atomic: a `compare_exchange` flips it `false → true` lock-free,
     /// and only the FIRST transition takes the mutex to enqueue the name. Since the
     /// ready-set is drained only by the (not-yet-wired) phase-4 governor — which
-    /// clears the flag via [`Scheduler::drain_order_clearing`] — a hot box stays
+    /// clears the flag via [`Scheduler::drain_order_clearing`] — a hot topic stays
     /// dirty and every subsequent append on it is a single relaxed atomic load +
     /// failed CAS, removing the per-write global lock that capped WAL-shard scaling.
     pub fn mark_dirty_fast(
         &self,
-        box_name: &str,
+        topic_name: &str,
         eff_priority: i64,
         already_dirty: &std::sync::atomic::AtomicBool,
     ) {
@@ -141,10 +141,10 @@ impl Scheduler {
         {
             return;
         }
-        self.mark_dirty(box_name, eff_priority);
+        self.mark_dirty(topic_name, eff_priority);
     }
 
-    /// As [`Scheduler::drain_order`], but also clears each drained box's
+    /// As [`Scheduler::drain_order`], but also clears each drained topic's
     /// `sched_dirty` flag (looked up via `clear`) so a future write re-enqueues it.
     /// The phase-4 governor will use this; provided now so the `sched_dirty`
     /// fast-path stays correct whenever a drainer is wired in.
@@ -159,7 +159,7 @@ impl Scheduler {
         out
     }
 
-    /// Bump a box's recency clock to `now`, so its auto-priority term resets to
+    /// Bump a topic's recency clock to `now`, so its auto-priority term resets to
     /// `AUTO_MAX` (a "consume" event: GET state / diff / SSE attach or delivery;
     /// DESIGN §3.1). Centralizes the recency write behind the scheduler so the
     /// phase-4 governor can hook it.
@@ -170,7 +170,7 @@ impl Scheduler {
     /// Drain the ready-set in strict priority-band order (B4→B0), FIFO within a
     /// band. Phase 2 drains inline (delivery is synchronous-on-append), so this
     /// is the clean ordering abstraction the phase-4 DWRR scheduler replaces.
-    /// Returns the dirty box names in the order they would be serviced.
+    /// Returns the dirty topic names in the order they would be serviced.
     pub fn drain_order(&self) -> Vec<String> {
         let mut ready = self.ready.lock();
         let mut out = Vec::new();
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn manual_priority_overrides_auto() {
-        // A box with a manual priority ignores the auto-recency term entirely,
+        // A topic with a manual priority ignores the auto-recency term entirely,
         // even if just consumed (DESIGN §3.1: config priority ⇒ auto-only off).
         let now = 1_000_000;
         // Manual +750 with a fresh consume: result is exactly the clamped manual
@@ -279,10 +279,10 @@ mod tests {
     #[test]
     fn touch_resets_recency_via_clock() {
         let (sched, clock) = sched_with_clock(1_000_000);
-        let last = AtomicI64::new(crate::engine::box_state::TS_NEVER);
-        // Before any touch, an untouched box has no auto bonus.
+        let last = AtomicI64::new(crate::engine::topic_state::TS_NEVER);
+        // Before any touch, an untouched topic has no auto bonus.
         let lc = match last.load(Ordering::Relaxed) {
-            crate::engine::box_state::TS_NEVER => None,
+            crate::engine::topic_state::TS_NEVER => None,
             v => Some(v),
         };
         assert_eq!(sched.effective_priority(None, true, lc, None), 0);
@@ -292,7 +292,7 @@ mod tests {
         let lc = Some(last.load(Ordering::Relaxed));
         assert_eq!(sched.effective_priority(None, true, lc, None), 500);
 
-        // Advance 30s; the same box decays to 250.
+        // Advance 30s; the same topic decays to 250.
         clock.advance(30_000);
         assert_eq!(sched.effective_priority(None, true, lc, None), 250);
     }
@@ -313,7 +313,7 @@ mod tests {
         sched.mark_dirty("mid", 300); // B2
         sched.mark_dirty("hi2", 900); // B4
         sched.mark_dirty("neg", -50); // B0
-                                      // Dedupe: re-marking an already-dirty box is a no-op.
+                                      // Dedupe: re-marking an already-dirty topic is a no-op.
         sched.mark_dirty("hi", 800);
 
         let order = sched.drain_order();
@@ -322,7 +322,7 @@ mod tests {
         assert!(sched.drain_order().is_empty());
     }
 
-    /// The lock-free `mark_dirty_fast` enqueues a box exactly once (the first
+    /// The lock-free `mark_dirty_fast` enqueues a topic exactly once (the first
     /// transition of its `sched_dirty` flag), and `drain_order_clearing` clears the
     /// flag so a later write re-enqueues it (codex P1 hot-path lock removal).
     #[test]

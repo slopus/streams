@@ -4,7 +4,7 @@
 //! delete segment-granular reclaim path + the on-recovery orphan sweep + the
 //! voluntary front-prefix delete) against the Phase-8A hostile filesystem harness
 //! ([`FakeDisk`] / [`FaultFs`] from `src/storage/testfs.rs`). The lower-level
-//! strategies drive the *real* [`LocalSegmentStore`] / [`BoxTier`] /
+//! strategies drive the *real* [`LocalSegmentStore`] / [`TopicTier`] /
 //! [`SegmentWriter::reclaim_orphans_below`] wired onto a [`FakeDisk`]; the
 //! WAL-level strategies drive the *real, fully-wired* [`Engine`] through
 //! `Engine::with_data_dir_fs` (the same plumbing as `tests/crash_oracle.rs`), so a
@@ -55,9 +55,9 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
 use streams::storage::{
-    data_name, BoxTier, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, Tier,
+    data_name, TopicTier, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, Tier,
 };
-use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Segment-store-level helpers (mirror tests/fault_cold_flip.rs): a real segment
@@ -65,8 +65,8 @@ use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, RecordIn, W
 // orphan sweep through SegmentWriter::reclaim_orphans_below.
 // ===========================================================================
 
-const HOT_DIR: &str = "/data/boxes/00000001";
-const COLD_DIR: &str = "/cold/boxes/00000001";
+const HOT_DIR: &str = "/data/topics/00000001";
+const COLD_DIR: &str = "/cold/topics/00000001";
 
 /// Build a real segment (`.data` + `.idx`) of `n` records starting at `start`.
 fn build_segment(start: u64, n: u64) -> (Vec<u8>, Vec<u8>) {
@@ -83,16 +83,16 @@ fn build_segment(start: u64, n: u64) -> (Vec<u8>, Vec<u8>) {
     b.finish()
 }
 
-/// Open a HOT+COLD [`BoxTier`] whose every byte of segment I/O routes through
+/// Open a HOT+COLD [`TopicTier`] whose every byte of segment I/O routes through
 /// `fs` (so a `crash()` on the underlying disk decides what survives).
-fn open_tier_on(fs: Arc<dyn Fs>) -> Arc<BoxTier> {
+fn open_tier_on(fs: Arc<dyn Fs>) -> Arc<TopicTier> {
     let hot = LocalSegmentStore::open_with(PathBuf::from(HOT_DIR), fs.clone()).unwrap();
     let cold = LocalSegmentStore::open_with(PathBuf::from(COLD_DIR), fs).unwrap();
-    Arc::new(BoxTier::new(Box::new(hot), Some(Box::new(cold))))
+    Arc::new(TopicTier::new(Box::new(hot), Some(Box::new(cold))))
 }
 
 /// The HOT+COLD tier on the FakeDisk directly (the common case).
-fn open_tier(disk: &FakeDisk) -> Arc<BoxTier> {
+fn open_tier(disk: &FakeDisk) -> Arc<TopicTier> {
     open_tier_on(disk.arc())
 }
 
@@ -102,10 +102,10 @@ fn open_tier(disk: &FakeDisk) -> Arc<BoxTier> {
 fn sync_all_dirs(disk: &FakeDisk) {
     let fs = disk.arc();
     for d in [
-        "/data/boxes/00000001",
-        "/cold/boxes/00000001",
-        "/data/boxes",
-        "/cold/boxes",
+        "/data/topics/00000001",
+        "/cold/topics/00000001",
+        "/data/topics",
+        "/cold/topics",
         "/data",
         "/cold",
     ] {
@@ -115,14 +115,14 @@ fn sync_all_dirs(disk: &FakeDisk) {
 
 /// Seal a segment into the HOT store and make it durable (its bytes are fsync'd
 /// by `put`; we fsync the dir so the name survives a crash).
-fn seal_hot(tier: &BoxTier, disk: &FakeDisk, id: u64, n: u64) {
+fn seal_hot(tier: &TopicTier, disk: &FakeDisk, id: u64, n: u64) {
     let (data, idx) = build_segment(id, n);
     tier.hot().put(id, &data, &idx).unwrap();
     sync_all_dirs(disk);
 }
 
 /// Re-derive a fresh tier from the current durable disk image (a "recovery" open).
-fn rederive(disk: &FakeDisk) -> Arc<BoxTier> {
+fn rederive(disk: &FakeDisk) -> Arc<TopicTier> {
     open_tier(disk)
 }
 
@@ -131,7 +131,7 @@ fn rederive(disk: &FakeDisk) -> Arc<BoxTier> {
 /// orphan segment ids dropped. The sweep's registry is empty, so the
 /// "not registered" test is governed purely by the `live_floor` argument —
 /// exactly what recovery passes after rebuilding the registry.
-fn run_orphan_sweep(tier: &Arc<BoxTier>, live_floor: u64) -> usize {
+fn run_orphan_sweep(tier: &Arc<TopicTier>, live_floor: u64) -> usize {
     let cfg = SegmentConfig {
         max_events: 1,
         max_bytes: 0,
@@ -145,7 +145,7 @@ fn run_orphan_sweep(tier: &Arc<BoxTier>, live_floor: u64) -> usize {
 }
 
 /// Whether a tier currently considers `id` a complete, resolvable segment.
-fn resolvable(tier: &BoxTier, id: u64) -> bool {
+fn resolvable(tier: &TopicTier, id: u64) -> bool {
     tier.resolve(id).is_some()
 }
 
@@ -422,10 +422,10 @@ fn sync_wal_dir(disk: &FakeDisk) {
     let _ = fs.sync_dir(&PathBuf::from(DATA_DIR).join("meta"));
 }
 
-/// A flat dump of one recovered box: head / earliest / count / live seqs /
+/// A flat dump of one recovered topic: head / earliest / count / live seqs /
 /// per-seq data, and whether a from-0 read surfaces a tombstone.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -435,8 +435,8 @@ struct BoxDump {
 }
 
 /// Read the full recovered state of `name` through the engine's public API.
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut data = BTreeMap::new();
     let mut tombstone = false;
     let mut from = 0u64;
@@ -472,7 +472,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -501,19 +501,19 @@ fn append(engine: &Engine, name: &str, data: &str, tag: Option<&str>) -> u64 {
     resp.last_seq
 }
 
-/// Create a durable box.
-fn put_durable_box(engine: &Engine, name: &str) {
+/// Create a durable topic.
+fn put_durable_topic(engine: &Engine, name: &str) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 cap_records: 0,
                 ..Default::default()
             },
         )
-        .expect("put_box");
+        .expect("put_topic");
 }
 
 // ===========================================================================
@@ -530,13 +530,13 @@ fn put_durable_box(engine: &Engine, name: &str) {
 fn f_reclaim_delete_never_resurrects() {
     let disk = FakeDisk::new();
 
-    // Workload: a durable box with 5 records, then a voluntary prefix delete
+    // Workload: a durable topic with 5 records, then a voluntary prefix delete
     // (before_seq=3 ⇒ seqs 1,2 deleted) AND a tag delete (tag "drop" ⇒ seq 4).
     // The delete's WAL frame is fsync'd (durable append blocks on the group fsync,
     // and `delete()` logs the frame with durable=true and propagates its result).
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "jobs");
+        put_durable_topic(&engine, "jobs");
         append(&engine, "jobs", "a", Some("keep"));
         append(&engine, "jobs", "b", Some("keep"));
         append(&engine, "jobs", "c", Some("keep"));
@@ -573,7 +573,7 @@ fn f_reclaim_delete_never_resurrects() {
     // absent, only 3 & 5 survive. No deleted seq resurrects.
     let d1 = {
         let engine = open_engine(&disk);
-        let d = dump_box(&engine, "jobs").expect("jobs survives recovery #1");
+        let d = dump_topic(&engine, "jobs").expect("jobs survives recovery #1");
         assert_eq!(d.seqs, vec![3, 5], "deleted seqs 1,2,4 absent; 3,5 survive");
         assert_eq!(d.data[&3], "c");
         assert_eq!(d.data[&5], "e");
@@ -594,7 +594,7 @@ fn f_reclaim_delete_never_resurrects() {
     // the deleted seqs STAY absent across repeated recovery (never resurrect).
     let d2 = {
         let engine = open_engine(&disk);
-        dump_box(&engine, "jobs").expect("jobs survives recovery #2")
+        dump_topic(&engine, "jobs").expect("jobs survives recovery #2")
     };
     assert_eq!(
         d1, d2,
@@ -609,14 +609,14 @@ fn f_reclaim_delete_never_resurrects() {
 //           voluntary delete.
 //   oracle: earliest_seq recovers to the delete boundary; the deleted prefix
 //           stays gone and SILENT (no tombstone); count/head consistent (matches
-//           sigkill_durable test's jobs box).
+//           sigkill_durable test's jobs topic).
 // ===========================================================================
 
 #[test]
 fn f_reclaim_front_prefix() {
     let disk = FakeDisk::new();
 
-    // A durable "jobs" box: append 6, then voluntarily delete the front prefix
+    // A durable "jobs" topic: append 6, then voluntarily delete the front prefix
     // (before_seq=4 ⇒ seqs 1,2,3 gone). The front reclaim (earliest_seq advance +
     // index compaction) runs inside `apply_delete`; we crash right after the
     // Delete fsync, which is "between delete commit and index compaction" as far
@@ -624,7 +624,7 @@ fn f_reclaim_front_prefix() {
     // frame is durable, and it replays the same boundary on recovery).
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "jobs");
+        put_durable_topic(&engine, "jobs");
         for i in 1..=6 {
             append(&engine, "jobs", &i.to_string(), None);
         }
@@ -643,7 +643,7 @@ fn f_reclaim_front_prefix() {
     disk.reset_power();
 
     let engine = open_engine(&disk);
-    let d = dump_box(&engine, "jobs").expect("jobs survives recovery");
+    let d = dump_topic(&engine, "jobs").expect("jobs survives recovery");
 
     // earliest_seq recovered to the delete boundary (4); the deleted prefix is gone
     // and SILENT (no tombstone); count/head consistent.
@@ -667,7 +667,7 @@ fn f_reclaim_front_prefix() {
 
     // Idempotent recovery: the boundary stays put across a second recovery.
     let engine2 = open_engine(&disk);
-    let d2 = dump_box(&engine2, "jobs").expect("jobs survives recovery #2");
+    let d2 = dump_topic(&engine2, "jobs").expect("jobs survives recovery #2");
     assert_eq!(
         d, d2,
         "front-prefix boundary stable across repeated recovery"

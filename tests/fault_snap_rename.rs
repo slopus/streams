@@ -59,7 +59,7 @@ use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage
 use streams::storage::{
     load_latest_with, next_snapshot_id_with, write_snapshot_with, Checkpoint, Fs, Snapshot,
 };
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 
@@ -80,7 +80,7 @@ fn open_engine(disk: &FakeDisk) -> Arc<Engine> {
 }
 
 /// Append one durable (group-fsynced ⇒ acked) record to `name`, auto-creating a
-/// durable box. Returns the assigned seq.
+/// durable topic. Returns the assigned seq.
 fn append_durable(engine: &Engine, name: &str, data: &str) -> u64 {
     let req = WriteRequest {
         records: vec![RecordIn {
@@ -99,19 +99,19 @@ fn append_durable(engine: &Engine, name: &str, data: &str) -> u64 {
     resp.last_seq
 }
 
-/// Create a durable box explicitly (so auto-create defaults don't make it
+/// Create a durable topic explicitly (so auto-create defaults don't make it
 /// non-durable).
-fn put_durable_box(engine: &Engine, name: &str) {
+fn put_durable_topic(engine: &Engine, name: &str) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 ..Default::default()
             },
         )
-        .expect("put durable box");
+        .expect("put durable topic");
 }
 
 /// Read every live record's `data` string back through the real diff path.
@@ -186,7 +186,7 @@ fn mk_snapshot(id: u64, seq: u64) -> Snapshot {
     Snapshot {
         id,
         ts: 1,
-        next_box_id: 1,
+        next_topic_id: 1,
         checkpoint: Checkpoint {
             wal_idx: 1,
             wal_offset: 0,
@@ -194,7 +194,7 @@ fn mk_snapshot(id: u64, seq: u64) -> Snapshot {
             shards: vec![(1, 0)],
             shard_keys: vec![String::new()],
         },
-        boxes: vec![],
+        topics: vec![],
         routers: vec![],
     }
 }
@@ -353,7 +353,7 @@ fn f_snap_crash_after_tmp_before_rename() {
     // Phase 1: a durable workload + a FIRST durable snapshot (fully installed).
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "jobs");
+        put_durable_topic(&engine, "jobs");
         append_durable(&engine, "jobs", "a");
         append_durable(&engine, "jobs", "b");
         engine.write_snapshot().expect("snapshot #1 installs");
@@ -417,7 +417,7 @@ fn f_snap_eio_rename() {
     // Phase 1: durable workload + first installed snapshot.
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "jobs");
+        put_durable_topic(&engine, "jobs");
         append_durable(&engine, "jobs", "a");
         append_durable(&engine, "jobs", "b");
         engine.write_snapshot().expect("snapshot #1 installs");
@@ -472,7 +472,7 @@ fn f_snap_crash_before_prune() {
     // Phase 1: durable workload + first installed snapshot.
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "jobs");
+        put_durable_topic(&engine, "jobs");
         append_durable(&engine, "jobs", "a");
         append_durable(&engine, "jobs", "b");
         engine.write_snapshot().expect("snapshot #1 installs");
@@ -571,7 +571,7 @@ fn f_sweep_snapshot_write() {
     // so we replay the small workload — it is bounded and deterministic).
     let build_preop = |disk: &FakeDisk| -> (u64, Vec<String>) {
         let engine = open_engine(disk);
-        put_durable_box(&engine, "jobs");
+        put_durable_topic(&engine, "jobs");
         append_durable(&engine, "jobs", "a");
         engine.write_snapshot().expect("pre-op snapshot #1");
         // One acked append AFTER the snapshot, covered by the WAL (not snap #1), so

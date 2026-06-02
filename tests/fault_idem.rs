@@ -40,7 +40,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Plumbing (mirrors tests/crash_oracle.rs)
@@ -73,7 +73,7 @@ fn sync_dirs(disk: &FakeDisk) {
 }
 
 /// Append one record to `name` with an optional idempotency key, on a durable
-/// box (`durable=true` ⇒ the write blocks on the group fsync ⇒ acked ⇒ durable).
+/// topic (`durable=true` ⇒ the write blocks on the group fsync ⇒ acked ⇒ durable).
 fn write_one(
     engine: &Engine,
     name: &str,
@@ -90,8 +90,8 @@ fn write_one(
         node: None,
         idempotency_key: idempotency_key.map(|s| s.to_string()),
         create: Some(true),
-        config: Some(BoxConfig {
-            r#type: BoxType::Log,
+        config: Some(TopicConfig {
+            r#type: TopicType::Log,
             durable: true,
             ..Default::default()
         }),
@@ -176,7 +176,7 @@ fn f_idemp_retry_after_crash() {
         assert_eq!(r2.last_seq, 3);
 
         sync_dirs(&disk);
-        // Power loss with every write durable+acked (durable box ⇒ all fsynced).
+        // Power loss with every write durable+acked (durable topic ⇒ all fsynced).
         disk.crash(TornDamage::None);
         drop(engine);
         (dedup.seqs.clone().unwrap(), r2.head_seq)
@@ -240,7 +240,7 @@ fn f_idemp_retry_after_crash() {
     );
 
     // (d) Head monotone & advanced by exactly the one retried record.
-    let st = engine.box_state("jobs", false).expect("state");
+    let st = engine.topic_state("jobs", false).expect("state");
     assert_eq!(st.head_seq, 4, "head advanced to head_before+1");
     assert!(
         st.head_seq > head_before,
@@ -258,7 +258,7 @@ fn f_idemp_retry_after_crash() {
         vec![1, 2, 3, 4],
         "recovery is idempotent"
     );
-    let b = engine2.get_box("jobs").expect("box present");
+    let b = engine2.get_topic("jobs").expect("topic present");
     assert!(
         b.dedupe.read().is_empty(),
         "dedupe map is never rebuilt from durable state on recovery"
@@ -289,7 +289,7 @@ fn f_idemp_window_not_persisted() {
 
         // Sanity: the dedupe map IS populated in the live engine pre-snapshot —
         // so a non-empty restore would be a real persistence regression.
-        let live = engine.get_box("q").expect("box present");
+        let live = engine.get_topic("q").expect("topic present");
         assert_eq!(
             live.dedupe.read().len(),
             2,
@@ -326,7 +326,7 @@ fn f_idemp_window_not_persisted() {
 
     // (2) THE INVARIANT UNDER TEST: the restored dedupe map is EMPTY — the
     //     snapshot intentionally carries no dedupe state (best-effort window).
-    let b = engine.get_box("q").expect("box present after recovery");
+    let b = engine.get_topic("q").expect("topic present after recovery");
     assert!(
         b.dedupe.read().is_empty(),
         "restored dedupe map MUST be empty (dedupe is never persisted to the snapshot)"

@@ -31,14 +31,14 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::types::{
-    BoxConfig, DeleteRequest, DiffRequest, Discard, Filter, NodeFilter, RecordIn, WriteRequest,
+    TopicConfig, DeleteRequest, DiffRequest, Discard, Filter, NodeFilter, RecordIn, WriteRequest,
 };
 
 // ---------------------------------------------------------------------------
 // Fixtures / helpers
 // ---------------------------------------------------------------------------
 
-const BOX: &str = "p";
+const TOPIC: &str = "p";
 /// A clock start far enough from 0 that records always carry a positive `$ts`
 /// and we can advance/rewind within the window without underflow.
 const T0: i64 = 1_000_000_000;
@@ -80,7 +80,7 @@ fn diff_from(from_seq: u64) -> DiffRequest {
     }
 }
 
-/// Fully drain a box from `from_seq` via repeated diffs, following
+/// Fully drain a topic from `from_seq` via repeated diffs, following
 /// `next_from_seq` until `caught_up`, returning every delivered `$seq` in
 /// delivery order. Asserts (per page) that delivered seqs are strictly
 /// ascending and `> from_seq`, that the cursor never goes backward, and that
@@ -118,7 +118,7 @@ fn drain(engine: &Engine, name: &str, mut from_seq: u64) -> (Vec<u64>, bool) {
             d.next_from_seq
         );
         // Progress guarantee: if not caught up the cursor must advance, else a
-        // node-/delete-filtered box would loop forever.
+        // node-/delete-filtered topic would loop forever.
         if d.caught_up {
             break;
         }
@@ -173,7 +173,7 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// The master invariant test: a randomized op sequence against a box with a
+    /// The master invariant test: a randomized op sequence against a topic with a
     /// finite cap + TTL, checking (i)–(iv) on every step.
     #[test]
     fn invariants_under_random_ops(
@@ -182,17 +182,17 @@ proptest! {
         ttl in prop::option::of(200u64..2000),
     ) {
         let (engine, clock) = build_engine(T0);
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             cap_records: cap.unwrap_or(0),
             ttl_ms: ttl.unwrap_or(0),
             discard: Discard::Old,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         };
-        engine.put_box(BOX, cfg).unwrap();
+        engine.put_topic(TOPIC, cfg).unwrap();
 
         // Model state for cross-step invariants.
         let mut prev_head: u64 = 0;
-        let mut prev_earliest: u64 = engine.box_state(BOX, false).unwrap().earliest_seq;
+        let mut prev_earliest: u64 = engine.topic_state(TOPIC, false).unwrap().earliest_seq;
         // Seqs the model knows were voluntarily deleted (by us). Once deleted,
         // they MUST NOT ever reappear in a read (invariant iv).
         let mut deleted_seqs: BTreeSet<u64> = BTreeSet::new();
@@ -202,13 +202,13 @@ proptest! {
         for op in ops {
             match op {
                 Op::Write { n, tag_k, node_m } => {
-                    let head_before = engine.box_state(BOX, false).unwrap().head_seq;
+                    let head_before = engine.topic_state(TOPIC, false).unwrap().head_seq;
                     let tag = tag_k.map(|k| format!("t{k}"));
                     let node = node_m.map(|m| format!("n{m}"));
                     let records: Vec<RecordIn> = (0..n)
                         .map(|i| rec(serde_json::json!({"i": i}), tag.clone(), node.clone()))
                         .collect();
-                    let resp = engine.write(BOX, write_req(records), true).unwrap();
+                    let resp = engine.write(TOPIC, write_req(records), true).unwrap();
                     let seqs = resp.seqs.clone().unwrap();
                     // (i) contiguous assignment starting at head_before + 1.
                     prop_assert_eq!(resp.first_seq, head_before + 1);
@@ -229,24 +229,24 @@ proptest! {
                     clock.advance(ms as i64);
                 }
                 Op::DeleteBefore { back } => {
-                    let head = engine.box_state(BOX, false).unwrap().head_seq;
+                    let head = engine.topic_state(TOPIC, false).unwrap().head_seq;
                     if head == 0 {
                         continue;
                     }
                     let before = head.saturating_sub(back as u64).max(1);
                     // Snapshot which currently-live seqs this removes.
-                    let live = drain(&engine, BOX, 0).0;
+                    let live = drain(&engine, TOPIC, 0).0;
                     let to_delete: Vec<u64> =
                         live.iter().copied().filter(|&s| s < before).collect();
                     engine
-                        .delete(BOX, DeleteRequest { before_seq: Some(before), match_: None })
+                        .delete(TOPIC, DeleteRequest { before_seq: Some(before), match_: None })
                         .unwrap();
                     deleted_seqs.extend(to_delete);
                 }
                 Op::DeleteTag { tag_k } => {
                     let tag = format!("t{tag_k}");
                     // Which currently-live seqs carry this tag (point-in-time).
-                    let live = drain(&engine, BOX, 0).0;
+                    let live = drain(&engine, TOPIC, 0).0;
                     let to_delete: Vec<u64> = live
                         .iter()
                         .copied()
@@ -254,7 +254,7 @@ proptest! {
                         .collect();
                     engine
                         .delete(
-                            BOX,
+                            TOPIC,
                             DeleteRequest {
                                 before_seq: None,
                                 match_: Some(Filter::from_shorthand(&tag)),
@@ -264,15 +264,15 @@ proptest! {
                     deleted_seqs.extend(to_delete);
                 }
                 Op::Read { back } => {
-                    let head = engine.box_state(BOX, false).unwrap().head_seq;
+                    let head = engine.topic_state(TOPIC, false).unwrap().head_seq;
                     let from = head.saturating_sub(back as u64);
-                    let _ = drain(&engine, BOX, from);
+                    let _ = drain(&engine, TOPIC, from);
                 }
             }
 
             // --- Per-step state invariants (ii). ---------------------------
-            let st = engine.box_state(BOX, false).unwrap();
-            let b = engine.get_box(BOX).unwrap();
+            let st = engine.topic_state(TOPIC, false).unwrap();
+            let b = engine.get_topic(TOPIC).unwrap();
             let evict_earliest = b.evict_earliest_seq();
 
             // head_seq monotonic non-decreasing.
@@ -282,7 +282,7 @@ proptest! {
                 st.head_seq,
                 prev_head
             );
-            // earliest_seq monotonic non-decreasing (over a box instance's life;
+            // earliest_seq monotonic non-decreasing (over a topic instance's life;
             // no delete+recreate happens in this test).
             prop_assert!(
                 st.earliest_seq >= prev_earliest,
@@ -307,7 +307,7 @@ proptest! {
             // strictly ascending, none below the floor, none ever-deleted, and
             // a tombstone exactly iff the cursor (0) is below the involuntary
             // floor. --------------------------------------------------------
-            let d0 = engine.diff(BOX, diff_from(0)).unwrap();
+            let d0 = engine.diff(TOPIC, diff_from(0)).unwrap();
             // tombstone-iff: from_seq=0, so gap iff 1 < evict_earliest.
             let expect_tombstone = 1 < evict_earliest;
             prop_assert_eq!(
@@ -359,7 +359,7 @@ proptest! {
         let mut all = Vec::new();
         for n in batches {
             let recs: Vec<RecordIn> = (0..n).map(|_| rec(serde_json::json!(1), None, None)).collect();
-            let resp = engine.write(BOX, write_req(recs), true).unwrap();
+            let resp = engine.write(TOPIC, write_req(recs), true).unwrap();
             let seqs = resp.seqs.unwrap();
             for s in &seqs {
                 prop_assert_eq!(*s, next);
@@ -367,17 +367,17 @@ proptest! {
                 all.push(*s);
             }
             // A read in the middle must never perturb assignment.
-            let _ = engine.diff(BOX, diff_from(0)).unwrap();
+            let _ = engine.diff(TOPIC, diff_from(0)).unwrap();
         }
         // Globally strictly increasing & gap-free.
         for w in all.windows(2) {
             prop_assert_eq!(w[1], w[0] + 1);
         }
-        prop_assert_eq!(engine.box_state(BOX, false).unwrap().head_seq, next - 1);
+        prop_assert_eq!(engine.topic_state(TOPIC, false).unwrap().head_seq, next - 1);
     }
 
     /// (iv) Deleted records never reappear; (iii) deletion is silent (no
-    /// tombstone) on a cap/TTL-free box even though `earliest_seq` advances.
+    /// tombstone) on a cap/TTL-free topic even though `earliest_seq` advances.
     #[test]
     fn deletes_are_silent_and_permanent(
         total in 4u8..40,
@@ -385,21 +385,21 @@ proptest! {
     ) {
         let (engine, _clock) = build_engine(T0);
         // No cap, no TTL ⇒ the only floor mover is the voluntary delete.
-        engine.put_box(BOX, BoxConfig::default()).unwrap();
+        engine.put_topic(TOPIC, TopicConfig::default()).unwrap();
         let recs: Vec<RecordIn> = (0..total).map(|i| rec(serde_json::json!({"i": i}), None, None)).collect();
-        engine.write(BOX, write_req(recs), true).unwrap();
-        let head = engine.box_state(BOX, false).unwrap().head_seq;
+        engine.write(TOPIC, write_req(recs), true).unwrap();
+        let head = engine.topic_state(TOPIC, false).unwrap().head_seq;
         let before = before.min(head + 1);
 
-        let resp = engine.delete(BOX, DeleteRequest { before_seq: Some(before), match_: None }).unwrap();
+        let resp = engine.delete(TOPIC, DeleteRequest { before_seq: Some(before), match_: None }).unwrap();
         // earliest advanced to `before` (or head+1 if all deleted).
         prop_assert_eq!(resp.earliest_seq, before.min(head + 1).max(1));
 
-        let b = engine.get_box(BOX).unwrap();
+        let b = engine.get_topic(TOPIC).unwrap();
         // Pure delete never advances the involuntary floor.
         prop_assert_eq!(b.evict_earliest_seq(), 1);
 
-        let d = engine.diff(BOX, diff_from(0)).unwrap();
+        let d = engine.diff(TOPIC, diff_from(0)).unwrap();
         prop_assert!(d.tombstone.is_none(), "pure delete must be silent");
         // Every delivered seq is >= before (deleted prefix never reappears).
         for r in &d.records {
@@ -420,16 +420,16 @@ proptest! {
         writes in 7u8..40,
     ) {
         let (engine, _clock) = build_engine(T0);
-        engine.put_box(BOX, BoxConfig { cap_records: cap, ..BoxConfig::default() }).unwrap();
+        engine.put_topic(TOPIC, TopicConfig { cap_records: cap, ..TopicConfig::default() }).unwrap();
         for i in 0..writes {
-            engine.write(BOX, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
+            engine.write(TOPIC, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
         }
-        let st = engine.box_state(BOX, false).unwrap();
+        let st = engine.topic_state(TOPIC, false).unwrap();
         prop_assert_eq!(st.head_seq, writes as u64);
         // With writes > cap, the front was involuntarily evicted.
         prop_assert!(st.earliest_seq > 1, "cap should have evicted the front");
 
-        let d = engine.diff(BOX, diff_from(0)).unwrap();
+        let d = engine.diff(TOPIC, diff_from(0)).unwrap();
         let tomb = d.tombstone.expect("cap eviction crossing from_seq=0 must tombstone");
         prop_assert_eq!(tomb.gap_from, 1);
         prop_assert_eq!(tomb.gap_to, st.earliest_seq - 1);
@@ -452,23 +452,23 @@ proptest! {
         extra in 1u32..50,
     ) {
         let (engine, clock) = build_engine(T0);
-        engine.put_box(BOX, BoxConfig { ttl_ms: ttl, ..BoxConfig::default() }).unwrap();
+        engine.put_topic(TOPIC, TopicConfig { ttl_ms: ttl, ..TopicConfig::default() }).unwrap();
         // Write n records at T0.
         for i in 0..n {
-            engine.write(BOX, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
+            engine.write(TOPIC, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
         }
         // Advance strictly past the TTL so all n expire (now - ts > ttl).
         clock.advance(ttl as i64 + extra as i64);
         // One fresh write so head moves and earliest can advance past expired.
-        engine.write(BOX, write_req(vec![rec(serde_json::json!(99), None, None)]), true).unwrap();
+        engine.write(TOPIC, write_req(vec![rec(serde_json::json!(99), None, None)]), true).unwrap();
 
-        let st = engine.box_state(BOX, false).unwrap();
+        let st = engine.topic_state(TOPIC, false).unwrap();
         prop_assert_eq!(st.head_seq, n as u64 + 1);
         // The n original records expired; only the fresh one is live.
         prop_assert_eq!(st.earliest_seq, n as u64 + 1);
         prop_assert_eq!(st.count, 1);
 
-        let d = engine.diff(BOX, diff_from(0)).unwrap();
+        let d = engine.diff(TOPIC, diff_from(0)).unwrap();
         let tomb = d.tombstone.expect("ttl expiry crossing from_seq=0 must tombstone");
         prop_assert_eq!(tomb.reason, streams::types::TombstoneReason::Ttl);
         prop_assert_eq!(tomb.gap_from, 1);
@@ -485,7 +485,7 @@ proptest! {
         nodes in prop::collection::vec(0u8..3, 1..40),
     ) {
         let (engine, _clock) = build_engine(T0);
-        engine.put_box(BOX, BoxConfig::default()).unwrap();
+        engine.put_topic(TOPIC, TopicConfig::default()).unwrap();
         let name_of = |k: u8| match k { 0 => "self", 1 => "self2", _ => "other" };
         let mut foreign_seqs = Vec::new();
         for (i, &k) in nodes.iter().enumerate() {
@@ -494,7 +494,7 @@ proptest! {
                 foreign_seqs.push(seq);
             }
             engine
-                .write(BOX, write_req(vec![rec(serde_json::json!(i), None, Some(name_of(k).to_string()))]), true)
+                .write(TOPIC, write_req(vec![rec(serde_json::json!(i), None, Some(name_of(k).to_string()))]), true)
                 .unwrap();
         }
         // Reader filters out both of its own identities.
@@ -504,7 +504,7 @@ proptest! {
             node: Some(NodeFilter::Many(vec!["self".to_string(), "self2".to_string()])),
             ..DiffRequest::default()
         };
-        let d = engine.diff(BOX, req).unwrap();
+        let d = engine.diff(TOPIC, req).unwrap();
         // Only the foreign-node records are delivered.
         let got: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
         prop_assert_eq!(got, foreign_seqs);
@@ -523,7 +523,7 @@ proptest! {
         batch in 1u8..5,
     ) {
         let (engine, _clock) = build_engine(T0);
-        engine.put_box(BOX, BoxConfig::default()).unwrap();
+        engine.put_topic(TOPIC, TopicConfig::default()).unwrap();
         let make = |key: &str, batch: u8| WriteRequest {
             records: (0..batch).map(|i| rec(serde_json::json!(i), None, None)).collect(),
             node: None,
@@ -532,32 +532,32 @@ proptest! {
             config: None,
             disable_backpressure: false,
         };
-        let first = engine.write(BOX, make("k1", batch), true).unwrap();
+        let first = engine.write(TOPIC, make("k1", batch), true).unwrap();
         let original = first.seqs.clone().unwrap();
         prop_assert!(!first.deduped);
-        let head_after_first = engine.box_state(BOX, false).unwrap().head_seq;
+        let head_after_first = engine.topic_state(TOPIC, false).unwrap().head_seq;
         prop_assert_eq!(head_after_first, batch as u64);
 
         for _ in 0..replays {
-            let r = engine.write(BOX, make("k1", batch), true).unwrap();
+            let r = engine.write(TOPIC, make("k1", batch), true).unwrap();
             prop_assert!(r.deduped, "in-window replay must be deduped");
             prop_assert_eq!(r.seqs.clone().unwrap(), original.clone());
             // Head never advances on a dedupe.
-            prop_assert_eq!(engine.box_state(BOX, false).unwrap().head_seq, head_after_first);
+            prop_assert_eq!(engine.topic_state(TOPIC, false).unwrap().head_seq, head_after_first);
         }
 
         // A distinct key appends fresh, contiguous seqs.
-        let other = engine.write(BOX, make("k2", batch), true).unwrap();
+        let other = engine.write(TOPIC, make("k2", batch), true).unwrap();
         prop_assert!(!other.deduped);
         prop_assert_eq!(other.first_seq, head_after_first + 1);
 
         // A full drain shows exactly the two batches (no dup of the first).
-        let (seqs, _) = drain(&engine, BOX, 0);
+        let (seqs, _) = drain(&engine, TOPIC, 0);
         let expected: Vec<u64> = (1..=head_after_first + batch as u64).collect();
         prop_assert_eq!(seqs, expected);
     }
 
-    /// (iii) The dual-watermark mix: deletes + cap on the same box. A
+    /// (iii) The dual-watermark mix: deletes + cap on the same topic. A
     /// purely-deleted gap below `earliest_seq` is silent, while any cap loss
     /// below the cursor still tombstones. The full-drain set never contains a
     /// deleted seq and is always strictly ascending.
@@ -570,38 +570,38 @@ proptest! {
         post in 6u8..30,
     ) {
         let (engine, _clock) = build_engine(T0);
-        engine.put_box(BOX, BoxConfig { cap_records: cap, ..BoxConfig::default() }).unwrap();
+        engine.put_topic(TOPIC, TopicConfig { cap_records: cap, ..TopicConfig::default() }).unwrap();
         // Phase 1: write `pre` records strictly within cap (2..=cap-1).
         let pre = 2 + (pre_frac % (cap - 2)); // in [2, cap-1]
         for i in 0..pre {
-            engine.write(BOX, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
+            engine.write(TOPIC, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
         }
-        let pre_head = engine.box_state(BOX, false).unwrap().head_seq;
+        let pre_head = engine.topic_state(TOPIC, false).unwrap().head_seq;
         // Delete a prefix (voluntary) — must stay silent.
         let before = (pre_head / 2).max(1) + 1;
-        engine.delete(BOX, DeleteRequest { before_seq: Some(before), match_: None }).unwrap();
-        let after_del = engine.box_state(BOX, false).unwrap();
-        let b = engine.get_box(BOX).unwrap();
+        engine.delete(TOPIC, DeleteRequest { before_seq: Some(before), match_: None }).unwrap();
+        let after_del = engine.topic_state(TOPIC, false).unwrap();
+        let b = engine.get_topic(TOPIC).unwrap();
         // Deletion advanced earliest but not the involuntary floor.
         prop_assert!(after_del.earliest_seq >= before.min(pre_head + 1));
         prop_assert_eq!(b.evict_earliest_seq(), 1, "delete must not move evict floor");
-        let d_silent = engine.diff(BOX, diff_from(0)).unwrap();
+        let d_silent = engine.diff(TOPIC, diff_from(0)).unwrap();
         prop_assert!(d_silent.tombstone.is_none(), "purely-deleted gap is silent");
 
         // Phase 2: overflow the cap so live records are involuntarily evicted.
         for i in 0..post {
-            engine.write(BOX, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
+            engine.write(TOPIC, write_req(vec![rec(serde_json::json!(i), None, None)]), true).unwrap();
         }
-        let st = engine.box_state(BOX, false).unwrap();
-        let b2 = engine.get_box(BOX).unwrap();
+        let st = engine.topic_state(TOPIC, false).unwrap();
+        let b2 = engine.get_topic(TOPIC).unwrap();
         let evict_earliest = b2.evict_earliest_seq();
         // The dual watermark invariant still holds.
         prop_assert!(evict_earliest <= st.earliest_seq);
-        let d = engine.diff(BOX, diff_from(0)).unwrap();
+        let d = engine.diff(TOPIC, diff_from(0)).unwrap();
         // tombstone iff the involuntary floor crossed the cursor.
         prop_assert_eq!(d.tombstone.is_some(), 1 < evict_earliest);
         // Drain is strictly ascending, resumes at earliest, count == cap.
-        let (seqs, _) = drain(&engine, BOX, 0);
+        let (seqs, _) = drain(&engine, TOPIC, 0);
         for w in seqs.windows(2) {
             prop_assert!(w[1] > w[0]);
         }

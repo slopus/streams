@@ -2,7 +2,7 @@
 //!
 //! - **R3** — `disk`-class seq monotonicity across restart. A `disk` write is
 //!   acked before its WAL frame is fsynced, so a power loss can drop the frame.
-//!   A durable per-box head RESERVATION (fsynced ahead of use) guarantees the
+//!   A durable per-topic head RESERVATION (fsynced ahead of use) guarantees the
 //!   recovered head never regresses and an already-acked `disk` seq is never
 //!   re-handed: the lost records become silent deleted gaps, but the seq counter
 //!   only advances.
@@ -13,8 +13,8 @@
 //! - **R14** — RAII publish-ticket guard. A panic in a ticketed writer between
 //!   taking the publish ticket and releasing it must NOT hang `quiesce_publishes`
 //!   (snapshot capture) or strand every later writer behind the unreleased ticket.
-//! - **put_box CREATE WAL-first** — a fresh create whose `BoxConfig` WAL frame
-//!   fails to commit must leave NO box (no orphan) and return an error.
+//! - **put_topic CREATE WAL-first** — a fresh create whose `TopicConfig` WAL frame
+//!   fails to commit must leave NO topic (no orphan) and return an error.
 //!
 //! ```text
 //! cargo test --features test-fs --test crash_stage2
@@ -31,7 +31,7 @@ use streams::config::{self, ServerConfig};
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp};
 use streams::storage::Fs;
-use streams::types::{BoxConfig, BoxType, DiffRequest, Durability, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, Durability, RecordIn, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 
@@ -54,8 +54,8 @@ fn open_engine_fs(fs: Arc<dyn Fs>) -> Arc<Engine> {
     Engine::with_data_dir_fs(cfg(), clock(), fs).expect("engine opens through fs")
 }
 
-fn put_box(engine: &Engine, name: &str, config: BoxConfig) {
-    engine.put_box(name, config).expect("put_box");
+fn put_topic(engine: &Engine, name: &str, config: TopicConfig) {
+    engine.put_topic(name, config).expect("put_topic");
 }
 
 /// Append one record; returns the assigned seq.
@@ -119,27 +119,27 @@ fn sync_dirs(disk: &FakeDisk) {
 // R3 — disk-class seq monotonicity / no reuse across a power loss
 // ===========================================================================
 
-/// A `disk` box acks writes before their frames fsync. After a power loss that
+/// A `disk` topic acks writes before their frames fsync. After a power loss that
 /// drops the un-fsynced tail, recovery must NOT regress the head and re-hand an
 /// already-acked seq: the durable head reservation advances the recovered head
 /// past every acked seq (the lost records are silent gaps), so the next append
 /// continues ABOVE the highest seq ever acked — never reusing one.
 #[test]
-fn disk_box_does_not_reuse_acked_seq_after_crash() {
+fn disk_topic_does_not_reuse_acked_seq_after_crash() {
     let disk = FakeDisk::new();
 
     let highest_acked = {
         let engine = open_engine(&disk);
-        put_box(
+        put_topic(
             &engine,
             "d",
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durability: Some(Durability::Disk),
                 ..Default::default()
             },
         );
-        // The create's BoxConfig frame fsynced. The FIRST disk write fsyncs a head
+        // The create's TopicConfig frame fsynced. The FIRST disk write fsyncs a head
         // RESERVATION (a block ahead) before acking — that fsync also hardens this
         // record's frame. Subsequent writes within the reservation are acked from
         // the buffered write only (no fsync), so a crash drops their frames.
@@ -159,7 +159,7 @@ fn disk_box_does_not_reuse_acked_seq_after_crash() {
     // Recover. The head must not regress below the highest acked seq (no reuse),
     // and it sits at the durable reservation ceiling (the lost seqs are gaps).
     let engine = open_engine(&disk);
-    let st = engine.box_state("d", false).expect("disk box recovers");
+    let st = engine.topic_state("d", false).expect("disk topic recovers");
     assert!(
         st.head_seq >= highest_acked,
         "recovered head {} regressed below the highest acked seq {highest_acked} (REUSE!)",
@@ -199,19 +199,19 @@ fn disk_box_does_not_reuse_acked_seq_after_crash() {
     );
 }
 
-/// A CLEANLY-stopped `disk` box never loses an acked seq either: every acked
+/// A CLEANLY-stopped `disk` topic never loses an acked seq either: every acked
 /// record survives, head never regresses, and a post-restart append never reuses
 /// a seq.
 #[test]
-fn disk_box_clean_restart_preserves_seqs_no_reuse() {
+fn disk_topic_clean_restart_preserves_seqs_no_reuse() {
     let disk = FakeDisk::new();
     let highest = {
         let engine = open_engine(&disk);
-        put_box(
+        put_topic(
             &engine,
             "d",
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durability: Some(Durability::Disk),
                 ..Default::default()
             },
@@ -225,7 +225,7 @@ fn disk_box_clean_restart_preserves_seqs_no_reuse() {
         last
     };
     let engine = open_engine(&disk);
-    let st = engine.box_state("d", false).expect("disk box recovers");
+    let st = engine.topic_state("d", false).expect("disk topic recovers");
     // All 5 acked records survive a clean restart.
     let seqs = live_seqs(&engine, "d");
     assert_eq!(
@@ -248,16 +248,16 @@ fn disk_box_clean_restart_preserves_seqs_no_reuse() {
 #[test]
 fn ttl_evicted_record_does_not_resurrect_after_crash() {
     let disk = FakeDisk::new();
-    // A fsync box with a short TTL so the records are durably on disk AND expire.
+    // A fsync topic with a short TTL so the records are durably on disk AND expire.
     let ttl = 10_000i64;
     let clk = Arc::new(TestClock::new(1_700_000_000_000));
     {
         let engine = Engine::with_data_dir_fs(cfg(), clk.clone(), disk.arc()).expect("engine");
-        put_box(
+        put_topic(
             &engine,
             "t",
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 ttl_ms: ttl as u64,
                 ..Default::default()
@@ -284,7 +284,7 @@ fn ttl_evicted_record_does_not_resurrect_after_crash() {
     // clock, must keep the floor): the records must NOT resurrect.
     let rewound = Arc::new(TestClock::new(1_700_000_000_000));
     let engine = Engine::with_data_dir_fs(cfg(), rewound, disk.arc()).expect("recover engine");
-    let st = engine.box_state("t", false).expect("ttl box recovers");
+    let st = engine.topic_state("t", false).expect("ttl topic recovers");
     let seqs = live_seqs(&engine, "t");
     assert!(
         seqs.is_empty(),
@@ -326,11 +326,11 @@ fn byte_cap_evicted_record_does_not_resurrect_after_crash() {
     {
         let engine = open_engine(&disk);
         // A small byte cap so a few writes push the oldest out.
-        put_box(
+        put_topic(
             &engine,
             "b",
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 cap_bytes: 200,
                 ..Default::default()
@@ -390,30 +390,30 @@ fn byte_cap_evicted_record_does_not_resurrect_after_crash() {
 
 // NOTE: R14 (the RAII publish-ticket guard releasing the gate on a panicking
 // ticketed writer) is exercised by the focused unit test
-// `box_state::tests::publish_guard_releases_gate_on_panic`, which panics a guard
-// holder directly at the `BoxState` gate (without the WAL writer-thread confound
+// `topic_state::tests::publish_guard_releases_gate_on_panic`, which panics a guard
+// holder directly at the `TopicState` gate (without the WAL writer-thread confound
 // an engine-level failpoint would introduce) and asserts a second waiter +
 // `quiesce_publishes` still make progress.
 
 // ===========================================================================
-// put_box CREATE WAL-first — a create whose WAL frame fails leaves NO box
+// put_topic CREATE WAL-first — a create whose WAL frame fails leaves NO topic
 // ===========================================================================
 
-/// A fresh `put_box` CREATE whose `BoxConfig` WAL frame fails to fsync must apply
-/// NOTHING: the call returns an error AND no orphan box is left in the registry
-/// (the WAL-first path logs+fsyncs the create BEFORE inserting the box). After
-/// the error, the box does not exist; a later successful create works normally.
+/// A fresh `put_topic` CREATE whose `TopicConfig` WAL frame fails to fsync must apply
+/// NOTHING: the call returns an error AND no orphan topic is left in the registry
+/// (the WAL-first path logs+fsyncs the create BEFORE inserting the topic). After
+/// the error, the topic does not exist; a later successful create works normally.
 #[test]
-fn put_box_create_wal_fail_leaves_no_orphan_box() {
+fn put_topic_create_wal_fail_leaves_no_orphan_topic() {
     let disk = FakeDisk::new();
 
-    // Lay down one durable box on a clean disk so the engine + WAL are healthy.
+    // Lay down one durable topic on a clean disk so the engine + WAL are healthy.
     {
         let engine = open_engine(&disk);
-        put_box(
+        put_topic(
             &engine,
             "ok",
-            BoxConfig {
+            TopicConfig {
                 durable: true,
                 ..Default::default()
             },
@@ -425,13 +425,13 @@ fn put_box_create_wal_fail_leaves_no_orphan_box() {
     // Reopen and arm a one-shot SyncData EIO at index 0. Engine open + recovery
     // only ever `sync_all`/`sync_dir` (never the group-commit `sync_data`), and we
     // issue NO durable write before the create — so the FIRST `sync_data` on the
-    // device is the create's BoxConfig group-commit fsync. The CREATE must FAIL.
+    // device is the create's TopicConfig group-commit fsync. The CREATE must FAIL.
     let faulty = FaultFs::new(disk.arc(), FaultOp::SyncData, FaultKind::Eio, 0, true);
     let engine = open_engine_fs(faulty.arc());
 
-    let res = engine.put_box(
+    let res = engine.put_topic(
         "orphan",
-        BoxConfig {
+        TopicConfig {
             durable: true,
             ..Default::default()
         },
@@ -441,55 +441,55 @@ fn put_box_create_wal_fail_leaves_no_orphan_box() {
         "a create whose WAL frame EIOs must return an error"
     );
 
-    // NO ORPHAN: the box must not exist in memory (the WAL-first path never
-    // inserted it; the old apply-first path would have left a phantom box).
+    // NO ORPHAN: the topic must not exist in memory (the WAL-first path never
+    // inserted it; the old apply-first path would have left a phantom topic).
     assert!(
-        engine.box_state("orphan", false).is_err(),
-        "a create whose WAL frame failed must leave NO box (orphan!)"
+        engine.topic_state("orphan", false).is_err(),
+        "a create whose WAL frame failed must leave NO topic (orphan!)"
     );
-    // The box-count gauge is exact (the reservation was released): only the
-    // pre-existing "ok" box counts.
+    // The topic-count gauge is exact (the reservation was released): only the
+    // pre-existing "ok" topic counts.
     assert_eq!(
-        engine.box_count(),
+        engine.topic_count(),
         1,
         "the failed create's reservation was released"
     );
 
     // A subsequent create (device healthy again) succeeds normally.
-    let again = engine.put_box(
+    let again = engine.put_topic(
         "orphan",
-        BoxConfig {
+        TopicConfig {
             durable: true,
             ..Default::default()
         },
     );
     assert!(
         again.is_ok(),
-        "a retry after the device recovers creates the box"
+        "a retry after the device recovers creates the topic"
     );
     assert!(
-        engine.box_state("orphan", false).is_ok(),
-        "the box now exists"
+        engine.topic_state("orphan", false).is_ok(),
+        "the topic now exists"
     );
     assert_eq!(
-        engine.box_count(),
+        engine.topic_count(),
         2,
-        "box count reflects the now-created box"
+        "topic count reflects the now-created topic"
     );
 }
 
 /// A successful CREATE is durable: it survives recovery (the WAL-first path logs +
 /// fsyncs the create before returning, so a crash right after the ack recovers it).
 #[test]
-fn put_box_create_success_is_durable() {
+fn put_topic_create_success_is_durable() {
     let disk = FakeDisk::new();
     {
         let engine = open_engine(&disk);
-        put_box(
+        put_topic(
             &engine,
             "c",
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 cap_records: 7,
                 ..Default::default()
@@ -501,8 +501,8 @@ fn put_box_create_success_is_durable() {
     }
     let engine = open_engine(&disk);
     let st = engine
-        .box_state("c", false)
-        .expect("created box survives recovery");
+        .topic_state("c", false)
+        .expect("created topic survives recovery");
     assert_eq!(
         st.config.cap_records, 7,
         "the created config survives recovery"

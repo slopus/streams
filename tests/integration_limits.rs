@@ -4,7 +4,7 @@
 //! cap means unlimited. Concurrency caps (SSE connections, per-key in-flight) free
 //! their slot when the request/stream ends.
 //!
-//! Black-box against the real bound server.
+//! Black-topic against the real bound server.
 
 mod common;
 
@@ -38,63 +38,63 @@ fn code(body: &Value) -> &str {
 }
 
 #[test]
-fn max_boxes_cap_via_put() {
+fn max_topics_cap_via_put() {
     let h = limited_harness(Limits {
-        max_boxes: 2,
+        max_topics: 2,
         ..Default::default()
     });
-    // First two boxes create (201).
-    let (s, _) = h.put("/v0/boxes/a", json!({}));
+    // First two topics create (201).
+    let (s, _) = h.put("/v0/topics/a", json!({}));
     assert_eq!(s, StatusCode::CREATED);
-    let (s, _) = h.put("/v0/boxes/b", json!({}));
+    let (s, _) = h.put("/v0/topics/b", json!({}));
     assert_eq!(s, StatusCode::CREATED);
-    // Third NEW box is refused with 429 throttled + Retry-After detail.
-    let (s, body) = h.put("/v0/boxes/c", json!({}));
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "3rd box over cap: {body}");
+    // Third NEW topic is refused with 429 throttled + Retry-After detail.
+    let (s, body) = h.put("/v0/topics/c", json!({}));
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "3rd topic over cap: {body}");
     assert_eq!(code(&body), "throttled");
-    assert_eq!(body["error"]["detail"]["limit"], json!("max_boxes"));
+    assert_eq!(body["error"]["detail"]["limit"], json!("max_topics"));
     assert_eq!(body["error"]["detail"]["max"], json!(2));
 
-    // An idempotent re-PUT of an EXISTING box is an update, not a create — it must
+    // An idempotent re-PUT of an EXISTING topic is an update, not a create — it must
     // still succeed even at the cap (a saturated server can be reconfigured).
-    let (s, _) = h.put("/v0/boxes/a", json!({ "ttl_ms": 1000 }));
+    let (s, _) = h.put("/v0/topics/a", json!({ "ttl_ms": 1000 }));
     assert_eq!(
         s,
         StatusCode::OK,
-        "re-PUT of existing box at cap must update"
+        "re-PUT of existing topic at cap must update"
     );
 }
 
 #[test]
-fn max_boxes_cap_via_auto_create_write() {
+fn max_topics_cap_via_auto_create_write() {
     let h = limited_harness(Limits {
-        max_boxes: 1,
+        max_topics: 1,
         ..Default::default()
     });
-    // First write auto-creates the box (201).
-    let (s, _) = h.post("/v0/boxes/a", json!({ "records": [{ "data": 1 }] }));
+    // First write auto-creates the topic (201).
+    let (s, _) = h.post("/v0/topics/a", json!({ "records": [{ "data": 1 }] }));
     assert_eq!(s, StatusCode::CREATED);
-    // A write that WOULD auto-create a second box hits the cap → 429.
-    let (s, body) = h.post("/v0/boxes/b", json!({ "records": [{ "data": 1 }] }));
+    // A write that WOULD auto-create a second topic hits the cap → 429.
+    let (s, body) = h.post("/v0/topics/b", json!({ "records": [{ "data": 1 }] }));
     assert_eq!(
         s,
         StatusCode::TOO_MANY_REQUESTS,
         "auto-create over cap: {body}"
     );
     assert_eq!(code(&body), "throttled");
-    // But appending to the EXISTING box still works (not a create).
-    let (s, _) = h.post("/v0/boxes/a", json!({ "records": [{ "data": 2 }] }));
+    // But appending to the EXISTING topic still works (not a create).
+    let (s, _) = h.post("/v0/topics/a", json!({ "records": [{ "data": 2 }] }));
     assert_eq!(s, StatusCode::OK);
 }
 
 #[test]
-fn max_boxes_zero_is_unlimited() {
+fn max_topics_zero_is_unlimited() {
     let h = limited_harness(Limits {
-        max_boxes: 0,
+        max_topics: 0,
         ..Default::default()
     });
     for i in 0..50 {
-        let (s, _) = h.put(&format!("/v0/boxes/b{i}"), json!({}));
+        let (s, _) = h.put(&format!("/v0/topics/b{i}"), json!({}));
         assert_eq!(s, StatusCode::CREATED);
     }
 }
@@ -103,8 +103,8 @@ fn max_boxes_zero_is_unlimited() {
 fn max_routers_cap() {
     let h = limited_harness(Limits {
         max_routers: 1,
-        // Generous box cap so router source/dest auto-create is unaffected.
-        max_boxes: 1000,
+        // Generous topic cap so router source/dest auto-create is unaffected.
+        max_topics: 1000,
         ..Default::default()
     });
     let (s, _) = h.put("/v0/routers/r1", json!({ "source": "src", "dest": "dst1" }));
@@ -119,13 +119,13 @@ fn max_routers_cap() {
     assert_eq!(code(&body), "throttled");
     assert_eq!(body["error"]["detail"]["limit"], json!("max_routers"));
 
-    // A refused router must not have auto-created its dest box (checked before any
-    // box auto-create).
-    let (s, _) = h.get("/v0/boxes/dst2");
+    // A refused router must not have auto-created its dest topic (checked before any
+    // topic auto-create).
+    let (s, _) = h.get("/v0/topics/dst2");
     assert_eq!(
         s,
         StatusCode::NOT_FOUND,
-        "refused router left no phantom dest box"
+        "refused router left no phantom dest topic"
     );
 
     // Re-PUT of the existing router still updates at the cap.
@@ -142,8 +142,8 @@ fn max_watch_sessions_cap() {
         max_watch_sessions: 2,
         ..Default::default()
     });
-    h.put("/v0/boxes/events", json!({}));
-    let body = json!({ "boxes": { "events": {} } });
+    h.put("/v0/topics/events", json!({}));
+    let body = json!({ "topics": { "events": {} } });
 
     let (s, _) = h.post("/v0/watch", body.clone());
     assert_eq!(s, StatusCode::OK);
@@ -171,13 +171,13 @@ fn max_sse_connections_global_cap_and_release() {
         max_sse_connections: 1,
         ..Default::default()
     });
-    h.put("/v0/boxes/events", json!({}));
-    let (_s, w) = h.post("/v0/watch", json!({ "boxes": { "events": {} } }));
+    h.put("/v0/topics/events", json!({}));
+    let (_s, w) = h.post("/v0/watch", json!({ "topics": { "events": {} } }));
     let wid = w["wid"].as_str().expect("wid").to_string();
     let stream_url = format!("{}/v0/watch/{}", h.base_url(), wid);
 
     // A second watch session for the parallel test.
-    let (_s, w2) = h.post("/v0/watch", json!({ "boxes": { "events": {} } }));
+    let (_s, w2) = h.post("/v0/watch", json!({ "topics": { "events": {} } }));
     let wid2 = w2["wid"].as_str().expect("wid2").to_string();
     let stream_url2 = format!("{}/v0/watch/{}", h.base_url(), wid2);
 
@@ -241,7 +241,7 @@ fn max_inflight_per_key_does_not_break_normal_traffic() {
         &["k"],
     );
     for i in 0..20 {
-        let (s, _) = h.put_auth(&format!("/v0/boxes/b{i}"), json!({}), "k");
+        let (s, _) = h.put_auth(&format!("/v0/topics/b{i}"), json!({}), "k");
         assert_eq!(
             s,
             StatusCode::CREATED,
@@ -259,11 +259,11 @@ fn max_total_bytes_quota_refuses_oversize_write() {
         ..Default::default()
     });
     // A modest write fits under the 200-byte quota.
-    let (s, _) = h.post("/v0/boxes/a", json!({ "records": [{ "data": "x" }] }));
+    let (s, _) = h.post("/v0/topics/a", json!({ "records": [{ "data": "x" }] }));
     assert_eq!(s, StatusCode::CREATED, "first small write fits");
     // A large write past the quota is refused.
     let big = "y".repeat(500);
-    let (s, body) = h.post("/v0/boxes/a", json!({ "records": [{ "data": big }] }));
+    let (s, body) = h.post("/v0/topics/a", json!({ "records": [{ "data": big }] }));
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "over-quota write: {body}");
     assert_eq!(code(&body), "throttled");
     assert_eq!(body["error"]["detail"]["limit"], json!("max_total_bytes"));
@@ -277,7 +277,7 @@ fn max_total_bytes_zero_is_unlimited() {
         ..Default::default()
     });
     let big = "z".repeat(100_000);
-    let (s, _) = h.post("/v0/boxes/a", json!({ "records": [{ "data": big }] }));
+    let (s, _) = h.post("/v0/topics/a", json!({ "records": [{ "data": big }] }));
     assert_eq!(s, StatusCode::CREATED, "0 ⇒ unlimited, large write allowed");
 }
 
@@ -286,14 +286,14 @@ fn queue_ack_rejects_unbounded_seqs() {
     // codex MEDIUM #10: ack/nack/extend must reject a seqs array longer than
     // MAX_CLAIM (1000) with a clear 4xx rather than allocating/echoing it.
     let h = Harness::start();
-    h.put("/v0/boxes/q", json!({ "type": "queue" }));
+    h.put("/v0/topics/q", json!({ "type": "queue" }));
     let seqs: Vec<u64> = (1..=1001).collect();
-    let (s, body) = h.post("/v0/boxes/q/ack", json!({ "node": "w1", "seqs": seqs }));
+    let (s, body) = h.post("/v0/topics/q/ack", json!({ "node": "w1", "seqs": seqs }));
     assert_eq!(s, StatusCode::BAD_REQUEST, "1001 seqs rejected: {body}");
     assert_eq!(code(&body), "batch_too_large");
     // A bounded ack (no matching leases) is a normal 200 with 0 acked.
     let (s, body) = h.post(
-        "/v0/boxes/q/ack",
+        "/v0/topics/q/ack",
         json!({ "node": "w1", "seqs": [1, 2, 3] }),
     );
     assert_eq!(s, StatusCode::OK, "bounded ack ok: {body}");
@@ -302,7 +302,7 @@ fn queue_ack_rejects_unbounded_seqs() {
 #[test]
 fn metrics_requires_auth_when_enabled() {
     // codex LOW #12: /v0/metrics is gated behind auth by default (it exposes the
-    // box count); health/ready stay open.
+    // topic count); health/ready stay open.
     let h = limited_auth_harness(Limits::default(), &["k"]);
     // No token ⇒ 401 on metrics.
     let (s, _) = h.get("/v0/metrics");
@@ -321,14 +321,14 @@ fn query_token_rejected_for_non_sse_routes() {
     // stream GETs, never for ordinary data routes (it leaks via logs).
     let h = limited_auth_harness(Limits::default(), &["k"]);
     // A normal GET with ?token= (no header) is unauthorized.
-    let (s, _) = h.get("/v0/boxes?token=k");
+    let (s, _) = h.get("/v0/topics?token=k");
     assert_eq!(
         s,
         StatusCode::UNAUTHORIZED,
         "?token= must not auth a data route"
     );
     // The header still works.
-    let (s, _) = h.get_auth("/v0/boxes", "k");
+    let (s, _) = h.get_auth("/v0/topics", "k");
     assert_eq!(s, StatusCode::OK);
 }
 
@@ -337,11 +337,11 @@ fn limits_default_when_unconfigured_unchanged() {
     // The default limits are generous enough that a normal flow never trips them.
     let h = Harness::start();
     for i in 0..30 {
-        let (s, _) = h.put(&format!("/v0/boxes/b{i}"), json!({}));
+        let (s, _) = h.put(&format!("/v0/topics/b{i}"), json!({}));
         assert_eq!(s, StatusCode::CREATED);
     }
     let (s, _) = h.put("/v0/routers/r", json!({ "source": "b0", "dest": "b1" }));
     assert_eq!(s, StatusCode::CREATED);
-    let (s, _) = h.post("/v0/watch", json!({ "boxes": { "b0": {} } }));
+    let (s, _) = h.post("/v0/watch", json!({ "topics": { "b0": {} } }));
     assert_eq!(s, StatusCode::OK);
 }

@@ -6,7 +6,7 @@
 //! built on `reqwest::blocking` so integration tests read top-to-bottom without
 //! `async`/`await`. The server uses a real `SystemClock` (live HTTP), so any
 //! TTL/priority *correctness* assertions belong in the engine unit/property
-//! tests with a `TestClock`; this harness is for black-box wire-contract flows.
+//! tests with a `TestClock`; this harness is for black-topic wire-contract flows.
 //!
 //! Each `Harness` owns its own engine + port, so tests are fully isolated and
 //! may run in parallel.
@@ -21,10 +21,10 @@
 //! let url = h.base_url();                     // e.g. "http://127.0.0.1:53124"
 //!
 //! // JSON helpers -> (StatusCode, serde_json::Value):
-//! let (status, body) = h.put("/v0/boxes/jobs", json!({ "durable": true }));
-//! let (status, body) = h.post("/v0/boxes/jobs", json!({ "records": [{ "data": 1 }] }));
-//! let (status, body) = h.get("/v0/boxes/jobs");
-//! let (status, body) = h.delete("/v0/boxes/jobs");
+//! let (status, body) = h.put("/v0/topics/jobs", json!({ "durable": true }));
+//! let (status, body) = h.post("/v0/topics/jobs", json!({ "records": [{ "data": 1 }] }));
+//! let (status, body) = h.get("/v0/topics/jobs");
+//! let (status, body) = h.delete("/v0/topics/jobs");
 //! // `post`/`put`/`delete` send `Content-Type: application/json` automatically.
 //! // For an explicit empty body use `post_empty(path)`.
 //!
@@ -78,7 +78,7 @@ impl Harness {
     }
 
     /// Like [`start`](Self::start) but with an injected [`TestClock`] (returned
-    /// alongside via [`Harness::clock`]) so a black-box test can advance the
+    /// alongside via [`Harness::clock`]) so a black-topic test can advance the
     /// server's notion of time deterministically — used for lease-expiry /
     /// visibility-timeout and delayed-nack flows that would otherwise need real
     /// sleeps. The server runs on this exact clock, so a `clock.advance(ms)`

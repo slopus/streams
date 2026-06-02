@@ -6,7 +6,7 @@
 //! can read medians per metric:
 //!
 //!   * `append`     — single-record and batched (1/10/100/1000) at 64 B / 1 KiB.
-//!   * `diff`       — getDifference at limit 1 / 256 / 1000 over a warm box.
+//!   * `diff`       — getDifference at limit 1 / 256 / 1000 over a warm topic.
 //!   * `tag_match`  — tag-index match cost, exact (`Eq`) and prefix (`Glob`).
 //!   * `cap_evict`  — cap eviction cost on the write path (`discard:"old"`).
 //!   * `delete`     — `before_seq` (prefix) delete and `match` (tag) delete.
@@ -21,11 +21,11 @@ use serde_json::{json, Value};
 
 use streams::clock::{Clock, SharedClock, SystemClock};
 use streams::config::ServerConfig;
-use streams::engine::box_state::{BoxIndex, BoxState, StoredRecord};
+use streams::engine::topic_state::{TopicIndex, TopicState, StoredRecord};
 use streams::engine::{Engine, SEQ_BASE};
-use streams::types::{BoxConfig, DiffRequest, Discard, Filter, FilterOp, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, DiffRequest, Discard, Filter, FilterOp, RecordIn, WriteRequest};
 
-const BOX: &str = "bench";
+const TOPIC: &str = "bench";
 
 /// A real (wall-clock) shared clock; correctness is asserted elsewhere with
 /// `TestClock`, here we only measure CPU work.
@@ -70,7 +70,7 @@ fn write_req(n: usize, data: &Value) -> WriteRequest {
 
 fn bench_append(c: &mut Criterion) {
     let mut g = c.benchmark_group("append");
-    // Each batch is created against a FRESH engine so the box starts empty and
+    // Each batch is created against a FRESH engine so the topic starts empty and
     // we measure pure append (no growing-index artifacts), via iter_batched.
     for &payload_bytes in &[64usize, 1024] {
         let data = payload(payload_bytes);
@@ -81,7 +81,7 @@ fn bench_append(c: &mut Criterion) {
                 b.iter_batched(
                     || (fresh_engine(), write_req(batch, &data)),
                     |(engine, req)| {
-                        engine.write(BOX, req, false).unwrap();
+                        engine.write(TOPIC, req, false).unwrap();
                     },
                     BatchSize::SmallInput,
                 );
@@ -92,10 +92,10 @@ fn bench_append(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// diff — getDifference at limit 1 / 256 / 1000 over a warm, populated box.
+// diff — getDifference at limit 1 / 256 / 1000 over a warm, populated topic.
 // ---------------------------------------------------------------------------
 
-/// A warm engine whose `BOX` holds `n` records of `payload_bytes` each.
+/// A warm engine whose `TOPIC` holds `n` records of `payload_bytes` each.
 fn warm_engine(n: usize, payload_bytes: usize) -> Arc<Engine> {
     let engine = fresh_engine();
     let data = payload(payload_bytes);
@@ -103,7 +103,7 @@ fn warm_engine(n: usize, payload_bytes: usize) -> Arc<Engine> {
     let mut remaining = n;
     while remaining > 0 {
         let chunk = remaining.min(1000);
-        engine.write(BOX, write_req(chunk, &data), false).unwrap();
+        engine.write(TOPIC, write_req(chunk, &data), false).unwrap();
         remaining -= chunk;
     }
     engine
@@ -123,7 +123,7 @@ fn bench_diff(c: &mut Criterion) {
                     limit,
                     ..Default::default()
                 };
-                let resp = engine.diff(BOX, req).unwrap();
+                let resp = engine.diff(TOPIC, req).unwrap();
                 resp.records.len()
             });
         });
@@ -134,14 +134,14 @@ fn bench_diff(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 // tag_match — pure tag-index match cost (no delete), exact + prefix.
 //
-// Builds a BoxIndex with many tagged records spread over many tags so the
+// Builds a TopicIndex with many tagged records spread over many tags so the
 // prefix scan is meaningful, then measures `matching_live_seqs` directly.
 // ---------------------------------------------------------------------------
 
-/// A `BoxIndex` with `n` records, tagged `tenant:<i % tenants>`, so each tag
+/// A `TopicIndex` with `n` records, tagged `tenant:<i % tenants>`, so each tag
 /// holds ~`n / tenants` postings. The prefix `tenant:` matches all of them.
-fn tagged_index(n: usize, tenants: usize) -> (BoxIndex, u64) {
-    let mut index = BoxIndex::new(SEQ_BASE);
+fn tagged_index(n: usize, tenants: usize) -> (TopicIndex, u64) {
+    let mut index = TopicIndex::new(SEQ_BASE);
     for i in 0..n {
         let seq = SEQ_BASE + i as u64;
         let tag = format!("tenant:{}", i % tenants);
@@ -193,29 +193,29 @@ fn bench_tag_match(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// cap_evict — cap eviction cost on the write path. A `discard:"old"` box with
+// cap_evict — cap eviction cost on the write path. A `discard:"old"` topic with
 // a small `cap_records` is kept full, so every write evicts the oldest front
 // records (lazy reclaim + tag/byte accounting) inside enforce_retention.
 // ---------------------------------------------------------------------------
 
-fn capped_box_config(cap: u64) -> BoxConfig {
-    BoxConfig {
+fn capped_topic_config(cap: u64) -> TopicConfig {
+    TopicConfig {
         cap_records: cap,
         discard: Discard::Old,
         ..Default::default()
     }
 }
 
-/// An engine whose `BOX` is at its `cap_records` so the next writes evict.
+/// An engine whose `TOPIC` is at its `cap_records` so the next writes evict.
 fn full_capped_engine(cap: u64, payload_bytes: usize) -> Arc<Engine> {
     let engine = fresh_engine();
-    engine.put_box(BOX, capped_box_config(cap)).unwrap();
+    engine.put_topic(TOPIC, capped_topic_config(cap)).unwrap();
     let data = payload(payload_bytes);
     // Fill to the cap.
     let mut remaining = cap as usize;
     while remaining > 0 {
         let chunk = remaining.min(1000);
-        engine.write(BOX, write_req(chunk, &data), false).unwrap();
+        engine.write(TOPIC, write_req(chunk, &data), false).unwrap();
         remaining -= chunk;
     }
     engine
@@ -225,7 +225,7 @@ fn bench_cap_evict(c: &mut Criterion) {
     const CAP: u64 = 10_000;
     let mut g = c.benchmark_group("cap_evict");
 
-    // Steady-state: box at cap, append one batch which evicts an equal number
+    // Steady-state: topic at cap, append one batch which evicts an equal number
     // of front records. Measures the per-batch evict + append cost.
     for &batch in &[1usize, 100] {
         g.throughput(Throughput::Elements(batch as u64));
@@ -233,7 +233,7 @@ fn bench_cap_evict(c: &mut Criterion) {
             let engine = full_capped_engine(CAP, 64);
             let data = payload(64);
             b.iter(|| {
-                engine.write(BOX, write_req(batch, &data), false).unwrap();
+                engine.write(TOPIC, write_req(batch, &data), false).unwrap();
             });
         });
     }
@@ -243,16 +243,16 @@ fn bench_cap_evict(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 // delete — before_seq (prefix) delete and match (tag) delete cost.
 //
-// Each iteration deletes from a FRESH warm box (via iter_batched) so we always
+// Each iteration deletes from a FRESH warm topic (via iter_batched) so we always
 // measure the cost of removing live records, never a no-op second delete.
 // ---------------------------------------------------------------------------
 
-/// A `BoxState` with `n` records, half tagged `hot`, half tagged `cold`.
-fn warm_box(n: usize) -> Arc<BoxState> {
-    let b = Arc::new(BoxState::new(
-        BOX.to_string(),
-        1, // interned box_id (irrelevant to the in-memory bench).
-        BoxConfig::default(),
+/// A `TopicState` with `n` records, half tagged `hot`, half tagged `cold`.
+fn warm_topic(n: usize) -> Arc<TopicState> {
+    let b = Arc::new(TopicState::new(
+        TOPIC.to_string(),
+        1, // interned topic_id (irrelevant to the in-memory bench).
+        TopicConfig::default(),
         SEQ_BASE,
         1,
     ));
@@ -283,7 +283,7 @@ fn bench_delete(c: &mut Criterion) {
     // before_seq: delete the entire live prefix (all N records).
     g.bench_function("before_seq_all", |b| {
         b.iter_batched(
-            || warm_box(N),
+            || warm_topic(N),
             |bx| bx.apply_delete(Some(SEQ_BASE + N as u64), None, None, now),
             BatchSize::SmallInput,
         );
@@ -297,7 +297,7 @@ fn bench_delete(c: &mut Criterion) {
     g.throughput(Throughput::Elements((N / 2) as u64));
     g.bench_function("match_exact", |b| {
         b.iter_batched(
-            || warm_box(N),
+            || warm_topic(N),
             |bx| bx.apply_delete(None, Some(&hot), None, now),
             BatchSize::SmallInput,
         );

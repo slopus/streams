@@ -33,7 +33,7 @@ pub async fn ready(State(state): State<AppState>) -> Response {
         return Json(ReadyResponse {
             status: "ready".to_string(),
             wal_replay_complete: true,
-            boxes: state.engine.box_count(),
+            topics: state.engine.topic_count(),
         })
         .into_response();
     }
@@ -49,7 +49,7 @@ pub async fn ready(State(state): State<AppState>) -> Response {
 
 /// `GET /v0/metrics` — Prometheus text exposition by default; JSON snapshot
 /// when `Accept: application/json`. Always `200`. Requires authentication (a
-/// read-scoped key) when auth is enabled — it exposes operational state (box
+/// read-scoped key) when auth is enabled — it exposes operational state (topic
 /// count), so it is not in the unauthenticated liveness/readiness probe set
 /// (codex LOW #12).
 pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -72,10 +72,10 @@ pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-/// Cardinality cap on per-box metric series (M3 / codex P2 #1): a deployment with
-/// thousands of boxes must not blow up a Prometheus scrape (and the engine's label
-/// memory) with unbounded series. Beyond this the per-box pass is truncated and a
-/// `streams_box_metrics_truncated` gauge flags it.
+/// Cardinality cap on per-topic metric series (M3 / codex P2 #1): a deployment with
+/// thousands of topics must not blow up a Prometheus scrape (and the engine's label
+/// memory) with unbounded series. Beyond this the per-topic pass is truncated and a
+/// `streams_topic_metrics_truncated` gauge flags it.
 const MAX_PER_BOX_SERIES: usize = 1000;
 
 /// Append a single Prometheus metric line with its `# HELP` / `# TYPE` header.
@@ -86,8 +86,8 @@ fn metric(out: &mut String, name: &str, help: &str, typ: &str, value: impl std::
     let _ = writeln!(out, "{name} {value}");
 }
 
-/// Escape a box name for use as a Prometheus label value (backslash, double-quote,
-/// newline) per the text exposition format, so an adversarial box name cannot
+/// Escape a topic name for use as a Prometheus label value (backslash, double-quote,
+/// newline) per the text exposition format, so an adversarial topic name cannot
 /// inject extra series/lines.
 fn escape_label(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
@@ -108,14 +108,14 @@ fn escape_label(v: &str) -> String {
 fn render_json(state: &AppState) -> serde_json::Value {
     let eng = state.engine.metrics_snapshot();
     let mut snap = serde_json::json!({
-        "boxes": state.engine.box_count(),
-        "boxes_memory": eng.boxes_memory,
-        "boxes_disk": eng.boxes_disk,
-        "boxes_fsync": eng.boxes_fsync,
+        "topics": state.engine.topic_count(),
+        "topics_memory": eng.topics_memory,
+        "topics_disk": eng.topics_disk,
+        "topics_fsync": eng.topics_fsync,
         "routers": state.engine.router_count(),
         "records_live": eng.records_live,
         "bytes_live": eng.bytes_live,
-        "queue_boxes": eng.queue_boxes,
+        "queue_topics": eng.queue_topics,
         "queue_leases_in_flight": eng.leases_in_flight,
         "sse_connections": state.live.sse_total(),
         "watch_sessions": state.sessions.len(),
@@ -142,7 +142,7 @@ fn render_json(state: &AppState) -> serde_json::Value {
     snap
 }
 
-/// Render the Prometheus text exposition body (M3): engine box/record/byte
+/// Render the Prometheus text exposition body (M3): engine topic/record/byte
 /// gauges, WAL group-commit + fsync-latency histogram + queue-depth + rotation
 /// counters, recovery progress, and queue-lease + SSE-connection gauges.
 fn render_prometheus(state: &AppState) -> String {
@@ -152,31 +152,31 @@ fn render_prometheus(state: &AppState) -> String {
     let eng = state.engine.metrics_snapshot();
     let mut out = String::new();
 
-    // --- Engine: boxes / routers / records / bytes -------------------------
+    // --- Engine: topics / routers / records / bytes -------------------------
     metric(
         &mut out,
-        "streams_boxes",
-        "Number of boxes.",
+        "streams_topics",
+        "Number of topics.",
         "gauge",
-        state.engine.box_count(),
+        state.engine.topic_count(),
     );
-    // Boxes broken down by durability class (single multi-series gauge).
-    out.push_str("# HELP streams_boxes_by_class Number of boxes by durability class.\n");
-    out.push_str("# TYPE streams_boxes_by_class gauge\n");
+    // Topics broken down by durability class (single multi-series gauge).
+    out.push_str("# HELP streams_topics_by_class Number of topics by durability class.\n");
+    out.push_str("# TYPE streams_topics_by_class gauge\n");
     let _ = writeln!(
         out,
-        "streams_boxes_by_class{{class=\"memory\"}} {}",
-        eng.boxes_memory
-    );
-    let _ = writeln!(
-        out,
-        "streams_boxes_by_class{{class=\"disk\"}} {}",
-        eng.boxes_disk
+        "streams_topics_by_class{{class=\"memory\"}} {}",
+        eng.topics_memory
     );
     let _ = writeln!(
         out,
-        "streams_boxes_by_class{{class=\"fsync\"}} {}",
-        eng.boxes_fsync
+        "streams_topics_by_class{{class=\"disk\"}} {}",
+        eng.topics_disk
+    );
+    let _ = writeln!(
+        out,
+        "streams_topics_by_class{{class=\"fsync\"}} {}",
+        eng.topics_fsync
     );
     metric(
         &mut out,
@@ -188,82 +188,82 @@ fn render_prometheus(state: &AppState) -> String {
     metric(
         &mut out,
         "streams_records_live",
-        "Live (net-of-delete) records retained across all boxes.",
+        "Live (net-of-delete) records retained across all topics.",
         "gauge",
         eng.records_live,
     );
     metric(
         &mut out,
         "streams_bytes_live",
-        "Retained payload bytes across all boxes.",
+        "Retained payload bytes across all topics.",
         "gauge",
         eng.bytes_live,
     );
 
-    // --- Per-box gauges (M3 / codex P2 #1) ---------------------------------
-    // Labeled by box name, bounded to MAX_PER_BOX_SERIES to cap label cardinality.
-    let (per_box, total_boxes) = state.engine.per_box_metrics(MAX_PER_BOX_SERIES);
-    out.push_str("# HELP streams_box_head_seq Per-box head seq (highest assigned).\n");
-    out.push_str("# TYPE streams_box_head_seq gauge\n");
-    for m in &per_box {
+    // --- Per-topic gauges (M3 / codex P2 #1) ---------------------------------
+    // Labeled by topic name, bounded to MAX_PER_BOX_SERIES to cap label cardinality.
+    let (per_topic, total_topics) = state.engine.per_topic_metrics(MAX_PER_BOX_SERIES);
+    out.push_str("# HELP streams_topic_head_seq Per-topic head seq (highest assigned).\n");
+    out.push_str("# TYPE streams_topic_head_seq gauge\n");
+    for m in &per_topic {
         let _ = writeln!(
             out,
-            "streams_box_head_seq{{box=\"{}\"}} {}",
+            "streams_topic_head_seq{{topic=\"{}\"}} {}",
             escape_label(&m.name),
             m.head_seq
         );
     }
-    out.push_str("# HELP streams_box_earliest_seq Per-box earliest retained seq.\n");
-    out.push_str("# TYPE streams_box_earliest_seq gauge\n");
-    for m in &per_box {
+    out.push_str("# HELP streams_topic_earliest_seq Per-topic earliest retained seq.\n");
+    out.push_str("# TYPE streams_topic_earliest_seq gauge\n");
+    for m in &per_topic {
         let _ = writeln!(
             out,
-            "streams_box_earliest_seq{{box=\"{}\"}} {}",
+            "streams_topic_earliest_seq{{topic=\"{}\"}} {}",
             escape_label(&m.name),
             m.earliest_seq
         );
     }
-    out.push_str("# HELP streams_box_records_live Per-box live (net-of-delete) record count.\n");
-    out.push_str("# TYPE streams_box_records_live gauge\n");
-    for m in &per_box {
+    out.push_str("# HELP streams_topic_records_live Per-topic live (net-of-delete) record count.\n");
+    out.push_str("# TYPE streams_topic_records_live gauge\n");
+    for m in &per_topic {
         let _ = writeln!(
             out,
-            "streams_box_records_live{{box=\"{}\"}} {}",
+            "streams_topic_records_live{{topic=\"{}\"}} {}",
             escape_label(&m.name),
             m.records_live
         );
     }
-    out.push_str("# HELP streams_box_bytes_live Per-box retained payload bytes.\n");
-    out.push_str("# TYPE streams_box_bytes_live gauge\n");
-    for m in &per_box {
+    out.push_str("# HELP streams_topic_bytes_live Per-topic retained payload bytes.\n");
+    out.push_str("# TYPE streams_topic_bytes_live gauge\n");
+    for m in &per_topic {
         let _ = writeln!(
             out,
-            "streams_box_bytes_live{{box=\"{}\"}} {}",
+            "streams_topic_bytes_live{{topic=\"{}\"}} {}",
             escape_label(&m.name),
             m.bytes_live
         );
     }
-    // Queue ready / in-flight, only for queue boxes (a label avoids emitting 0 for
-    // every non-queue box).
-    out.push_str("# HELP streams_box_queue_ready Per-queue-box claimable jobs.\n");
-    out.push_str("# TYPE streams_box_queue_ready gauge\n");
-    for m in &per_box {
+    // Queue ready / in-flight, only for queue topics (a label avoids emitting 0 for
+    // every non-queue topic).
+    out.push_str("# HELP streams_topic_queue_ready Per-queue-topic claimable jobs.\n");
+    out.push_str("# TYPE streams_topic_queue_ready gauge\n");
+    for m in &per_topic {
         if let Some(ready) = m.queue_ready {
             let _ = writeln!(
                 out,
-                "streams_box_queue_ready{{box=\"{}\"}} {}",
+                "streams_topic_queue_ready{{topic=\"{}\"}} {}",
                 escape_label(&m.name),
                 ready
             );
         }
     }
-    out.push_str("# HELP streams_box_queue_in_flight Per-queue-box leased (in-flight) jobs.\n");
-    out.push_str("# TYPE streams_box_queue_in_flight gauge\n");
-    for m in &per_box {
+    out.push_str("# HELP streams_topic_queue_in_flight Per-queue-topic leased (in-flight) jobs.\n");
+    out.push_str("# TYPE streams_topic_queue_in_flight gauge\n");
+    for m in &per_topic {
         if let Some(inflight) = m.queue_in_flight {
             let _ = writeln!(
                 out,
-                "streams_box_queue_in_flight{{box=\"{}\"}} {}",
+                "streams_topic_queue_in_flight{{topic=\"{}\"}} {}",
                 escape_label(&m.name),
                 inflight
             );
@@ -271,24 +271,24 @@ fn render_prometheus(state: &AppState) -> String {
     }
     metric(
         &mut out,
-        "streams_box_metrics_truncated",
-        "1 if the per-box series were truncated at the cardinality cap, else 0.",
+        "streams_topic_metrics_truncated",
+        "1 if the per-topic series were truncated at the cardinality cap, else 0.",
         "gauge",
-        u8::from(total_boxes > per_box.len()),
+        u8::from(total_topics > per_topic.len()),
     );
 
     // --- Queue (lease) gauges ----------------------------------------------
     metric(
         &mut out,
-        "streams_queue_boxes",
-        "Number of queue boxes (carry a lease projection).",
+        "streams_queue_topics",
+        "Number of queue topics (carry a lease projection).",
         "gauge",
-        eng.queue_boxes,
+        eng.queue_topics,
     );
     metric(
         &mut out,
         "streams_queue_leases_in_flight",
-        "Jobs with an active (un-expired) lease across all queue boxes.",
+        "Jobs with an active (un-expired) lease across all queue topics.",
         "gauge",
         eng.leases_in_flight,
     );

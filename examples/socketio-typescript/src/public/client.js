@@ -10,7 +10,7 @@ const els = {
   socketStatus: document.querySelector("#socket-status"),
   streamStatus: document.querySelector("#stream-status"),
   serverId: document.querySelector("#server-id"),
-  clientBox: document.querySelector("#client-box"),
+  clientTopic: document.querySelector("#client-topic"),
   cursor: document.querySelector("#cursor"),
   messages: document.querySelector("#messages"),
   form: document.querySelector("#chat-form"),
@@ -36,9 +36,9 @@ socket.on("disconnect", () => {
 socket.on("server:hello", (hello) => {
   connectedServerId = hello.serverId;
   els.serverId.textContent = hello.serverId;
-  els.clientBox.textContent = hello.boxes.client;
+  els.clientTopic.textContent = hello.topics.client;
   els.cursor.textContent = String(hello.cursor);
-  els.subtitle.textContent = `Client ${hello.clientId} is subscribed to ${hello.boxes.ingress}`;
+  els.subtitle.textContent = `Client ${hello.clientId} is subscribed to ${hello.topics.ingress}`;
   setStatus(els.streamStatus, "streams ready", "ok");
   setFormEnabled(true);
 });

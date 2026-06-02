@@ -1,7 +1,7 @@
 //! Phase-8B fault catalog — **boundary: segment-write** (file A).
 //!
 //! Five fault strategies that hammer the sealed-segment durability boundary —
-//! `LocalSegmentStore::{put,read_range,list,exists}`, `BoxTier::resolve`, and the
+//! `LocalSegmentStore::{put,read_range,list,exists}`, `TopicTier::resolve`, and the
 //! `.data` frame decoder — through the Phase-8A harness (`FakeDisk` /  `FaultFs`).
 //! A sealed segment is the *materialization* of WAL records: it is two files
 //! (`seg-<start>.data` + `.idx`) written `.data`→`.idx`→`sync_dir`, each part
@@ -42,7 +42,7 @@ use streams::storage::segment::{
     data_name, decode_data_frame, idx_name, lookup, SegmentBuilder, SegmentError, SegmentRecord,
 };
 use streams::storage::segstore::{
-    BoxTier, LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier,
+    TopicTier, LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier,
 };
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
@@ -257,7 +257,7 @@ fn f_seg_eio_data_write() {
     // frees nothing and keeps the payloads resident). We assert that contract via
     // the same decision seal_active makes — resolve() finds the segment in NO tier
     // (it never landed), so the seal yields an empty sealed-seqs set.
-    let tier = BoxTier::new(Box::new(store_on(&disk)), None);
+    let tier = TopicTier::new(Box::new(store_on(&disk)), None);
     assert_eq!(
         tier.resolve(1),
         None,
@@ -466,7 +466,7 @@ fn f_seg_crc_corrupt_data() {
 //         construction; no duplication.
 //
 // INJECT: seal a segment durably, simulate the recovery re-materialize by building
-//         the SAME range again and consulting BoxTier::resolve (the exact decision
+//         the SAME range again and consulting TopicTier::resolve (the exact decision
 //         seal_active makes): because the id already resolves to a tier, the put
 //         is skipped and the surviving copy is reused unchanged. We exercise both
 //         the hot-already-present case and the cold-already-present case (the
@@ -488,7 +488,7 @@ fn f_seg_put_overwrite_idempotent() {
 
         // Recovery re-materialize: the SAME range is rebuilt and offered to the
         // seal writer. seal_active's decision is `tier.resolve(start_seq)`.
-        let tier = BoxTier::new(Box::new(hot), None);
+        let tier = TopicTier::new(Box::new(hot), None);
         let existing = tier.resolve(1);
         assert_eq!(existing, Some(Tier::Hot), "the id already resolves to HOT");
 
@@ -529,7 +529,7 @@ fn f_seg_put_overwrite_idempotent() {
         cold.put(1, &data, &idx).expect("cold copy seal");
         let _ = disk_cold.arc().sync_dir(Path::new("/cold/box1"));
 
-        let tier = BoxTier::new(Box::new(hot), Some(Box::new(cold)));
+        let tier = TopicTier::new(Box::new(hot), Some(Box::new(cold)));
 
         // Recovery re-materialize resolves the id: it is in COLD, so seal_active
         // records Tier::Cold and SKIPS the put — it must NOT pull cold back to hot.

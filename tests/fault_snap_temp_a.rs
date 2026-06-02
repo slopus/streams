@@ -41,7 +41,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ===========================================================================
 // TmpFaulter — inject an io::Error on the FIRST write_at (or sync_all) to a
@@ -177,7 +177,7 @@ impl Fs for TmpFaulter {
 }
 
 // ===========================================================================
-// Reference model (minimal — the must-survive acked set per box)
+// Reference model (minimal — the must-survive acked set per topic)
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,19 +188,19 @@ struct ModelRecord {
 }
 
 #[derive(Debug, Default)]
-struct ModelBox {
+struct ModelTopic {
     acked: BTreeMap<u64, ModelRecord>,
     head: u64,
 }
 
 #[derive(Debug, Default)]
 struct RefModel {
-    boxes: BTreeMap<String, ModelBox>,
+    topics: BTreeMap<String, ModelTopic>,
 }
 
 impl RefModel {
     fn ack_append(&mut self, name: &str, seq: u64, rec: ModelRecord) {
-        let b = self.boxes.entry(name.to_string()).or_default();
+        let b = self.topics.entry(name.to_string()).or_default();
         b.acked.insert(seq, rec);
         b.head = b.head.max(seq);
     }
@@ -231,14 +231,14 @@ fn open_engine(disk: &FakeDisk) -> Arc<Engine> {
     open_engine_fs(disk.arc())
 }
 
-/// Create a durable box.
-fn put_durable_box(engine: &Engine, name: &str) {
-    let c = BoxConfig {
-        r#type: BoxType::Log,
+/// Create a durable topic.
+fn put_durable_topic(engine: &Engine, name: &str) {
+    let c = TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         ..Default::default()
     };
-    engine.put_box(name, c).expect("put_box");
+    engine.put_topic(name, c).expect("put_topic");
 }
 
 /// Append one durable record, blocking on its group fsync (acked ⇒ durable),
@@ -325,17 +325,17 @@ fn dump_records(engine: &Engine, name: &str) -> BTreeMap<u64, ModelRecord> {
     records
 }
 
-/// Assert the recovered box equals the model's acked set exactly (every durable
+/// Assert the recovered topic equals the model's acked set exactly (every durable
 /// acked record present byte-for-byte, head matches, nothing fabricated).
 fn assert_full_recovery(engine: &Engine, model: &RefModel, name: &str) {
-    let mbox = &model.boxes[name];
+    let mbox = &model.topics[name];
     let recovered = dump_records(engine, name);
     let model_live: BTreeMap<u64, ModelRecord> = mbox.acked.clone();
     assert_eq!(
         recovered, model_live,
         "{name}: recovered live set must equal the model's acked set"
     );
-    let st = engine.box_state(name, false).expect("box_state");
+    let st = engine.topic_state(name, false).expect("topic_state");
     assert_eq!(st.head_seq, mbox.head, "{name}: head_seq must match model");
 }
 
@@ -343,10 +343,10 @@ fn assert_full_recovery(engine: &Engine, model: &RefModel, name: &str) {
 // Snapshot-path call indexing
 // ===========================================================================
 
-/// The canonical durable workload all five tests share: one durable box, four
+/// The canonical durable workload all five tests share: one durable topic, four
 /// acked appends. Mirrored into `model`.
 fn build_workload(engine: &Engine, model: &mut RefModel, name: &str) {
-    put_durable_box(engine, name);
+    put_durable_topic(engine, name);
     append(engine, model, name, "a", Some("t1"));
     append(engine, model, name, "b", Some("t2"));
     append(engine, model, name, "c", None);
@@ -469,7 +469,7 @@ fn f_snap_eio_tmp_fsync() {
     // a subsequent recovery still yields the full state.
     {
         let mut m2 = RefModel::default();
-        // Re-derive the model for the surviving box from the recovered records.
+        // Re-derive the model for the surviving topic from the recovered records.
         let recovered = dump_records(&engine, "s");
         for (seq, rec) in recovered {
             m2.ack_append("s", seq, rec);

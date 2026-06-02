@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: Measured streams performance — engine-core throughput, the realistic single-box HTTP ceiling by durability class, SSE fan-out latency, and recovery time — framed honestly against the hardware floor.
+description: Measured streams performance — engine-core throughput, the realistic single-topic HTTP ceiling by durability class, SSE fan-out latency, and recovery time — framed honestly against the hardware floor.
 ---
 
 import { Callout } from 'nextra/components'
@@ -10,7 +10,7 @@ import { Callout } from 'nextra/components'
 These are measured numbers, not targets, and they are framed honestly: the in-process
 engine core is fast enough that the live ceiling is the HTTP/serialization path and the
 durability class, not the engine. This page leads with the engine core as the upper bound,
-then gives the realistic single-box HTTP ceiling per durability class, SSE fan-out latency,
+then gives the realistic single-topic HTTP ceiling per durability class, SSE fan-out latency,
 and recovery time — and is explicit about where the hardware, not the design, sets the
 floor.
 
@@ -38,12 +38,12 @@ the raw CPU cost of the hot paths:
 The engine core is comfortably above the ~1 M events/s bar. Everything below it — the HTTP
 ceiling — is the cost of the request path and durability, not the engine.
 
-## Single-box HTTP write throughput & latency
+## Single-topic HTTP write throughput & latency
 
-Over real loopback HTTP through a single box (16 writers × batch 100), the ceiling drops to
+Over real loopback HTTP through a single topic (16 writers × batch 100), the ceiling drops to
 the HTTP request and `serde_json` serialization path plus the durability class:
 
-| Class | Write-ack p50 | Write-ack p99 | Throughput (1 box) |
+| Class | Write-ack p50 | Write-ack p99 | Throughput (1 topic) |
 |---|---|---|---|
 | `disk` (`durable:false`) | **0.062 ms** | 0.102 ms | **525–566 K records/s** |
 | `fsync` (`durable:true`) | **5.21 ms** | 6.76 ms | **143 K records/s** |
@@ -67,7 +67,7 @@ write's group-commit window collapses to its 500 µs minimum, so the latency *is
 
 ## SSE fan-out (write → deliver)
 
-A pulse is serialized **once** and ref-counted to every watcher (never copied into N boxes),
+A pulse is serialized **once** and ref-counted to every watcher (never copied into N topics),
 so per-watcher delivery latency stays flat as fan-out grows:
 
 | Watchers | Deliver p50 | Deliver p99 |
@@ -98,14 +98,14 @@ interval, not the total record count. See [Crash Recovery](/how-it-works/recover
 ## The ~1 M events/s framing
 
 The often-quoted ~1 M events/s figure is an **aggregate** target — reached via batching and
-sharding across boxes and connections — not a single-origin, single-connection HTTP number.
+sharding across topics and connections — not a single-origin, single-connection HTTP number.
 Be precise about which ceiling applies:
 
 - **Engine core: met.** In-process append is 5.6–5.9 M records/s; diff projects at 12–13 M
   records/s. The engine has 5×+ headroom over the bar.
-- **Single-box single-origin HTTP: ~0.5 M records/s** disk-class. The ceiling here is the
+- **Single-topic single-origin HTTP: ~0.5 M records/s** disk-class. The ceiling here is the
   HTTP request / `serde_json` serialization path and per-request lock acquisition, **not the
-  engine**. Reaching ~1 M/s in aggregate is a matter of multi-connection / multi-box load
+  engine**. Reaching ~1 M/s in aggregate is a matter of multi-connection / multi-topic load
   plus batched writes, not a change to the server.
 - **Latency target (~1 ms): met for the non-durable path** (disk-class write-ack p50
   0.062 ms; SSE deliver 0.34–0.85 ms out to 100 watchers; tail/caught-up ~0.05 ms). **Not

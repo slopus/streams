@@ -31,7 +31,7 @@ are specified in [DESIGN.md](DESIGN.md); the wire contract is [API.md](API.md).
 
 ---
 
-## 1. In-memory representation of a box
+## 1. In-memory representation of a topic
 
 ### 1.1 The core: a base+offset location vector
 
@@ -42,7 +42,7 @@ dense and O(1)-indexable) — see below. So the seq→location map is a **contig
 array offset by the earliest physical seq**:
 
 ```rust
-struct BoxIndex {
+struct TopicIndex {
     base_seq: u64,             // seq of locs[0]; == earliest physical (not-yet-popped) seq
     locs: VecDeque<RecordLoc>, // index i  <=>  seq (base_seq + i)
     delete_below: u64,         // max before_seq ever applied (O(1) snapshot/prefix delete)
@@ -78,13 +78,13 @@ immediate (invisible to reads, `count`/`bytes` updated) while physical reclaim i
 is the earliest **physical** seq; `earliest_seq` (DESIGN §5.1) is the earliest **live** seq and may
 be greater (the front holds dead-but-not-yet-popped slots).
 
-### 1.2 Per-box in-memory state
+### 1.2 Per-topic in-memory state
 
 ```rust
-struct Box {
-    config: BoxConfig,                  // ttl_ms, cap_records, cap_bytes, discard, durable,
+struct Topic {
+    config: TopicConfig,                  // ttl_ms, cap_records, cap_bytes, discard, durable,
                                         //   priority, auto_priority, ...
-    index: parking_lot::RwLock<BoxIndex>, // locs + delete_below + tag_index (§1.1, §1.4)
+    index: parking_lot::RwLock<TopicIndex>, // locs + delete_below + tag_index (§1.1, §1.4)
     head_seq: AtomicU64,                // last assigned seq (log end)
     earliest_seq: AtomicU64,            // earliest LIVE seq, the read watermark (DESIGN §5.1)
     evict_floor: AtomicU64,             // involuntary cap/TTL floor; sole tombstone trigger
@@ -97,19 +97,19 @@ struct Box {
 }
 ```
 
-`head_seq`/`earliest_seq`/`evict_floor`/`epoch`/`eff_priority` are atomics so `GET /v0/boxes/:box`
+`head_seq`/`earliest_seq`/`evict_floor`/`epoch`/`eff_priority` are atomics so `GET /v0/topics/:topic`
 is lock-free and the diff path can decide tombstone-vs-silent with two atomic loads
 (`from_seq + 1 < evict_floor` ⇒ tombstone; below `earliest_seq` but not `evict_floor` ⇒ silent
 deleted gap) before taking the index read lock. **The dual floor is the on-disk/in-memory
 expression of DESIGN §5.1:** `evict_floor` advances only on involuntary cap/TTL eviction of live
 records; deletion advances `earliest_seq` only. Invariant `evict_floor <= earliest_seq` is held by
 construction. `Notify` is the wakeup primitive that lets SSE/diff hit 1–5 ms without polling. The
-global registry is `DashMap<BoxId, Arc<Box>>` for sharded concurrent access across many boxes.
+global registry is `DashMap<TopicId, Arc<Topic>>` for sharded concurrent access across many topics.
 
-### 1.3 The per-box tag index (efficient match-deletes)
+### 1.3 The per-topic tag index (efficient match-deletes)
 
 A `match` delete (DESIGN §7) MUST be efficient over many records — it must not scan the whole log.
-Each box keeps, inside `BoxIndex`, a **tag index** mapping a tag to its live seqs in ascending
+Each topic keeps, inside `TopicIndex`, a **tag index** mapping a tag to its live seqs in ascending
 order:
 
 ```rust
@@ -125,9 +125,9 @@ tag_index: BTreeMap<Box<str>, Vec<u64>>,   // tag -> ascending live seqs
 - **`match ["tag","Glob","X*"]`** → range scan over keys in `["X", next-key)` (the lexicographic
   successor of the prefix), unioning their seq vectors.
 
-A `before_seq`-only (snapshot/prefix) delete is O(1): bump `BoxIndex.delete_below = max(delete_below,
+A `before_seq`-only (snapshot/prefix) delete is O(1): bump `TopicIndex.delete_below = max(delete_below,
 before_seq)`; reads start at `max(from_seq + 1, base_seq)` and skip any slot `< delete_below`, while
-the background reclaimer pops the now-dead front. The tag index is held under the same per-box
+the background reclaimer pops the now-dead front. The tag index is held under the same per-topic
 index `RwLock` as `locs` (a delete is a rare, mutating operation; the hot read path doesn't touch
 it).
 
@@ -157,12 +157,12 @@ little-endian.
 ```
  off  size  field
    0    4   frame_len   u32   bytes of this frame EXCLUDING this field
-   4    1   type        u8    1=Append 2=BoxCreate 3=BoxDelete 4=RouterCreate
+   4    1   type        u8    1=Append 2=TopicCreate 3=TopicDelete 4=RouterCreate
                                 5=RouterDelete 6=Delete 7=EvictWatermark
                                 8=CheckpointMark 9=ConfigUpdate 10=Lease
                                 11=HeadWatermark
    5    1   flags       u8    bit0=has_tag bit1=has_node bit2=durable
-   6    4   box_id      u32   interned numeric box id (string<->id in meta store)
+   6    4   topic_id      u32   interned numeric topic id (string<->id in meta store)
   10    8   seq         u64   server-assigned (0 for non-Append control frames)
   18    8   ts          u64   server commit ms
   26    2   node_len    u16
@@ -179,9 +179,9 @@ little-endian.
 - **XXH3-64** (fast, modern 64-bit hash; ~2³² lower false-accept than a 32-bit CRC) over everything
   between `frame_len` and the checksum. A mismatch ⇒ torn/partial frame ⇒ logical end of log
   (truncate). This is the crash-consistency anchor (§4).
-- **`box_id` is an interned u32** (not the string name), keeping frames small; the name↔id mapping
+- **`topic_id` is an interned u32** (not the string name), keeping frames small; the name↔id mapping
   lives in the metadata store (§5).
-- **Control frames** (BoxCreate, Delete, EvictWatermark, ConfigUpdate, …) share the same WAL, so
+- **Control frames** (TopicCreate, Delete, EvictWatermark, ConfigUpdate, …) share the same WAL, so
   config, deletes, and data live on one ordered, crash-consistent timeline — there is exactly one
   truth: WAL order. A `Delete` frame records the operation (`before_seq` and/or `match`) so the
   permanent removal is replayed deterministically on recovery (the deleted seqs are re-derived from
@@ -191,12 +191,12 @@ little-endian.
 
 ```
 write request
-  -> validate; resolve box_id; assign seq = head_seq.fetch_add(n)   (after a discard:"reject" cap check)
+  -> validate; resolve topic_id; assign seq = head_seq.fetch_add(n)   (after a discard:"reject" cap check)
   -> serialize frame(s) into a reusable per-writer scratch BytesMut
-  -> hand (frames, durability_class, completion-oneshot) to the box's WAL-shard writer
+  -> hand (frames, durability_class, completion-oneshot) to the topic's WAL-shard writer
   -> shard writer appends bytes to that shard's active wal file (buffered write())
   -> on commit (fsync for durable, or group-commit tick): fulfill oneshots
-  -> update in-memory: push RecordLoc into BoxIndex, bump head_seq visibility, Notify watchers
+  -> update in-memory: push RecordLoc into TopicIndex, bump head_seq visibility, Notify watchers
   -> respond { seqs, head_seq, performance }
 ```
 
@@ -205,16 +205,16 @@ The seq is assigned **before** the WAL commit (so it can be returned) but the re
 a write was acked, it is in the WAL.** The WAL is **sharded** (`STREAMS_WAL_SHARDS`, default
 `min(num_cpus, 8)`): there are **N independent shard writers**, each fed by its own MPSC channel and
 owning its own file set + group-commit loop, so durable write throughput scales ~linearly with the
-shard count. Each box routes to **exactly one shard** by a stable hash of its interned id
-(`xxh3(box_id) % n`), so within a shard appends are still one ordered sequential stream (matching the
-hardware, making group commit trivial and removing write-side lock contention), and per-box ordering
-and every durability guarantee still hold because a box always lives on the same shard. Recovery is
-**shard-count-agnostic** (it replays all discovered shards by `box_id`, §4), so the shard count may
+shard count. Each topic routes to **exactly one shard** by a stable hash of its interned id
+(`xxh3(topic_id) % n`), so within a shard appends are still one ordered sequential stream (matching the
+hardware, making group commit trivial and removing write-side lock contention), and per-topic ordering
+and every durability guarantee still hold because a topic always lives on the same shard. Recovery is
+**shard-count-agnostic** (it replays all discovered shards by `topic_id`, §4), so the shard count may
 change between restarts. `STREAMS_WAL_SHARDS=1` is the legacy single-writer / flat-layout path.
 
 ### 2.3 Durability classes & group commit
 
-Durability is per-box. **Three commit classes, one writer per WAL shard:**
+Durability is per-topic. **Three commit classes, one writer per WAL shard:**
 
 | Class (`durable` alias) | Commit class | Behavior |
 |---|---|---|
@@ -237,7 +237,7 @@ loop:
       fdatasync(wal_fd)                            // one fsync for the whole batch
       ack durable frames
   ack non-durable frames                           // already in page cache
-  publish all frames to in-memory indexes; Notify per-box waiters
+  publish all frames to in-memory indexes; Notify per-topic waiters
 ```
 
 **Tuning for 1–5 ms on NVMe.** NVMe `fdatasync` is ~50–500 µs. An **adaptive window** ≤ 1 ms
@@ -259,8 +259,8 @@ deletable only after a checkpoint durably absorbs all their frames (§3).
 
 ## 3. Commit / checkpoint → segments
 
-The WAL is a fast, append-ordered, mixed-box, short-lived log. WAL frames are periodically applied
-into per-box **segment files** — the long-term store and read source for `getDifference` — to keep
+The WAL is a fast, append-ordered, mixed-topic, short-lived log. WAL frames are periodically applied
+into per-topic **segment files** — the long-term store and read source for `getDifference` — to keep
 recovery bounded and reads efficient.
 
 ### 3.1 Checkpoint process
@@ -268,20 +268,20 @@ recovery bounded and reads efficient.
 A background **compactor** task (triggered by time or WAL rotation):
 
 ```
-for each box with new frames since last checkpoint:
-    append those records (in seq order) to the box's active segment file
+for each topic with new frames since last checkpoint:
+    append those records (in seq order) to the topic's active segment file
     (segment frames are byte-identical to WAL Append frames — a buffered copy of
-     contiguous byte ranges, split by box; no re-serialization)
-    update the box's .idx file
+     contiguous byte ranges, split by topic; no re-serialization)
+    update the topic's .idx file
 fsync touched segment + idx files
-write a CheckpointMark frame to the WAL (per box: highest_seq_checkpointed, watermarks,
+write a CheckpointMark frame to the WAL (per topic: highest_seq_checkpointed, watermarks,
      active-segment positions); fsync the WAL
 WAL files whose every frame's seq <= the global min checkpointed seq are now deletable
 ```
 
 ### 3.2 Segment format
 
-Per box, a directory of numbered pairs (named by first seq, `seg-<first_seq>`, zero-padded so they
+Per topic, a directory of numbered pairs (named by first seq, `seg-<first_seq>`, zero-padded so they
 sort into seq order — ARCHITECTURE §6). A segment covers a contiguous range `[start_seq, end_seq]`.
 Implemented in `src/storage/segment.rs`:
 
@@ -299,12 +299,12 @@ A `.data` frame is `frame_len:u32` (excludes itself) + `flags:u8` (`has_tag`/`ha
 **sealed/immutable** segment a checksum mismatch is corruption, surfaced rather than silently
 truncated (unlike the WAL's torn tail).
 
-The `.idx` is the on-disk twin of `BoxIndex`: fixed-stride (**20 bytes/entry**), so `seq → entry` is
+The `.idx` is the on-disk twin of `TopicIndex`: fixed-stride (**20 bytes/entry**), so `seq → entry` is
 `(seq - first_seq) * 20` — a direct seek, no scan. This makes rebuilding the in-memory index on
 restart a **bulk read of `.idx` files** rather than a re-parse of all data. The inline `ts` enables
 **binary search for the TTL boundary**, and the inline `flags` a cheap tag/node presence probe,
 without touching the data file. A segment is **sealed** when any of three triggers fires
-(`segment_max_events` ≈ 10k, `segment_max_bytes` ≈ 64 MB, or `segment_max_age_ms` for an idle box —
+(`segment_max_events` ≈ 10k, `segment_max_bytes` ≈ 64 MB, or `segment_max_age_ms` for an idle topic —
 §3.6); the newest is "active" (still appended), older ones immutable.
 
 A `SegmentBuilder` accumulates a contiguous, gapless run of records into the `(.data, .idx)` byte
@@ -323,7 +323,7 @@ It never rewrites a segment. Two mechanisms:
    evict_floor` returns a tombstone (DESIGN §5.4).
 2. **Segment dropping (physical reclaim).** A whole **sealed** segment whose highest seq <
    `earliest_seq` is entirely gone (evicted or deleted) → its `.data`+`.idx` files are deleted.
-   Reclaim is segment-granular and lazy (Redis `~` / Kafka), so the box may retain slightly more
+   Reclaim is segment-granular and lazy (Redis `~` / Kafka), so the topic may retain slightly more
    than cap (only whole sealed segments drop) — the documented, accepted approximation. The active
    segment is never dropped.
 
@@ -332,9 +332,9 @@ CheckpointMark), so eviction and the tombstone boundary survive restart. A crash
 watermark-advance and file-delete is harmless: on restart we re-derive which segments are fully
 below the watermark and delete them (idempotent reclaim).
 
-**Full-box policy.** `discard:"old"` (default) evicts oldest as above. `discard:"reject"` (durable
+**Full-topic policy.** `discard:"old"` (default) evicts oldest as above. `discard:"reject"` (durable
 queue): the cap check happens on the append path *before* WAL write and seq assignment, so a rejected
-write (`422 box_full`) never enters the log — never ack-then-drop (the NATS DiscardNew foot-gun).
+write (`422 topic_full`) never enters the log — never ack-then-drop (the NATS DiscardNew foot-gun).
 
 ### 3.4 Serving `getDifference`: mmap vs buffered
 
@@ -354,7 +354,7 @@ write (`422 box_full`) never enters the log — never ack-then-drop (the NATS Di
 Deletion (DESIGN §7) is **logically immediate but physically lazy**, so it never stalls the hot
 path. The two halves:
 
-1. **Logical removal (synchronous, on the delete call).** Under the per-box index lock: resolve the
+1. **Logical removal (synchronous, on the delete call).** Under the per-topic index lock: resolve the
    target seqs (`before_seq` via `delete_below`; `match` via the tag index, §1.3), set each slot's
    `deleted` flag, free its payload/tag, subtract `bytes`, decrement `count`, prune tag-index
    entries, and advance `earliest_seq` if the front became dead. Write the `Delete` control frame
@@ -380,9 +380,9 @@ the OS.
 
 ### 3.6 Tiered storage: the `SegmentStore` trait + HOT/COLD tiers (phase 6)
 
-Data outgrows RAM and the fast NVMe. Each box's segments are split across **two tiers**:
+Data outgrows RAM and the fast NVMe. Each topic's segments are split across **two tiers**:
 
-- **HOT** — the active segment + recent sealed segments, on fast local NVMe (a per-box dir under the
+- **HOT** — the active segment + recent sealed segments, on fast local NVMe (a per-topic dir under the
   data dir). Reads here are buffered/mmap-fast; the live tail (active segment + the in-memory index
   + a bounded recent-record cache) is always hot and independent of cold access.
 - **COLD** — older sealed segments, on a slower tier. **v1's cold tier is a different configured
@@ -404,13 +404,13 @@ trait SegmentStore: Send + Sync {           // synchronous ⇒ runs on a blockin
 }
 ```
 
-A `SegmentId` is the segment's first seq; `part` is `Data` or `Idx`. A per-box `BoxTier` bundles a
+A `SegmentId` is the segment's first seq; `part` is `Data` or `Idx`. A per-topic `TopicTier` bundles a
 required HOT store + an optional COLD store and `resolve(id)`s which tier holds a segment, **preferring
 the HOT copy when both exist** (the transient mid-relocation window).
 
 **The HARD INVARIANT.** Cold reads MAY degrade `getDifference`/historical reads but MUST NOT affect
 **writes** or **live delivery** (SSE/tail). Cold I/O + the relocator run on a **separate blocking/IO
-pool**; they never hold a box write lock or block an SSE push during a slow cold fetch. The trait is
+pool**; they never hold a topic write lock or block an SSE push during a slow cold fetch. The trait is
 deliberately **synchronous and self-contained** so each call can be issued via `spawn_blocking`.
 
 **Memory bounding.** The in-memory index maps `seq → (tier, segment, offset, len)`; recent records
@@ -420,11 +420,11 @@ bounded by the index entry count, not the payload volume.
 **Hot-retention + relocation (later stage).** Sealed segments beyond the hot-retention bound
 (`hot_retain_segments` ≈ last 4, or `hot_retain_bytes`) relocate to cold. Relocation is **crash-safe
 and idempotent**: copy the segment to cold → fsync → durably flip the tier pointer (meta/WAL) →
-delete the hot copy. If interrupted, restart prefers the surviving copy (`BoxTier::resolve` favors
+delete the hot copy. If interrupted, restart prefers the surviving copy (`TopicTier::resolve` favors
 HOT) — a segment is never lost. Cap/TTL/delete reclaim drops a whole segment file/object in **either**
 tier. The WAL remains the durability boundary; segments are a derivable materialization.
 
-Stage 1 builds the trait, the segment format, the `BoxTier`, and the config knobs (§3.2, below).
+Stage 1 builds the trait, the segment format, the `TopicTier`, and the config knobs (§3.2, below).
 Sealing-on-the-write-path, the relocator, the bounded cache, and cold serving land in later stages.
 
 ---
@@ -435,15 +435,15 @@ Goal: rebuild all in-memory state, lose only data not yet in the WAL, tolerate a
 instant.
 
 ```
-1. Open data dir; load latest valid metadata snapshot (boxes, routers, name<->id,
-   watermarks (evict_floor + earliest_seq), delete_below per box, CURRENT wal ptr,
+1. Open data dir; load latest valid metadata snapshot (topics, routers, name<->id,
+   watermarks (evict_floor + earliest_seq), delete_below per topic, CURRENT wal ptr,
    last_checkpoint_seq).
-2. Per box: bulk-load segment .idx files into BoxIndex (fixed-stride sequential read). Set
+2. Per topic: bulk-load segment .idx files into TopicIndex (fixed-stride sequential read). Set
    base_seq from the lowest surviving segment, evict_floor/earliest_seq from the persisted
    watermarks, head_seq from the highest segment seq. Rebuild the tag index from the
    surviving tagged records.
 3. Replay EVERY WAL shard (shard-count-agnostic: all discovered shards — the flat `wal/` and each
-   `wal/shard-NN/` — are replayed, dispatching each frame by box_id; each shard resumes from its own
+   `wal/shard-NN/` — are replayed, dispatching each frame by topic_id; each shard resumes from its own
    per-shard checkpoint position recorded in the CheckpointMark). For each frame, in order:
      - frame_len fits remaining bytes? else torn tail -> STOP (truncate this shard here).
      - xxh3 valid? else torn/partial -> STOP (truncate this shard here).
@@ -460,7 +460,7 @@ instant.
 **Crash-consistency guarantees:**
 - **Torn tail:** detected by `frame_len` overrunning EOF or checksum mismatch; stop at the last fully
   written, checksum-valid frame and truncate. Since a write is acked only after its frame is committed
-  (and fsynced, for durable boxes), an **acked durable write is always a complete checksum-valid frame ⇒
+  (and fsynced, for durable topics), an **acked durable write is always a complete checksum-valid frame ⇒
   never lost.**
 - **Partial `write()`:** the trailing partial frame fails the XXH3 checksum / length check and is
   discarded; never interpreted as data.
@@ -472,7 +472,7 @@ instant.
 - **"Only data not yet in the WAL is lost":** for `fsync` (`durable=true`) an acked write survives
   (ack waits for fsync); for `disk` (`durable=false`) writes acked but not yet fsynced (within the
   group-commit timer) can be lost on power loss — the documented fast-path tradeoff, surfacing to
-  consumers as ordinary eviction-style gaps; a `memory` box takes the same path but with no
+  consumers as ordinary eviction-style gaps; a `memory` topic takes the same path but with no
   guarantee at all (its records may survive or be lost, head never above the acked head). In all
   cases the boundary is precisely "what reached the WAL on disk."
 - **Routers recover from a durable per-router cursor.** Forwarded copies are **derived** (not
@@ -490,23 +490,23 @@ replaying the WAL from time zero.
 
 ```rust
 struct Meta {
-    boxes:   HashMap<String, BoxId>,    // name -> interned u32 id (stable across restart)
-    box_cfg: HashMap<BoxId, BoxConfig>,
-    watermarks: HashMap<BoxId, (u64, u64)>, // persisted (evict_floor, earliest_seq) per box
-    delete_below: HashMap<BoxId, u64>,  // persisted max before_seq applied (snapshot delete)
+    topics:   HashMap<String, TopicId>,    // name -> interned u32 id (stable across restart)
+    topic_cfg: HashMap<TopicId, TopicConfig>,
+    watermarks: HashMap<TopicId, (u64, u64)>, // persisted (evict_floor, earliest_seq) per topic
+    delete_below: HashMap<TopicId, u64>,  // persisted max before_seq applied (snapshot delete)
     routers: Vec<Router>,               // {name, source, dest, preserve_*, filter, allow_cycle}
-    epochs: HashMap<BoxId, u64>,        // delete+recreate detection
-    next_box_id: u32,
+    epochs: HashMap<TopicId, u64>,        // delete+recreate detection
+    next_topic_id: u32,
     current_wal: String,
     last_checkpoint_seq: u64,           // global lower bound for WAL replay
 }
 ```
 
 **Deletes are not standing state.** Unlike the old read-time filter set, a permanent delete (DESIGN
-§7) leaves **no** per-box rule structure to persist: it is a one-shot operation logged as a `Delete`
+§7) leaves **no** per-topic rule structure to persist: it is a one-shot operation logged as a `Delete`
 control frame and reflected immediately in the index (slots flagged deleted, payloads freed) and in
 the two persisted watermarks + `delete_below`. The only deletion-related structure carried at
-runtime is the per-box **tag index** (§1.3) used to *find* matching seqs efficiently; it is derived
+runtime is the per-topic **tag index** (§1.3) used to *find* matching seqs efficiently; it is derived
 from the live records and rebuilt on recovery, not snapshotted.
 
 **The read loop is filter-free for deletion.** Because a deleted slot carries a `deleted` flag, the
@@ -533,12 +533,12 @@ the compact snapshot; metadata is tiny and changes rarely.
 ├── wal/                            # sharded (STREAMS_WAL_SHARDS, default min(num_cpus,8))
 │   ├── shard-00/                   # one dir per shard when shards>1 (shards==1 ⇒ flat wal/)
 │   │   ├── CURRENT                 # tiny file naming this shard's active wal segment
-│   │   ├── wal-0000000000001024.log # preallocated, append-only, mixed-box framed records
+│   │   ├── wal-0000000000001024.log # preallocated, append-only, mixed-topic framed records
 │   │   └── wal-0000000000004096.log # active wal segment (highest first-seq)
 │   └── shard-01/
 │       └── ...                     # each shard: own writer thread / file set / group commit
-└── boxes/                          # HOT tier (fast NVMe)
-    ├── 0000000A/                    # one dir per box, named by interned box_id (hex)
+└── topics/                          # HOT tier (fast NVMe)
+    ├── 0000000A/                    # one dir per topic, named by interned topic_id (hex)
     │   ├── seg-0000000000000001.data
     │   ├── seg-0000000000000001.idx # fixed-stride 20 B [offset,len,ts,flags,pad]; seq->entry by arithmetic
     │   ├── seg-0000000000010001.data
@@ -548,7 +548,7 @@ the compact snapshot; metadata is tiny and changes rarely.
         └── ...
 
 <STREAMS_COLD_DIR>/                  # COLD tier (optional; absent ⇒ tiering disabled, all hot)
-└── boxes/
+└── topics/
     └── 0000000A/                    # relocated older sealed segments, same seg-<first_seq> naming
         ├── seg-0000000000000001.data
         └── seg-0000000000000001.idx
@@ -556,13 +556,13 @@ the compact snapshot; metadata is tiny and changes rarely.
 
 The WAL is **sharded** (`STREAMS_WAL_SHARDS`, default `min(num_cpus, 8)`): N independent shard
 writers, each an ordered append stream over its own file set with trivial group commit (matching the
-sequential disk). A box maps to one shard by `xxh3(box_id) % n`; on disk each shard >1 lives under
-`wal/shard-NN/` (shards==1 is the flat `wal/` layout). Segments are **per-box** (independent
-eviction, per-box mmap, locality for `getDifference`).
+sequential disk). A topic maps to one shard by `xxh3(topic_id) % n`; on disk each shard >1 lives under
+`wal/shard-NN/` (shards==1 is the flat `wal/` layout). Segments are **per-topic** (independent
+eviction, per-topic mmap, locality for `getDifference`).
 Segment files named by first seq sort into seq order; finding a segment for a seq is a binary search
 over first-seqs. The same `seg-<first_seq>` naming is used in both tiers, so a relocated segment keeps
-its identity (§3.6); the cold tier mirrors the per-box layout under `STREAMS_COLD_DIR`. A box delete
-is a control frame + a fast rename `boxes/0000000A.deleted` then background unlink (fast and
+its identity (§3.6); the cold tier mirrors the per-topic layout under `STREAMS_COLD_DIR`. A topic delete
+is a control frame + a fast rename `topics/0000000A.deleted` then background unlink (fast and
 crash-safe).
 
 ### 6.1 Storage config knobs (phase 6)
@@ -585,32 +585,32 @@ tests).
 
 ## 7. Priority scheduler & elastic throttling
 
-The unit of scheduling is **delivery work** for a box: waking SSE watchers, running routers, and
+The unit of scheduling is **delivery work** for a topic: waking SSE watchers, running routers, and
 flushing pending write batches / group commit. Writes are admitted on the request path; scheduling
 governs the *post-write propagation* that must hit the latency target. The priority **formula and
 defaults** are in [DESIGN.md §3](DESIGN.md).
 
-### 7.1 Shape: a bounded pool draining a banded ready-set of *dirty boxes*
+### 7.1 Shape: a bounded pool draining a banded ready-set of *dirty topics*
 
 ```
-write/router makes a box "dirty" -> insert into its shard's ready set (at most once)
+write/router makes a topic "dirty" -> insert into its shard's ready set (at most once)
                                          |
                                          v
    banded weighted-fair queue (DWRR) keyed by effective priority + aging
                                          |
                        pop highest-credit band -> bounded worker pool (N_workers tasks)
-                       each worker drains ONE box fully, requeues if more work arrived
+                       each worker drains ONE topic fully, requeues if more work arrived
 ```
 
-The schedulable entity is a **box, not a record/watcher**: a write marks the box dirty and inserts
+The schedulable entity is a **topic, not a record/watcher**: a write marks the topic dirty and inserts
 it into the ready set if not already present (a membership bit prevents duplicates). This bounds the
-queue to O(#dirty boxes) and coalesces a box's burst of writes into one unit of work. A worker that
-picks up box B **drains B fully** (wakes all its SSE watchers, forwards to all router dests, flushes
-its commit batch) before moving on — preserving per-box ordering and amortizing the lock.
+queue to O(#dirty topics) and coalesces a topic's burst of writes into one unit of work. A worker that
+picks up topic B **drains B fully** (wakes all its SSE watchers, forwards to all router dests, flushes
+its commit batch) before moving on — preserving per-topic ordering and amortizing the lock.
 
 ### 7.2 Banded weighted-fair queue (anti-starvation) + aging
 
-A pure max-heap on priority starves low-priority boxes. Instead, priorities bucket into bands drawn
+A pure max-heap on priority starves low-priority topics. Instead, priorities bucket into bands drawn
 by **deficit weighted round-robin (DWRR)**:
 
 ```
@@ -623,16 +623,16 @@ Band  P_eff range    weight
 ```
 
 Within a band, FIFO by `enqueued_at`. Across bands, each round grants credit proportional to weight;
-with the defaults, for every 1 low-priority box serviced up to 8 top-band boxes may be — high
+with the defaults, for every 1 low-priority topic serviced up to 8 top-band topics may be — high
 priority strongly favored, but B1/B0 always make forward progress every round.
 
-**Aging** prevents a box stuck at the bottom of a busy band from waiting forever:
+**Aging** prevents a topic stuck at the bottom of a busy band from waiting forever:
 `age_boost = AGE_RATE * min(now - enqueued_at, AGE_CAP_MS)` (+100/s, capped at +1000 after 10 s). A
-50 ms aging tick promotes boxes across band boundaries. `enqueued_at` resets only when the box is
-actually serviced, so a continuously-rewritten box still ages. **Combined guarantee:** no box waits
+50 ms aging tick promotes topics across band boundaries. `enqueued_at` resets only when the topic is
+actually serviced, so a continuously-rewritten topic still ages. **Combined guarantee:** no topic waits
 more than 10 s before reaching the top band, and DWRR drains the top band every round — worst-case
 scheduling latency is bounded even under sustained high-priority load. Under unsaturated load the
-ready set is near-empty and boxes are serviced within microseconds of being marked dirty (1–5 ms
+ready set is near-empty and topics are serviced within microseconds of being marked dirty (1–5 ms
 target).
 
 ### 7.3 Elastic throttling — shed cost, never data
@@ -641,20 +641,20 @@ A **governor task** every 100 ms samples three cheap signals into `pressure ∈ 
 depth vs `N_workers`, EWMA scheduling latency vs the 5 ms ceiling, and the blocking/compute-pool busy
 ratio. `pressure` is published as a lock-free atomic and drives an escalating, composable ladder:
 
-1. **Batch coalescing (`pressure > 0.2`).** Stop waking watchers per-record; coalesce a box's
+1. **Batch coalescing (`pressure > 0.2`).** Stop waking watchers per-record; coalesce a topic's
    pending records into one multi-record frame / diff. Cheap, lossless, often improves throughput.
    Window grows `0..20 ms` with pressure.
 2. **Widen group-commit window (`pressure > 0.4`).** `commit_window_ms = lerp(0.5, 10, pressure)` —
    fewer fsyncs/sec, more headroom; cost is up to +9.5 ms write-ack latency, observed as latency,
    never loss.
 3. **Defer lowest-value work (`pressure > 0.8`, sustained).** Routers (fan-out) are enqueued one band
-   lower; `B0`/negative-priority boxes stop receiving DWRR credit until `pressure < 0.6` (hysteresis)
+   lower; `B0`/negative-priority topics stop receiving DWRR credit until `pressure < 0.6` (hysteresis)
    — their data is still durably stored and fully pollable via `getDifference`, only the *push* is
    paused. If a per-shard ingest channel is full and `pressure ≈ 1.0`, the write endpoint returns
    **`429` + `Retry-After`** (writers may bypass with `disable_backpressure: true`).
 
 The cardinal rule: **throttling degrades latency and push-eagerness, never correctness.** A deferred
-box is always fully consistent on the next `getDifference`. All data loss remains the explicit,
+topic is always fully consistent on the next `getDifference`. All data loss remains the explicit,
 configured cap/TTL path with in-band tombstones; full-write rejection is synchronous (`422`/`429`),
 never ack-then-drop.
 
@@ -672,42 +672,42 @@ never ack-then-drop.
 
 ### 8.1 Sharding
 
-Boxes are partitioned across `S` **delivery** shards by `shard = hash(box_id) % S`, with
-`S = N_workers` (one shard per core) by default. Each shard owns its slice of the box map and its
+Topics are partitioned across `S` **delivery** shards by `shard = hash(topic_id) % S`, with
+`S = N_workers` (one shard per core) by default. Each shard owns its slice of the topic map and its
 ready-set. **State is sharded, not globally locked.** The only global structures are the lock-free
-`pressure` atomic and the read-mostly box-name→shard directory (`dashmap`). This delivery sharding is
+`pressure` atomic and the read-mostly topic-name→shard directory (`dashmap`). This delivery sharding is
 **independent of the WAL sharding** (§2.2): the WAL has its own N shard writers, each with its own
-ingest channel; a box maps to one delivery shard *and* one WAL shard, by separate hashes. There is no
+ingest channel; a topic maps to one delivery shard *and* one WAL shard, by separate hashes. There is no
 single WAL writer.
 
-### 8.2 Lock strategy: short shard lock + per-box fine lock
+### 8.2 Lock strategy: short shard lock + per-topic fine lock
 
 - **Per-shard mutex** held only for the O(1) ready-set splice (push/pop a deque, flip a bitset bit) —
   a few instructions, negligible contention even when workers share a shard.
-- **Per-box `RwLock`** guarding the append tail, watcher list, and pending-work buffer. A worker
-  draining box B holds only B's lock, so two workers drain two different boxes in the same shard
-  fully in parallel. Reads (`getDifference`) take the box read lock against committed segments; the
+- **Per-topic `RwLock`** guarding the append tail, watcher list, and pending-work buffer. A worker
+  draining topic B holds only B's lock, so two workers drain two different topics in the same shard
+  fully in parallel. Reads (`getDifference`) take the topic read lock against committed segments; the
   append tail uses a seqlock so reads rarely block writes.
-- **Lock ordering** to avoid deadlock: shard-ready lock → box lock, never reverse; routers acquire
-  source then dest in ascending `(shard, box_id)` order.
+- **Lock ordering** to avoid deadlock: shard-ready lock → topic lock, never reverse; routers acquire
+  source then dest in ascending `(shard, topic_id)` order.
 
 ### 8.3 How operations interleave
 
 | Operation | Path | Contention |
 |---|---|---|
-| **Write** | HTTP task → shard lane → append under box lock → assign seqs → mark dirty (short shard lock) → return | box's own lock + brief splice; independent boxes never contend |
+| **Write** | HTTP task → shard lane → append under topic lock → assign seqs → mark dirty (short shard lock) → return | topic's own lock + brief splice; independent topics never contend |
 | **getState** | lock-free atomic loads (head/earliest/count) + `last_consumed_ms` store | lock-free |
-| **getDifference** | box read lock over committed segments; bounded batch; bump recency; tombstone iff `from_seq+1 < evict_floor` (the involuntary cap/TTL floor — a purely-deleted gap below `earliest_seq` is silent) | box read lock; doesn't block other boxes; rarely blocks the append tail (seqlock) |
-| **SSE push** | worker draining the box pushes frames to each watcher's bounded channel; slow consumer's channel full → degrade that connection, not the box | per-box during drain; per-connection channel isolates a slow client |
-| **Router** | **async, off the write/ack path** (the shipped default): a background per-router worker forwards from a durable cursor; forwarded copies are **derived** (not WAL-logged — one WAL write per source append regardless of fan-out); each derived dest is single-source (a different second source ⇒ `409 box_exists_incompatible`, `error.detail.reason: "router_dest_fan_in"`); dest scheduling/priority applies; node filtering at dest read time. **Legacy opt-out** `STREAMS_FORWARD_V2=0`: synchronous in-line forward on the ack path — durable-by-construction but WAL-amplified (N WAL writes per N-way fan-out) and it permits multi-source fan-in | no cross-shard lock on the source ack path; recovery replays from the per-router cursor |
+| **getDifference** | topic read lock over committed segments; bounded batch; bump recency; tombstone iff `from_seq+1 < evict_floor` (the involuntary cap/TTL floor — a purely-deleted gap below `earliest_seq` is silent) | topic read lock; doesn't block other topics; rarely blocks the append tail (seqlock) |
+| **SSE push** | worker draining the topic pushes frames to each watcher's bounded channel; slow consumer's channel full → degrade that connection, not the topic | per-topic during drain; per-connection channel isolates a slow client |
+| **Router** | **async, off the write/ack path** (the shipped default): a background per-router worker forwards from a durable cursor; forwarded copies are **derived** (not WAL-logged — one WAL write per source append regardless of fan-out); each derived dest is single-source (a different second source ⇒ `409 topic_exists_incompatible`, `error.detail.reason: "router_dest_fan_in"`); dest scheduling/priority applies; node filtering at dest read time. **Legacy opt-out** `STREAMS_FORWARD_V2=0`: synchronous in-line forward on the ack path — durable-by-construction but WAL-amplified (N WAL writes per N-way fan-out) and it permits multi-source fan-in | no cross-shard lock on the source ack path; recovery replays from the per-router cursor |
 
 ### 8.4 Slow-consumer isolation (SSE)
 
 Each SSE connection has a bounded outbound channel (default 1024 frames). If a worker can't enqueue,
-it does **not** block the box drain; the connection is marked **lagged**, the server stops buffering
+it does **not** block the topic drain; the connection is marked **lagged**, the server stops buffering
 for it, records the last-delivered composite cursor, and on the next successful send emits a tombstone
-for the skipped range (for lossy boxes) so the client catches up via `getDifference`. One slow client
-is contained to its own connection; the box and all other watchers proceed at full speed.
+for the skipped range (for lossy topics) so the client catches up via `getDifference`. One slow client
+is contained to its own connection; the topic and all other watchers proceed at full speed.
 
 ### 8.5 Mapping onto tokio + a bounded compute pool
 
@@ -724,7 +724,7 @@ is contained to its own connection; the box and all other watchers proceed at fu
 work (heap splice + channel sends), completing in microseconds when unsaturated; blocking work is
 quarantined in a bounded pool that can never consume all async threads; backpressure is structural
 (every ingest and SSE channel is bounded, with defined `429`/tombstone behavior rather than unbounded
-memory growth); and there is no global lock on writes, reads, or pushes for distinct boxes, so
+memory growth); and there is no global lock on writes, reads, or pushes for distinct topics, so
 throughput scales ~linearly with cores until the durability pool or NVMe is the bottleneck — at which
 point group-commit widening trades latency for throughput, gracefully.
 
@@ -735,14 +735,14 @@ point group-commit widening trades latency for throughput, gracefully.
 The push chain on a non-durable write, unsaturated:
 
 1. **Append + wake** (~tens of µs): append to the in-memory tail, assign seq, write frame bytes to
-   the WAL page cache, signal the box's `Notify`. (For `consistency:strong` SSE / `durable` boxes,
+   the WAL page cache, signal the topic's `Notify`. (For `consistency:strong` SSE / `durable` topics,
    the signal/ack waits for the group-commit fsync — see below.)
-2. **Watcher registry, not scan** (~µs): each box keeps its registered watchers; the `Notify` wakes
-   only those connections. No periodic poll; idle boxes cost nothing.
-3. **Coalesced flush** (~tens of µs): each woken worker reads from its per-box cursor up to
+2. **Watcher registry, not scan** (~µs): each topic keeps its registered watchers; the `Notify` wakes
+   only those connections. No periodic poll; idle topics cost nothing.
+3. **Coalesced flush** (~tens of µs): each woken worker reads from its per-topic cursor up to
    `limit`/`max_batch_bytes`, skipping deleted/expired/own-node slots, builds one frame, writes to
    the socket and flushes (`X-Accel-Buffering: no` + `TCP_NODELAY` → no proxy/Nagle buffering).
-4. **Routers add one hop** (~µs): a forwarded record triggers the dest box's `Notify` exactly like a
+4. **Routers add one hop** (~µs): a forwarded record triggers the dest topic's `Notify` exactly like a
    direct write — one extra in-process append.
 5. **Backpressure cannot stall the writer**: the write path only *signals*; slow-consumer buffering
    happens in the consumer's own task, so fast-consumer latency is independent of slow ones.
@@ -755,13 +755,13 @@ Budget breakdown (NVMe-class hardware, unsaturated):
 | WAL frame serialize + buffered write | 10–50 µs | reusable scratch buffer, page cache |
 | `fdatasync` (durable / strong only) | 50–500 µs | one per group-commit batch |
 | Index update + `Notify` | < 10 µs | atomic + deque push |
-| Worker wake + filter + frame build | 20–100 µs | per-box read lock, in-memory slice |
+| Worker wake + filter + frame build | 20–100 µs | per-topic read lock, in-memory slice |
 | Socket write + flush | 10–50 µs | `TCP_NODELAY`, explicit flush |
 
 Non-durable / `eventual`: end-to-end well under 1 ms typical, comfortably inside the 1–5 ms target.
 Durable / `strong`: add the group-commit fsync window (≤ 1 ms adaptive), still inside budget. The
 only intentional latency knobs are `consistency:strong` (adds the fsync window) and the scheduler's
-deliberate pacing of low-priority boxes under CPU pressure — both explicit and visible (in the
+deliberate pacing of low-priority topics under CPU pressure — both explicit and visible (in the
 `performance.fsync_ms`/`throttle_wait_ms` fields and SSE `error` frames).
 
 ---
@@ -779,9 +779,9 @@ deliberate pacing of low-priority boxes under CPU pressure — both explicit and
 | `bytes` | zero-copy buffers | `Bytes`/`BytesMut` for reference-counted payload slices and reusable WAL framing scratch. |
 | `xxhash-rust` (xxh3) | frame integrity | XXH3-64 for WAL/segment checksums — modern, fast, 64-bit (~2³² lower false-accept than 32-bit CRC); the torn-tail crash anchor. |
 | `memmap2` | segment reads | mmap sealed immutable segments for zero-copy, page-cache-backed `getDifference`. |
-| `parking_lot` | locks | Faster, smaller `RwLock`/`Mutex` for the per-box index lock on the hot path. |
-| `dashmap` | box registry | Sharded concurrent `HashMap<BoxId, Arc<Box>>` — many boxes without a global lock. |
-| `arc-swap` | COW config | Wait-free `load()` of a box's current config/router set on the hot path; rare writers publish a new `Arc`. |
+| `parking_lot` | locks | Faster, smaller `RwLock`/`Mutex` for the per-topic index lock on the hot path. |
+| `dashmap` | topic registry | Sharded concurrent `HashMap<TopicId, Arc<Topic>>` — many topics without a global lock. |
+| `arc-swap` | COW config | Wait-free `load()` of a topic's current config/router set on the hot path; rare writers publish a new `Arc`. |
 | `smallvec` | tiny allocations | Per-write seq batches / small node/tag buffers avoid heap allocation in the common single-record case. |
 | `rustix` (or `nix`) | raw fs syscalls | `fdatasync`, `fallocate`, `pread`, atomic `renameat` + dir fsync — durability primitives std doesn't expose. |
 | `ahash` | fast hashing | Backing hasher for `dashmap` / exact-tag `HashSet`. |
@@ -795,12 +795,12 @@ deliberate pacing of low-priority boxes under CPU pressure — both explicit and
 ## 11. Phase-2 → Phase-4 summary
 
 **Unchanged across phases** (write once in phase 2): the HTTP API surface, the base+offset
-`BoxIndex`, the dual floor (`earliest_seq`/`evict_floor`) + `epoch` atomics, tombstone/gap
-computation, the per-box tag index + permanent-delete path (logical removal + lazy front-reclaim) +
+`TopicIndex`, the dual floor (`earliest_seq`/`evict_floor`) + `epoch` atomics, tombstone/gap
+computation, the per-topic tag index + permanent-delete path (logical removal + lazy front-reclaim) +
 node loop-prevention read loop, priority/recency tracking, `Notify`-based SSE/diff wakeups, the
 banded scheduler (in-memory it just has nothing to fsync).
 
-**Added in phase 4:** the WAL (framing, **sharded** group-commit writers, per-box durable fsync), the
+**Added in phase 4:** the WAL (framing, **sharded** group-commit writers, per-topic durable fsync), the
 compactor (WAL→segment checkpointing), segment files + `.idx` + mmap serving, segment-granular lazy
 cap/TTL eviction, the **background orphan-segment dropper** (async **whole-segment drop** when a delete
 clears a segment — **no compaction / no partial-segment rewrite / no per-record reclaim**; deletes flip
@@ -809,8 +809,8 @@ and restart recovery. Phase 4 only re-points `RecordLoc` from heap `Bytes` to `(
 inserts the WAL on the append path, and adds the background whole-segment drop — the serving and indexing
 logic is reused intact.
 
-**Added in phase 6 (tiered storage, §3.6):** the `SegmentStore` trait + `LocalSegmentStore` + per-box
-`BoxTier` (HOT + optional COLD), the segment file format (`src/storage/segment.rs`), and the
+**Added in phase 6 (tiered storage, §3.6):** the `SegmentStore` trait + `LocalSegmentStore` + per-topic
+`TopicTier` (HOT + optional COLD), the segment file format (`src/storage/segment.rs`), and the
 seal/hot-retention/`STREAMS_COLD_DIR` config. Tiering is **additive and transparent**: with no cold
 dir, nothing relocates and the phase-4 behavior is unchanged. Cold I/O + the relocator run off the
 hot path; the HARD INVARIANT is that cold reads may degrade historical reads but never affect writes
@@ -829,9 +829,9 @@ free the payload and advance `earliest_seq` synchronously, reclaim disk/memory i
 
 ## 12. Queue layer (materialized lease view, reclaim freelist, claim cursor)
 
-A **queue** box (DESIGN §10) reuses every structure above for its **jobs log** (the box's own
-`BoxIndex` + WAL + segments) and adds a thin lease layer on top — purely additive, no change to
-the §1–§11 storage path. A queue holds **two logs**: the jobs log (the box) and a companion
+A **queue** topic (DESIGN §10) reuses every structure above for its **jobs log** (the topic's own
+`TopicIndex` + WAL + segments) and adds a thin lease layer on top — purely additive, no change to
+the §1–§11 storage path. A queue holds **two logs**: the jobs log (the topic) and a companion
 **leases log** of lifecycle events, both WAL-framed. The live who-holds-what state is the
 **materialized projection** of the leases log (event-sourced, DESIGN §10.1), held in memory:
 
@@ -869,8 +869,8 @@ contended atomics, predictable fairness (DESIGN §10.3). `claim_jitter_ms = 0` s
 immediately. All windows/deadlines use the **Clock trait** so `TestClock` drives lease expiry,
 the jitter window, and delayed nacks deterministically — no wall-clock sleep is load-bearing.
 
-The queue state lives under the box's existing per-box lock (DESIGN §10 transitions are rare
+The queue state lives under the topic's existing per-topic lock (DESIGN §10 transitions are rare
 relative to the read hot path); ack reuses the permanent-delete path (§3.5), so an acked job's
 storage is reclaimed exactly like any deleted record. Dead-lettering (DESIGN §10.7) is an
-internal append into the `dead_letter` box plus a permanent delete from the jobs log — no new
+internal append into the `dead_letter` topic plus a permanent delete from the jobs log — no new
 storage mechanism.

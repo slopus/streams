@@ -1,9 +1,9 @@
 //! Multiplexed SSE watch: POST `/v0/watch` (create session) and
 //! GET `/v0/watch/:wid` (open the SSE stream).
 //!
-//! Frame types (API §7.5): `record`, `tombstone`, `caught-up`, `box-deleted`,
-//! `error`; data-bearing frames carry a composite base64url `id:` (the per-box
-//! `box → seq` cursor map), heartbeats are bare `:` comments, and `retry:` is
+//! Frame types (API §7.5): `record`, `tombstone`, `caught-up`, `topic-deleted`,
+//! `error`; data-bearing frames carry a composite base64url `id:` (the per-topic
+//! `topic → seq` cursor map), heartbeats are bare `:` comments, and `retry:` is
 //! sent once at open. Resume via `Last-Event-ID`.
 
 use super::AppState;
@@ -30,14 +30,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The `record` SSE frame envelope. Fields are declared in **sorted key order**
-/// (`box`,`from_seq`,`head_seq`,`records`,`to_seq`) so `serde_json` emits bytes
+/// (`topic`,`from_seq`,`head_seq`,`records`,`to_seq`) so `serde_json` emits bytes
 /// byte-identical to the prior `serde_json::json!` map (which sorts keys), while
 /// `records` embeds the shared, pre-serialized [`RawValue`] frames verbatim
 /// (zero re-serialization of the record bodies).
 #[derive(Serialize)]
 struct RecordEnvelope<'a> {
-    #[serde(rename = "box")]
-    box_name: &'a str,
+    #[serde(rename = "topic")]
+    topic_name: &'a str,
     from_seq: u64,
     head_seq: u64,
     #[serde(serialize_with = "serialize_shared_frames")]
@@ -65,11 +65,11 @@ where
 }
 
 /// A stored watch session: the immutable subscription definition plus the
-/// authoritative, mutable per-box cursor map (so a GET reconnect resumes
+/// authoritative, mutable per-topic cursor map (so a GET reconnect resumes
 /// exactly; API §7.1/§7.4).
 pub struct Session {
     pub req: WatchCreateRequest,
-    /// Authoritative `box → last-delivered seq` cursor map.
+    /// Authoritative `topic → last-delivered seq` cursor map.
     pub cursors: Mutex<BTreeMap<String, u64>>,
     /// The id of the key that created this session, when auth is enabled (a
     /// non-secret SHA-256 digest, never the plaintext). `None` in dev mode. The
@@ -299,10 +299,10 @@ impl Drop for StreamHandle {
 
 /// `POST /v0/watch` — create a watch session; returns a `wid` + `stream_url`.
 ///
-/// Validates the `boxes` map (size, names) and resolves each box's initial
-/// `from_seq`/`tail` against current watermarks, returning per-box
+/// Validates the `topics` map (size, names) and resolves each topic's initial
+/// `from_seq`/`tail` against current watermarks, returning per-topic
 /// head/earliest so the client can see fall-off before streaming. `?lenient=true`
-/// skips unknown boxes instead of `404`.
+/// skips unknown topics instead of `404`.
 pub async fn create_watch(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -312,33 +312,33 @@ pub async fn create_watch(
 ) -> Result<Json<WatchCreateResponse>> {
     let mut req: WatchCreateRequest = super::parse_json_body(&headers, &body)?;
 
-    if req.boxes.is_empty() {
-        return Err(Error::invalid_request("watch must name >=1 box"));
+    if req.topics.is_empty() {
+        return Err(Error::invalid_request("watch must name >=1 topic"));
     }
-    if req.boxes.len() > config::MAX_WATCH_BOXES {
+    if req.topics.len() > config::MAX_WATCH_TOPICS {
         return Err(Error::invalid_request(format!(
-            "watch names {} boxes, exceeds max {}",
-            req.boxes.len(),
-            config::MAX_WATCH_BOXES
+            "watch names {} topics, exceeds max {}",
+            req.topics.len(),
+            config::MAX_WATCH_TOPICS
         )));
     }
 
-    // Authorization: a prefix-restricted key may only watch boxes within its
+    // Authorization: a prefix-restricted key may only watch topics within its
     // allowlist. The route-level scope check (`POST /v0/watch` needs read) does
-    // NOT see the body's box names — they arrive here — so the prefix allowlist
-    // must be enforced against every requested box BEFORE resolving/storing the
-    // session, or a prefix-limited read key could subscribe to any box (codex
+    // NOT see the body's topic names — they arrive here — so the prefix allowlist
+    // must be enforced against every requested topic BEFORE resolving/storing the
+    // session, or a prefix-limited read key could subscribe to any topic (codex
     // HIGH #1). A full-access / unrestricted key (empty allowlist) passes
     // transparently. The dev-mode principal is full-access.
     let principal = extensions.get::<crate::auth::Principal>();
     if let Some(p) = principal {
-        for name in req.boxes.keys() {
+        for name in req.topics.keys() {
             if !p.allows_name(name) {
                 return Err(Error::new(
                     ErrorCode::Forbidden,
-                    "api key is not allowed to watch this box",
+                    "api key is not allowed to watch this topic",
                 )
-                .with_detail(serde_json::json!({ "box": name })));
+                .with_detail(serde_json::json!({ "topic": name })));
             }
         }
     }
@@ -358,9 +358,9 @@ pub async fn create_watch(
         .clamp(config::min_heartbeat_ms(), config::MAX_HEARTBEAT_MS);
 
     let lenient = super::query_bool(&params, "lenient", false);
-    let states = state.engine.watch_box_states(&req.boxes, lenient)?;
+    let states = state.engine.watch_topic_states(&req.topics, lenient)?;
 
-    // Seed the authoritative cursor map from the resolved per-box `from_seq`.
+    // Seed the authoritative cursor map from the resolved per-topic `from_seq`.
     let mut cursors = BTreeMap::new();
     for (name, st) in &states {
         cursors.insert(name.clone(), st.from_seq);
@@ -406,7 +406,7 @@ pub async fn create_watch(
         stream_url: format!("/v0/watch/{wid}"),
         wid,
         session_ttl_ms: config::SESSION_TTL_MS,
-        boxes: states,
+        topics: states,
         performance: Performance::default(),
     }))
 }
@@ -521,9 +521,9 @@ pub async fn stream_watch(
 }
 
 /// Build the SSE event stream for a resolved session. Reuses the engine's diff
-/// primitive per box (TTL + deleted skip + node filter + tombstone), emits
-/// `record`/`tombstone`/`caught-up`/`box-deleted` frames with composite `id:`
-/// cursors, and parks on each box's `Notify` between flushes (no busy poll).
+/// primitive per topic (TTL + deleted skip + node filter + tombstone), emits
+/// `record`/`tombstone`/`caught-up`/`topic-deleted` frames with composite `id:`
+/// cursors, and parks on each topic's `Notify` between flushes (no busy poll).
 fn build_stream(
     engine: Arc<Engine>,
     session: Arc<Session>,
@@ -551,19 +551,19 @@ fn build_stream(
         // `retry:` once at open (deliberate 2 s backoff; API §7.5).
         yield Ok(Event::default().retry(Duration::from_millis(config::SSE_RETRY_MS)));
 
-        // Track which boxes we've already reported as deleted (terminal per box)
-        // and whether each box was last seen caught-up (to re-emit on the
+        // Track which topics we've already reported as deleted (terminal per topic)
+        // and whether each topic was last seen caught-up (to re-emit on the
         // backlog→tailing transition only).
-        let box_names: Vec<String> =
+        let topic_names: Vec<String> =
             session.cursors.lock().keys().cloned().collect();
         let mut deleted: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut was_caught_up: HashMap<String, bool> = HashMap::new();
-        // Boxes not yet read once: a tombstone on the *first* read is the
+        // Topics not yet read once: a tombstone on the *first* read is the
         // connect-time "offset out of range" case (`from_seq_too_old`; API §7.5),
         // distinct from a gap that crosses the cursor while live.
         let mut first_read: std::collections::HashSet<String> =
-            box_names.iter().cloned().collect();
+            topic_names.iter().cloned().collect();
 
         loop {
             // Graceful shutdown (M11): if the server is winding down, emit a
@@ -580,32 +580,32 @@ fn build_stream(
                 break;
             }
 
-            // Hold the live box `Arc`s for this pass so the `Notified` futures
-            // we build at the end (which borrow each box's `Notify`) outlive the
-            // per-box loop body.
-            let mut live: Vec<Arc<crate::engine::box_state::BoxState>> = Vec::new();
+            // Hold the live topic `Arc`s for this pass so the `Notified` futures
+            // we build at the end (which borrow each topic's `Notify`) outlive the
+            // per-topic loop body.
+            let mut live: Vec<Arc<crate::engine::topic_state::TopicState>> = Vec::new();
 
-            for name in &box_names {
+            for name in &topic_names {
                 if deleted.contains(name) {
                     continue;
                 }
-                let Some(b) = engine.get_box(name) else {
-                    // Box vanished mid-watch ⇒ terminal box-deleted frame.
+                let Some(b) = engine.get_topic(name) else {
+                    // Topic vanished mid-watch ⇒ terminal topic-deleted frame.
                     let head = 0;
                     deleted.insert(name.clone());
                     let id = encode_session_id(&session);
                     let data = serde_json::json!({
-                        "box": name, "head_seq": head, "reason": "deleted"
+                        "topic": name, "head_seq": head, "reason": "deleted"
                     });
                     yield Ok(Event::default()
                         .id(id)
-                        .event("box-deleted")
+                        .event("topic-deleted")
                         .data(data.to_string()));
                     continue;
                 };
                 live.push(b.clone());
 
-                // Drain this box up to head in `limit`-sized batches.
+                // Drain this topic up to head in `limit`-sized batches.
                 loop {
                     let from_seq = session
                         .cursors
@@ -626,27 +626,27 @@ fn build_stream(
                         max_batch_bytes: session.req.max_batch_bytes,
                     };
                     let Ok(d) = engine.diff(name, req) else {
-                        // Diff only fails with box_not_found here.
+                        // Diff only fails with topic_not_found here.
                         deleted.insert(name.clone());
                         let id = encode_session_id(&session);
                         let data = serde_json::json!({
-                            "box": name, "head_seq": 0, "reason": "deleted"
+                            "topic": name, "head_seq": 0, "reason": "deleted"
                         });
                         yield Ok(Event::default()
                             .id(id)
-                            .event("box-deleted")
+                            .event("topic-deleted")
                             .data(data.to_string()));
                         break;
                     };
 
                     // A tombstone crossed this consumer's cursor: emit it first,
-                    // its `id` already advances the box cursor to `gap_to`.
+                    // its `id` already advances the topic cursor to `gap_to`.
                     if let Some(tomb) = &d.tombstone {
                         session
                             .cursors
                             .lock()
                             .insert(name.clone(), tomb.gap_to);
-                        // On the first read of a box, a below-floor cursor is the
+                        // On the first read of a topic, a below-floor cursor is the
                         // connect-time `from_seq_too_old` variant (API §7.5);
                         // afterward, report the engine's cap/ttl/mixed reason.
                         let reason = if first_read.contains(name) {
@@ -656,7 +656,7 @@ fn build_stream(
                         };
                         let id = encode_session_id(&session);
                         let data = serde_json::json!({
-                            "box": name,
+                            "topic": name,
                             "reason": reason,
                             "gap_from": tomb.gap_from,
                             "gap_to": tomb.gap_to,
@@ -675,10 +675,10 @@ fn build_stream(
                     let to_seq = d.next_from_seq;
                     if !d.records.is_empty() {
                         // Zero-copy broadcast: each record frame is serialized
-                        // ONCE per box and shared (ref-counted `Arc<RawValue>`)
-                        // across all watchers via the box's broadcast cache,
+                        // ONCE per topic and shared (ref-counted `Arc<RawValue>`)
+                        // across all watchers via the topic's broadcast cache,
                         // instead of re-serializing per connection. The envelope
-                        // (`box`/`from_seq`/`to_seq`/`head_seq`) and the composite
+                        // (`topic`/`from_seq`/`to_seq`/`head_seq`) and the composite
                         // `id:` cursor are still per-connection (they depend on
                         // this session's cursor map). The struct's field order is
                         // sorted to stay byte-identical to the old `json!` map.
@@ -690,7 +690,7 @@ fn build_stream(
                         session.cursors.lock().insert(name.clone(), to_seq);
                         let id = encode_session_id(&session);
                         let payload = RecordEnvelope {
-                            box_name: name.as_str(),
+                            topic_name: name.as_str(),
                             from_seq,
                             head_seq: d.head_seq,
                             records,
@@ -714,7 +714,7 @@ fn build_stream(
                         if !was_caught_up.get(name).copied().unwrap_or(false) {
                             let id = encode_session_id(&session);
                             let data = serde_json::json!({
-                                "box": name, "head_seq": d.head_seq
+                                "topic": name, "head_seq": d.head_seq
                             });
                             yield Ok(Event::default()
                                 .id(id)
@@ -727,18 +727,18 @@ fn build_stream(
                 }
             }
 
-            // If every box is terminal (deleted), end the stream.
-            if box_names.iter().all(|n| deleted.contains(n)) {
+            // If every topic is terminal (deleted), end the stream.
+            if topic_names.iter().all(|n| deleted.contains(n)) {
                 break;
             }
 
-            // Drained pass: park until any watched box appends or the heartbeat
+            // Drained pass: park until any watched topic appends or the heartbeat
             // window elapses, then re-check. Tokio `Notify` wakeups give the
             // ~1-5 ms push target without busy polling (API §7.6); the axum
             // `KeepAlive` layer emits the `: hb` comment on its own cadence.
             let notifies: Vec<_> = live.iter().map(|b| Box::pin(b.notify.notified())).collect();
             if notifies.is_empty() {
-                // No live boxes to wait on; honor the heartbeat tick, but wake at
+                // No live topics to wait on; honor the heartbeat tick, but wake at
                 // once on shutdown so the next loop pass emits the close frame (M11).
                 tokio::select! {
                     _ = shutdown.notified() => {}
@@ -782,7 +782,7 @@ pub(crate) fn record_frame(r: &RecordOut, include_data: bool) -> serde_json::Val
     serde_json::Value::Object(obj)
 }
 
-/// Encode the session's current per-box cursor map as a base64url JSON id
+/// Encode the session's current per-topic cursor map as a base64url JSON id
 /// (API §7.4). Used as both the SSE `id:` and the `Last-Event-ID` resume token.
 fn encode_session_id(session: &Session) -> String {
     let map = session.cursors.lock().clone();
@@ -790,7 +790,7 @@ fn encode_session_id(session: &Session) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
 }
 
-/// Decode a `Last-Event-ID` / `cursor` composite id back to a `box → seq` map.
+/// Decode a `Last-Event-ID` / `cursor` composite id back to a `topic → seq` map.
 fn decode_cursor_id(id: &str) -> Option<BTreeMap<String, u64>> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(id)
@@ -841,7 +841,7 @@ mod tests {
         let session = Session {
             req: WatchCreateRequest {
                 node: None,
-                boxes: HashMap::new(),
+                topics: HashMap::new(),
                 limit: 256,
                 max_batch_bytes: 262_144,
                 heartbeat_ms: 15_000,
@@ -866,7 +866,7 @@ mod tests {
         Session {
             req: WatchCreateRequest {
                 node: None,
-                boxes: HashMap::new(),
+                topics: HashMap::new(),
                 limit: 256,
                 max_batch_bytes: 262_144,
                 heartbeat_ms: 15_000,

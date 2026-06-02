@@ -2,7 +2,7 @@
 //! tombstone gap computation (DESIGN §5, ARCHITECTURE §3.3).
 //!
 //! Phase 2 evaluates these logically (no segments); `earliest_seq` is the
-//! authoritative retained floor and is always computed/read from the box.
+//! authoritative retained floor and is always computed/read from the topic.
 
 use crate::types::{Tombstone, TombstoneReason};
 
@@ -88,12 +88,12 @@ impl Floors {
     }
 }
 
-/// How a full box reacts to an incoming write.
+/// How a full topic reacts to an incoming write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmitDecision {
     /// Admit the write; possibly evict oldest afterward (`discard:"old"`).
     Admit,
-    /// Reject with `422 box_full` (`discard:"reject"`).
+    /// Reject with `422 topic_full` (`discard:"reject"`).
     Reject,
 }
 

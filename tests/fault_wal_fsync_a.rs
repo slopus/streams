@@ -48,7 +48,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
 use streams::storage::Fs;
-use streams::types::{BoxConfig, BoxType, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs — reused, not reinvented).
@@ -94,21 +94,21 @@ fn durable_write(engine: &Engine, name: &str, data: &str) -> Result<Vec<u64>, ()
     }
 }
 
-/// Create a durable Log box.
-fn put_durable_box(engine: &Engine, name: &str) {
-    let c = BoxConfig {
-        r#type: BoxType::Log,
+/// Create a durable Log topic.
+fn put_durable_topic(engine: &Engine, name: &str) {
+    let c = TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         cap_records: 0,
         ..Default::default()
     };
-    engine.put_box(name, c).expect("put_box");
+    engine.put_topic(name, c).expect("put_topic");
 }
 
 /// The live seqs present after recovery, read back through the real diff path
 /// (the same bytes a consumer sees) — plus the recovered head.
 fn recovered_seqs(engine: &Engine, name: &str) -> (Vec<u64>, u64) {
-    let st = match engine.box_state(name, false) {
+    let st = match engine.topic_state(name, false) {
         Ok(st) => st,
         Err(_) => return (Vec::new(), 0),
     };
@@ -171,10 +171,10 @@ fn fast_cfg(dir: &std::path::Path) -> WalConfig {
     c
 }
 
-/// An Append frame for box 1 at `seq` with a fixed payload.
+/// An Append frame for topic 1 at `seq` with a fixed payload.
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -228,7 +228,7 @@ fn f_wal_eio_fsync() {
     // Phase 1: three durable acked writes on a clean disk (the must-survive set).
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "p");
+        put_durable_topic(&engine, "p");
         assert_eq!(durable_write(&engine, "p", "1").unwrap(), vec![1]);
         assert_eq!(durable_write(&engine, "p", "2").unwrap(), vec![2]);
         assert_eq!(durable_write(&engine, "p", "3").unwrap(), vec![3]);
@@ -290,7 +290,7 @@ fn f_wal_fsync_eio_persist() {
     // first group-commit fsync calls cleanly.
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "q");
+        put_durable_topic(&engine, "q");
         assert_eq!(durable_write(&engine, "q", "1").unwrap(), vec![1]);
         assert_eq!(durable_write(&engine, "q", "2").unwrap(), vec![2]);
         sync_wal_dir(&disk);
@@ -436,7 +436,7 @@ fn f_wal_crash_after_fsync() {
         let disk = FakeDisk::new();
         {
             let engine = open_engine(&disk);
-            put_durable_box(&engine, "k");
+            put_durable_topic(&engine, "k");
             for i in 1..=5 {
                 // engine.write blocks on the durable commit token ⇒ returns Ok only
                 // after sync_data returned ⇒ acked & durable.

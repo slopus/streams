@@ -1,15 +1,15 @@
 ---
 title: Segments & Snapshots
-description: How the WAL is checkpointed into per-box segment files, the .data/.idx format and seq→entry arithmetic, sealing triggers, mmap vs buffered serving, and atomic metadata snapshots.
+description: How the WAL is checkpointed into per-topic segment files, the .data/.idx format and seq→entry arithmetic, sealing triggers, mmap vs buffered serving, and atomic metadata snapshots.
 ---
 
 import { Callout, FileTree } from 'nextra/components'
 
 # Segments & Snapshots
 
-The WAL is fast, append-ordered, and short-lived; it mixes every box's frames into one
+The WAL is fast, append-ordered, and short-lived; it mixes every topic's frames into one
 stream. To keep recovery bounded and reads efficient, a background **compactor**
-periodically applies WAL frames into per-box **segment files** — the long-term store and the
+periodically applies WAL frames into per-topic **segment files** — the long-term store and the
 read source for [diff reads](/api/reading). This page covers the checkpoint process, the
 `.data`/`.idx` segment format and its constant-time `seq → entry` arithmetic, the three
 sealing triggers, how reads choose mmap versus buffered I/O, the atomic metadata snapshot,
@@ -20,17 +20,17 @@ boundary. Losing a segment is recoverable by replay; losing a WAL frame is not.
 
 ## Checkpointing the WAL into segments
 
-The compactor runs on a timer (and on WAL rotation). For each box with new frames since its
+The compactor runs on a timer (and on WAL rotation). For each topic with new frames since its
 last checkpoint:
 
 ```text
-for each box with new frames since last checkpoint:
-    append those records, in seq order, to the box's active segment file
+for each topic with new frames since last checkpoint:
+    append those records, in seq order, to the topic's active segment file
       (segment frames are a buffered copy of contiguous WAL byte ranges, split by
-       box — no re-serialization)
-    update the box's .idx file
+       topic — no re-serialization)
+    update the topic's .idx file
 fsync the touched .data + .idx files
-write a CheckpointMark frame to the WAL (per box: highest seq checkpointed,
+write a CheckpointMark frame to the WAL (per topic: highest seq checkpointed,
      watermarks, active-segment positions); fsync the WAL
 WAL files whose every frame's seq <= the global min checkpointed seq become deletable
 ```
@@ -45,7 +45,7 @@ restart (a seq already in the segment index is ignored). See
 
 ## Segment format: `.data` + `.idx`
 
-Each box owns a directory of numbered segment pairs, named by the segment's first seq
+Each topic owns a directory of numbered segment pairs, named by the segment's first seq
 (`seg-<first_seq>`, zero-padded so they sort into seq order). A segment covers a contiguous
 range `[first_seq, end_seq]`.
 
@@ -122,7 +122,7 @@ locality:
 
 ## Metadata snapshots
 
-Box config, the name↔id map, routers, per-box watermarks, and the checkpoint lower bound
+Topic config, the name↔id map, routers, per-topic watermarks, and the checkpoint lower bound
 live in a **metadata store** that mirrors the WAL philosophy: every mutation is a control
 frame in the WAL (ordered and crash-consistent with data), and a **periodic snapshot** lets
 recovery start without replaying the WAL from time zero.
@@ -130,13 +130,13 @@ recovery start without replaying the WAL from time zero.
 ```rust
 // The snapshotted metadata (compact bincode). Tiny and changes rarely.
 struct Meta {
-    boxes:        HashMap<String, BoxId>,      // name -> interned u32 id (stable across restart)
-    box_cfg:      HashMap<BoxId, BoxConfig>,
-    watermarks:   HashMap<BoxId, (u64, u64)>,  // persisted (evict_floor, earliest_seq) per box
-    delete_below: HashMap<BoxId, u64>,         // max before_seq applied (snapshot delete)
+    topics:        HashMap<String, TopicId>,      // name -> interned u32 id (stable across restart)
+    topic_cfg:      HashMap<TopicId, TopicConfig>,
+    watermarks:   HashMap<TopicId, (u64, u64)>,  // persisted (evict_floor, earliest_seq) per topic
+    delete_below: HashMap<TopicId, u64>,         // max before_seq applied (snapshot delete)
     routers:      Vec<Router>,
-    epochs:       HashMap<BoxId, u64>,         // delete+recreate detection
-    next_box_id:  u32,
+    epochs:       HashMap<TopicId, u64>,         // delete+recreate detection
+    next_topic_id:  u32,
     current_wal:  String,
     last_checkpoint_seq: u64,                  // global lower bound for WAL replay
 }
@@ -161,20 +161,20 @@ the rename may roll back on power loss, and recovery simply loads the older snap
 previous file is removed only after the new one is durably in place.
 
 <Callout type="info">
-  Deletes are **not** standing state. A permanent delete leaves no per-box rule to persist —
+  Deletes are **not** standing state. A permanent delete leaves no per-topic rule to persist —
   it is a one-shot `Delete` control frame, reflected immediately in the index and in the two
   persisted watermarks plus `delete_below`. The only deletion-related runtime structure is
-  the per-box tag index used to *find* matching seqs; it is rebuilt from live records on
+  the per-topic tag index used to *find* matching seqs; it is rebuilt from live records on
   recovery, never snapshotted.
 </Callout>
 
 ## On-disk layout
 
 Putting it together: the WAL is **sharded** (`STREAMS_WAL_SHARDS`, default `min(num_cpus, 8)`)
-into N independent ordered streams — each box maps to one shard, and each shard (when shards >
-1) is its own `wal/shard-NN/` directory with its own `CURRENT` + files. Segments are per-box
-(independent eviction, per-box mmap, locality for diff reads). Box directories are named by the
-interned `box_id` (hex), never the box name — so there is no path traversal from a user-supplied
+into N independent ordered streams — each topic maps to one shard, and each shard (when shards >
+1) is its own `wal/shard-NN/` directory with its own `CURRENT` + files. Segments are per-topic
+(independent eviction, per-topic mmap, locality for diff reads). Topic directories are named by the
+interned `topic_id` (hex), never the topic name — so there is no path traversal from a user-supplied
 name.
 
 <FileTree>
@@ -186,13 +186,13 @@ name.
     <FileTree.Folder name="wal (sharded; STREAMS_WAL_SHARDS, default min(num_cpus,8))" defaultOpen>
       <FileTree.Folder name="shard-00 (one dir per shard when shards>1; shards==1 ⇒ flat wal/)">
         <FileTree.File name="CURRENT (names this shard's active wal file)" />
-        <FileTree.File name="wal-0000000000001024.log (preallocated, mixed-box)" />
+        <FileTree.File name="wal-0000000000001024.log (preallocated, mixed-topic)" />
         <FileTree.File name="wal-0000000000004096.log (active wal file)" />
       </FileTree.Folder>
       <FileTree.Folder name="shard-01 (own writer thread / file set / group commit)" />
     </FileTree.Folder>
-    <FileTree.Folder name="boxes (HOT tier)" defaultOpen>
-      <FileTree.Folder name="0000000A (one dir per box, by box_id hex)">
+    <FileTree.Folder name="topics (HOT tier)" defaultOpen>
+      <FileTree.Folder name="0000000A (one dir per topic, by topic_id hex)">
         <FileTree.File name="seg-0000000000000001.data" />
         <FileTree.File name="seg-0000000000000001.idx (20 B/entry)" />
         <FileTree.File name="seg-0000000000010001.data" />
@@ -203,7 +203,7 @@ name.
   </FileTree.Folder>
 </FileTree>
 
-When `STREAMS_COLD_DIR` is set, older sealed segments relocate to a mirror of the per-box
+When `STREAMS_COLD_DIR` is set, older sealed segments relocate to a mirror of the per-topic
 layout under that directory, keeping the same `seg-<first_seq>` identity. When it is unset
 (the default), tiering is disabled and nothing relocates — everything stays hot, behavior
 unchanged by construction. See [Storage & Tiering](/deployment/storage-and-tiering).

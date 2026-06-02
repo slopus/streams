@@ -1,18 +1,18 @@
 //! Crash/race test for the SNAPSHOT ↔ WAL-FIRST-DELETE interaction (codex P0 #1).
 //!
 //! Stage 1 made the API `delete` WAL-first: it logs the `Delete` frame (and waits
-//! for its fsync on a durable box) BEFORE applying the deletion in memory. That
+//! for its fsync on a durable topic) BEFORE applying the deletion in memory. That
 //! opened a window the snapshot path could fall into:
 //!
 //!   1. delete logs its `Delete` frame at WAL offset X and its fsync returns,
 //!   2. a checkpoint is taken — its position lands AFTER X (the frame is covered),
-//!   3. the snapshot materializes the box's memory, which is STILL UNDELETED
+//!   3. the snapshot materializes the topic's memory, which is STILL UNDELETED
 //!      (the delete hasn't run its in-memory apply yet),
 //!   4. crash. Recovery restores the snapshot (record present) and replays the WAL
 //!      tail FROM the checkpoint offset — which is past frame X — so the `Delete`
 //!      frame is NEVER replayed and the deleted record RESURRECTS.
 //!
-//! The fix threads the delete's in-memory apply through the SAME per-box publish
+//! The fix threads the delete's in-memory apply through the SAME per-topic publish
 //! gate appends use: a ticket is reserved under `append_lock` (right after the
 //! `Delete` frame is enqueued) and released only after the in-memory apply, so a
 //! concurrent snapshot's `quiesce_publishes()` drains the in-flight delete before
@@ -45,7 +45,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::types::{
-    BoxConfig, BoxType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
 };
 
 const DATA_DIR: &str = "/data";
@@ -103,15 +103,15 @@ fn live_by_tag(engine: &Engine, name: &str) -> BTreeMap<u64, String> {
 
 fn put_durable_log(engine: &Engine, name: &str) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 ..Default::default()
             },
         )
-        .expect("create durable box");
+        .expect("create durable topic");
 }
 
 fn append(engine: &Engine, name: &str, tag: &str) -> u64 {
@@ -158,7 +158,7 @@ fn snapshot_blocks_on_inflight_delete_no_resurrection() {
         fail::cfg("delete::after_commit_before_apply", "pause").unwrap();
 
         // Worker: delete tag "gone". It logs + fsyncs the `Delete` frame (durable
-        // box), takes its publish ticket, then PARKS at the failpoint holding the
+        // topic), takes its publish ticket, then PARKS at the failpoint holding the
         // ticket — frame durable, memory still undeleted.
         let worker = {
             let engine = engine.clone();
@@ -191,9 +191,9 @@ fn snapshot_blocks_on_inflight_delete_no_resurrection() {
         };
 
         // Give the snapshot thread time to reach (and, under the fix, block on)
-        // the per-box quiesce, then release the delete seam. The delete applies,
+        // the per-topic quiesce, then release the delete seam. The delete applies,
         // releases its ticket, and the snapshot — now unblocked — captures the
-        // box WITH the deletion applied.
+        // topic WITH the deletion applied.
         thread::sleep(std::time::Duration::from_millis(150));
         fail::cfg("delete::after_commit_before_apply", "off").unwrap();
 

@@ -43,20 +43,20 @@ impl Error {
         Error::new(ErrorCode::InvalidRequest, message)
     }
 
-    pub fn box_not_found(box_name: &str) -> Self {
+    pub fn topic_not_found(topic_name: &str) -> Self {
         Error::new(
-            ErrorCode::BoxNotFound,
-            format!("box {box_name:?} does not exist"),
+            ErrorCode::TopicNotFound,
+            format!("topic {topic_name:?} does not exist"),
         )
-        .with_detail(serde_json::json!({ "box": box_name }))
+        .with_detail(serde_json::json!({ "topic": topic_name }))
     }
 
-    pub fn not_a_queue(box_name: &str) -> Self {
+    pub fn not_a_queue(topic_name: &str) -> Self {
         Error::new(
             ErrorCode::NotAQueue,
-            format!("box {box_name:?} is not a queue"),
+            format!("topic {topic_name:?} is not a queue"),
         )
-        .with_detail(serde_json::json!({ "box": box_name }))
+        .with_detail(serde_json::json!({ "topic": topic_name }))
     }
 
     pub fn router_not_found(router: &str) -> Self {

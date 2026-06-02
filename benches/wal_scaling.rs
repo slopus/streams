@@ -1,11 +1,11 @@
 //! WAL-sharding scaling benchmark (Stage 2).
 //!
 //! Drives many concurrent **durable** (`fsync`-class) writers spread across many
-//! boxes against a real, on-disk durable [`Engine`], and measures the AGGREGATE
+//! topics against a real, on-disk durable [`Engine`], and measures the AGGREGATE
 //! write-ack throughput (acks/sec) at several `STREAMS_WAL_SHARDS` values. The
 //! goal is to show write throughput scaling ~linearly with shard count up to the
 //! core / NVMe-fsync limit: each shard is an independent writer thread + mpsc +
-//! fsync stream, so spreading boxes across shards lets N group-commit fsyncs run
+//! fsync stream, so spreading topics across shards lets N group-commit fsyncs run
 //! in parallel instead of serializing on one writer.
 //!
 //! This is a plain `main` (`harness = false`) rather than a criterion bench: we
@@ -19,7 +19,7 @@
 //! ```text
 //! cargo bench --bench wal_scaling
 //! # or with overrides:
-//! WAL_BENCH_SHARDS=1,2,4,8,16 WAL_BENCH_WRITERS=64 WAL_BENCH_BOXES=256 \
+//! WAL_BENCH_SHARDS=1,2,4,8,16 WAL_BENCH_WRITERS=64 WAL_BENCH_TOPICS=256 \
 //!   WAL_BENCH_OPS=20000 WAL_BENCH_PAYLOAD=256 cargo bench --bench wal_scaling
 //! ```
 //!
@@ -35,7 +35,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::types::{BoxConfig, Durability, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, Durability, RecordIn, WriteRequest};
 
 /// One benchmark configuration.
 struct Params {
@@ -43,15 +43,15 @@ struct Params {
     shards: Vec<usize>,
     /// Number of concurrent OS writer threads.
     writers: usize,
-    /// Number of distinct boxes the writers spread their writes across.
-    boxes: usize,
+    /// Number of distinct topics the writers spread their writes across.
+    topics: usize,
     /// Total durable write-acks to perform per measured run (across all writers).
     ops: usize,
     /// Payload size in bytes per record.
     payload: usize,
     /// Records per write request (batch size). 1 = one ack per record.
     batch: usize,
-    /// Durability class for the boxes under test.
+    /// Durability class for the topics under test.
     durability: Durability,
     /// Repeats per shard count; the best run is reported.
     repeat: usize,
@@ -96,7 +96,7 @@ impl Params {
         Params {
             shards: env_list("WAL_BENCH_SHARDS", &[1, 2, 4, 8, 16]),
             writers: env_usize("WAL_BENCH_WRITERS", 64),
-            boxes: env_usize("WAL_BENCH_BOXES", 256),
+            topics: env_usize("WAL_BENCH_TOPICS", 256),
             ops: env_usize("WAL_BENCH_OPS", 20_000),
             payload: env_usize("WAL_BENCH_PAYLOAD", 256),
             batch: env_usize("WAL_BENCH_BATCH", 1),
@@ -106,13 +106,13 @@ impl Params {
     }
 }
 
-/// A box config of the requested durability class.
-fn box_config(d: Durability) -> BoxConfig {
-    BoxConfig {
+/// A topic config of the requested durability class.
+fn topic_config(d: Durability) -> TopicConfig {
+    TopicConfig {
         durability: Some(d),
         // `durable` is kept consistent with the class for back-compat (fsync ⇒ true).
         durable: d == Durability::Fsync,
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     }
 }
 
@@ -152,7 +152,7 @@ struct Diag {
 }
 
 /// Run one measured pass: `writers` threads each drive durable writes round-robin
-/// across `boxes` boxes until `ops` total writes are done. Returns (acks/sec, diag).
+/// across `topics` topics until `ops` total writes are done. Returns (acks/sec, diag).
 fn measure_once(p: &Params, shards: usize) -> (f64, Diag) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = ServerConfig {
@@ -163,12 +163,12 @@ fn measure_once(p: &Params, shards: usize) -> (f64, Diag) {
     let clock: SharedClock = Arc::new(SystemClock);
     let engine = Engine::with_data_dir(config, clock).expect("durable engine");
 
-    // Pre-create every box (so the create-lock path is out of the measured loop).
-    let names: Vec<String> = (0..p.boxes).map(|i| format!("bench-{i:05}")).collect();
+    // Pre-create every topic (so the create-lock path is out of the measured loop).
+    let names: Vec<String> = (0..p.topics).map(|i| format!("bench-{i:05}")).collect();
     for name in &names {
         engine
-            .put_box(name, box_config(p.durability))
-            .expect("put_box");
+            .put_topic(name, topic_config(p.durability))
+            .expect("put_topic");
     }
 
     let data = payload(p.payload);
@@ -176,7 +176,7 @@ fn measure_once(p: &Params, shards: usize) -> (f64, Diag) {
     let engine_c = engine.clone();
     // A shared monotonically-increasing op dispenser so the total work is exactly
     // `ops` regardless of how the threads interleave; each claimed index picks a
-    // box round-robin so the writes spread evenly across boxes (and thus shards).
+    // topic round-robin so the writes spread evenly across topics (and thus shards).
     let next = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(p.writers + 1));
     let total_ops = p.ops;
@@ -189,7 +189,7 @@ fn measure_once(p: &Params, shards: usize) -> (f64, Diag) {
         let data = data.clone();
         let barrier = barrier.clone();
         let batch = p.batch;
-        let nboxes = p.boxes;
+        let nboxes = p.topics;
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             loop {
@@ -244,9 +244,9 @@ fn main() {
 
     println!("# streams WAL-sharding scaling benchmark");
     println!(
-        "# cores(available_parallelism)={cores}  writers={}  boxes={}  ops/run={}  \
+        "# cores(available_parallelism)={cores}  writers={}  topics={}  ops/run={}  \
          payload={}B  batch={}  durability={}  repeat={}",
-        p.writers, p.boxes, p.ops, p.payload, p.batch, cls, p.repeat
+        p.writers, p.topics, p.ops, p.payload, p.batch, cls, p.repeat
     );
     println!("#");
     println!("# shards   acks/sec     speedup-vs-1   per-shard-eff");

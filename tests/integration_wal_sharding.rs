@@ -1,5 +1,5 @@
 //! WAL sharding (STREAMS_WAL_SHARDS) integration tests: a multi-shard engine
-//! round-trips writes and recovers them; a box always lands in exactly ONE shard
+//! round-trips writes and recovers them; a topic always lands in exactly ONE shard
 //! within a run; recovery with a DIFFERENT shard count than was written still
 //! recovers ALL data (the shard-count-agnostic-replay property); and a stalled /
 //! failed shard is isolated from healthy ones.
@@ -16,7 +16,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::storage::{shard_for_box, WalReader};
+use streams::storage::{shard_for_topic, WalReader};
 use streams::types::*;
 
 /// A `ServerConfig` pointed at `dir` with `shards` WAL shards.
@@ -49,10 +49,10 @@ fn one(data: serde_json::Value, tag: Option<&str>) -> WriteRequest {
     }
 }
 
-fn durable_box() -> BoxConfig {
-    BoxConfig {
+fn durable_topic() -> TopicConfig {
+    TopicConfig {
         durable: true,
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     }
 }
 
@@ -64,18 +64,18 @@ fn diff_from(from_seq: u64) -> DiffRequest {
     }
 }
 
-/// Multi-shard round-trip + recovery: write to several boxes spread across shards,
+/// Multi-shard round-trip + recovery: write to several topics spread across shards,
 /// drop the engine (drains + fsyncs every shard), reopen with the SAME shard
-/// count, and verify every box's records survive.
+/// count, and verify every topic's records survive.
 #[test]
 fn multi_shard_round_trips_and_recovers() {
     let dir = tempfile::tempdir().unwrap();
-    let boxes = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+    let topics = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
 
     {
         let engine = engine_at(dir.path(), 4);
-        for b in boxes {
-            engine.put_box(b, durable_box()).unwrap();
+        for b in topics {
+            engine.put_topic(b, durable_topic()).unwrap();
             for i in 1..=10 {
                 engine
                     .write(b, one(json!({ "b": b, "i": i }), Some("t")), true)
@@ -86,53 +86,53 @@ fn multi_shard_round_trips_and_recovers() {
     }
 
     let engine = engine_at(dir.path(), 4);
-    for b in boxes {
-        let st = engine.box_state(b, false).unwrap();
-        assert_eq!(st.head_seq, 10, "box {b}: all 10 writes recovered");
-        assert_eq!(st.count, 10, "box {b}: count recovered");
+    for b in topics {
+        let st = engine.topic_state(b, false).unwrap();
+        assert_eq!(st.head_seq, 10, "topic {b}: all 10 writes recovered");
+        assert_eq!(st.count, 10, "topic {b}: count recovered");
         let d = engine.diff(b, diff_from(0)).unwrap();
         let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
         assert_eq!(
             seqs,
             (1..=10).collect::<Vec<_>>(),
-            "box {b}: contiguous seqs"
+            "topic {b}: contiguous seqs"
         );
         assert_eq!(d.records[0].data, json!({ "b": b, "i": 1 }));
     }
 }
 
-/// A box's frames all land in ONE shard within a run: with N>1 shards, the
-/// per-shard WAL subdirs that contain a given box's `Append` frames number exactly
-/// one. We write to several boxes, then scan every shard's WAL files and confirm
-/// each box id appears in exactly one shard — and that shard matches the routing
-/// hash `shard_for_box(box_id, N)`.
+/// A topic's frames all land in ONE shard within a run: with N>1 shards, the
+/// per-shard WAL subdirs that contain a given topic's `Append` frames number exactly
+/// one. We write to several topics, then scan every shard's WAL files and confirm
+/// each topic id appears in exactly one shard — and that shard matches the routing
+/// hash `shard_for_topic(topic_id, N)`.
 #[test]
-fn a_box_lands_in_exactly_one_shard() {
+fn a_topic_lands_in_exactly_one_shard() {
     let dir = tempfile::tempdir().unwrap();
     let n = 4usize;
     let names = [
         "one", "two", "three", "four", "five", "six", "seven", "eight",
     ];
 
-    let mut box_ids = std::collections::HashMap::new();
+    let mut topic_ids = std::collections::HashMap::new();
     {
         let engine = engine_at(dir.path(), n);
         for name in names {
-            engine.put_box(name, durable_box()).unwrap();
+            engine.put_topic(name, durable_topic()).unwrap();
             for i in 1..=5 {
                 engine
                     .write(name, one(json!({ "i": i }), None), true)
                     .unwrap();
             }
-            // Capture the interned box id for the routing assertion.
-            let id = engine.get_box(name).unwrap().box_id;
-            box_ids.insert(name.to_string(), id);
+            // Capture the interned topic id for the routing assertion.
+            let id = engine.get_topic(name).unwrap().topic_id;
+            topic_ids.insert(name.to_string(), id);
         }
     }
 
-    // For each shard subdir, collect the set of box ids that have an Append frame.
+    // For each shard subdir, collect the set of topic ids that have an Append frame.
     let wal_dir = dir.path().join("wal");
-    let mut shard_of_box: std::collections::HashMap<u32, Vec<usize>> =
+    let mut shard_of_topic: std::collections::HashMap<u32, Vec<usize>> =
         std::collections::HashMap::new();
     for s in 0..n {
         let sub = wal_dir.join(format!("shard-{s:02}"));
@@ -153,47 +153,47 @@ fn a_box_lands_in_exactly_one_shard() {
         let mut seen: HashSet<u32> = HashSet::new();
         for f in files {
             for frame in WalReader::open(&f).unwrap() {
-                if let WalRecordKind::Append(box_id) = classify(&frame) {
-                    seen.insert(box_id);
+                if let WalRecordKind::Append(topic_id) = classify(&frame) {
+                    seen.insert(topic_id);
                 }
             }
         }
         for id in seen {
-            shard_of_box.entry(id).or_default().push(s);
+            shard_of_topic.entry(id).or_default().push(s);
         }
     }
 
-    // Every box's Append frames appear in exactly ONE shard, and that shard is the
+    // Every topic's Append frames appear in exactly ONE shard, and that shard is the
     // one the routing hash selects.
-    for (name, id) in &box_ids {
-        let shards = shard_of_box.get(id).cloned().unwrap_or_default();
+    for (name, id) in &topic_ids {
+        let shards = shard_of_topic.get(id).cloned().unwrap_or_default();
         assert_eq!(
             shards.len(),
             1,
-            "box {name} (id {id}) must land in exactly one shard, got {shards:?}"
+            "topic {name} (id {id}) must land in exactly one shard, got {shards:?}"
         );
         assert_eq!(
             shards[0],
-            shard_for_box(*id, n),
-            "box {name} (id {id}) lands in the hash-routed shard"
+            shard_for_topic(*id, n),
+            "topic {name} (id {id}) lands in the hash-routed shard"
         );
     }
 }
 
 /// The shard-count-agnostic-replay property: a data dir WRITTEN with one shard
 /// count recovers ALL data when REOPENED with a DIFFERENT shard count. We exercise
-/// several reconfigurations (8→1, 1→8, 4→3, …) so a box that routed to one shard
-/// at write time is dispatched by box_id on replay regardless of the new count.
+/// several reconfigurations (8→1, 1→8, 4→3, …) so a topic that routed to one shard
+/// at write time is dispatched by topic_id on replay regardless of the new count.
 #[test]
 fn recovery_is_shard_count_agnostic() {
     for (write_shards, read_shards) in [(8usize, 1usize), (1, 8), (4, 3), (3, 7), (6, 2)] {
         let dir = tempfile::tempdir().unwrap();
-        let boxes = ["a", "bb", "ccc", "dddd", "eeeee"];
+        let topics = ["a", "bb", "ccc", "dddd", "eeeee"];
 
         {
             let engine = engine_at(dir.path(), write_shards);
-            for b in boxes {
-                engine.put_box(b, durable_box()).unwrap();
+            for b in topics {
+                engine.put_topic(b, durable_topic()).unwrap();
                 for i in 1..=7 {
                     engine
                         .write(b, one(json!({ "b": b, "i": i }), Some("tag")), true)
@@ -204,24 +204,24 @@ fn recovery_is_shard_count_agnostic() {
 
         // Reopen with a DIFFERENT shard count — all data must still recover.
         let engine = engine_at(dir.path(), read_shards);
-        for b in boxes {
+        for b in topics {
             let st = engine
-                .box_state(b, false)
-                .unwrap_or_else(|_| panic!("box {b} recovered ({write_shards}->{read_shards})"));
+                .topic_state(b, false)
+                .unwrap_or_else(|_| panic!("topic {b} recovered ({write_shards}->{read_shards})"));
             assert_eq!(
                 st.head_seq, 7,
-                "box {b}: all writes recovered ({write_shards}->{read_shards})"
+                "topic {b}: all writes recovered ({write_shards}->{read_shards})"
             );
             assert_eq!(
                 st.count, 7,
-                "box {b}: count ({write_shards}->{read_shards})"
+                "topic {b}: count ({write_shards}->{read_shards})"
             );
             let d = engine.diff(b, diff_from(0)).unwrap();
             let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
             assert_eq!(
                 seqs,
                 (1..=7).collect::<Vec<_>>(),
-                "box {b}: contiguous seqs ({write_shards}->{read_shards})"
+                "topic {b}: contiguous seqs ({write_shards}->{read_shards})"
             );
         }
 
@@ -230,7 +230,7 @@ fn recovery_is_shard_count_agnostic() {
         engine
             .write("a", one(json!({ "post": true }), None), true)
             .unwrap();
-        let st = engine.box_state("a", false).unwrap();
+        let st = engine.topic_state("a", false).unwrap();
         assert_eq!(
             st.head_seq, 8,
             "post-reopen write acked ({write_shards}->{read_shards})"
@@ -238,7 +238,7 @@ fn recovery_is_shard_count_agnostic() {
         drop(engine);
 
         let engine = engine_at(dir.path(), read_shards);
-        let st = engine.box_state("a", false).unwrap();
+        let st = engine.topic_state("a", false).unwrap();
         assert_eq!(
             st.head_seq, 8,
             "post-reopen write survives a second restart ({write_shards}->{read_shards})"
@@ -247,8 +247,8 @@ fn recovery_is_shard_count_agnostic() {
 }
 
 /// Per-shard failure isolation: a single WAL shard is exercised with many
-/// concurrent durable writers across boxes that spread over all shards; the writes
-/// to healthy shards succeed and survive a restart even though boxes are
+/// concurrent durable writers across topics that spread over all shards; the writes
+/// to healthy shards succeed and survive a restart even though topics are
 /// independent per-shard streams (no shard blocks another). This is the positive
 /// side of isolation — the negative (a stalled shard's `Full` does not stall
 /// others) is covered by the unit test in `sharded_wal`.
@@ -256,13 +256,13 @@ fn recovery_is_shard_count_agnostic() {
 fn shards_are_independent_under_concurrent_load() {
     let dir = tempfile::tempdir().unwrap();
     let n = 4usize;
-    // Enough distinct boxes that, with 4 shards, every shard gets at least one box.
-    let names: Vec<String> = (0..16).map(|i| format!("box-{i}")).collect();
+    // Enough distinct topics that, with 4 shards, every shard gets at least one topic.
+    let names: Vec<String> = (0..16).map(|i| format!("topic-{i}")).collect();
 
     {
         let engine = engine_at(dir.path(), n);
         for name in &names {
-            engine.put_box(name, durable_box()).unwrap();
+            engine.put_topic(name, durable_topic()).unwrap();
         }
         let mut handles = Vec::new();
         for name in &names {
@@ -280,15 +280,15 @@ fn shards_are_independent_under_concurrent_load() {
             h.join().unwrap();
         }
         for name in &names {
-            let st = engine.box_state(name, false).unwrap();
-            assert_eq!(st.head_seq, 50, "box {name}: all writes acked");
+            let st = engine.topic_state(name, false).unwrap();
+            assert_eq!(st.head_seq, 50, "topic {name}: all writes acked");
         }
     }
 
-    // Confirm every shard actually received at least one box's writes (the load
+    // Confirm every shard actually received at least one topic's writes (the load
     // really was spread, so isolation is meaningful) AND everything recovered.
     let used_shards: HashSet<usize> = (0..names.len())
-        .map(|i| shard_for_box((i as u32) + 1, n)) // box ids are 1..=16 in order
+        .map(|i| shard_for_topic((i as u32) + 1, n)) // topic ids are 1..=16 in order
         .collect();
     assert!(
         used_shards.len() >= 2,
@@ -297,8 +297,8 @@ fn shards_are_independent_under_concurrent_load() {
 
     let engine = engine_at(dir.path(), n);
     for name in &names {
-        let st = engine.box_state(name, false).unwrap();
-        assert_eq!(st.head_seq, 50, "box {name}: all writes recovered");
+        let st = engine.topic_state(name, false).unwrap();
+        assert_eq!(st.head_seq, 50, "topic {name}: all writes recovered");
         assert_eq!(st.count, 50);
     }
 }
@@ -311,7 +311,7 @@ fn single_shard_uses_flat_legacy_layout() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path(), 1);
-        engine.put_box("jobs", durable_box()).unwrap();
+        engine.put_topic("jobs", durable_topic()).unwrap();
         for i in 1..=3 {
             engine
                 .write("jobs", one(json!({ "i": i }), None), true)
@@ -349,11 +349,11 @@ fn single_shard_uses_flat_legacy_layout() {
     );
 }
 
-/// codex P0 #3: a box-scoped CONTROL frame (config update / delete / head
+/// codex P0 #3: a topic-scoped CONTROL frame (config update / delete / head
 /// watermark) written under the NEW layout must not be lost or regressed when the
-/// box's older-layout frames replay in a different group. We write under 3 shards
+/// topic's older-layout frames replay in a different group. We write under 3 shards
 /// with NO snapshot (so the old create+appends stay in the WAL), reopen under 7
-/// shards — a NON-multiple reconfigure where some boxes route to a LOWER shard idx
+/// shards — a NON-multiple reconfigure where some topics route to a LOWER shard idx
 /// (ids 1/5/11/13 go old-shard-2 → new-shard-0/1), so their NEW group sorts BEFORE
 /// their OLD group — apply a config update + a delete + more appends, then restart
 /// again WITHOUT a fresh snapshot so the new control frames AND the old create frame
@@ -362,14 +362,14 @@ fn single_shard_uses_flat_legacy_layout() {
 #[test]
 fn control_frames_survive_shard_count_reconfigure() {
     let dir = tempfile::tempdir().unwrap();
-    // Many boxes so several route old-shard > new-shard (the failing order); ids
+    // Many topics so several route old-shard > new-shard (the failing order); ids
     // 1/5/11/13 are the 3->7 inversions verified by the routing hash.
-    let boxes: Vec<String> = (0..24).map(|i| format!("ctrl-{i}")).collect();
+    let topics: Vec<String> = (0..24).map(|i| format!("ctrl-{i}")).collect();
 
     {
         let engine = engine_at(dir.path(), 3);
-        for b in &boxes {
-            engine.put_box(b, durable_box()).unwrap();
+        for b in &topics {
+            engine.put_topic(b, durable_topic()).unwrap();
             for i in 1..=10 {
                 engine
                     .write(b, one(json!({ "i": i }), Some("t")), true)
@@ -383,13 +383,13 @@ fn control_frames_survive_shard_count_reconfigure() {
 
     {
         // Reopen with 7 shards; apply control ops that log NEW frames in (for the
-        // inverted boxes) a lower-sorting group than the box's old create frame.
+        // inverted topics) a lower-sorting group than the topic's old create frame.
         let engine = engine_at(dir.path(), 7);
-        for b in &boxes {
-            // Config update (logs a BoxConfig update frame under the new layout).
-            let mut cfg = durable_box();
+        for b in &topics {
+            // Config update (logs a TopicConfig update frame under the new layout).
+            let mut cfg = durable_topic();
             cfg.cap_records = 1000;
-            engine.put_box(b, cfg).unwrap();
+            engine.put_topic(b, cfg).unwrap();
             // Delete the first 3 records (logs a Delete frame; bound to point-in-time).
             engine
                 .delete(
@@ -416,27 +416,27 @@ fn control_frames_survive_shard_count_reconfigure() {
     // exercise a 7 -> 1 shrink over the same un-snapshotted control frames.
     for read_shards in [7usize, 1usize] {
         let engine = engine_at(dir.path(), read_shards);
-        for b in &boxes {
+        for b in &topics {
             let st = engine
-                .box_state(b, false)
-                .unwrap_or_else(|_| panic!("box {b} recovered (->{read_shards})"));
+                .topic_state(b, false)
+                .unwrap_or_else(|_| panic!("topic {b} recovered (->{read_shards})"));
             assert_eq!(
                 st.head_seq, 13,
-                "box {b}: head after appends (->{read_shards})"
+                "topic {b}: head after appends (->{read_shards})"
             );
             // First 3 deleted ⇒ live count 13 - 3 = 10.
-            assert_eq!(st.count, 10, "box {b}: delete survived (->{read_shards})");
-            let cfg = engine.get_box(b).unwrap().config.read().clone();
+            assert_eq!(st.count, 10, "topic {b}: delete survived (->{read_shards})");
+            let cfg = engine.get_topic(b).unwrap().config.read().clone();
             assert_eq!(
                 cfg.cap_records, 1000,
-                "box {b}: config update survived (->{read_shards})"
+                "topic {b}: config update survived (->{read_shards})"
             );
             let d = engine.diff(b, diff_from(0)).unwrap();
             let seqs: Vec<u64> = d.records.iter().map(|r| r.seq).collect();
             assert_eq!(
                 seqs,
                 (4..=13).collect::<Vec<_>>(),
-                "box {b}: deleted prefix gone, rest contiguous (->{read_shards})"
+                "topic {b}: deleted prefix gone, rest contiguous (->{read_shards})"
             );
         }
         drop(engine);
@@ -455,7 +455,7 @@ fn flat_group_not_skipped_by_stale_shard_checkpoint() {
     let b = "jobs";
     {
         let engine = engine_at(dir.path(), 4);
-        engine.put_box(b, durable_box()).unwrap();
+        engine.put_topic(b, durable_topic()).unwrap();
         for i in 1..=5 {
             engine.write(b, one(json!({ "i": i }), None), true).unwrap();
         }
@@ -471,7 +471,7 @@ fn flat_group_not_skipped_by_stale_shard_checkpoint() {
         drop(engine);
     }
     let engine = engine_at(dir.path(), 1);
-    let st = engine.box_state(b, false).unwrap();
+    let st = engine.topic_state(b, false).unwrap();
     assert_eq!(
         st.head_seq, 9,
         "flat-group frames not skipped by stale shard offset"
@@ -489,7 +489,7 @@ fn flat_group_not_skipped_by_stale_shard_checkpoint() {
 /// best-effort removes the orphans), then resurrect the orphan files on disk and
 /// restart with 1 shard. Because the snapshot recorded an ABSORBED position for
 /// every group (incl. the orphans), recovery skips the resurrected orphan frames —
-/// the box's config update is not overwritten by the old create, and no deleted
+/// the topic's config update is not overwritten by the old create, and no deleted
 /// record resurfaces.
 #[test]
 fn surviving_orphan_wal_files_do_not_regress_state() {
@@ -499,7 +499,7 @@ fn surviving_orphan_wal_files_do_not_regress_state() {
 
     {
         let engine = engine_at(dir.path(), 4);
-        engine.put_box(b, durable_box()).unwrap();
+        engine.put_topic(b, durable_topic()).unwrap();
         for i in 1..=6 {
             engine.write(b, one(json!({ "i": i }), None), true).unwrap();
         }
@@ -542,9 +542,9 @@ fn surviving_orphan_wal_files_do_not_regress_state() {
         // checkpoint records every group (incl. orphans) as absorbed. Also tighten
         // config so a resurrected old create frame would visibly regress it.
         let engine = engine_at(dir.path(), 1);
-        let mut cfg = durable_box();
+        let mut cfg = durable_topic();
         cfg.cap_records = 777;
-        engine.put_box(b, cfg).unwrap();
+        engine.put_topic(b, cfg).unwrap();
         for i in 7..=8 {
             engine.write(b, one(json!({ "i": i }), None), true).unwrap();
         }
@@ -567,13 +567,13 @@ fn surviving_orphan_wal_files_do_not_regress_state() {
     // Restart flat: the resurrected orphan frames must be skipped (absorbed), so
     // nothing regresses.
     let engine = engine_at(dir.path(), 1);
-    let st = engine.box_state(b, false).unwrap();
+    let st = engine.topic_state(b, false).unwrap();
     assert_eq!(st.head_seq, 8, "head not regressed by resurrected orphans");
     assert_eq!(
         st.count, 6,
         "first two stay deleted (2 deleted of 8) — no resurrection"
     );
-    let cfg = engine.get_box(b).unwrap().config.read().clone();
+    let cfg = engine.get_topic(b).unwrap().config.read().clone();
     assert_eq!(
         cfg.cap_records, 777,
         "config update not overwritten by old create frame"
@@ -599,7 +599,7 @@ enum WalRecordKind {
 fn classify(frame: &streams::storage::WalFrame) -> WalRecordKind {
     use streams::storage::WalRecord;
     match &frame.record {
-        WalRecord::Append { box_id, .. } => WalRecordKind::Append(*box_id),
+        WalRecord::Append { topic_id, .. } => WalRecordKind::Append(*topic_id),
         _ => WalRecordKind::Other,
     }
 }

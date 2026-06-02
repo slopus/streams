@@ -1,17 +1,17 @@
-//! Phase-8A reliability iteration #2 — **the off-lock per-box commit SEQUENCER**
-//! (`BoxState::append_lock` + `publish_ticket`/`publish_gate`/`publish_cv`, the
+//! Phase-8A reliability iteration #2 — **the off-lock per-topic commit SEQUENCER**
+//! (`TopicState::append_lock` + `publish_ticket`/`publish_gate`/`publish_cv`, the
 //! WAL `CommitToken` group commit, and the durable write path that stitches them
 //! together: stage under the lock → enqueue one WAL frame per record to the single
 //! ordered writer → take a publish ticket → wait the fsync OFF the lock → publish
 //! in strict ticket order). This is the recently-added concurrency primitive that
-//! lets many same-box durable writers coalesce into ONE group-commit fsync while
+//! lets many same-topic durable writers coalesce into ONE group-commit fsync while
 //! still publishing in seq order, so it is under-tested relative to the original
 //! 125-strategy suite.
 //!
 //! Invariants under test (the sequencer oracle):
 //!
 //! ```text
-//!   CONTIGUOUS+ORDERED : the published seqs of one box are a dense [base..=head]
+//!   CONTIGUOUS+ORDERED : the published seqs of one topic are a dense [base..=head]
 //!                        with no gap and no duplicate — head advances in commit
 //!                        (ticket) order, monotonically.
 //!   NO PRE-FSYNC READ  : a reader gating on head_seq never observes a record
@@ -29,7 +29,7 @@
 //! [`Engine::with_data_dir_fs`], the durable write path driven through
 //! `engine.write`, a [`FaultFs`] for EIO injection on `sync_data`, a `CrashAfter`
 //! wrapper (copied from `tests/crash_oracle.rs`) for the bounded power-loss sweep,
-//! and a per-box dense-prefix / no-fabrication oracle.
+//! and a per-topic dense-prefix / no-fabrication oracle.
 //!
 //! ### loom / shuttle (documented follow-up — same status as `fault_concurrency_a`)
 //!
@@ -72,7 +72,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
-use streams::types::{BoxConfig, BoxType, DiffRequest, Durability, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, Durability, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_concurrency_a.rs).
@@ -113,19 +113,19 @@ fn sync_wal_dir(disk: &FakeDisk) {
     let _ = fs.sync_dir(&PathBuf::from(DATA_DIR).join("meta"));
 }
 
-/// A `fsync`-class durable box (the strongest class: the ack is held until the
+/// A `fsync`-class durable topic (the strongest class: the ack is held until the
 /// group fsync returns — the sequencer's hard case).
-fn durable_box(name: &str, engine: &Engine) {
+fn durable_topic(name: &str, engine: &Engine) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durability: Some(Durability::Fsync),
                 ..Default::default()
             },
         )
-        .expect("put_box durable");
+        .expect("put_topic durable");
 }
 
 /// One write of a single record carrying a writer-identifying payload + tag.
@@ -150,9 +150,9 @@ fn write_one(engine: &Engine, name: &str, data: &str, tag: Option<&str>) -> Opti
 }
 
 /// Read every live record of `name` through the public diff path (the same bytes
-/// a consumer sees), returning `(seq -> data "v")`. `None` if the box is gone.
+/// a consumer sees), returning `(seq -> data "v")`. `None` if the topic is gone.
 fn dump(engine: &Engine, name: &str) -> Option<BTreeMap<u64, String>> {
-    engine.box_state(name, false).ok()?;
+    engine.topic_state(name, false).ok()?;
     let mut out = BTreeMap::new();
     let mut from = 0u64;
     loop {
@@ -349,12 +349,12 @@ impl Fs for CrashAfter {
 }
 
 // ===========================================================================
-// 1) Many concurrent durable writers to ONE box: published seqs are CONTIGUOUS,
+// 1) Many concurrent durable writers to ONE topic: published seqs are CONTIGUOUS,
 //    in commit order, with no gap / no duplicate (the sequencer's core contract).
 // ===========================================================================
 
-/// 16 threads each issue a burst of `fsync`-class durable writes to a single box.
-/// The per-box sequencer must assign + publish contiguous gapless seqs in commit
+/// 16 threads each issue a burst of `fsync`-class durable writes to a single topic.
+/// The per-topic sequencer must assign + publish contiguous gapless seqs in commit
 /// order even though the fsync waits overlap off the append lock. We assert:
 ///   * every returned seq is unique (no two writers got the same seq),
 ///   * the union of returned seqs is exactly the dense range [1..=N*K],
@@ -368,7 +368,7 @@ fn many_concurrent_durable_writers_contiguous_seqs() {
 
     let disk = FakeDisk::new();
     let engine = open_engine(&disk);
-    durable_box("hot", &engine);
+    durable_topic("hot", &engine);
 
     let start = Arc::new(Barrier::new(WRITERS as usize));
     let mut handles = Vec::new();
@@ -408,14 +408,14 @@ fn many_concurrent_durable_writers_contiguous_seqs() {
     );
 
     // The live read-back is the same dense range (every acked write visible).
-    let live = dump(&engine, "hot").expect("box present");
+    let live = dump(&engine, "hot").expect("topic present");
     assert_eq!(
         live.keys().copied().collect::<BTreeSet<u64>>(),
         uniq,
         "published (visible) seqs == assigned seqs"
     );
 
-    let st = engine.box_state("hot", false).unwrap();
+    let st = engine.topic_state("hot", false).unwrap();
     assert_eq!(
         st.head_seq, total,
         "head advanced to cover every acked write"
@@ -424,7 +424,7 @@ fn many_concurrent_durable_writers_contiguous_seqs() {
 }
 
 // ===========================================================================
-// 2) NO PRE-FSYNC READ: a reader spinning on the box never sees a record before
+// 2) NO PRE-FSYNC READ: a reader spinning on the topic never sees a record before
 //    its durable group fsync returned. Concurrent durable writers + a hammering
 //    reader; every observed seq must have already been ack-returned by its writer.
 // ===========================================================================
@@ -446,7 +446,7 @@ fn reader_never_observes_pre_fsync_record() {
 
     let disk = FakeDisk::new();
     let engine = open_engine(&disk);
-    durable_box("vis", &engine);
+    durable_topic("vis", &engine);
 
     // Every seq the reader ever saw visible (must all be durable on recovery).
     let observed: Arc<Mutex<BTreeSet<u64>>> = Arc::new(Mutex::new(BTreeSet::new()));
@@ -498,7 +498,7 @@ fn reader_never_observes_pre_fsync_record() {
     done.store(true, Ordering::Relaxed);
     reader.join().expect("reader joined (no deadlock)");
 
-    let st = engine.box_state("vis", false).unwrap();
+    let st = engine.topic_state("vis", false).unwrap();
     assert_eq!(st.head_seq, WRITERS * PER, "all acked");
     let observed = Arc::try_unwrap(observed).unwrap().into_inner().unwrap();
 
@@ -511,7 +511,7 @@ fn reader_never_observes_pre_fsync_record() {
 
     let engine = open_engine(&disk);
     let survivors: BTreeSet<u64> = dump(&engine, "vis")
-        .expect("box recovered")
+        .expect("topic recovered")
         .keys()
         .copied()
         .collect();
@@ -543,12 +543,12 @@ fn fail_injected_batch_no_trace_no_gap() {
     // Phase 1: 4 clean durable acked writes.
     {
         let engine = open_engine(&disk);
-        durable_box("p", &engine);
+        durable_topic("p", &engine);
         for i in 0..4 {
             let seqs = write_one(&engine, "p", &format!("ok-{i}"), None).expect("acked");
             acked.extend(seqs);
         }
-        let head_before = engine.box_state("p", false).unwrap().head_seq;
+        let head_before = engine.topic_state("p", false).unwrap().head_seq;
         assert_eq!(head_before, 4, "4 acked writes visible");
         sync_wal_dir(&disk);
 
@@ -581,7 +581,7 @@ fn fail_injected_batch_no_trace_no_gap() {
         }
         // The failed batches must NOT be visible: head stayed at the phase-1 prefix
         // (the sequencer rolled back each failed batch's seqs, never publishing).
-        let live = dump(&engine2, "p").expect("box present");
+        let live = dump(&engine2, "p").expect("topic present");
         assert_eq!(
             live.keys().copied().collect::<BTreeSet<u64>>(),
             (1..=4).collect::<BTreeSet<u64>>(),
@@ -596,7 +596,7 @@ fn fail_injected_batch_no_trace_no_gap() {
 
     // Recover a fresh engine: exactly the phase-1 acked prefix, dense, no gap.
     let engine = open_engine(&disk);
-    let live = dump(&engine, "p").expect("box recovered");
+    let live = dump(&engine, "p").expect("topic recovered");
     assert_dense_prefix_of_acked(&live, &acked);
     assert_eq!(
         live.keys().copied().collect::<BTreeSet<u64>>(),
@@ -625,7 +625,7 @@ fn sweep_concurrent_durable_crash_points_oracle() {
     // Run a concurrent durable workload, collecting the genuinely-acked seqs.
     // `fs_factory` lets the sweep swap in a CrashAfter for each crash point.
     fn run(engine: &Arc<Engine>) -> BTreeSet<u64> {
-        durable_box("s", engine);
+        durable_topic("s", engine);
         let start = Arc::new(Barrier::new(WRITERS as usize));
         let acked: Arc<Mutex<BTreeSet<u64>>> = Arc::new(Mutex::new(BTreeSet::new()));
         let mut handles = Vec::new();
@@ -688,11 +688,11 @@ fn sweep_concurrent_durable_crash_points_oracle() {
         if let Some(live) = dump(&engine, "s") {
             assert_dense_prefix_of_acked(&live, &acked);
         } else {
-            // Box vanished entirely: acceptable only if nothing was acked (the
-            // crash hit before the box-create + first durable batch landed).
+            // Topic vanished entirely: acceptable only if nothing was acked (the
+            // crash hit before the topic-create + first durable batch landed).
             assert!(
                 acked.is_empty(),
-                "box vanished but {} writes were acked (lost durable state)",
+                "topic vanished but {} writes were acked (lost durable state)",
                 acked.len()
             );
         }
@@ -702,48 +702,48 @@ fn sweep_concurrent_durable_crash_points_oracle() {
 
 // ===========================================================================
 // 5) NO LOST WAKEUP / NO DEADLOCK under heavy multi-writer churn across MANY
-//    boxes (cross-box group-commit coalescing + per-box ticket ordering). A
+//    topics (cross-topic group-commit coalescing + per-topic ticket ordering). A
 //    watchdog thread bounds the run so a stuck CommitToken / publish-gate waiter
 //    fails loud instead of hanging the suite.
 // ===========================================================================
 
-/// 32 writers spread across 4 durable boxes, each issuing a burst. Every write
+/// 32 writers spread across 4 durable topics, each issuing a burst. Every write
 /// must complete (its CommitToken fires and its publish-gate turn arrives) — no
 /// lost wakeup, no deadlock. A watchdog asserts the whole thing finishes well
-/// within a bound. Afterwards each box's published seqs are a dense [1..=k_box].
+/// within a bound. Afterwards each topic's published seqs are a dense [1..=k_topic].
 #[test]
-fn no_lost_wakeup_multi_box_high_thread_stress() {
+fn no_lost_wakeup_multi_topic_high_thread_stress() {
     const WRITERS: usize = 32;
     const PER: u64 = 10;
-    const BOXES: usize = 4;
+    const TOPICS: usize = 4;
 
     let disk = FakeDisk::new();
     let engine = open_engine(&disk);
-    for b in 0..BOXES {
-        durable_box(&format!("b{b}"), &engine);
+    for b in 0..TOPICS {
+        durable_topic(&format!("b{b}"), &engine);
     }
 
-    // Per-box ack tally to verify dense ranges + the total completion count.
-    let per_box: Arc<Vec<Mutex<BTreeSet<u64>>>> =
-        Arc::new((0..BOXES).map(|_| Mutex::new(BTreeSet::new())).collect());
+    // Per-topic ack tally to verify dense ranges + the total completion count.
+    let per_topic: Arc<Vec<Mutex<BTreeSet<u64>>>> =
+        Arc::new((0..TOPICS).map(|_| Mutex::new(BTreeSet::new())).collect());
     let completed = Arc::new(AtomicU64::new(0));
     let start = Arc::new(Barrier::new(WRITERS));
 
     let mut handles = Vec::new();
     for w in 0..WRITERS {
         let engine = engine.clone();
-        let per_box = per_box.clone();
+        let per_topic = per_topic.clone();
         let completed = completed.clone();
         let start = start.clone();
         handles.push(std::thread::spawn(move || {
             start.wait();
-            // Each writer round-robins a box so every box has concurrent writers.
-            let bi = w % BOXES;
+            // Each writer round-robins a topic so every topic has concurrent writers.
+            let bi = w % TOPICS;
             let name = format!("b{bi}");
             for i in 0..PER {
                 let seqs = write_one(&engine, &name, &format!("w{w}-{i}"), None)
                     .expect("durable write acked (token fired, gate turn arrived)");
-                let mut s = per_box[bi].lock().unwrap();
+                let mut s = per_topic[bi].lock().unwrap();
                 s.extend(seqs);
                 completed.fetch_add(1, Ordering::Relaxed);
             }
@@ -782,28 +782,28 @@ fn no_lost_wakeup_multi_box_high_thread_stress() {
         "every write acked"
     );
 
-    // Each box's published seqs are a dense [1..=k_box], in commit order.
-    for b in 0..BOXES {
+    // Each topic's published seqs are a dense [1..=k_topic], in commit order.
+    for b in 0..TOPICS {
         let name = format!("b{b}");
-        let acked = per_box[b].lock().unwrap();
-        let live = dump(&engine, &name).expect("box present");
+        let acked = per_topic[b].lock().unwrap();
+        let live = dump(&engine, &name).expect("topic present");
         assert_eq!(
             live.keys().copied().collect::<BTreeSet<u64>>(),
             acked.iter().copied().collect::<BTreeSet<u64>>(),
-            "box {name}: published == acked"
+            "topic {name}: published == acked"
         );
         let k = acked.len() as u64;
         assert_eq!(
             acked.iter().copied().collect::<BTreeSet<u64>>(),
             (1..=k).collect::<BTreeSet<u64>>(),
-            "box {name}: dense [1..={k}] (sequencer kept seqs contiguous)"
+            "topic {name}: dense [1..={k}] (sequencer kept seqs contiguous)"
         );
     }
 }
 
 // ===========================================================================
 // 6) Loom-shaped 2-writer sequencer primitive stress (the natural loom seed): two
-//    writers contend the SAME box's append_lock + publish gate while a reader
+//    writers contend the SAME topic's append_lock + publish gate while a reader
 //    spins. The strict-2-thread interleaving is the case a loom model would
 //    enumerate; we drive the real primitive many bounded iterations with the
 //    real Engine. Invariant: published seqs are always a dense prefix, head is
@@ -811,7 +811,7 @@ fn no_lost_wakeup_multi_box_high_thread_stress() {
 // ===========================================================================
 
 /// The minimal contended case (matching `fault_concurrency_a`'s documented
-/// loom-follow-up seed): exactly two durable writers + one reader on one box,
+/// loom-follow-up seed): exactly two durable writers + one reader on one topic,
 /// repeated for many bounded rounds. Each round both writers race a single
 /// durable write; we assert head advanced by exactly 2 and the live set stayed a
 /// dense prefix throughout (a reader never sees a gap or a non-durable record).
@@ -821,7 +821,7 @@ fn seq_sequencer_two_writer_stress() {
 
     let disk = FakeDisk::new();
     let engine = open_engine(&disk);
-    durable_box("two", &engine);
+    durable_topic("two", &engine);
 
     let done = Arc::new(AtomicBool::new(false));
     // Reader spins the whole time asserting the dense-prefix invariant.
@@ -841,7 +841,7 @@ fn seq_sequencer_two_writer_stress() {
     };
 
     for round in 0..ROUNDS {
-        let head_before = engine.box_state("two", false).unwrap().head_seq;
+        let head_before = engine.topic_state("two", false).unwrap().head_seq;
         let barrier = Arc::new(Barrier::new(2));
         let mut hs = Vec::new();
         for w in 0..2u64 {
@@ -868,7 +868,7 @@ fn seq_sequencer_two_writer_stress() {
             head_before + 1,
             head_before + 2
         );
-        let head_after = engine.box_state("two", false).unwrap().head_seq;
+        let head_after = engine.topic_state("two", false).unwrap().head_seq;
         assert_eq!(
             head_after,
             head_before + 2,
@@ -878,7 +878,7 @@ fn seq_sequencer_two_writer_stress() {
     done.store(true, Ordering::Relaxed);
     reader.join().expect("reader joined (no deadlock)");
 
-    let st = engine.box_state("two", false).unwrap();
+    let st = engine.topic_state("two", false).unwrap();
     assert_eq!(st.head_seq, ROUNDS * 2, "final head == all writes");
     assert_eq!(st.count, ROUNDS * 2, "no gap across the whole stress run");
 }
@@ -903,10 +903,10 @@ fn queue_durable_ack_delete_survives_crash() {
     {
         let (engine, _clk) = open_engine_clock(&disk);
         engine
-            .put_box(
+            .put_topic(
                 "q",
-                BoxConfig {
-                    r#type: BoxType::Queue,
+                TopicConfig {
+                    r#type: TopicType::Queue,
                     durability: Some(Durability::Fsync),
                     leases_durable: true,
                     ..Default::default()
@@ -979,15 +979,15 @@ fn queue_durable_ack_delete_survives_crash() {
 
 // ===========================================================================
 // 8) QUEUE dead-letter re-queue path: when a job exceeds max_deliveries it is
-//    durably moved to the dead-letter box (a durable_append into the DL box, which
+//    durably moved to the dead-letter topic (a durable_append into the DL topic, which
 //    rides the SAME commit sequencer) and deleted from the source. After a crash
 //    the DL copy is durable (it went through the fsync-gated durable_append) and
 //    the source job is gone — no duplicate, no silent loss.
 // ===========================================================================
 
-/// A `fsync`-class queue with `max_deliveries=1` and a dead-letter box. Claim a
+/// A `fsync`-class queue with `max_deliveries=1` and a dead-letter topic. Claim a
 /// job, let its lease expire, re-claim past the delivery cap ⇒ the job is
-/// dead-lettered: durably appended to the DL box (via the commit sequencer's
+/// dead-lettered: durably appended to the DL topic (via the commit sequencer's
 /// `durable_append`) and deleted from the source. Crash + recover: the DL copy
 /// survives (durable by construction) and the source no longer holds the job.
 #[test]
@@ -998,10 +998,10 @@ fn queue_dead_letter_requeue_durable_through_sequencer() {
     {
         let (engine, clk) = open_engine_clock(&disk);
         engine
-            .put_box(
+            .put_topic(
                 "jobs",
-                BoxConfig {
-                    r#type: BoxType::Queue,
+                TopicConfig {
+                    r#type: TopicType::Queue,
                     durability: Some(Durability::Fsync),
                     leases_durable: true,
                     max_deliveries: 1,
@@ -1010,8 +1010,8 @@ fn queue_dead_letter_requeue_durable_through_sequencer() {
                 },
             )
             .expect("put queue with DL");
-        // Dead-letter target: a durable box so its copy is durable-by-construction.
-        durable_box("dead", &engine);
+        // Dead-letter target: a durable topic so its copy is durable-by-construction.
+        durable_topic("dead", &engine);
 
         dl_payload = "poison".to_string();
         let seq = write_one(&engine, "jobs", &dl_payload, None).expect("job acked")[0];
@@ -1027,11 +1027,11 @@ fn queue_dead_letter_requeue_durable_through_sequencer() {
         let _ = engine.claim("jobs", "w", 1, Some(60_000));
 
         // The job is now durably moved into "dead" and deleted from "jobs".
-        let dl = dump(&engine, "dead").expect("dead-letter box present");
+        let dl = dump(&engine, "dead").expect("dead-letter topic present");
         assert_eq!(dl.len(), 1, "exactly one job dead-lettered (no duplicate)");
         assert!(
             dl.values().any(|v| v == &dl_payload),
-            "the poison payload landed in the dead-letter box: {dl:?}"
+            "the poison payload landed in the dead-letter topic: {dl:?}"
         );
         let src = dump(&engine, "jobs").unwrap_or_default();
         assert!(
@@ -1048,7 +1048,7 @@ fn queue_dead_letter_requeue_durable_through_sequencer() {
     // Recover: the DL copy is durable (the durable_append rode the fsync-gated
     // commit sequencer), and the source no longer holds the dead-lettered job.
     let engine = open_engine(&disk);
-    let dl = dump(&engine, "dead").expect("dead-letter box recovered");
+    let dl = dump(&engine, "dead").expect("dead-letter topic recovered");
     assert_eq!(
         dl.len(),
         1,
@@ -1056,7 +1056,7 @@ fn queue_dead_letter_requeue_durable_through_sequencer() {
     );
     assert!(
         dl.values().any(|v| v == &dl_payload),
-        "the recovered dead-letter box still holds the poison payload"
+        "the recovered dead-letter topic still holds the poison payload"
     );
     let src = dump(&engine, "jobs").unwrap_or_default();
     assert!(

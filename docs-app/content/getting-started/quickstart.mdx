@@ -42,19 +42,19 @@ docker run --rm -p 4000:4000 -v streams-data:/data \
   </Tabs.Tab>
 </Tabs>
 
-### Create a box (optional)
+### Create a topic (optional)
 
-A box is created lazily on first write, so this step is optional — but it lets you set
+A topic is created lazily on first write, so this step is optional — but it lets you set
 config up front. Here we make a durable, unbounded queue.
 
 ```bash
-curl -X PUT localhost:4000/v0/boxes/jobs \
+curl -X PUT localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "durable": true, "cap_records": 1000000, "ttl_ms": 0 }'
 ```
 
 ```json
-{ "box": "jobs", "created": true,
+{ "topic": "jobs", "created": true,
   "config": { "ttl_ms": 0, "cap_records": 1000000, "cap_bytes": 0, "discard": "old",
               "durable": true, "durability": "fsync", "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true },
@@ -67,7 +67,7 @@ The server assigns each record a `$seq` (a monotonic `u64`) and a `$ts`. A singl
 can carry up to 10,000 records, committed atomically.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs \
+curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "node": "worker-eu-1",
         "records": [
@@ -77,7 +77,7 @@ curl -X POST localhost:4000/v0/boxes/jobs \
 ```
 
 ```json
-{ "box": "jobs", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
+{ "topic": "jobs", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
   "head_seq": 2, "count": 2, "created": false, "deduped": false,
   "performance": { "server_total_ms": 0.62, "fsync_ms": 0.39 } }
 ```
@@ -89,13 +89,13 @@ continuation cursor, and any tombstone. The monotonic `seq` **is** the cursor �
 no opaque token. Advancing your stored `from_seq` is the ack.
 
 ```bash
-curl -X POST localhost:4000/v0/boxes/jobs/diff \
+curl -X POST localhost:4000/v0/topics/jobs/diff \
   -H 'content-type: application/json' \
   -d '{ "from_seq": 0, "limit": 500, "node": "worker-eu-1" }'
 ```
 
 ```json
-{ "box": "jobs",
+{ "topic": "jobs",
   "records": [
     { "$seq": 1, "$ts": 1748470000123, "data": { "url": "s3://b/a.png", "w": 256 } },
     { "$seq": 2, "$ts": 1748470000140, "data": { "url": "s3://b/b.png", "w": 512 } }
@@ -111,7 +111,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/diff \
   them, so `caught_up` — not `records.length` — is the reliable "no more right now" signal.
 </Callout>
 
-### Watch many boxes over one SSE stream
+### Watch many topics over one SSE stream
 
 `POST /v0/watch` creates a session and returns a `wid`; a `GET` on that `wid` opens the
 `EventSource`-compatible stream.
@@ -121,7 +121,7 @@ curl -X POST localhost:4000/v0/boxes/jobs/diff \
 curl -X POST localhost:4000/v0/watch \
   -H 'content-type: application/json' \
   -d '{ "node": "worker-eu-1",
-        "boxes": { "jobs": { "from_seq": 0 }, "events": { "tail": true } } }'
+        "topics": { "jobs": { "from_seq": 0 }, "events": { "tail": true } } }'
 # → { "wid": "wid_BuRguGorNdVFWNQULz-rrw", "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw", ... }
 
 # 2. Open the stream.
@@ -133,11 +133,11 @@ retry: 2000
 
 id: eyJqb2JzIjoxfQ
 event: record
-data: {"box":"jobs","records":[{"$seq":1,"$ts":1748470000123,"data":{"url":"s3://b/a.png"}}],"from_seq":0,"to_seq":1,"head_seq":2}
+data: {"topic":"jobs","records":[{"$seq":1,"$ts":1748470000123,"data":{"url":"s3://b/a.png"}}],"from_seq":0,"to_seq":1,"head_seq":2}
 
 id: eyJqb2JzIjoyfQ
 event: caught-up
-data: {"box":"jobs","head_seq":2}
+data: {"topic":"jobs","head_seq":2}
 
 : hb
 ```
@@ -162,13 +162,13 @@ point-in-time (future records with the same tag are never affected).
 
 ```bash
 # Cancel one job by exact tag match.
-curl -X POST localhost:4000/v0/boxes/jobs/delete \
+curl -X POST localhost:4000/v0/topics/jobs/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
 ```
 
 ```json
-{ "box": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
+{ "topic": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
   "performance": { "server_total_ms": 0.12 } }
 ```
 

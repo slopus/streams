@@ -14,14 +14,14 @@ Recovery is a single deterministic pass: load the latest metadata snapshot, repl
 frame, then reclaim segments that the live set no longer references.
 
 The whole process rests on one anchor: a write is acked only after its frame is committed
-(and, for an `fsync`-class box, fsynced), and every frame carries an **XXH3-64** checksum
+(and, for an `fsync`-class topic, fsynced), and every frame carries an **XXH3-64** checksum
 over its bytes. So an acked durable write is, by construction, a complete checksum-valid
 frame on disk — and recovery never discards one.
 
 <Callout type="important">
   **The recovery invariant:** an acked `fsync`-class (`durable:true`) write is always a
   complete, checksum-valid WAL frame, so it is **never lost** — recovered for any crash at
-  any instant. A `disk`-class (`durable:false`) box loses only its **un-fsynced tail** (the
+  any instant. A `disk`-class (`durable:false`) topic loses only its **un-fsynced tail** (the
   group-commit window that hadn't reached disk), which surfaces to consumers as ordinary
   eviction-style gaps, never as a misread or torn record.
 </Callout>
@@ -38,8 +38,8 @@ completes.
 ### Load the latest metadata snapshot
 
 Open the data dir and load the most recent valid snapshot under `meta/`. It carries the
-box and router definitions, the name↔id mapping, the persisted watermarks
-(`evict_floor` + `earliest_seq`) and `delete_below` per box, the `CURRENT` WAL pointer,
+topic and router definitions, the name↔id mapping, the persisted watermarks
+(`evict_floor` + `earliest_seq`) and `delete_below` per topic, the `CURRENT` WAL pointer,
 and `last_checkpoint_seq` — the global lower bound for replay. Snapshots are written
 atomically (`tmp` → fsync → rename → dir-fsync), so the swap is crash-atomic and the
 loaded snapshot is always whole.
@@ -49,13 +49,13 @@ shutdown (SIGINT/SIGTERM) a final snapshot is written, so recovery starts from t
 checkpoint and replays only the tail. After a hard kill with no recent snapshot, replay
 starts from offset zero — the worst case (see [Performance](/how-it-works/performance)).
 
-### Rebuild each box's index from its segments
+### Rebuild each topic's index from its segments
 
-Per box, bulk-load the segment `.idx` files into the in-memory index. Each `.idx` entry is
+Per topic, bulk-load the segment `.idx` files into the in-memory index. Each `.idx` entry is
 a fixed 20 bytes (offset, len, ts, flags, pad), so `seq → entry` is pure arithmetic — a
 sequential read, not a re-parse of payloads. Set `base_seq` from the lowest surviving
 segment, `evict_floor`/`earliest_seq` from the persisted watermarks, and `head_seq` from
-the highest segment seq. The per-box tag index is rebuilt from the surviving tagged
+the highest segment seq. The per-topic tag index is rebuilt from the surviving tagged
 records.
 
 ### Replay the WAL from the checkpoint
@@ -76,7 +76,7 @@ order:
 - **`EvictWatermark`** — restore the involuntary floor **monotonically**: the watermark
   only ever moves forward, so eviction and its tombstone boundary survive the restart
   exactly as they stood before the crash.
-- **Other control frames** (`BoxCreate`, `BoxDelete`, `RouterCreate`, `RouterDelete`,
+- **Other control frames** (`TopicCreate`, `TopicDelete`, `RouterCreate`, `RouterDelete`,
   `ConfigUpdate`) mutate config, routers, and watermarks on the same ordered timeline as
   the data — there is exactly one truth: WAL order.
 
@@ -141,7 +141,7 @@ boundary on a crash is *what reached the WAL on disk*, and it differs by
   group-committed path as `disk` and recovered through the **same** replay, but with **no
   durability guarantee**. On restart its records **may survive or be lost** — recovery is
   gradual / best-effort and guarantees neither completeness nor emptiness; only no-fabrication /
-  no-future-seq holds. The box config always persists as a control frame.
+  no-future-seq holds. The topic config always persists as a control frame.
 
 <Callout type="info">
   Recovery time is bounded by the un-checkpointed tail, not the total record count. After a

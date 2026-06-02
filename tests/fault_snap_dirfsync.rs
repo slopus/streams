@@ -49,7 +49,7 @@ use streams::engine::Engine;
 use streams::storage::snapshot::{load_latest_with, write_snapshot_with, Checkpoint, Snapshot};
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs, tests/fault_batch1.rs)
@@ -105,7 +105,7 @@ fn sync_data_dirs(disk: &FakeDisk) {
     let _ = fs.sync_dir(&meta_dir());
 }
 
-/// A single-record durable write request for box `name` carrying `data`.
+/// A single-record durable write request for topic `name` carrying `data`.
 fn one_write(data: &str) -> WriteRequest {
     WriteRequest {
         records: vec![RecordIn {
@@ -122,21 +122,21 @@ fn one_write(data: &str) -> WriteRequest {
     }
 }
 
-fn put_durable_box(engine: &Engine, name: &str) {
+fn put_durable_topic(engine: &Engine, name: &str) {
     engine
-        .put_box(
+        .put_topic(
             name,
-            BoxConfig {
-                r#type: BoxType::Log,
+            TopicConfig {
+                r#type: TopicType::Log,
                 durable: true,
                 cap_records: 0,
                 ..Default::default()
             },
         )
-        .expect("put_box");
+        .expect("put_topic");
 }
 
-/// Append `n` durable records "1".."n" to box `name`, each blocking on the group
+/// Append `n` durable records "1".."n" to topic `name`, each blocking on the group
 /// fsync (so it is acked ⇒ durable). Returns the seqs assigned.
 fn append_durable(engine: &Engine, name: &str, n: usize) -> Vec<u64> {
     let mut seqs = Vec::new();
@@ -149,10 +149,10 @@ fn append_durable(engine: &Engine, name: &str, n: usize) -> Vec<u64> {
     seqs
 }
 
-/// Read back the live records of box `name` (seq → data string) through the
-/// engine's diff path; `None` if the box is absent.
+/// Read back the live records of topic `name` (seq → data string) through the
+/// engine's diff path; `None` if the topic is absent.
 fn dump_records(engine: &Engine, name: &str) -> Option<BTreeMap<u64, String>> {
-    let _ = engine.box_state(name, false).ok()?;
+    let _ = engine.topic_state(name, false).ok()?;
     let mut out = BTreeMap::new();
     let mut from = 0u64;
     loop {
@@ -196,13 +196,13 @@ fn durable_bytes(disk: &FakeDisk, path: &Path) -> Vec<u8> {
     buf
 }
 
-/// A minimal valid snapshot body (no boxes/routers) for the manual-swap tests
+/// A minimal valid snapshot body (no topics/routers) for the manual-swap tests
 /// that only care about the file-level atomicity around the dir fsync.
 fn mk_snapshot(id: u64, seq: u64) -> Snapshot {
     Snapshot {
         id,
         ts: 1,
-        next_box_id: 1,
+        next_topic_id: 1,
         checkpoint: Checkpoint {
             wal_idx: 1,
             wal_offset: 0,
@@ -210,7 +210,7 @@ fn mk_snapshot(id: u64, seq: u64) -> Snapshot {
             shards: vec![(1, 0)],
             shard_keys: vec![String::new()],
         },
-        boxes: vec![],
+        topics: vec![],
         routers: vec![],
     }
 }
@@ -307,7 +307,7 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     // checkpoint covers seqs 1..=3.
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "jobs");
+        put_durable_topic(&engine, "jobs");
         append_durable(&engine, "jobs", 3); // seqs 1..=3
         assert!(engine.write_snapshot().expect("snapshot #1 writes"));
         // Five more durable appends AFTER the snapshot (seqs 4..=8), so the WAL tail
@@ -364,7 +364,7 @@ fn f_snap_crash_after_rename_before_dirfsync() {
     // restores every acked durable record (snapshot + WAL covers the gap). No acked
     // seq is lost, the survivor set is a dense [1..=head] prefix.
     let engine = open_engine(&disk);
-    let recs = dump_records(&engine, "jobs").expect("jobs box recovers");
+    let recs = dump_records(&engine, "jobs").expect("jobs topic recovers");
     let seqs: Vec<u64> = recs.keys().copied().collect();
     assert!(
         !seqs.is_empty(),
@@ -399,7 +399,7 @@ fn f_snap_eio_dirfsync() {
     // Phase 1: durable workload + a fully-installed snapshot #1 (seqs 1..=3).
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "p");
+        put_durable_topic(&engine, "p");
         append_durable(&engine, "p", 3);
         assert!(engine.write_snapshot().expect("snapshot #1 writes"));
         sync_data_dirs(&disk);
@@ -509,7 +509,7 @@ fn f_nfs_dirfsync_unsupported() {
     // whatever valid snapshot survived + the WAL.
     {
         let engine = open_engine_fs(nfs.arc());
-        put_durable_box(&engine, "q");
+        put_durable_topic(&engine, "q");
         append_durable(&engine, "q", 4);
         // write_snapshot tolerates the no-op dir fsync ⇒ returns Ok(true).
         let wrote = engine

@@ -1,7 +1,7 @@
-//! The materialized lease projection for a queue box (DESIGN §10,
+//! The materialized lease projection for a queue topic (DESIGN §10,
 //! ARCHITECTURE §12).
 //!
-//! A queue is **two logs**: the jobs log (the box's own [`BoxIndex`]) and an
+//! A queue is **two logs**: the jobs log (the topic's own [`TopicIndex`]) and an
 //! append-only **leases log** of lifecycle events. The pending who-holds-what
 //! state is the **materialized projection** of the leases log — held here in
 //! memory and rebuilt on restart by replaying whatever lease events survived
@@ -11,7 +11,7 @@
 //! All time decisions (lease deadlines, the jitter window, delayed nacks) read
 //! the [`Clock`](crate::clock::Clock); no wall-clock sleep is load-bearing.
 //!
-//! [`BoxIndex`]: crate::engine::box_state::BoxIndex
+//! [`TopicIndex`]: crate::engine::topic_state::TopicIndex
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -21,7 +21,7 @@ use std::collections::{BinaryHeap, HashMap};
 pub struct Lease {
     /// The holder node.
     pub node: String,
-    /// Opaque lease identity for this delivery (monotonic per box).
+    /// Opaque lease identity for this delivery (monotonic per topic).
     pub lease_id: u64,
     /// Absolute deadline ms; the job is reclaimable once `now > deadline`.
     pub deadline_ms: i64,
@@ -32,7 +32,7 @@ pub struct Lease {
 }
 
 /// The in-memory materialized lease view + reclaim/claim scheduling state. Lives
-/// under the box's `queue` mutex; one batched cohort claim pass holds it for a
+/// under the topic's `queue` mutex; one batched cohort claim pass holds it for a
 /// single critical section (DESIGN §10.3, ARCHITECTURE §12).
 #[derive(Debug)]
 pub struct QueueProjection {
@@ -50,9 +50,9 @@ pub struct QueueProjection {
     /// Monotonic claim cursor over the jobs log: the next never-yet-leased seq to
     /// hand out once the freelist is empty (the fresh-job source).
     pub claim_cursor: u64,
-    /// Cumulative jobs moved to the dead-letter box (observability §10.7).
+    /// Cumulative jobs moved to the dead-letter topic (observability §10.7).
     pub dead_lettered: u64,
-    /// Monotonic lease-id allocator (per box instance).
+    /// Monotonic lease-id allocator (per topic instance).
     next_lease_id: u64,
     /// Seqs currently sitting on `reclaim`, so we never double-enqueue a seq.
     in_reclaim: std::collections::HashSet<u64>,
@@ -215,12 +215,12 @@ impl QueueProjection {
 
 // ===========================================================================
 // Engine queue API (DESIGN §10, API §10) — claim / ack / nack / extend +
-// observability. The leases log is the box's WAL stream (lease frames); the
+// observability. The leases log is the topic's WAL stream (lease frames); the
 // projection above is its materialized view.
 // ===========================================================================
 
 use crate::config;
-use crate::engine::box_state::BoxState;
+use crate::engine::topic_state::TopicState;
 use crate::engine::segwriter::SealedResolve;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
@@ -259,12 +259,12 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 impl Engine {
-    /// Resolve a box that MUST be a queue, returning `404 box_not_found` if
+    /// Resolve a topic that MUST be a queue, returning `404 topic_not_found` if
     /// absent or `409 not_a_queue` if it is a plain log (API §10).
-    fn get_queue(&self, name: &str) -> Result<Arc<BoxState>> {
+    fn get_queue(&self, name: &str) -> Result<Arc<TopicState>> {
         let b = self
-            .get_box(name)
-            .ok_or_else(|| Error::box_not_found(name))?;
+            .get_topic(name)
+            .ok_or_else(|| Error::topic_not_found(name))?;
         if !b.is_queue() {
             return Err(Error::not_a_queue(name));
         }
@@ -276,14 +276,14 @@ impl Engine {
     /// after its lease was already dropped (codex HIGH #4) — without this the seq
     /// is below the advanced claim cursor and off the freelist, so it would never
     /// be handed out again.
-    fn reclaim_seq(&self, b: &BoxState, seq: u64) {
+    fn reclaim_seq(&self, b: &TopicState, seq: u64) {
         if let Some(q) = &b.queue {
             q.lock().push_reclaim(seq);
         }
     }
 
-    /// Compute the live `queue` counters (§10.7) for a queue box at `now`.
-    pub(crate) fn queue_counters(&self, b: &BoxState, now: i64) -> QueueState {
+    /// Compute the live `queue` counters (§10.7) for a queue topic at `now`.
+    pub(crate) fn queue_counters(&self, b: &TopicState, now: i64) -> QueueState {
         let Some(q) = &b.queue else {
             return QueueState {
                 ready: 0,
@@ -306,7 +306,7 @@ impl Engine {
     /// Compute `(ready, in_flight)` in O(active-leases + pending-delayed) — the
     /// queue's working set — rather than O(retained jobs). Phase-5A's
     /// `count_ready` scanned every retained seq; this derives the same value from
-    /// the box's maintained `live_count` (records present and not deleted, net of
+    /// the topic's maintained `live_count` (records present and not deleted, net of
     /// cap/TTL eviction and ack/dead-letter deletes):
     ///
     /// ```text
@@ -322,7 +322,7 @@ impl Engine {
     /// un-expired and every elapsed delayed entry has been promoted to `reclaim`).
     fn ready_in_flight_locked(
         &self,
-        b: &BoxState,
+        b: &TopicState,
         q: &mut QueueProjection,
         now: i64,
     ) -> (u64, u64) {
@@ -354,7 +354,7 @@ impl Engine {
         (ready, in_flight)
     }
 
-    /// `POST /v0/boxes/:q/claim` — lease up to `max` claimable jobs to `node`
+    /// `POST /v0/topics/:q/claim` — lease up to `max` claimable jobs to `node`
     /// (the greedy, single-claimer path used when `claim_jitter_ms == 0`).
     /// Returns the leased jobs ascending by seq (DESIGN §10.2).
     pub fn claim(
@@ -398,7 +398,7 @@ impl Engine {
             .collect();
         let count = claimed.len() as u64;
         Ok(ClaimResponse {
-            box_name: name.to_string(),
+            topic_name: name.to_string(),
             claimed,
             count,
             ready,
@@ -433,7 +433,7 @@ impl Engine {
     /// `max`). Records a `claimed` lease event per lease.
     fn run_claim_cohort(
         &self,
-        b: &Arc<BoxState>,
+        b: &Arc<TopicState>,
         claimers: &[Claimer],
         lease_ms: Option<u64>,
     ) -> Result<(Vec<Vec<LeasedJob>>, u64)> {
@@ -441,7 +441,7 @@ impl Engine {
         b.enforce_retention(now);
 
         let cfg = b.config.read();
-        let box_lease_ms = cfg.lease_ms;
+        let topic_lease_ms = cfg.lease_ms;
         let max_deliveries = cfg.max_deliveries;
         let dead_letter = cfg.dead_letter.clone();
         // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
@@ -449,11 +449,11 @@ impl Engine {
         // is set (best-effort: a lost lease frame self-heals — the job becomes
         // claimable again on restart, DESIGN §10.6).
         let leases_durable = cfg.leases_durable;
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
         drop(cfg);
 
         let effective_lease = lease_ms
-            .unwrap_or(box_lease_ms)
+            .unwrap_or(topic_lease_ms)
             .clamp(config::MIN_LEASE_MS, config::MAX_LEASE_MS) as i64;
         let deadline = now.saturating_add(effective_lease);
 
@@ -596,7 +596,7 @@ impl Engine {
             }
         }
 
-        // Dead-letter the diverted jobs (append to the DL box + permanent delete
+        // Dead-letter the diverted jobs (append to the DL topic + permanent delete
         // from the jobs log), outside the queue lock.
         if !to_dead_letter.is_empty() {
             if let Some(dl) = &dead_letter {
@@ -607,7 +607,7 @@ impl Engine {
         // Append `claimed` events to the leases log (durable iff leases_durable).
         for (idx, seq, lease_id, deliveries) in &lease_events {
             self.log_lease_event(
-                box_id,
+                topic_id,
                 *seq,
                 LeaseEvent::Claimed,
                 &claimers[*idx].node,
@@ -627,7 +627,7 @@ impl Engine {
         Ok((out, ready))
     }
 
-    /// `POST /v0/boxes/:q/ack` — complete jobs held by `node`: record an `acked`
+    /// `POST /v0/topics/:q/ack` — complete jobs held by `node`: record an `acked`
     /// event and permanently delete each from the jobs log (the ack *is* the
     /// delete, DESIGN §10.4). Seqs not held by `node` are silently skipped.
     pub fn ack(&self, name: &str, node: &str, seqs: &[u64]) -> Result<AckResponse> {
@@ -655,7 +655,7 @@ impl Engine {
         check_lease_ids_len("ack", seqs, lease_ids)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
         // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
         // so it logs lease events exactly like a `disk` queue when `leases_durable`
         // is set (best-effort: a lost lease frame self-heals — the in-flight job
@@ -684,7 +684,7 @@ impl Engine {
         }
 
         // Delete the acked jobs from the jobs log (the §7 permanent delete). Ack
-        // durability == jobs-log durability: a durable box fsyncs the delete
+        // durability == jobs-log durability: a durable topic fsyncs the delete
         // BEFORE the ack returns (codex P0).
         //
         // The leases were ALL removed from the projection above. If a durable delete
@@ -710,7 +710,7 @@ impl Engine {
                 }
             }
             self.log_lease_event(
-                box_id,
+                topic_id,
                 seq,
                 LeaseEvent::Acked,
                 node,
@@ -728,7 +728,7 @@ impl Engine {
             perf.fsync_ms = Some(fsync_ms);
         }
         Ok(AckResponse {
-            box_name: name.to_string(),
+            topic_name: name.to_string(),
             acked: acked_seqs.len() as u64,
             skipped,
             ready,
@@ -737,7 +737,7 @@ impl Engine {
         })
     }
 
-    /// `POST /v0/boxes/:q/nack` — release leased jobs held by `node` for
+    /// `POST /v0/topics/:q/nack` — release leased jobs held by `node` for
     /// immediate (or `delay_ms`-delayed) reclaim, recording a `released` event
     /// (DESIGN §10.5).
     pub fn nack(
@@ -768,7 +768,7 @@ impl Engine {
         check_lease_ids_len("nack", seqs, lease_ids)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
         // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
         // so it logs lease events exactly like a `disk` queue when `leases_durable`
         // is set (best-effort: a lost lease frame self-heals — the in-flight job
@@ -803,7 +803,7 @@ impl Engine {
 
         for &(seq, lease_id) in &nacked {
             self.log_lease_event(
-                box_id,
+                topic_id,
                 seq,
                 LeaseEvent::Released,
                 node,
@@ -817,7 +817,7 @@ impl Engine {
 
         let (ready, in_flight) = self.queue_ready_inflight(&b, now);
         Ok(NackResponse {
-            box_name: name.to_string(),
+            topic_name: name.to_string(),
             nacked: nacked.len() as u64,
             skipped,
             ready,
@@ -826,7 +826,7 @@ impl Engine {
         })
     }
 
-    /// `POST /v0/boxes/:q/extend` — push out the deadline of leases held by
+    /// `POST /v0/topics/:q/extend` — push out the deadline of leases held by
     /// `node` (the heartbeat for long jobs). The delivery counter is untouched
     /// (DESIGN §10.6). An expired/reclaimed seq is skipped.
     pub fn extend(
@@ -857,7 +857,7 @@ impl Engine {
         check_lease_ids_len("extend", seqs, lease_ids)?;
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
         // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
         // so it logs lease events exactly like a `disk` queue when `leases_durable`
         // is set (best-effort: a lost lease frame self-heals — the in-flight job
@@ -893,7 +893,7 @@ impl Engine {
 
         for &(seq, lease_id) in &extended {
             self.log_lease_event(
-                box_id,
+                topic_id,
                 seq,
                 LeaseEvent::Extended,
                 node,
@@ -906,7 +906,7 @@ impl Engine {
         }
 
         Ok(ExtendResponse {
-            box_name: name.to_string(),
+            topic_name: name.to_string(),
             extended: extended.len() as u64,
             skipped,
             deadlines,
@@ -914,18 +914,18 @@ impl Engine {
         })
     }
 
-    /// Compute `(ready, in_flight)` for a queue box at `now`.
-    pub(crate) fn queue_ready_inflight(&self, b: &BoxState, now: i64) -> (u64, u64) {
+    /// Compute `(ready, in_flight)` for a queue topic at `now`.
+    pub(crate) fn queue_ready_inflight(&self, b: &TopicState, now: i64) -> (u64, u64) {
         let q = self.queue_counters(b, now);
         (q.ready, q.in_flight)
     }
 
     /// Permanently delete a single job seq from the jobs log (the ack/dead-letter
-    /// delete path). Reuses [`BoxState::apply_delete`] with a bounded `before_seq`
+    /// delete path). Reuses [`TopicState::apply_delete`] with a bounded `before_seq`
     /// AND-ed against the seq's tag so exactly this seq is removed; falls back to
     /// a direct index mark when the record is untagged.
-    fn delete_one_seq(&self, b: &BoxState, seq: u64, now: i64) -> Result<f64> {
-        let box_id = b.box_id;
+    fn delete_one_seq(&self, b: &TopicState, seq: u64, now: i64) -> Result<f64> {
+        let topic_id = b.topic_id;
         let class = b.config.read().durability_class();
         if class == crate::types::Durability::Fsync {
             // Durable jobs log (codex P0): log the explicit-seq Delete frame and
@@ -937,7 +937,7 @@ impl Engine {
             // (the job stays claimable) and the caller surfaces the error.
             let (_a, fsync_ms) = self.wal_commit(
                 WalRecord::Delete {
-                    box_id,
+                    topic_id,
                     before_seq: None,
                     match_: None,
                     seqs: vec![seq],
@@ -956,16 +956,16 @@ impl Engine {
         // frame: it shares the disk-like path (§0.10), just with no durability
         // GUARANTEE (the frame may persist or be lost).
         b.delete_seqs(&[seq], now);
-        self.wal_log_delete_seqs(box_id, vec![seq], now, false);
+        self.wal_log_delete_seqs(topic_id, vec![seq], now, false);
         Ok(0.0)
     }
 
-    /// Move jobs to the dead-letter box (append + permanent delete), stamping
+    /// Move jobs to the dead-letter topic (append + permanent delete), stamping
     /// provenance meta (DESIGN §10.7).
     fn dead_letter_jobs(
         &self,
-        src: &BoxState,
-        dl_box: &str,
+        src: &TopicState,
+        dl_topic: &str,
         seqs: &[u64],
         max_deliveries: u64,
         now: i64,
@@ -975,7 +975,7 @@ impl Engine {
         // so a diverted job — already popped off the claim cursor / reclaim freelist
         // in the claim pass — is never stranded (it resurfaces as claimable and is
         // re-dead-lettered later, at-least-once).
-        let requeue_diverted = |src: &BoxState| {
+        let requeue_diverted = |src: &TopicState| {
             if let Some(q) = &src.queue {
                 let mut q = q.lock();
                 for &seq in seqs {
@@ -985,16 +985,16 @@ impl Engine {
             }
         };
 
-        // Ensure the dead-letter box exists (auto-create with defaults). If it does
+        // Ensure the dead-letter topic exists (auto-create with defaults). If it does
         // not exist and cannot be created, do NOT strand the diverted jobs: re-queue
         // them for reclaim and bail (codex P1 #6).
-        if self.get_box(dl_box).is_none() {
-            let _ = self.put_box(dl_box, BoxConfig::default());
+        if self.get_topic(dl_topic).is_none() {
+            let _ = self.put_topic(dl_topic, TopicConfig::default());
         }
-        let Some(dl) = self.get_box(dl_box) else {
+        let Some(dl) = self.get_topic(dl_topic) else {
             tracing::warn!(
-                src = %src.name, dead_letter = %dl_box,
-                "dead-letter: DL box missing/uncreatable; re-queuing source jobs for reclaim"
+                src = %src.name, dead_letter = %dl_topic,
+                "dead-letter: DL topic missing/uncreatable; re-queuing source jobs for reclaim"
             );
             requeue_diverted(src);
             return;
@@ -1028,7 +1028,7 @@ impl Engine {
                 .collect()
         };
 
-        let mut records: Vec<crate::engine::box_state::StoredRecord> = Vec::new();
+        let mut records: Vec<crate::engine::topic_state::StoredRecord> = Vec::new();
         for slot in slots {
             let (data, src_meta) = match slot.resident {
                 Some(p) => p,
@@ -1056,7 +1056,7 @@ impl Engine {
             );
             let meta_val = serde_json::Value::Object(meta);
             let bytes = crate::engine::payload_bytes(&data, &Some(meta_val.clone()));
-            records.push(crate::engine::box_state::StoredRecord {
+            records.push(crate::engine::topic_state::StoredRecord {
                 ts: now,
                 node: slot.node,
                 tag: slot.tag,
@@ -1071,11 +1071,11 @@ impl Engine {
         if !records.is_empty() {
             // Dead-lettered copies go through the SAME WAL-first durable append
             // path as user writes (ARCHITECTURE §2.2): a dead-letter record into a
-            // durable DL box is durable by construction and recovers via WAL
+            // durable DL topic is durable by construction and recovers via WAL
             // replay, instead of living only in memory and vanishing on restart.
             if let Err(e) = self.durable_append(&dl, records, now) {
                 tracing::warn!(
-                    src = %src.name, dead_letter = %dl_box, error = %e,
+                    src = %src.name, dead_letter = %dl_topic, error = %e,
                     "dead-letter: durable DL append failed; re-queuing source jobs for reclaim"
                 );
                 // The DL append failed and published nothing. The diverted seqs were
@@ -1113,9 +1113,9 @@ impl Engine {
     /// Count the active (un-expired) leases currently held by a `/work`
     /// connection (the in-flight depth for backpressure, API §10.8). Expired
     /// leases are not counted — they are logically reclaimable. Returns 0 for a
-    /// missing / non-queue box.
+    /// missing / non-queue topic.
     pub fn work_conn_in_flight(&self, name: &str, conn: u64) -> u32 {
-        let Some(b) = self.get_box(name) else {
+        let Some(b) = self.get_topic(name) else {
             return 0;
         };
         if !b.is_queue() {
@@ -1133,16 +1133,16 @@ impl Engine {
     /// failover on disconnect, API §10.8): drop each lease keyed to `conn` and
     /// push its seq onto the reclaim freelist so it is immediately claimable
     /// again, recording a `released` event per seq. A no-op for a missing /
-    /// non-queue box (the connection is gone; nothing to fail loudly about).
+    /// non-queue topic (the connection is gone; nothing to fail loudly about).
     /// Lease expiry (§10.3) still covers hard crashes where the disconnect is
     /// never observed.
     pub fn release_work_conn(&self, name: &str, conn: u64) {
-        let Some(b) = self.get_box(name) else { return };
+        let Some(b) = self.get_topic(name) else { return };
         if !b.is_queue() {
             return;
         }
         let now = self.clock.now_ms();
-        let box_id = b.box_id;
+        let topic_id = b.topic_id;
         // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
         // so it logs lease events exactly like a `disk` queue when `leases_durable`
         // is set (best-effort: a lost lease frame self-heals — the in-flight job
@@ -1170,7 +1170,7 @@ impl Engine {
         }
         for (seq, node, lease_id) in &released {
             self.log_lease_event(
-                box_id,
+                topic_id,
                 *seq,
                 LeaseEvent::Released,
                 node,
@@ -1190,7 +1190,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn log_lease_event(
         &self,
-        box_id: u32,
+        topic_id: u32,
         seq: u64,
         event: LeaseEvent,
         node: &str,
@@ -1204,7 +1204,7 @@ impl Engine {
             return;
         }
         self.wal_log_lease(WalRecord::Lease {
-            box_id,
+            topic_id,
             seq,
             event: event as u8,
             node: node.to_string(),
@@ -1272,7 +1272,7 @@ fn lease_token_ok(lease_ids: &[Option<u64>], i: usize, held: u64) -> bool {
 /// Returns `None` when the queue is (near-)empty.
 fn next_claimable(
     q: &mut QueueProjection,
-    index: &crate::engine::box_state::BoxIndex,
+    index: &crate::engine::topic_state::TopicIndex,
     head: u64,
 ) -> Option<u64> {
     // 1) Reclaim freelist first.
@@ -1318,15 +1318,15 @@ mod tests {
         (Engine::new(ServerConfig::default(), shared), clock)
     }
 
-    fn queue_cfg() -> BoxConfig {
-        BoxConfig {
-            r#type: BoxType::Queue,
+    fn queue_cfg() -> TopicConfig {
+        TopicConfig {
+            r#type: TopicType::Queue,
             lease_ms: 30_000,
-            ..BoxConfig::default()
+            ..TopicConfig::default()
         }
     }
 
-    /// Write `n` untagged jobs to a queue box, returning the assigned seqs.
+    /// Write `n` untagged jobs to a queue topic, returning the assigned seqs.
     fn produce(engine: &Engine, q: &str, n: usize) -> Vec<u64> {
         let records: Vec<RecordIn> = (0..n)
             .map(|i| RecordIn {
@@ -1356,7 +1356,7 @@ mod tests {
     #[test]
     fn claim_distributes_and_limits() {
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 10);
 
         // max=4 leases the 4 lowest seqs, in ascending order.
@@ -1392,15 +1392,15 @@ mod tests {
         // an unleased (ready) job, `live_count` drops and `ready` must follow
         // exactly — without rescanning the log.
         let (engine, _clock) = engine_with_clock();
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             cap_records: 5,
             discard: Discard::Old,
             ..queue_cfg()
         };
-        engine.put_box("jobs", cfg).unwrap();
+        engine.put_topic("jobs", cfg).unwrap();
         produce(&engine, "jobs", 5);
         // All 5 ready, none leased.
-        let st = engine.box_state("jobs", false).unwrap();
+        let st = engine.topic_state("jobs", false).unwrap();
         assert_eq!(st.queue.as_ref().unwrap().ready, 5);
         assert_eq!(st.queue.as_ref().unwrap().in_flight, 0);
 
@@ -1414,7 +1414,7 @@ mod tests {
         // 5 ready, and the 2 leases whose jobs were evicted no longer count as
         // in-flight.
         produce(&engine, "jobs", 3);
-        let st = engine.box_state("jobs", false).unwrap();
+        let st = engine.topic_state("jobs", false).unwrap();
         let q = st.queue.as_ref().unwrap();
         // 5 live, 0 live leases (the 2 leases' jobs were evicted) ⇒ ready=5.
         assert_eq!(q.ready, 5);
@@ -1426,11 +1426,11 @@ mod tests {
         let (engine, _clock) = engine_with_clock();
         // claim_jitter_ms>0 is the coalescing window; the engine's cohort pass
         // divides evenly regardless of the (HTTP-layer) window timing.
-        let cfg = BoxConfig {
+        let cfg = TopicConfig {
             claim_jitter_ms: 50,
             ..queue_cfg()
         };
-        engine.put_box("jobs", cfg).unwrap();
+        engine.put_topic("jobs", cfg).unwrap();
         produce(&engine, "jobs", 50);
 
         // Ten workers each asking for max:10 against 50 available ⇒ ~5 each, NOT
@@ -1455,7 +1455,7 @@ mod tests {
     #[test]
     fn coalescing_window_respects_each_max() {
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 9);
         // Two claimers: max 2 and max 100. Round-robin fills the small one to its
         // cap (2) and gives the rest to the larger (7).
@@ -1479,7 +1479,7 @@ mod tests {
     #[test]
     fn ack_removes_jobs() {
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 3);
         let r = engine.claim("jobs", "w1", 3, None).unwrap();
         let seqs: Vec<u64> = r.claimed.iter().map(|c| c.seq).collect();
@@ -1490,7 +1490,7 @@ mod tests {
         assert_eq!(a.ready, 0);
         assert_eq!(a.in_flight, 0);
         // Acked jobs are deleted from the jobs log.
-        assert_eq!(engine.box_state("jobs", false).unwrap().count, 0);
+        assert_eq!(engine.topic_state("jobs", false).unwrap().count, 0);
 
         // Acking a non-held seq is silently skipped (idempotent).
         let a2 = engine.ack("jobs", "w1", &seqs).unwrap();
@@ -1503,7 +1503,7 @@ mod tests {
         // codex MEDIUM #10: a seqs array longer than MAX_CLAIM is rejected with
         // batch_too_large before any allocation/echo; a bounded array is accepted.
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         let over: Vec<u64> = (1..=(config::MAX_CLAIM as u64 + 1)).collect();
 
         let e = engine.ack("jobs", "w1", &over).unwrap_err();
@@ -1521,7 +1521,7 @@ mod tests {
     #[test]
     fn nack_requeues_for_immediate_reclaim() {
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 2);
         let r = engine.claim("jobs", "w1", 2, None).unwrap();
         let seqs: Vec<u64> = r.claimed.iter().map(|c| c.seq).collect();
@@ -1541,7 +1541,7 @@ mod tests {
     #[test]
     fn nack_delay_holds_until_elapsed() {
         let (engine, clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 1);
         let r = engine.claim("jobs", "w1", 1, None).unwrap();
         let seq = r.claimed[0].seq;
@@ -1563,7 +1563,7 @@ mod tests {
     #[test]
     fn extend_pushes_deadline() {
         let (engine, clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 1);
         let r = engine.claim("jobs", "w1", 1, Some(10_000)).unwrap();
         let seq = r.claimed[0].seq;
@@ -1579,7 +1579,7 @@ mod tests {
         // Past the original deadline but within the extended one ⇒ still leased.
         clock.advance(5_000); // now +14s; original was +10s, extended is +19s.
         assert_eq!(engine.claim("jobs", "w2", 1, None).unwrap().count, 0);
-        let st = engine.box_state("jobs", false).unwrap();
+        let st = engine.topic_state("jobs", false).unwrap();
         assert_eq!(st.queue.as_ref().unwrap().in_flight, 1);
 
         // Extending an already-expired/never-held seq is skipped.
@@ -1599,7 +1599,7 @@ mod tests {
         // re-delivered under a NEW lease id) must NOT be able to ack the newer
         // delivery with its stale token.
         let (engine, clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 1);
 
         // First delivery to w1 under lease L1 with a short lease.
@@ -1624,7 +1624,7 @@ mod tests {
         assert_eq!(a.skipped, vec![seq]);
         assert_eq!(a.in_flight, 1, "the fresh lease still holds the job");
         assert_eq!(
-            engine.box_state("jobs", false).unwrap().count,
+            engine.topic_state("jobs", false).unwrap().count,
             1,
             "not deleted"
         );
@@ -1635,7 +1635,7 @@ mod tests {
             .unwrap();
         assert_eq!(a2.acked, 1);
         assert!(a2.skipped.is_empty());
-        assert_eq!(engine.box_state("jobs", false).unwrap().count, 0, "deleted");
+        assert_eq!(engine.topic_state("jobs", false).unwrap().count, 0, "deleted");
     }
 
     #[test]
@@ -1643,7 +1643,7 @@ mod tests {
         // R4 for nack + extend: a stale token is rejected (skipped); the correct
         // token is honored. An empty `lease_ids` preserves the legacy node match.
         let (engine, clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 1);
 
         let r1 = engine.claim("jobs", "w1", 1, Some(1_000)).unwrap();
@@ -1688,7 +1688,7 @@ mod tests {
     fn fenced_ops_reject_mismatched_lease_ids_length() {
         // R4: a non-empty `lease_ids` must be exactly seqs-aligned.
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         let e = engine
             .ack_fenced("jobs", "w1", &[1, 2], &[Some(7)])
             .unwrap_err();
@@ -1698,7 +1698,7 @@ mod tests {
     #[test]
     fn lease_expiry_makes_seq_claimable() {
         let (engine, clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
+        engine.put_topic("jobs", queue_cfg()).unwrap();
         produce(&engine, "jobs", 1);
         let r = engine.claim("jobs", "w1", 1, Some(1_000)).unwrap();
         let seq = r.claimed[0].seq;
@@ -1719,14 +1719,14 @@ mod tests {
     #[test]
     fn dead_letter_after_max_deliveries() {
         let (engine, clock) = engine_with_clock();
-        engine.put_box("dlq", BoxConfig::default()).unwrap();
-        let cfg = BoxConfig {
+        engine.put_topic("dlq", TopicConfig::default()).unwrap();
+        let cfg = TopicConfig {
             max_deliveries: 2,
             dead_letter: Some("dlq".to_string()),
             lease_ms: 1_000,
             ..queue_cfg()
         };
-        engine.put_box("jobs", cfg).unwrap();
+        engine.put_topic("jobs", cfg).unwrap();
         produce(&engine, "jobs", 1);
 
         // Delivery 1, expire.
@@ -1742,9 +1742,9 @@ mod tests {
         let r3 = engine.claim("jobs", "w", 1, None).unwrap();
         assert_eq!(r3.count, 0);
 
-        // The job moved to the dead-letter box with provenance meta.
-        assert_eq!(engine.box_state("jobs", false).unwrap().count, 0);
-        let dlq = engine.box_state("jobs", false).unwrap();
+        // The job moved to the dead-letter topic with provenance meta.
+        assert_eq!(engine.topic_state("jobs", false).unwrap().count, 0);
+        let dlq = engine.topic_state("jobs", false).unwrap();
         assert_eq!(dlq.queue.as_ref().unwrap().dead_lettered, 1);
 
         let d = engine
@@ -1764,25 +1764,25 @@ mod tests {
     }
 
     #[test]
-    fn non_queue_box_rejects_claim() {
+    fn non_queue_topic_rejects_claim() {
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("log", BoxConfig::default()).unwrap();
+        engine.put_topic("log", TopicConfig::default()).unwrap();
         let err = engine.claim("log", "w", 1, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotAQueue);
-        // A missing box is 404, not 409.
+        // A missing topic is 404, not 409.
         let err2 = engine.claim("nope", "w", 1, None).unwrap_err();
-        assert_eq!(err2.code, ErrorCode::BoxNotFound);
+        assert_eq!(err2.code, ErrorCode::TopicNotFound);
     }
 
     #[test]
     fn type_is_immutable_on_put() {
         let (engine, _clock) = engine_with_clock();
-        engine.put_box("jobs", queue_cfg()).unwrap();
-        // Re-PUT as a log ⇒ 409 box_exists_incompatible.
-        let err = engine.put_box("jobs", BoxConfig::default()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::BoxExistsIncompatible);
+        engine.put_topic("jobs", queue_cfg()).unwrap();
+        // Re-PUT as a log ⇒ 409 topic_exists_incompatible.
+        let err = engine.put_topic("jobs", TopicConfig::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TopicExistsIncompatible);
         // Re-PUT as a queue (same type) is fine (idempotent config update).
-        assert!(engine.put_box("jobs", queue_cfg()).is_ok());
+        assert!(engine.put_topic("jobs", queue_cfg()).is_ok());
     }
 
     #[test]
@@ -1798,25 +1798,25 @@ mod tests {
                 ..ServerConfig::default()
             };
             let engine = Engine::with_data_dir(cfg, Arc::new(clock.clone())).unwrap();
-            let qcfg = BoxConfig {
-                r#type: BoxType::Queue,
+            let qcfg = TopicConfig {
+                r#type: TopicType::Queue,
                 durable: true, // jobs log durable (we must not lose jobs).
                 lease_ms: 30_000,
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             };
-            engine.put_box("jobs", qcfg).unwrap();
+            engine.put_topic("jobs", qcfg).unwrap();
             produce(&engine, "jobs", 3);
             let r = engine.claim("jobs", "w1", 1, None).unwrap();
             assert_eq!(r.count, 1);
             // 1 in-flight, 2 ready before restart.
-            let st = engine.box_state("jobs", false).unwrap();
+            let st = engine.topic_state("jobs", false).unwrap();
             assert_eq!(st.queue.as_ref().unwrap().in_flight, 1);
             assert_eq!(st.queue.as_ref().unwrap().ready, 2);
             // Drop the engine (its WAL Drop flushes + joins the writer thread).
             drop(engine);
         }
 
-        // Second boot: recovery rebuilds the box from the WAL. The queue TYPE
+        // Second boot: recovery rebuilds the topic from the WAL. The queue TYPE
         // survives (config frame); the jobs survive (durable jobs log); the
         // non-durable leases log is gone ⇒ all 3 jobs are claimable again
         // (self-healing visibility timeout, DESIGN §10.6).
@@ -1826,9 +1826,9 @@ mod tests {
                 ..ServerConfig::default()
             };
             let engine = Engine::with_data_dir(cfg, Arc::new(clock.clone())).unwrap();
-            let st = engine.box_state("jobs", false).unwrap();
-            assert_eq!(st.r#type, BoxType::Queue, "queue type survives restart");
-            assert!(engine.get_box("jobs").unwrap().is_queue());
+            let st = engine.topic_state("jobs", false).unwrap();
+            assert_eq!(st.r#type, TopicType::Queue, "queue type survives restart");
+            assert!(engine.get_topic("jobs").unwrap().is_queue());
             // The previously in-flight job has no replayed lease ⇒ claimable.
             assert_eq!(st.queue.as_ref().unwrap().in_flight, 0);
             assert_eq!(st.queue.as_ref().unwrap().ready, 3, "all jobs claimable");

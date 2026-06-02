@@ -11,8 +11,8 @@ streams exposes three operational endpoints — **liveness**, **readiness**, and
 plus an inline `performance` block on every JSON response. The probes are designed for
 load-balancer and Kubernetes health checks, and crucially the readiness probe gates traffic
 during **WAL replay** on boot. The metrics surface is a **full catalog** — process/aggregate
-gauges, per-box gauges, real WAL counters, and a fsync-latency histogram (see below) — not a
-box-count stub.
+gauges, per-topic gauges, real WAL counters, and a fsync-latency histogram (see below) — not a
+topic-count stub.
 
 ## Liveness — health
 
@@ -56,7 +56,7 @@ curl -i localhost:4000/v0/ready
 
 ```json
 # → 200 OK when serving
-{ "status": "ready", "wal_replay_complete": true, "boxes": 42 }
+{ "status": "ready", "wal_replay_complete": true, "topics": 42 }
 ```
 
 While replaying the WAL, it returns `503 not_ready` with a `Retry-After` header and a replay
@@ -73,7 +73,7 @@ progress fraction:
 
 | State | HTTP | `error.code` | Body |
 |---|---|---|---|
-| Serving | `200` | — | `{ status, wal_replay_complete: true, boxes }` |
+| Serving | `200` | — | `{ status, wal_replay_complete: true, topics }` |
 | Booting (WAL replay) | `503` | `not_ready` | `Retry-After` + `error.detail.replay_progress` (0.0–1.0) |
 | Draining (shutdown) | `503` | `shutting_down` | `Retry-After` |
 
@@ -135,22 +135,22 @@ curl -H 'accept: application/json' localhost:4000/v0/metrics
   scope (a full-access key suffices). In dev mode (no keys) it is open.
 </Callout>
 
-`/v0/metrics` emits a **full catalog**: process/aggregate gauges (`streams_boxes`,
-`streams_boxes_by_class{class=…}`, `streams_routers`, `streams_records_live`,
-`streams_bytes_live`, `streams_queue_boxes`, `streams_queue_leases_in_flight`,
+`/v0/metrics` emits a **full catalog**: process/aggregate gauges (`streams_topics`,
+`streams_topics_by_class{class=…}`, `streams_routers`, `streams_records_live`,
+`streams_bytes_live`, `streams_queue_topics`, `streams_queue_leases_in_flight`,
 `streams_sse_connections`, `streams_watch_sessions`, `streams_ready`,
-`streams_recovery_progress`, `streams_uptime_ms`), **per-box gauges** (`streams_box_head_seq` /
+`streams_recovery_progress`, `streams_uptime_ms`), **per-topic gauges** (`streams_topic_head_seq` /
 `_earliest_seq` / `_records_live` / `_bytes_live` / `_queue_ready` / `_queue_in_flight`,
-labelled `{box=…}`, bounded by `streams_box_metrics_truncated`), real **WAL counters**
+labelled `{topic=…}`, bounded by `streams_topic_metrics_truncated`), real **WAL counters**
 (`streams_wal_frames_total` / `_batches_total` / `_fsyncs_total` / `_bytes_written_total` /
 `_rotations_total` / `_queue_depth` / `_queue_depth_peak` / `_submit_full_total` /
 `_read_only`), and a **fsync-latency histogram** `streams_wal_fsync_latency_us`. There are no
-per-box append/read/eviction/tombstone counters and no scheduler-throttle metric.
+per-topic append/read/eviction/tombstone counters and no scheduler-throttle metric.
 
 ```json
 # Accept: application/json — the JSON snapshot mirrors the same series in one object
-{ "boxes": 42, "boxes_memory": 3, "boxes_disk": 30, "boxes_fsync": 9, "routers": 5,
-  "records_live": 1843201, "bytes_live": 734003200, "queue_boxes": 2,
+{ "topics": 42, "topics_memory": 3, "topics_disk": 30, "topics_fsync": 9, "routers": 5,
+  "records_live": 1843201, "bytes_live": 734003200, "queue_topics": 2,
   "queue_leases_in_flight": 286, "sse_connections": 41, "watch_sessions": 44,
   "ready": true, "replay_progress": 1.0, "uptime_ms": 360123,
   "wal": { "fsyncs": 88241, "frames": 1843290, "batches": 90011,
@@ -186,7 +186,7 @@ when it does not apply to that call.
 |---|---|---|
 | `server_total_ms` | always | Total server-side handling time for the request. |
 | `wal_append_ms` | writes | Time to serialize and enqueue the WAL frame(s). |
-| `fsync_ms` | durable writes | Time parked on the group-commit fsync. `0.0` on non-durable (`disk`/`memory`) boxes. |
+| `fsync_ms` | durable writes | Time parked on the group-commit fsync. `0.0` on non-durable (`disk`/`memory`) topics. |
 | `records_scanned` | reads | Records examined (including filtered/deleted/own-node ones the cursor advanced past). |
 | `throttle_wait_ms` | under pressure | Time parked behind the elastic scheduler before the call ran. |
 | `cold_segments_read` | cold-tier reads | Number of [cold-tier](/deployment/storage-and-tiering#hotcold-tiering) segments touched. Present only when a read reached cold storage. |

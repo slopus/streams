@@ -14,7 +14,7 @@ ecosystem breadth. This page compares them dimension by dimension and is honest 
 Redis is the better choice.
 
 <Callout type="info">
-  Redis Streams (the `XADD` / `XREADGROUP` data type) is the real analog to a streams box.
+  Redis Streams (the `XADD` / `XREADGROUP` data type) is the real analog to a streams topic.
   Redis **Pub/Sub** is a different primitive — at-most-once, no persistence — covered in its
   own section below.
 </Callout>
@@ -25,9 +25,9 @@ Redis Streams is an in-memory append log. Each entry gets an ID of the form `<ms
 and a flat field/value map as its payload. Reads are by ID (`XRANGE`, `XREAD`), and
 consumer groups track per-group delivery state.
 
-streams is an append-only log of JSON records in named **boxes**. Each record gets a
+streams is an append-only log of JSON records in named **topics**. Each record gets a
 monotonic `$seq` (a `u64`) and a `$ts`, and the **`$seq` is the cursor** — you read with
-`POST /v0/boxes/:box/diff` from a `from_seq` and advance your stored cursor to ack. Payloads
+`POST /v0/topics/:topic/diff` from a `from_seq` and advance your stored cursor to ack. Payloads
 are arbitrary JSON `data`, with optional `tag` and `meta`. Both are logs you read forward;
 the difference is that streams persists to a write-ahead log on disk by default and exposes
 the cursor as a plain integer rather than an opaque entry ID.
@@ -41,7 +41,7 @@ can be lost on a crash — up to roughly the last second. There is no way to say
 stream is fsync-durable and that one is throwaway"; the persistence policy applies to the
 whole instance.
 
-streams makes durability a **per-box** decision via [durability classes](/guarantees/durability):
+streams makes durability a **per-topic** decision via [durability classes](/guarantees/durability):
 
 - **`memory`** — _disk-like but best-effort_: the same group-committed WAL path as `disk`, fully
   queryable, but with no durability guarantee — records MAY survive OR be lost on restart (the
@@ -51,15 +51,15 @@ streams makes durability a **per-box** decision via [durability classes](/guaran
 - **`fsync`** — the ack is **fsync-gated**: it is held until the group `fsync` completes, so
   an acknowledged write is committed and survives any crash, recovered by WAL replay.
 
-A best-effort `memory` cache box, a group-committed feed, and an `fsync`-gated job queue
+A best-effort `memory` cache topic, a group-committed feed, and an `fsync`-gated job queue
 coexist in one process, each buying exactly the guarantee it needs.
 
 <Callout type="warning">
   This is the central trade in Redis's favor on the *availability* axis: Redis replicates
   (async by default; `WAIT` is best-effort, not strongly consistent) and can fail over.
   streams is **single node** — one process is the entire durability and failure domain, with
-  **no replication or failover**. A durable `fsync` write survives a crash of that box, but
-  the box being down means the service is down.
+  **no replication or failover**. A durable `fsync` write survives a crash of that topic, but
+  the topic being down means the service is down.
 </Callout>
 
 ## Gap & loss detection
@@ -88,7 +88,7 @@ streams separates the two intents:
 
 - **Caps and TTL** (`cap_records`, `cap_bytes`, `ttl_ms`) are involuntary bounding — crossing
   a reader's cursor produces a tombstone.
-- **[Deletes](/guarantees/deletion)** (`POST /v0/boxes/:box/delete`) are **targeted,
+- **[Deletes](/guarantees/deletion)** (`POST /v0/topics/:topic/delete`) are **targeted,
   permanent, and point-in-time**: you remove records that exist *right now* by `seq` range
   and/or `tag` match (exact or prefix). A delete is effective immediately on all reads, never
   emits a tombstone, and never affects future records with the same tag. Deleting by tag
@@ -100,13 +100,13 @@ Redis consumer groups give at-least-once work distribution via the **Pending Ent
 (PEL): `XREADGROUP` claims entries, `XACK` confirms them, and `XCLAIM` / `XAUTOCLAIM`
 reclaim entries whose consumer died. This is mature, battle-tested tooling.
 
-streams provides native **[lease queues](/api/queues)** on the same log substrate. A box of
-`type:"queue"` is claimed with `POST /v0/boxes/:q/claim` (returning a `lease_id` and a
+streams provides native **[lease queues](/api/queues)** on the same log substrate. A topic of
+`type:"queue"` is claimed with `POST /v0/topics/:q/claim` (returning a `lease_id` and a
 `deadline`), confirmed with `ack` (the ack **is** the permanent delete), and released early
 with `nack` or extended with `extend`. Lease expiry is lazy — there are no per-job timers —
 so a crashed worker's jobs become reclaimable after the visibility timeout. Unlike Redis,
 streams also offers a built-in **dead-letter move**: after `max_deliveries`, a job is moved
-to a configured dead-letter box (stamped with provenance) rather than redelivered forever.
+to a configured dead-letter topic (stamped with provenance) rather than redelivered forever.
 
 <Callout type="info">
   Redis consumer-group tooling (`XAUTOCLAIM`, consumer lag introspection) is more mature and
@@ -125,7 +125,7 @@ Cluster shards keyspace across nodes for horizontal capacity, and managed offeri
 (ElastiCache, Redis Cloud, Valkey) handle failover for you.
 
 streams has **none of this**: no replication, no failover, no clustering, no managed
-service. One NVMe box is the whole system. This is the honest cost of its simplicity.
+service. One NVMe-backed machine is the whole system. This is the honest cost of its simplicity.
 
 ## Protocol & ecosystem
 
@@ -148,7 +148,7 @@ real-time broadcast where missing a message is acceptable (cache invalidation pi
 presence) and you want the absolute minimum overhead.
 
 streams' nearest equivalent is [watch over SSE](/api/watch): multiplexed live delivery across
-many boxes on one connection — but backed by a durable log, so a watcher can reconnect with
+many topics on one connection — but backed by a durable log, so a watcher can reconnect with
 `Last-Event-ID` (or just `diff` from a stored cursor) and catch up on everything it missed.
 If at-most-once broadcast with zero durability is genuinely all you need, Redis Pub/Sub is
 lighter; if you ever need replay, Pub/Sub cannot give it to you and streams can.
@@ -160,7 +160,7 @@ lighter; if you ever need replay, Pub/Sub cannot give it to you and streams can.
     <h4>streams wins when</h4>
     <ul>
       <li>You need an explicit, in-band <strong>gap/loss signal</strong> at delivery time, not a silent trim plus a lag metric.</li>
-      <li>You want <strong>per-box durability classes</strong> instead of one global AOF/RDB policy.</li>
+      <li>You want <strong>per-topic durability classes</strong> instead of one global AOF/RDB policy.</li>
       <li>Retained history must outlive RAM and survive a crash via WAL replay.</li>
       <li>You need <strong>targeted, permanent deletes</strong> by seq range or tag (e.g. GDPR/tenant purge by tag prefix).</li>
       <li>You want plain <strong>HTTP/JSON + SSE</strong> and <code>curl</code> as a client, with built-in routers for fan-out.</li>
@@ -181,6 +181,6 @@ lighter; if you ever need replay, Pub/Sub cannot give it to you and streams can.
 ## See also
 
 - [Comparisons overview](/comparisons) — the full capability matrix.
-- [Durability classes](/guarantees/durability) — `memory` / `disk` / `fsync` per box.
+- [Durability classes](/guarantees/durability) — `memory` / `disk` / `fsync` per topic.
 - [Tombstones](/guarantees/tombstones) — the explicit gap signal Redis trimming lacks.
 - [Queues API](/api/queues) — lease-based work distribution.

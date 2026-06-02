@@ -54,15 +54,15 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
 use streams::types::{
-    BoxConfig, BoxType, DiffRequest, Durability, RecordIn, RouterCreateRequest, WriteRequest,
+    TopicConfig, TopicType, DiffRequest, Durability, RecordIn, RouterCreateRequest, WriteRequest,
 };
 
 // ===========================================================================
 // Reference model (the oracle) — the durability-class-aware subset of the
-// `tests/crash_oracle.rs` RefModel. A `memory` box is modeled like a `disk` box
+// `tests/crash_oracle.rs` RefModel. A `memory` topic is modeled like a `disk` topic
 // for the no-fabrication universe (`ever_acked`), but it carries NO durability
 // guarantee: its survivors after a restart are an UNCONSTRAINED subset of
-// `ever_acked` (MAY survive OR be lost). A `disk`/`fsync` box keeps acked records,
+// `ever_acked` (MAY survive OR be lost). A `disk`/`fsync` topic keeps acked records,
 // with `fsync` being must-survive.
 // ===========================================================================
 
@@ -74,11 +74,11 @@ struct ModelRecord {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ModelBox {
+struct ModelTopic {
     class: Class,
-    /// Every acked record by seq (the must-survive set for an `fsync` box; the
-    /// clean-restart survivor set for a `disk` box; never survives a crash for a
-    /// `memory` box).
+    /// Every acked record by seq (the must-survive set for an `fsync` topic; the
+    /// clean-restart survivor set for a `disk` topic; never survives a crash for a
+    /// `memory` topic).
     acked: BTreeMap<u64, ModelRecord>,
     /// Every record ever acked (deletes/evictions never remove) — the universe a
     /// recovered seq is ever allowed to be (no fabrication: survivors ⊆ ever_acked).
@@ -106,7 +106,7 @@ impl Class {
     }
 }
 
-impl ModelBox {
+impl ModelTopic {
     fn live_seqs(&self) -> Vec<u64> {
         self.acked
             .keys()
@@ -118,12 +118,12 @@ impl ModelBox {
 
 #[derive(Debug, Default)]
 struct RefModel {
-    boxes: BTreeMap<String, ModelBox>,
+    topics: BTreeMap<String, ModelTopic>,
 }
 
 impl RefModel {
-    fn ensure_box(&mut self, name: &str, class: Class, cap: u64) {
-        self.boxes.entry(name.to_string()).or_insert(ModelBox {
+    fn ensure_topic(&mut self, name: &str, class: Class, cap: u64) {
+        self.topics.entry(name.to_string()).or_insert(ModelTopic {
             class,
             cap,
             ..Default::default()
@@ -131,7 +131,7 @@ impl RefModel {
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], recs: &[ModelRecord]) {
-        let b = self.boxes.get_mut(name).expect("box modeled before append");
+        let b = self.topics.get_mut(name).expect("topic modeled before append");
         for (s, r) in seqs.iter().zip(recs.iter()) {
             b.acked.insert(*s, r.clone());
             b.ever_acked.insert(*s, r.clone());
@@ -161,7 +161,7 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox {
+    PutTopic {
         name: String,
         class: Class,
         cap: u64,
@@ -177,15 +177,15 @@ enum Op {
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
     for op in ops {
         match op {
-            Op::PutBox { name, class, cap } => {
-                let cfg = BoxConfig {
-                    r#type: BoxType::Log,
+            Op::PutTopic { name, class, cap } => {
+                let cfg = TopicConfig {
+                    r#type: TopicType::Log,
                     durability: Some(class.durability()),
                     cap_records: *cap,
                     ..Default::default()
                 };
-                if engine.put_box(name, cfg).is_ok() {
-                    model.ensure_box(name, *class, *cap);
+                if engine.put_topic(name, cfg).is_ok() {
+                    model.ensure_topic(name, *class, *cap);
                 }
             }
             Op::Append {
@@ -207,9 +207,9 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     config: None,
                     disable_backpressure: true,
                 };
-                if !model.boxes.contains_key(name) {
+                if !model.topics.contains_key(name) {
                     // Auto-created here ⇒ default config (disk class).
-                    model.ensure_box(name, Class::Disk, 0);
+                    model.ensure_topic(name, Class::Disk, 0);
                 }
                 if let Ok(resp) = engine.write(name, req, true) {
                     let seqs = resp.seqs.clone().unwrap_or_else(|| vec![resp.last_seq]);
@@ -251,7 +251,7 @@ fn open_engine_fs(fs: Arc<dyn Fs>) -> Arc<Engine> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -260,9 +260,9 @@ struct BoxDump {
 }
 
 /// Read the full recovered state of `name` through the engine's public API.
-/// `None` if the box does not exist post-recovery.
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+/// `None` if the topic does not exist post-recovery.
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone_reason = None;
     let mut from = 0u64;
@@ -305,7 +305,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -323,11 +323,11 @@ fn sync_wal_dir(disk: &FakeDisk) {
 }
 
 // ===========================================================================
-// The oracle: diff a recovered box against the model under the class contract.
+// The oracle: diff a recovered topic against the model under the class contract.
 // `whole_tail_durable` is true on a clean stop or an all-acked-fsync crash.
 // ===========================================================================
 
-fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_durable: bool) {
+fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 
@@ -344,7 +344,7 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         );
     }
 
-    // (2) NO SILENT LOSS for an `fsync` box when the whole tail was durable.
+    // (2) NO SILENT LOSS for an `fsync` topic when the whole tail was durable.
     if model.class == Class::Fsync && whole_tail_durable {
         for seq in &live {
             assert!(
@@ -356,7 +356,7 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
     }
 
     // (3) NO GAP — survivors are a dense prefix of the model's live set. A `memory`
-    //     box is EXEMPT: it is best-effort/lossy (§0.10), so it may lose ANY records
+    //     topic is EXEMPT: it is best-effort/lossy (§0.10), so it may lose ANY records
     //     (not just a tail) — a hole below the surviving high-water is permitted.
     //     Only the no-fabrication (1) + head-monotone (4) checks bind it.
     if model.class != Class::Memory {
@@ -385,10 +385,10 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
     // (4) HEAD MONOTONE / NO SEQ REUSE (R3). The recovered head never REGRESSES
     //     below the highest acked seq when the whole tail is durable (a clean stop /
     //     all-fsync crash) — an already-acked seq is never re-handed. A `disk`-class
-    //     box (acked before fsync) recovers at its durable head RESERVATION, so its
+    //     topic (acked before fsync) recovers at its durable head RESERVATION, so its
     //     head may sit ABOVE the acked head by up to `DISK_HEAD_RESERVE_AHEAD` (the
-    //     dropped un-fsynced tail becomes silent deleted gaps); an `fsync` box has
-    //     no reservation, so its head matches the acked head exactly. A `memory` box
+    //     dropped un-fsynced tail becomes silent deleted gaps); an `fsync` topic has
+    //     no reservation, so its head matches the acked head exactly. A `memory` topic
     //     is best-effort (§0.10): its head never EXCEEDS the acked head (no future
     //     seq / no fabrication), but it may be anywhere from 0 up to the acked head
     //     (records may survive or be lost) — only the no-future-seq bound binds.
@@ -544,17 +544,17 @@ impl Fs for CrashAfter {
 //    never exceeds the acked head. NO exact empty-on-restart / full-survival.
 // ===========================================================================
 
-/// A `memory` box is best-effort across a CLEAN restart: the config always
-/// survives (a control-frame mutation), the box is fully queryable pre-restart,
+/// A `memory` topic is best-effort across a CLEAN restart: the config always
+/// survives (a control-frame mutation), the topic is fully queryable pre-restart,
 /// and the acked write is never fsync-gated. Post-restart the records MAY survive
 /// OR be lost — assert only the weak contract (no fabrication, head monotone), NOT
 /// an exact empty-on-restart.
 #[test]
-fn memory_box_best_effort_across_clean_restart() {
+fn memory_topic_best_effort_across_clean_restart() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
     let ops = vec![
-        Op::PutBox {
+        Op::PutTopic {
             name: "mem".into(),
             class: Class::Memory,
             cap: 0,
@@ -581,9 +581,9 @@ fn memory_box_best_effort_across_clean_restart() {
     {
         let engine = open_engine(&disk);
         run_ops(&engine, &mut model, &ops);
-        // The box reports the live records BEFORE restart (fully queryable).
-        let pre = dump_box(&engine, "mem").expect("mem box live pre-restart");
-        assert_eq!(pre.head, 3, "memory box head advances + is queryable");
+        // The topic reports the live records BEFORE restart (fully queryable).
+        let pre = dump_topic(&engine, "mem").expect("mem topic live pre-restart");
+        assert_eq!(pre.head, 3, "memory topic head advances + is queryable");
         assert_eq!(pre.count, 3);
         // A memory write is never fsync-gated (best-effort, no durability promise).
         let req = WriteRequest {
@@ -621,19 +621,19 @@ fn memory_box_best_effort_across_clean_restart() {
     // Reopen cleanly: the config ALWAYS persists. Records are best-effort — assert
     // only the weak contract (no fabrication, head monotone, may survive or be lost).
     let engine = open_engine(&disk);
-    let st = engine.box_state("mem", false).unwrap();
+    let st = engine.topic_state("mem", false).unwrap();
     assert_eq!(
         st.config.durability_class(),
         Durability::Memory,
         "memory class config persisted"
     );
-    let dump = dump_box(&engine, "mem").expect("memory box config persists across restart");
+    let dump = dump_topic(&engine, "mem").expect("memory topic config persists across restart");
     // whole_tail_durable=false: the WEAK contract (no fabrication + head monotone;
-    // a memory box may lose any records, even a non-tail hole).
-    assert_box_contract("mem", &model.boxes["mem"], &dump, false);
+    // a memory topic may lose any records, even a non-tail hole).
+    assert_topic_contract("mem", &model.topics["mem"], &dump, false);
 
-    // The box is fully functional post-restart: a fresh write advances head by 1.
-    let before = engine.box_state("mem", false).unwrap().head_seq;
+    // The topic is fully functional post-restart: a fresh write advances head by 1.
+    let before = engine.topic_state("mem", false).unwrap().head_seq;
     let req = WriteRequest {
         records: vec![RecordIn {
             data: json!({ "v": "z" }),
@@ -649,30 +649,30 @@ fn memory_box_best_effort_across_clean_restart() {
     };
     engine.write("mem", req, true).unwrap();
     assert_eq!(
-        engine.box_state("mem", false).unwrap().head_seq,
+        engine.topic_state("mem", false).unwrap().head_seq,
         before + 1,
         "a post-restart memory write advances head by 1"
     );
 }
 
-/// A `memory` box across a CRASH MID-WRITE: best-effort recovery never fabricates
+/// A `memory` topic across a CRASH MID-WRITE: best-effort recovery never fabricates
 /// and never exceeds the acked head. A `disk`-class sibling in the SAME workload
 /// recovers its acked prefix. Both honor the no-fabrication subset contract; the
-/// memory box additionally may lose ANY records (not just a tail).
+/// memory topic additionally may lose ANY records (not just a tail).
 #[test]
-fn memory_box_crash_mid_write_best_effort() {
-    // Sweep a few crash points; the memory box must ALWAYS satisfy the weak contract.
+fn memory_topic_crash_mid_write_best_effort() {
+    // Sweep a few crash points; the memory topic must ALWAYS satisfy the weak contract.
     for crash_at in [0u64, 2, 5, 9] {
         let disk = FakeDisk::with_seed(0x0E11_u64.wrapping_add(crash_at));
         let trip = CrashAfter::new(disk.clone(), crash_at);
         let mut model = RefModel::default();
         let mut ops = vec![
-            Op::PutBox {
+            Op::PutTopic {
                 name: "mem".into(),
                 class: Class::Memory,
                 cap: 0,
             },
-            Op::PutBox {
+            Op::PutTopic {
                 name: "dsk".into(),
                 class: Class::Disk,
                 cap: 0,
@@ -700,15 +700,15 @@ fn memory_box_crash_mid_write_best_effort() {
         disk.reset_power();
 
         let engine = open_engine(&disk);
-        // The memory box is best-effort: whatever recovers must satisfy the weak
+        // The memory topic is best-effort: whatever recovers must satisfy the weak
         // contract (no fabrication, head monotone) — it may have kept records or
         // come back empty, both are valid.
-        if let Some(dump) = dump_box(&engine, "mem") {
-            assert_box_contract("mem", &model.boxes["mem"], &dump, false);
+        if let Some(dump) = dump_topic(&engine, "mem") {
+            assert_topic_contract("mem", &model.topics["mem"], &dump, false);
         }
-        // The disk box recovers a dense prefix (subset contract) — no fabrication.
-        if let Some(dump) = dump_box(&engine, "dsk") {
-            assert_box_contract("dsk", &model.boxes["dsk"], &dump, false);
+        // The disk topic recovers a dense prefix (subset contract) — no fabrication.
+        if let Some(dump) = dump_topic(&engine, "dsk") {
+            assert_topic_contract("dsk", &model.topics["dsk"], &dump, false);
         }
     }
 }
@@ -718,13 +718,13 @@ fn memory_box_crash_mid_write_best_effort() {
 //    un-fsynced tail (a dense prefix, never a hole, never a torn misread).
 // ===========================================================================
 
-/// A `disk` box survives a CLEAN stop + reopen fully (the writer drains + fsyncs
+/// A `disk` topic survives a CLEAN stop + reopen fully (the writer drains + fsyncs
 /// on drop), recovering every acked record as a dense prefix matching the model.
 #[test]
-fn disk_box_survives_clean_restart() {
+fn disk_topic_survives_clean_restart() {
     let disk = FakeDisk::new();
     let mut model = RefModel::default();
-    let mut ops = vec![Op::PutBox {
+    let mut ops = vec![Op::PutTopic {
         name: "d".into(),
         class: Class::Disk,
         cap: 0,
@@ -744,29 +744,29 @@ fn disk_box_survives_clean_restart() {
         drop(engine); // clean stop: Drop drains + fsyncs the writer.
     }
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "d").expect("disk box survives clean restart");
+    let dump = dump_topic(&engine, "d").expect("disk topic survives clean restart");
     // A clean teardown hardens the whole tail ⇒ all 8 acked records recover.
     assert_eq!(
         dump.records.len(),
         8,
-        "disk box recovers all acked writes on a clean restart"
+        "disk topic recovers all acked writes on a clean restart"
     );
-    assert_box_contract("d", &model.boxes["d"], &dump, true);
+    assert_topic_contract("d", &model.topics["d"], &dump, true);
 }
 
-/// A `disk` box under a power loss (crash) loses ONLY the un-fsynced tail: the
+/// A `disk` topic under a power loss (crash) loses ONLY the un-fsynced tail: the
 /// survivors are a dense prefix of the acked set — never a hole, never a
 /// fabricated/torn frame. Swept over a bounded set of crash points + a couple of
 /// torn-damage modes, all with fixed seeds.
 #[test]
-fn disk_box_crash_loses_only_unfsynced_tail() {
+fn disk_topic_crash_loses_only_unfsynced_tail() {
     // Size the write_at call space first (at = u64::MAX ⇒ never fires).
     let total_writes = {
         let probe_disk = FakeDisk::new();
         let probe = CrashAfter::new(probe_disk.clone(), u64::MAX);
         let mut throwaway = RefModel::default();
         let engine = open_engine_fs(probe.arc());
-        let mut ops = vec![Op::PutBox {
+        let mut ops = vec![Op::PutTopic {
             name: "d".into(),
             class: Class::Disk,
             cap: 0,
@@ -799,7 +799,7 @@ fn disk_box_crash_loses_only_unfsynced_tail() {
         let disk = FakeDisk::with_seed(0xD15C_0000 ^ crash_at);
         let trip = CrashAfter::new(disk.clone(), crash_at);
         let mut model = RefModel::default();
-        let mut ops = vec![Op::PutBox {
+        let mut ops = vec![Op::PutTopic {
             name: "d".into(),
             class: Class::Disk,
             cap: 0,
@@ -820,18 +820,18 @@ fn disk_box_crash_loses_only_unfsynced_tail() {
         disk.reset_power();
 
         let engine = open_engine(&disk);
-        if let Some(dump) = dump_box(&engine, "d") {
+        if let Some(dump) = dump_topic(&engine, "d") {
             // Crash mid-stream ⇒ the un-fsynced tail may be gone; survivors must
             // be a dense prefix with no fabrication (subset contract).
-            assert_box_contract("d", &model.boxes["d"], &dump, false);
+            assert_topic_contract("d", &model.topics["d"], &dump, false);
         }
 
         // Idempotent recovery at a couple of points: recover(recover(x)) == recover(x).
         if crash_at % 5 == 0 {
-            let d1 = dump_box(&engine, "d");
+            let d1 = dump_topic(&engine, "d");
             drop(engine);
             let engine2 = open_engine(&disk);
-            let d2 = dump_box(&engine2, "d");
+            let d2 = dump_topic(&engine2, "d");
             assert_eq!(d1, d2, "disk recovery idempotent at crash_at {crash_at}");
         }
     }
@@ -841,11 +841,11 @@ fn disk_box_crash_loses_only_unfsynced_tail() {
 // 3) FSYNC class: every acked write survives a kill-9 (acked ⇒ durable).
 // ===========================================================================
 
-/// An `fsync` box: every write whose ack returned (its group fsync returned) is
+/// An `fsync` topic: every write whose ack returned (its group fsync returned) is
 /// durable — a power loss (kill-9) after the acks loses NOTHING. The model's live
 /// set survives intact, seq monotone, no gap, across torn-damage modes.
 #[test]
-fn fsync_box_acked_writes_survive_kill9() {
+fn fsync_topic_acked_writes_survive_kill9() {
     for &damage in &[
         TornDamage::None,
         TornDamage::PrefixTruncate,
@@ -853,7 +853,7 @@ fn fsync_box_acked_writes_survive_kill9() {
     ] {
         let disk = FakeDisk::with_seed(0xF59C ^ damage as u64);
         let mut model = RefModel::default();
-        let mut ops = vec![Op::PutBox {
+        let mut ops = vec![Op::PutTopic {
             name: "f".into(),
             class: Class::Fsync,
             cap: 0,
@@ -877,13 +877,13 @@ fn fsync_box_acked_writes_survive_kill9() {
         }
         disk.reset_power();
         let engine = open_engine(&disk);
-        let dump = dump_box(&engine, "f").expect("fsync box survives kill-9");
+        let dump = dump_topic(&engine, "f").expect("fsync topic survives kill-9");
         assert_eq!(
             dump.records.len(),
             6,
             "all 6 acked fsync writes survive kill-9 ({damage:?})"
         );
-        assert_box_contract("f", &model.boxes["f"], &dump, true);
+        assert_topic_contract("f", &model.topics["f"], &dump, true);
         assert_eq!(dump.head, 6, "fsync head fully recovered ({damage:?})");
     }
 }
@@ -895,13 +895,13 @@ fn fsync_box_acked_writes_survive_kill9() {
 /// must-survive (live) set is present below the surviving high-water, no
 /// fabrication, no hole.
 #[test]
-fn fsync_box_sweep_acked_always_durable() {
+fn fsync_topic_sweep_acked_always_durable() {
     let total_writes = {
         let probe_disk = FakeDisk::new();
         let probe = CrashAfter::new(probe_disk.clone(), u64::MAX);
         let mut throwaway = RefModel::default();
         let engine = open_engine_fs(probe.arc());
-        let mut ops = vec![Op::PutBox {
+        let mut ops = vec![Op::PutTopic {
             name: "f".into(),
             class: Class::Fsync,
             cap: 0,
@@ -926,7 +926,7 @@ fn fsync_box_sweep_acked_always_durable() {
         let disk = FakeDisk::with_seed(0x5EE0 ^ crash_at);
         let trip = CrashAfter::new(disk.clone(), crash_at);
         let mut model = RefModel::default();
-        let mut ops = vec![Op::PutBox {
+        let mut ops = vec![Op::PutTopic {
             name: "f".into(),
             class: Class::Fsync,
             cap: 0,
@@ -947,11 +947,11 @@ fn fsync_box_sweep_acked_always_durable() {
         disk.reset_power();
 
         let engine = open_engine(&disk);
-        if let Some(dump) = dump_box(&engine, "f") {
+        if let Some(dump) = dump_topic(&engine, "f") {
             // Crash mid-stream: cannot pin which acked op's fsync truly landed
             // relative to the freeze, so use the subset relaxation. The key
             // guarantee: no fabrication + no hole in the live set below high-water.
-            assert_box_contract("f", &model.boxes["f"], &dump, false);
+            assert_topic_contract("f", &model.topics["f"], &dump, false);
         }
     }
 }
@@ -972,9 +972,9 @@ fn router_into_memory_dest_best_effort() {
         let engine = open_engine(&disk);
         // Durable source.
         engine
-            .put_box(
+            .put_topic(
                 "src",
-                BoxConfig {
+                TopicConfig {
                     durability: Some(Durability::Fsync),
                     ..Default::default()
                 },
@@ -982,9 +982,9 @@ fn router_into_memory_dest_best_effort() {
             .unwrap();
         // Memory destination.
         engine
-            .put_box(
+            .put_topic(
                 "mem_dst",
-                BoxConfig {
+                TopicConfig {
                     durability: Some(Durability::Memory),
                     ..Default::default()
                 },
@@ -1021,7 +1021,7 @@ fn router_into_memory_dest_best_effort() {
             engine.write("src", req, true).unwrap();
         }
         // Pre-restart: the forwarded copies are visible + queryable in the dest.
-        let dst = dump_box(&engine, "mem_dst").expect("mem dest live pre-restart");
+        let dst = dump_topic(&engine, "mem_dst").expect("mem dest live pre-restart");
         assert_eq!(
             dst.count, 4,
             "router forwarded 4 copies into the memory dest (queryable)"
@@ -1034,12 +1034,12 @@ fn router_into_memory_dest_best_effort() {
     // survives. The forwarded copies are best-effort — assert only the weak
     // contract (head monotone, no fabrication; they may survive or be lost).
     let engine = open_engine(&disk);
-    let src = dump_box(&engine, "src").expect("durable source recovers");
+    let src = dump_topic(&engine, "src").expect("durable source recovers");
     assert_eq!(src.records.len(), 4, "durable router source fully recovers");
-    let dst = dump_box(&engine, "mem_dst").expect("memory dest config persists");
+    let dst = dump_topic(&engine, "mem_dst").expect("memory dest config persists");
     assert_eq!(
         engine
-            .box_state("mem_dst", false)
+            .topic_state("mem_dst", false)
             .unwrap()
             .config
             .durability,
@@ -1062,8 +1062,8 @@ fn router_into_memory_dest_best_effort() {
 
 // ===========================================================================
 // 5) BOUNDED concurrency stress: many threads writing durable (fsync) appends to
-//    one box, then a clean restart — every acked write survives as a contiguous
-//    [1..=N] (the off-lock-fsync + per-box commit-sequencer invariant under
+//    one topic, then a clean restart — every acked write survives as a contiguous
+//    [1..=N] (the off-lock-fsync + per-topic commit-sequencer invariant under
 //    contention). High-thread oracle stress (loom/shuttle are not wired into the
 //    crate, so this is the robust-stress alternative the harness note prescribes).
 // ===========================================================================
@@ -1077,9 +1077,9 @@ fn fsync_concurrent_writers_commit_sequencer_no_loss_across_restart() {
     {
         let engine = open_engine(&disk);
         engine
-            .put_box(
+            .put_topic(
                 "hot",
-                BoxConfig {
+                TopicConfig {
                     durability: Some(Durability::Fsync),
                     ..Default::default()
                 },
@@ -1111,7 +1111,7 @@ fn fsync_concurrent_writers_commit_sequencer_no_loss_across_restart() {
         for h in handles {
             h.join().unwrap();
         }
-        let st = engine.box_state("hot", false).unwrap();
+        let st = engine.topic_state("hot", false).unwrap();
         assert_eq!(st.head_seq, total, "all concurrent fsync writes acked");
         assert_eq!(st.count, total);
         sync_wal_dir(&disk);
@@ -1122,7 +1122,7 @@ fn fsync_concurrent_writers_commit_sequencer_no_loss_across_restart() {
     // (apply-in-WAL-order, skip seq<=head) finds a dense, contiguous [1..=total]
     // with no acked-durable loss and no fabricated/duplicate seq.
     let engine = open_engine(&disk);
-    let st = engine.box_state("hot", false).unwrap();
+    let st = engine.topic_state("hot", false).unwrap();
     assert_eq!(
         st.head_seq, total,
         "no acked fsync write lost across restart"

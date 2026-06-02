@@ -5,7 +5,7 @@
 //! budget so it can never hang.
 //!
 //! Flow (README §1–§6, ROADMAP Phase-2 acceptance):
-//!   create box -> write 2 records -> GET state -> diff (seqs/caught_up)
+//!   create topic -> write 2 records -> GET state -> diff (seqs/caught_up)
 //!   -> tag-delete -> diff again (suppressed) -> router fan-out
 //!   -> watch session + first SSE `record` + `caught-up` frames
 //!   -> node loop-prevention (a node never reads its own records).
@@ -65,16 +65,16 @@ async fn req_json(
 async fn quickstart_end_to_end() {
     let app = app();
 
-    // -- §1 Create a box (explicit config) -----------------------------------
+    // -- §1 Create a topic (explicit config) -----------------------------------
     let (status, body) = req_json(
         &app,
         "PUT",
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         Some(json!({ "durable": true, "cap_records": 1_000_000, "ttl_ms": 0 })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "first PUT creates -> 201");
-    assert_eq!(body["box"], "jobs");
+    assert_eq!(body["topic"], "jobs");
     assert_eq!(body["created"], true);
     // Documented config defaults must be echoed verbatim.
     let cfg = &body["config"];
@@ -91,7 +91,7 @@ async fn quickstart_end_to_end() {
     assert!(body["performance"]["server_total_ms"].is_number());
 
     // A second PUT is idempotent -> 200, created:false.
-    let (status, body) = req_json(&app, "PUT", "/v0/boxes/jobs", Some(json!({}))).await;
+    let (status, body) = req_json(&app, "PUT", "/v0/topics/jobs", Some(json!({}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["created"], false);
 
@@ -99,7 +99,7 @@ async fn quickstart_end_to_end() {
     let (status, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         Some(json!({
             "node": "worker-eu-1",
             "records": [
@@ -109,8 +109,8 @@ async fn quickstart_end_to_end() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "write to existing box -> 200");
-    assert_eq!(body["box"], "jobs");
+    assert_eq!(status, StatusCode::OK, "write to existing topic -> 200");
+    assert_eq!(body["topic"], "jobs");
     assert_eq!(body["first_seq"], 1);
     assert_eq!(body["last_seq"], 2);
     assert_eq!(body["seqs"], json!([1, 2]));
@@ -118,13 +118,13 @@ async fn quickstart_end_to_end() {
     assert_eq!(body["count"], 2);
     assert_eq!(body["created"], false);
     assert_eq!(body["deduped"], false);
-    // durable box, phase 2: fsync is a no-op fast path -> 0.0.
+    // durable topic, phase 2: fsync is a no-op fast path -> 0.0.
     assert_eq!(body["performance"]["fsync_ms"], 0.0);
 
     // -- §3 GET state --------------------------------------------------------
-    let (status, body) = req_json(&app, "GET", "/v0/boxes/jobs", None).await;
+    let (status, body) = req_json(&app, "GET", "/v0/topics/jobs", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["box"], "jobs");
+    assert_eq!(body["topic"], "jobs");
     assert_eq!(body["head_seq"], 2);
     assert_eq!(body["earliest_seq"], 1);
     assert_eq!(body["next_seq"], 3);
@@ -136,7 +136,7 @@ async fn quickstart_end_to_end() {
     let (status, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/jobs/diff",
+        "/v0/topics/jobs/diff",
         Some(json!({ "from_seq": 0, "limit": 500, "node": "reader-x", "include_tags": true })),
     )
     .await;
@@ -157,7 +157,7 @@ async fn quickstart_end_to_end() {
     let (status, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/jobs/diff",
+        "/v0/topics/jobs/diff",
         Some(json!({ "from_seq": 0, "limit": 500, "node": "worker-eu-1" })),
     )
     .await;
@@ -178,12 +178,12 @@ async fn quickstart_end_to_end() {
     let (status, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/jobs/delete",
+        "/v0/topics/jobs/delete",
         Some(json!({ "match": ["tag", "Eq", "tenant42:job-9001"] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["box"], "jobs");
+    assert_eq!(body["topic"], "jobs");
     assert_eq!(body["deleted"], 1, "exactly one record removed");
     assert_eq!(
         body["earliest_seq"], 2,
@@ -195,7 +195,7 @@ async fn quickstart_end_to_end() {
     let (status, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/jobs/diff",
+        "/v0/topics/jobs/diff",
         Some(json!({ "from_seq": 0, "limit": 500, "node": "reader-y" })),
     )
     .await;
@@ -214,7 +214,7 @@ async fn quickstart_end_to_end() {
     let (status, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/jobs/delete",
+        "/v0/topics/jobs/delete",
         Some(json!({ "match": ["tag", "Glob", "tenant42:*"] })),
     )
     .await;
@@ -224,7 +224,7 @@ async fn quickstart_end_to_end() {
     let (_, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/jobs/diff",
+        "/v0/topics/jobs/diff",
         Some(json!({ "from_seq": 0, "limit": 500, "node": "reader-z" })),
     )
     .await;
@@ -237,7 +237,7 @@ async fn quickstart_end_to_end() {
     assert_eq!(body["tombstone"], Value::Null, "still silent");
 
     // -- §5-style router fan-out: src -> dst preserves $node ------------------
-    // Fresh boxes so tag-deletes above don't interfere.
+    // Fresh topics so tag-deletes above don't interfere.
     let (status, body) = req_json(
         &app,
         "PUT",
@@ -253,11 +253,11 @@ async fn quickstart_end_to_end() {
 
     // Write to the source; the record must appear in the dest with $node intact.
     // (`feed` was already lazily materialized when the router was created, so
-    // the write is a 200 against an existing box, not a 201 create.)
+    // the write is a 200 against an existing topic, not a 201 create.)
     let (status, wbody) = req_json(
         &app,
         "POST",
-        "/v0/boxes/feed",
+        "/v0/topics/feed",
         Some(json!({ "node": "origin-1", "records": [{ "data": { "v": 1 } }] })),
     )
     .await;
@@ -272,7 +272,7 @@ async fn quickstart_end_to_end() {
     let (status, body) = req_json(
         &app,
         "POST",
-        "/v0/boxes/sub-a/diff",
+        "/v0/topics/sub-a/diff",
         Some(json!({ "from_seq": 0, "limit": 100, "node": "consumer" })),
     )
     .await;
@@ -301,7 +301,7 @@ async fn quickstart_end_to_end() {
         &app,
         "POST",
         "/v0/watch",
-        Some(json!({ "boxes": { "sub-a": { "from_seq": 0 } } })),
+        Some(json!({ "topics": { "sub-a": { "from_seq": 0 } } })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -311,7 +311,7 @@ async fn quickstart_end_to_end() {
     assert!(wid.starts_with("wid_"));
 
     // Open the stream; read the first two named frames (the `record` then the
-    // `caught-up` for the single backlog box) with a hard timeout so the test
+    // `caught-up` for the single backlog topic) with a hard timeout so the test
     // can never hang on the long-lived stream.
     let frames = read_sse_frames(&app, &stream_url, 2, Duration::from_secs(5)).await;
     let events: Vec<&str> = frames.iter().map(|f| f.event.as_str()).collect();
@@ -327,7 +327,7 @@ async fn quickstart_end_to_end() {
     // The record frame's payload matches the documented shape.
     let rec = frames.iter().find(|f| f.event == "record").unwrap();
     let data: Value = serde_json::from_str(&rec.data).unwrap();
-    assert_eq!(data["box"], "sub-a");
+    assert_eq!(data["topic"], "sub-a");
     assert_eq!(data["records"][0]["$seq"], 1);
     assert_eq!(data["records"][0]["data"]["v"], 1);
     assert!(
@@ -337,7 +337,7 @@ async fn quickstart_end_to_end() {
 
     let cu = frames.iter().find(|f| f.event == "caught-up").unwrap();
     let cu_data: Value = serde_json::from_str(&cu.data).unwrap();
-    assert_eq!(cu_data["box"], "sub-a");
+    assert_eq!(cu_data["topic"], "sub-a");
     assert_eq!(cu_data["head_seq"], 1);
 }
 

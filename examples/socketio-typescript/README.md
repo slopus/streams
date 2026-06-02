@@ -8,22 +8,22 @@ Topology:
 - Socket.IO clients send chat messages to whichever Node server they reached.
 - The server appends each message to `socketio.chat.ingress`.
 - Every browser client has a stable `clientId`, sent in the Socket.IO handshake.
-- For each Socket.IO client, the server creates a durable box named like
+- For each Socket.IO client, the server creates a durable topic named like
   `socketio.chat.client.<clientId>`.
 - For each Socket.IO client, the server creates a router from
-  `socketio.chat.ingress` to that client's box.
-- The Socket.IO server tails that client's own box and emits those records to
+  `socketio.chat.ingress` to that client's topic.
+- The Socket.IO server tails that client's own topic and emits those records to
   that socket.
 
 Because each browser client's subscription is represented by durable streams
 state, round-robin load balancing does not change the feed. A server can stop
 and restart; when the browser reconnects with the same `clientId`, the server
-reuses the same client box and router, then resumes from its saved cursor or
-replays the durable client box.
+reuses the same client topic and router, then resumes from its saved cursor or
+replays the durable client topic.
 
 Routers start forwarding from the current ingress head when they are created, so
 a brand-new browser client sees messages sent after it joins. A returning browser
-client keeps its existing client box and can replay messages routed there while
+client keeps its existing client topic and can replay messages routed there while
 its Socket.IO server was offline.
 
 ## Run
@@ -67,7 +67,7 @@ Useful environment variables:
 | Name | Default | Purpose |
 | --- | --- | --- |
 | `STREAMS_URL` | `http://127.0.0.1:4000` | streams base URL. |
-| `STREAM_PREFIX` | `socketio.chat` | Prefix for the ingress box, client boxes, and routers. |
+| `STREAM_PREFIX` | `socketio.chat` | Prefix for the ingress topic, client topics, and routers. |
 | `SERVER_ID` | random per process | Stable id for restart cursor state. |
 | `PORT` | `0` | Port to bind. `0` asks the OS for a free port. |
 | `HOST` | `127.0.0.1` | Listen host. |

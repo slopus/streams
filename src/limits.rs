@@ -2,21 +2,21 @@
 //!
 //! A small, **additive + back-compatible** layer that caps the resources a single
 //! server instance (and a single api key) can consume, so an unauthenticated dev
-//! box stays unbounded-friendly while a hardened deployment can refuse to be
+//! topic stays unbounded-friendly while a hardened deployment can refuse to be
 //! exhausted. Every cap is configurable via an env var with a sane default, and
 //! **`0` always means "unlimited"** (the explicit opt-out). The defaults are
 //! generous enough that the existing conformance/integration suites — which
-//! create only a handful of boxes/routers/sessions/streams — never hit them, so
+//! create only a handful of topics/routers/sessions/streams — never hit them, so
 //! enabling this module changes no existing behavior.
 //!
 //! # What is capped
 //!
 //! | Limit | Env var | Default | Enforced on |
 //! |---|---|---|---|
-//! | Max boxes | `STREAMS_MAX_BOXES` | `100_000` | every box creation ([`crate::engine::Engine::put_box`], auto-create) |
+//! | Max topics | `STREAMS_MAX_TOPICS` | `100_000` | every topic creation ([`crate::engine::Engine::put_topic`], auto-create) |
 //! | Max routers | `STREAMS_MAX_ROUTERS` | `10_000` | every router creation ([`crate::engine::Engine::put_router`]) |
 //! | Max watch sessions | `STREAMS_MAX_WATCH_SESSIONS` | `10_000` | `POST /v0/watch` |
-//! | Max SSE conns (global) | `STREAMS_MAX_SSE_CONNECTIONS` | `10_000` | every SSE stream GET (`/v0/watch/:wid`, `/v0/boxes/:q/work`) |
+//! | Max SSE conns (global) | `STREAMS_MAX_SSE_CONNECTIONS` | `10_000` | every SSE stream GET (`/v0/watch/:wid`, `/v0/topics/:q/work`) |
 //! | Max SSE conns / key | `STREAMS_MAX_SSE_CONNECTIONS_PER_KEY` | `1_000` | same, per authenticated key |
 //! | Max in-flight requests / key | `STREAMS_MAX_INFLIGHT_PER_KEY` | `1_000` | every request (concurrency cap in the auth middleware) |
 //!
@@ -29,7 +29,7 @@
 //!
 //! # How counts are tracked
 //!
-//! Box/router counts are read directly from the engine's registries at creation
+//! Topic/router counts are read directly from the engine's registries at creation
 //! time (no separate counter to drift). Live SSE connections and per-key in-flight
 //! requests are tracked in [`LiveCounts`] via atomic gauges and a small per-key
 //! map, with **RAII guards** ([`SseGuard`], [`InflightGuard`]) that decrement on
@@ -40,8 +40,8 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Default cap on the number of boxes (`STREAMS_MAX_BOXES`). `0` ⇒ unlimited.
-pub const DEFAULT_MAX_BOXES: u64 = 100_000;
+/// Default cap on the number of topics (`STREAMS_MAX_TOPICS`). `0` ⇒ unlimited.
+pub const DEFAULT_MAX_TOPICS: u64 = 100_000;
 /// Default cap on the number of routers (`STREAMS_MAX_ROUTERS`). `0` ⇒ unlimited.
 pub const DEFAULT_MAX_ROUTERS: u64 = 10_000;
 /// Default cap on live watch sessions (`STREAMS_MAX_WATCH_SESSIONS`). `0` ⇒ unlimited.
@@ -55,7 +55,7 @@ pub const DEFAULT_MAX_SSE_CONNECTIONS_PER_KEY: u64 = 1_000;
 /// Default cap on concurrent in-flight requests per api key
 /// (`STREAMS_MAX_INFLIGHT_PER_KEY`). `0` ⇒ unlimited.
 pub const DEFAULT_MAX_INFLIGHT_PER_KEY: u64 = 1_000;
-/// Default cap on the **total retained record bytes** across all boxes
+/// Default cap on the **total retained record bytes** across all topics
 /// (`STREAMS_MAX_TOTAL_BYTES`). `0` ⇒ unlimited (the default, so back-compat /
 /// existing suites are unaffected). Bounds disk/RAM growth from authenticated
 /// writers (codex HIGH #5); when set, a write that would push the live total over
@@ -63,7 +63,7 @@ pub const DEFAULT_MAX_INFLIGHT_PER_KEY: u64 = 1_000;
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 0;
 
 /// `Retry-After` (seconds) advertised on a capacity `429`. Short — capacity frees
-/// as soon as another client sheds a box/session/connection.
+/// as soon as another client sheds a topic/session/connection.
 pub const LIMIT_RETRY_AFTER_S: u64 = 1;
 
 /// The configured resource/rate limits. Each field is a hard cap; **`0` means
@@ -71,8 +71,8 @@ pub const LIMIT_RETRY_AFTER_S: u64 = 1;
 /// on every creation path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Max boxes that may exist at once. `0` ⇒ unlimited.
-    pub max_boxes: u64,
+    /// Max topics that may exist at once. `0` ⇒ unlimited.
+    pub max_topics: u64,
     /// Max routers that may exist at once. `0` ⇒ unlimited.
     pub max_routers: u64,
     /// Max live watch sessions in the registry. `0` ⇒ unlimited.
@@ -85,7 +85,7 @@ pub struct Limits {
     /// Max concurrent in-flight requests per authenticated api key (a simple
     /// concurrency / in-flight cap). `0` ⇒ unlimited. No effect in dev mode.
     pub max_inflight_per_key: u64,
-    /// Max total retained record bytes across all boxes (a global disk/RAM growth
+    /// Max total retained record bytes across all topics (a global disk/RAM growth
     /// quota; codex HIGH #5). `0` ⇒ unlimited (default). When set, a write that
     /// would push the live total over the cap is refused with `429 throttled`.
     pub max_total_bytes: u64,
@@ -94,7 +94,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            max_boxes: DEFAULT_MAX_BOXES,
+            max_topics: DEFAULT_MAX_TOPICS,
             max_routers: DEFAULT_MAX_ROUTERS,
             max_watch_sessions: DEFAULT_MAX_WATCH_SESSIONS,
             max_sse_connections: DEFAULT_MAX_SSE_CONNECTIONS,
@@ -110,7 +110,7 @@ impl Limits {
     /// var. A literal `0` disables that specific limit (unlimited).
     pub fn from_env() -> Self {
         let mut l = Limits::default();
-        env_u64("STREAMS_MAX_BOXES", &mut l.max_boxes);
+        env_u64("STREAMS_MAX_TOPICS", &mut l.max_topics);
         env_u64("STREAMS_MAX_ROUTERS", &mut l.max_routers);
         env_u64("STREAMS_MAX_WATCH_SESSIONS", &mut l.max_watch_sessions);
         env_u64("STREAMS_MAX_SSE_CONNECTIONS", &mut l.max_sse_connections);
@@ -124,19 +124,19 @@ impl Limits {
     }
 
     /// Whether a write of `incoming_bytes` is allowed given the `current_total`
-    /// live bytes across all boxes. `true` when the quota is unlimited (`0`) or the
+    /// live bytes across all topics. `true` when the quota is unlimited (`0`) or the
     /// resulting total stays at/under the cap. A single write larger than the whole
-    /// quota is allowed only when the box is currently empty-enough; the engine
+    /// quota is allowed only when the topic is currently empty-enough; the engine
     /// applies this as a coarse admission guard (codex HIGH #5).
     pub fn total_bytes_ok(&self, current_total: u64, incoming_bytes: u64) -> bool {
         self.max_total_bytes == 0
             || current_total.saturating_add(incoming_bytes) <= self.max_total_bytes
     }
 
-    /// Whether creating one more box is allowed given the `current` box count.
+    /// Whether creating one more topic is allowed given the `current` topic count.
     /// `true` when the cap is unlimited (`0`) or `current` is below it.
-    pub fn box_ok(&self, current: u64) -> bool {
-        self.max_boxes == 0 || current < self.max_boxes
+    pub fn topic_ok(&self, current: u64) -> bool {
+        self.max_topics == 0 || current < self.max_topics
     }
 
     /// Whether creating one more router is allowed given the `current` count.
@@ -162,7 +162,7 @@ fn env_u64(key: &str, slot: &mut u64) {
 
 /// Live, mutable per-instance counters for the limits that track *concurrent*
 /// resource use (SSE connections, per-key in-flight requests). Shared via `Arc` in
-/// the HTTP `AppState`. The box/router/session caps are checked against the
+/// the HTTP `AppState`. The topic/router/session caps are checked against the
 /// authoritative registries directly and need no counter here.
 ///
 /// All slots are acquired through RAII guards ([`SseGuard`], [`InflightGuard`]) so
@@ -331,12 +331,12 @@ mod tests {
     #[test]
     fn zero_means_unlimited() {
         let l = Limits {
-            max_boxes: 0,
+            max_topics: 0,
             max_routers: 0,
             max_watch_sessions: 0,
             ..Limits::default()
         };
-        assert!(l.box_ok(u64::MAX - 1));
+        assert!(l.topic_ok(u64::MAX - 1));
         assert!(l.router_ok(u64::MAX - 1));
         assert!(l.watch_session_ok(u64::MAX - 1));
     }
@@ -361,15 +361,15 @@ mod tests {
     #[test]
     fn creation_caps_are_strict_less_than() {
         let l = Limits {
-            max_boxes: 2,
+            max_topics: 2,
             max_routers: 1,
             max_watch_sessions: 3,
             ..Limits::default()
         };
-        assert!(l.box_ok(0));
-        assert!(l.box_ok(1));
-        assert!(!l.box_ok(2)); // at the cap: refuse the 3rd.
-        assert!(!l.box_ok(3));
+        assert!(l.topic_ok(0));
+        assert!(l.topic_ok(1));
+        assert!(!l.topic_ok(2)); // at the cap: refuse the 3rd.
+        assert!(!l.topic_ok(3));
 
         assert!(l.router_ok(0));
         assert!(!l.router_ok(1));

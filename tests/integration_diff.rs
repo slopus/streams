@@ -1,8 +1,8 @@
 //! Phase-3 §2 — in-process integration tests for the write + getDifference
-//! (`POST /v0/boxes/:box` and `POST /v0/boxes/:box/diff`) wire contract, driven
+//! (`POST /v0/topics/:topic` and `POST /v0/topics/:topic/diff`) wire contract, driven
 //! over a *real bound server* via the shared `common::Harness`.
 //!
-//! These are black-box HTTP assertions of the documented `/v0` shapes (API §2,
+//! These are black-topic HTTP assertions of the documented `/v0` shapes (API §2,
 //! §3, §3.2, §3.3, §0.8). The harness boots the real `http::build_router` with a
 //! live `SystemClock`, so TTL-correctness here is exercised with a genuinely
 //! short `ttl_ms` and a *bounded condition poll* (never a fixed sleep / exact
@@ -38,9 +38,9 @@ use serde_json::{json, Value};
 fn write_single_record_auto_creates_and_assigns_seq() {
     let h = Harness::start();
 
-    // First write to a not-yet-existent box auto-creates -> 201 Created.
+    // First write to a not-yet-existent topic auto-creates -> 201 Created.
     let (status, body) = h.post(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": { "url": "s3://b/a.png" } }] }),
     );
     assert_eq!(
@@ -48,7 +48,7 @@ fn write_single_record_auto_creates_and_assigns_seq() {
         StatusCode::CREATED,
         "first write auto-creates -> 201"
     );
-    assert_eq!(body["box"], "jobs");
+    assert_eq!(body["topic"], "jobs");
     assert_eq!(body["first_seq"], 1, "seqs start at SEQ_BASE = 1");
     assert_eq!(body["last_seq"], 1);
     assert_eq!(body["seqs"], json!([1]));
@@ -56,17 +56,17 @@ fn write_single_record_auto_creates_and_assigns_seq() {
     assert_eq!(body["count"], 1);
     assert_eq!(
         body["created"], true,
-        "this write brought the box into existence"
+        "this write brought the topic into existence"
     );
     assert_eq!(body["deduped"], false);
     assert!(body["performance"]["server_total_ms"].is_number());
 
-    // A subsequent write to the now-existing box -> 200, created:false, seqs continue.
+    // A subsequent write to the now-existing topic -> 200, created:false, seqs continue.
     let (status, body) = h.post(
-        "/v0/boxes/jobs",
+        "/v0/topics/jobs",
         json!({ "records": [{ "data": { "url": "s3://b/b.png" } }] }),
     );
-    assert_eq!(status, StatusCode::OK, "write to existing box -> 200");
+    assert_eq!(status, StatusCode::OK, "write to existing topic -> 200");
     assert_eq!(body["first_seq"], 2);
     assert_eq!(body["seqs"], json!([2]));
     assert_eq!(body["head_seq"], 2);
@@ -78,7 +78,7 @@ fn write_many_records_assigns_contiguous_seqs() {
     let h = Harness::start();
 
     let (status, body) = h.post(
-        "/v0/boxes/batch",
+        "/v0/topics/batch",
         json!({ "records": [
             { "data": 1 }, { "data": 2 }, { "data": 3 }, { "data": 4 }, { "data": 5 }
         ] }),
@@ -95,7 +95,7 @@ fn write_many_records_assigns_contiguous_seqs() {
     assert_eq!(body["count"], 5);
 
     // GET state reflects head_seq / count / next_seq exactly.
-    let (status, state) = h.get("/v0/boxes/batch");
+    let (status, state) = h.get("/v0/topics/batch");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(state["head_seq"], 5);
     assert_eq!(state["earliest_seq"], 1);
@@ -117,13 +117,13 @@ fn idempotency_key_body_dedupes_returns_original_seqs() {
     });
 
     // First write appends seqs 1,2.
-    let (status, first) = h.post("/v0/boxes/q", req.clone());
+    let (status, first) = h.post("/v0/topics/q", req.clone());
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(first["seqs"], json!([1, 2]));
     assert_eq!(first["deduped"], false);
 
     // Retry with the same in-window key -> ORIGINAL seqs, deduped:true, no append.
-    let (status, second) = h.post("/v0/boxes/q", req);
+    let (status, second) = h.post("/v0/topics/q", req);
     assert_eq!(status, StatusCode::OK, "dedupe hit is not a create -> 200");
     assert_eq!(second["deduped"], true);
     assert_eq!(second["seqs"], json!([1, 2]), "original seqs returned");
@@ -131,8 +131,8 @@ fn idempotency_key_body_dedupes_returns_original_seqs() {
     assert_eq!(second["last_seq"], 2);
     assert_eq!(second["head_seq"], 2);
 
-    // The box still has exactly the original two records (no second append).
-    let (_, state) = h.get("/v0/boxes/q");
+    // The topic still has exactly the original two records (no second append).
+    let (_, state) = h.get("/v0/topics/q");
     assert_eq!(state["head_seq"], 2, "no new append happened");
     assert_eq!(state["count"], 2);
 }
@@ -143,18 +143,18 @@ fn idempotency_key_header_dedupes_when_body_omits_it() {
 
     // First write carries the key only as the `Idempotency-Key` HTTP header.
     let body = json!({ "records": [{ "data": "x" }] });
-    let (status, first) = post_with_idem_header(&h, "/v0/boxes/qh", body.clone(), "hdr-key-1");
+    let (status, first) = post_with_idem_header(&h, "/v0/topics/qh", body.clone(), "hdr-key-1");
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(first["seqs"], json!([1]));
     assert_eq!(first["deduped"], false);
 
     // A retry with the same header key dedupes to the original seq.
-    let (status, second) = post_with_idem_header(&h, "/v0/boxes/qh", body, "hdr-key-1");
+    let (status, second) = post_with_idem_header(&h, "/v0/topics/qh", body, "hdr-key-1");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(second["deduped"], true);
     assert_eq!(second["seqs"], json!([1]));
 
-    let (_, state) = h.get("/v0/boxes/qh");
+    let (_, state) = h.get("/v0/topics/qh");
     assert_eq!(
         state["head_seq"], 1,
         "header-keyed retry did not append again"
@@ -167,7 +167,7 @@ fn idempotency_body_field_wins_over_header() {
 
     // Seed key "A" via body.
     let (_, a) = h.post(
-        "/v0/boxes/qw",
+        "/v0/topics/qw",
         json!({ "records": [{ "data": 1 }], "idempotency_key": "A" }),
     );
     assert_eq!(a["seqs"], json!([1]));
@@ -176,7 +176,7 @@ fn idempotency_body_field_wins_over_header() {
     // so this dedupes to "A"'s original seqs (does NOT append a fresh record).
     let (status, body) = post_with_idem_header(
         &h,
-        "/v0/boxes/qw",
+        "/v0/topics/qw",
         json!({ "records": [{ "data": 2 }], "idempotency_key": "A" }),
         "B",
     );
@@ -184,7 +184,7 @@ fn idempotency_body_field_wins_over_header() {
     assert_eq!(body["deduped"], true, "body field wins -> dedupe on A");
     assert_eq!(body["seqs"], json!([1]));
 
-    let (_, state) = h.get("/v0/boxes/qw");
+    let (_, state) = h.get("/v0/topics/qw");
     assert_eq!(state["head_seq"], 1, "body key won, no append");
 }
 
@@ -198,7 +198,7 @@ fn diff_returns_records_with_cursor_caughtup_and_lag() {
     seed(&h, "d", 3);
 
     // include_tags omitted -> default false -> $tag absent; include_meta default true.
-    let (status, body) = h.post("/v0/boxes/d/diff", json!({ "from_seq": 0 }));
+    let (status, body) = h.post("/v0/topics/d/diff", json!({ "from_seq": 0 }));
     assert_eq!(status, StatusCode::OK);
     let recs = body["records"].as_array().unwrap();
     assert_eq!(recs.len(), 3);
@@ -218,7 +218,7 @@ fn diff_returns_records_with_cursor_caughtup_and_lag() {
     assert!(body["performance"]["records_scanned"].is_number());
 
     // Partial read from a mid cursor: not caught up, lag reflects the remainder.
-    let (_, body) = h.post("/v0/boxes/d/diff", json!({ "from_seq": 1, "limit": 1 }));
+    let (_, body) = h.post("/v0/topics/d/diff", json!({ "from_seq": 1, "limit": 1 }));
     let recs = body["records"].as_array().unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0]["$seq"], 2);
@@ -227,7 +227,7 @@ fn diff_returns_records_with_cursor_caughtup_and_lag() {
     assert_eq!(body["lag"], 1, "head 3 - next_from_seq 2 = 1");
 
     // Tailing from head returns nothing new but stays caught up.
-    let (_, body) = h.post("/v0/boxes/d/diff", json!({ "from_seq": 3 }));
+    let (_, body) = h.post("/v0/topics/d/diff", json!({ "from_seq": 3 }));
     assert_eq!(body["records"].as_array().unwrap().len(), 0);
     assert_eq!(body["caught_up"], true);
     assert_eq!(body["next_from_seq"], 3);
@@ -238,14 +238,14 @@ fn diff_returns_records_with_cursor_caughtup_and_lag() {
 fn diff_include_tags_and_meta_flags() {
     let h = Harness::start();
     let (status, _) = h.post(
-        "/v0/boxes/im",
+        "/v0/topics/im",
         json!({ "records": [{ "data": 1, "tag": "t1", "meta": { "k": "v" } }] }),
     );
     assert_eq!(status, StatusCode::CREATED);
 
     // include_tags:true surfaces $tag; include_meta:true (default) keeps meta.
     let (_, body) = h.post(
-        "/v0/boxes/im/diff",
+        "/v0/topics/im/diff",
         json!({ "from_seq": 0, "include_tags": true }),
     );
     let rec = &body["records"][0];
@@ -254,7 +254,7 @@ fn diff_include_tags_and_meta_flags() {
 
     // include_meta:false drops meta; $tag also absent (include_tags default false).
     let (_, body) = h.post(
-        "/v0/boxes/im/diff",
+        "/v0/topics/im/diff",
         json!({ "from_seq": 0, "include_meta": false }),
     );
     let rec = &body["records"][0];
@@ -268,7 +268,7 @@ fn diff_default_limit_is_256() {
     seed(&h, "lim", 300);
 
     // No limit field -> default 256 (API §3). 300 records, so first page = 256.
-    let (status, body) = h.post("/v0/boxes/lim/diff", json!({ "from_seq": 0 }));
+    let (status, body) = h.post("/v0/topics/lim/diff", json!({ "from_seq": 0 }));
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["records"].as_array().unwrap().len(),
@@ -280,7 +280,7 @@ fn diff_default_limit_is_256() {
     assert_eq!(body["lag"], 44, "head 300 - 256");
 
     // limit:0 is treated as the default too.
-    let (_, body) = h.post("/v0/boxes/lim/diff", json!({ "from_seq": 0, "limit": 0 }));
+    let (_, body) = h.post("/v0/topics/lim/diff", json!({ "from_seq": 0, "limit": 0 }));
     assert_eq!(
         body["records"].as_array().unwrap().len(),
         256,
@@ -295,7 +295,7 @@ fn diff_limit_clamped_at_max_1000() {
 
     // limit far above MAX_LIMIT (1000) is clamped, never rejected (API §3).
     let (status, body) = h.post(
-        "/v0/boxes/big/diff",
+        "/v0/topics/big/diff",
         json!({ "from_seq": 0, "limit": 5000 }),
     );
     assert_eq!(
@@ -312,19 +312,19 @@ fn diff_limit_clamped_at_max_1000() {
     assert_eq!(body["caught_up"], false);
 
     // A small explicit limit is honored exactly.
-    let (_, body) = h.post("/v0/boxes/big/diff", json!({ "from_seq": 0, "limit": 10 }));
+    let (_, body) = h.post("/v0/topics/big/diff", json!({ "from_seq": 0, "limit": 10 }));
     assert_eq!(body["records"].as_array().unwrap().len(), 10);
     assert_eq!(body["next_from_seq"], 10);
 }
 
 #[test]
-fn diff_on_missing_box_is_404_never_auto_creates() {
+fn diff_on_missing_topic_is_404_never_auto_creates() {
     let h = Harness::start();
-    let (status, body) = h.post("/v0/boxes/ghost/diff", json!({ "from_seq": 0 }));
+    let (status, body) = h.post("/v0/topics/ghost/diff", json!({ "from_seq": 0 }));
     assert_eq!(status, StatusCode::NOT_FOUND, "diff never auto-creates");
-    assert_eq!(body["error"]["code"], "box_not_found");
-    // The box must still not exist.
-    let (status, _) = h.get("/v0/boxes/ghost");
+    assert_eq!(body["error"]["code"], "topic_not_found");
+    // The topic must still not exist.
+    let (status, _) = h.get("/v0/topics/ghost");
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -338,7 +338,7 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
     let h = Harness::start();
     // Records 1,2 from node "self"; record 3 from "other".
     let (status, _) = h.post(
-        "/v0/boxes/nb",
+        "/v0/topics/nb",
         json!({ "records": [
             { "data": 1, "node": "self" },
             { "data": 2, "node": "self" },
@@ -350,7 +350,7 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
     // Reader presenting "self" sees only the "other" record; cursor advances past
     // its own (skipped) records and reaches caught_up; no tombstone (silent).
     let (status, body) = h.post(
-        "/v0/boxes/nb/diff",
+        "/v0/topics/nb/diff",
         json!({ "from_seq": 0, "node": "self" }),
     );
     assert_eq!(status, StatusCode::OK);
@@ -371,11 +371,11 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
     // A reader of ONLY-own-node records: zero delivered yet caught_up reached and
     // the cursor advanced to head (the §3.2 reliable-no-more signal).
     let (status, _) = h.post(
-        "/v0/boxes/own",
+        "/v0/topics/own",
         json!({ "records": [{ "data": 1, "node": "me" }, { "data": 2, "node": "me" }] }),
     );
     assert_eq!(status, StatusCode::CREATED);
-    let (_, body) = h.post("/v0/boxes/own/diff", json!({ "from_seq": 0, "node": "me" }));
+    let (_, body) = h.post("/v0/topics/own/diff", json!({ "from_seq": 0, "node": "me" }));
     assert_eq!(body["records"].as_array().unwrap().len(), 0);
     assert_eq!(body["caught_up"], true);
     assert_eq!(body["next_from_seq"], 2);
@@ -383,7 +383,7 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
 
     // A node-filter ARRAY ("node": ["a","b"]) drops several of one's identities.
     let (status, _) = h.post(
-        "/v0/boxes/multi",
+        "/v0/topics/multi",
         json!({ "records": [
             { "data": 1, "node": "a" },
             { "data": 2, "node": "b" },
@@ -392,7 +392,7 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
     );
     assert_eq!(status, StatusCode::CREATED);
     let (_, body) = h.post(
-        "/v0/boxes/multi/diff",
+        "/v0/topics/multi/diff",
         json!({ "from_seq": 0, "node": ["a", "b"] }),
     );
     let recs = body["records"].as_array().unwrap();
@@ -411,21 +411,21 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
 fn diff_cap_eviction_emits_cap_tombstone() {
     let h = Harness::start();
     // cap_records=3, discard:"old" (default). Pre-create with the cap.
-    let (status, _) = h.put("/v0/boxes/cap", json!({ "cap_records": 3 }));
+    let (status, _) = h.put("/v0/topics/cap", json!({ "cap_records": 3 }));
     assert_eq!(status, StatusCode::CREATED);
 
     // Write 5 -> seqs 1..=5; cap evicts 1,2 -> earliest_seq=3, evict_floor=2.
     for i in 1..=5 {
-        let (status, _) = h.post("/v0/boxes/cap", json!({ "records": [{ "data": i }] }));
+        let (status, _) = h.post("/v0/topics/cap", json!({ "records": [{ "data": i }] }));
         assert_eq!(status, StatusCode::OK);
     }
-    let (_, state) = h.get("/v0/boxes/cap");
+    let (_, state) = h.get("/v0/topics/cap");
     assert_eq!(state["head_seq"], 5);
     assert_eq!(state["earliest_seq"], 3);
     assert_eq!(state["count"], 3);
 
     // A consumer at from_seq=0 fell below the involuntary floor -> cap tombstone.
-    let (status, body) = h.post("/v0/boxes/cap/diff", json!({ "from_seq": 0 }));
+    let (status, body) = h.post("/v0/topics/cap/diff", json!({ "from_seq": 0 }));
     assert_eq!(
         status,
         StatusCode::OK,
@@ -452,7 +452,7 @@ fn diff_cap_eviction_emits_cap_tombstone() {
     assert_eq!(body["caught_up"], true);
 
     // A consumer already at/above the floor gets NO tombstone (gap doesn't reach it).
-    let (_, body) = h.post("/v0/boxes/cap/diff", json!({ "from_seq": 3 }));
+    let (_, body) = h.post("/v0/topics/cap/diff", json!({ "from_seq": 3 }));
     assert_eq!(body["tombstone"], Value::Null);
     assert_eq!(body["records"].as_array().unwrap().len(), 2, "seqs 4,5");
 }
@@ -464,7 +464,7 @@ fn diff_cap_eviction_emits_cap_tombstone() {
 // (`start_with_test_clock`) so the server's notion of "now" is advanced
 // deterministically past the TTL window — no real sleeps, no polling, no
 // flakiness. `enforce_retention` is lazy (runs on each write/state read), so
-// after advancing the clock we append seq 4 to trigger it, then read the box
+// after advancing the clock we append seq 4 to trigger it, then read the topic
 // state ONCE and assert the exact steady-state shape.
 // ---------------------------------------------------------------------------
 
@@ -472,12 +472,12 @@ fn diff_cap_eviction_emits_cap_tombstone() {
 fn diff_ttl_expiry_emits_ttl_tombstone() {
     let h = Harness::start_with_test_clock();
     let ttl_ms = 150u64;
-    let (status, _) = h.put("/v0/boxes/ttl", json!({ "ttl_ms": ttl_ms }));
+    let (status, _) = h.put("/v0/topics/ttl", json!({ "ttl_ms": ttl_ms }));
     assert_eq!(status, StatusCode::CREATED);
 
     // Write 3 records (stamped at the clock's current time) that will expire.
     for i in 1..=3 {
-        let (status, _) = h.post("/v0/boxes/ttl", json!({ "records": [{ "data": i }] }));
+        let (status, _) = h.post("/v0/topics/ttl", json!({ "records": [{ "data": i }] }));
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -486,10 +486,10 @@ fn diff_ttl_expiry_emits_ttl_tombstone() {
     // Because the clock is injected, this is exact and instantaneous — the post
     // and the state read below observe the post-advance retention with no race.
     h.clock().advance((ttl_ms + 50) as i64);
-    let (status, _) = h.post("/v0/boxes/ttl", json!({ "records": [{ "data": 4 }] }));
+    let (status, _) = h.post("/v0/topics/ttl", json!({ "records": [{ "data": 4 }] }));
     assert_eq!(status, StatusCode::OK);
 
-    let (_, state) = h.get("/v0/boxes/ttl");
+    let (_, state) = h.get("/v0/topics/ttl");
     assert_eq!(
         state["earliest_seq"].as_u64().unwrap(),
         4,
@@ -499,7 +499,7 @@ fn diff_ttl_expiry_emits_ttl_tombstone() {
     assert_eq!(state["count"], 1, "only seq 4 remains live");
 
     // A consumer at from_seq=0 now crosses the TTL gap -> ttl tombstone.
-    let (status, body) = h.post("/v0/boxes/ttl/diff", json!({ "from_seq": 0 }));
+    let (status, body) = h.post("/v0/topics/ttl/diff", json!({ "from_seq": 0 }));
     assert_eq!(status, StatusCode::OK);
     let tomb = &body["tombstone"];
     assert!(tomb.is_object(), "expected a ttl tombstone, got {tomb}");
@@ -526,7 +526,7 @@ fn diff_wait_ms_long_poll_wakes_on_append() {
     let h = Harness::start();
     // Seed one record, then tail from head: a plain diff is immediately caught up
     // with nothing to deliver, which is exactly when wait_ms parks.
-    let (status, _) = h.post("/v0/boxes/lp", json!({ "records": [{ "data": 0 }] }));
+    let (status, _) = h.post("/v0/topics/lp", json!({ "records": [{ "data": 0 }] }));
     assert_eq!(status, StatusCode::CREATED);
 
     let base = h.base_url().to_string();
@@ -536,7 +536,7 @@ fn diff_wait_ms_long_poll_wakes_on_append() {
         thread::sleep(Duration::from_millis(150));
         let client = reqwest::blocking::Client::new();
         let _ = client
-            .post(format!("{base}/v0/boxes/lp"))
+            .post(format!("{base}/v0/topics/lp"))
             .json(&json!({ "records": [{ "data": 1 }] }))
             .send();
     });
@@ -545,7 +545,7 @@ fn diff_wait_ms_long_poll_wakes_on_append() {
     // well before the wait_ms ceiling.
     let started = Instant::now();
     let (status, body) = h.post(
-        "/v0/boxes/lp/diff",
+        "/v0/topics/lp/diff",
         json!({ "from_seq": 1, "wait_ms": 5000 }),
     );
     let elapsed = started.elapsed();
@@ -566,14 +566,14 @@ fn diff_wait_ms_long_poll_wakes_on_append() {
 #[test]
 fn diff_wait_ms_returns_at_deadline_when_idle() {
     let h = Harness::start();
-    let (status, _) = h.post("/v0/boxes/idle", json!({ "records": [{ "data": 0 }] }));
+    let (status, _) = h.post("/v0/topics/idle", json!({ "records": [{ "data": 0 }] }));
     assert_eq!(status, StatusCode::CREATED);
 
     // Nothing else writes; the long-poll parks then returns caught-up at the
     // (short) deadline. We only assert it returns the correct shape, not exact ms.
     let started = Instant::now();
     let (status, body) = h.post(
-        "/v0/boxes/idle/diff",
+        "/v0/topics/idle/diff",
         json!({ "from_seq": 1, "wait_ms": 200 }),
     );
     let elapsed = started.elapsed();
@@ -618,11 +618,11 @@ fn post_with_idem_header(
     (status, value)
 }
 
-/// Append `n` records (data = 1..=n) to `box_name`, one batch, asserting success.
-fn seed(h: &Harness, box_name: &str, n: usize) {
+/// Append `n` records (data = 1..=n) to `topic_name`, one batch, asserting success.
+fn seed(h: &Harness, topic_name: &str, n: usize) {
     let records: Vec<Value> = (1..=n).map(|i| json!({ "data": i })).collect();
     let (status, body) = h.post(
-        &format!("/v0/boxes/{box_name}"),
+        &format!("/v0/topics/{topic_name}"),
         json!({ "records": records }),
     );
     assert!(

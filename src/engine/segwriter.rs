@@ -1,6 +1,6 @@
-//! Per-box **segment writer** + **bounded payload cache** (Phase 6 Stage 2).
+//! Per-topic **segment writer** + **bounded payload cache** (Phase 6 Stage 2).
 //!
-//! As records commit to a box, their bytes are appended to the box's *active*
+//! As records commit to a topic, their bytes are appended to the topic's *active*
 //! HOT segment (a [`SegmentBuilder`]). When a seal trigger fires
 //! (`segment_max_events` / `segment_max_bytes` / `segment_max_age_ms`, read
 //! through the [`Clock`] so the age trigger is `TestClock`-drivable), the active
@@ -30,7 +30,7 @@
 //!
 //! # Default-safe / transparent
 //!
-//! A box only gets a [`SegmentWriter`] when the engine is durable (a data dir is
+//! A topic only gets a [`SegmentWriter`] when the engine is durable (a data dir is
 //! configured). Pure in-memory engines ([`crate::engine::Engine::new`], used by
 //! almost every unit test) attach none, so the read path resolves payloads from
 //! the resident in-memory slot exactly as before — behavior is unchanged by
@@ -38,7 +38,7 @@
 
 use crate::clock::SharedClock;
 use crate::storage::{
-    decode_data_frame, decode_data_frame_full, lookup, BoxTier, SegmentBuilder, SegmentPart,
+    decode_data_frame, decode_data_frame_full, lookup, TopicTier, SegmentBuilder, SegmentPart,
     SegmentRecord, Tier,
 };
 use std::collections::VecDeque;
@@ -96,11 +96,11 @@ struct CachedPayload {
 /// A locator captured under the writer lock so the actual (possibly slow, cold)
 /// segment read can run **after** the lock is dropped (the Phase-6 HARD
 /// INVARIANT: a cold fetch must never hold a lock that gates writes/delivery).
-/// It carries an `Arc<BoxTier>` clone so the I/O touches the stores without the
+/// It carries an `Arc<TopicTier>` clone so the I/O touches the stores without the
 /// writer mutex held.
 pub struct SealedLocator {
     /// Shared tier handle for the off-lock `read_range`.
-    tier: Arc<BoxTier>,
+    tier: Arc<TopicTier>,
     /// The sealed segment holding the seq.
     seg: SealedSegment,
     /// The seq being resolved.
@@ -164,14 +164,14 @@ pub fn read_locator(loc: &SealedLocator) -> Option<ResolvedPayload> {
     Some(ResolvedPayload { data, meta })
 }
 
-/// The per-box segment writer: the active [`SegmentBuilder`], the sealed-segment
+/// The per-topic segment writer: the active [`SegmentBuilder`], the sealed-segment
 /// registry, the bounded payload cache, and the seal policy/clock. Lives behind a
-/// `Mutex` on [`crate::engine::box_state::BoxState`]; it is touched on the commit
+/// `Mutex` on [`crate::engine::topic_state::TopicState`]; it is touched on the commit
 /// path (append + seal) and the read path (segment-backed payload resolution) —
-/// never holding a box write lock across a (potentially slow) cold fetch.
+/// never holding a topic write lock across a (potentially slow) cold fetch.
 pub struct SegmentWriter {
-    /// HOT + optional COLD stores for this box.
-    tier: Arc<BoxTier>,
+    /// HOT + optional COLD stores for this topic.
+    tier: Arc<TopicTier>,
     /// Seal triggers + hot-retention policy.
     cfg: SegmentConfig,
     /// Time source (real or [`crate::clock::TestClock`]); the age seal trigger
@@ -206,15 +206,15 @@ pub struct SegmentWriter {
     cold_reads: u64,
 
     /// Whether resident payloads should be freed once sealed (memory bounding).
-    /// Default `true` for a durable, writer-backed box; the read path then
+    /// Default `true` for a durable, writer-backed topic; the read path then
     /// resolves from cache/segment. Tests can disable to exercise the resident
     /// path alongside the writer.
     evict_resident: bool,
 }
 
 impl SegmentWriter {
-    /// Build a writer for a box whose first seq is `seq_base`.
-    pub fn new(tier: Arc<BoxTier>, cfg: SegmentConfig, clock: SharedClock) -> Self {
+    /// Build a writer for a topic whose first seq is `seq_base`.
+    pub fn new(tier: Arc<TopicTier>, cfg: SegmentConfig, clock: SharedClock) -> Self {
         SegmentWriter {
             tier,
             cfg,
@@ -271,7 +271,7 @@ impl SegmentWriter {
         // keeps each sealed segment within the caps (the active one can exceed by
         // at most the in-flight record, then seals on the next append/flush).
         //
-        // ALSO seal on a SEQ GAP (R3): a `disk`-class box recovered at its durable
+        // ALSO seal on a SEQ GAP (R3): a `disk`-class topic recovered at its durable
         // head reservation has reserved-but-unwritten seqs as deleted holes; the
         // next live append jumps past them, so `seq != active.next_seq`. Segments
         // are dense + gapless by construction, so seal the active segment and start
@@ -332,9 +332,9 @@ impl SegmentWriter {
     }
 
     /// Seal a partially-filled active segment if its age trigger has fired (the
-    /// idle-box path: no new appends, but the age cap should still seal it).
+    /// idle-topic path: no new appends, but the age cap should still seal it).
     /// Returns the seqs sealed (empty if nothing sealed). Called off the commit
-    /// path (e.g. a flush tick / read-path retention sync) so an idle box's data
+    /// path (e.g. a flush tick / read-path retention sync) so an idle topic's data
     /// can age out / relocate.
     pub fn maybe_seal_idle(&mut self) -> Vec<u64> {
         let should = match &self.active {
@@ -591,7 +591,7 @@ impl SegmentWriter {
     }
 
     /// Shared tier handle (for the engine's off-lock copy/relocation I/O).
-    pub fn tier(&self) -> Arc<BoxTier> {
+    pub fn tier(&self) -> Arc<TopicTier> {
         self.tier.clone()
     }
 
@@ -601,7 +601,7 @@ impl SegmentWriter {
     // Driven by the engine off the hot path. The crash-safe order is:
     //   plan -> copy hot->cold (off-lock, fsync'd) -> durably flip the tier
     //   pointer -> delete the hot copy.
-    // Each step is idempotent and `BoxTier::resolve` prefers HOT, so an interrupted
+    // Each step is idempotent and `TopicTier::resolve` prefers HOT, so an interrupted
     // relocation (a segment present in both tiers with the pointer not yet flipped)
     // recovers cleanly: the surviving HOT copy is used and the relocation re-runs.
     // =======================================================================
@@ -661,7 +661,7 @@ impl SegmentWriter {
         }
         // Flip the in-memory pointer first; the durable record of this flip is the
         // segment's presence in the cold store (re-derived on restart via
-        // `BoxTier::resolve` + the relocator), so this is crash-safe: a crash after
+        // `TopicTier::resolve` + the relocator), so this is crash-safe: a crash after
         // the cold copy but before the hot delete leaves both copies, HOT preferred,
         // and the relocator simply re-runs the (idempotent) drop.
         let (start, end) = (seg.start_seq, seg.end_seq);
@@ -682,7 +682,7 @@ impl SegmentWriter {
         // Named crash point: the tier pointer is flipped to COLD (the cold copy is
         // already durable) but the redundant HOT copy has NOT been deleted yet
         // (F-COLD-CRASH-AFTER-FLIP-BEFORE-DELETE). On restart the in-memory flip is
-        // lost but the cold copy exists; `BoxTier::resolve` re-derives the tier
+        // lost but the cold copy exists; `TopicTier::resolve` re-derives the tier
         // (HOT preferred while both exist) and the relocator re-runs the idempotent
         // drop — no loss, never zero copies. No-op without `--features failpoints`.
         fail::fail_point!("cold::after_flip_before_delete");
@@ -877,7 +877,7 @@ impl SegmentWriter {
     /// Which sealed segments are now ENTIRELY dead per `is_dead(seq)` — every seq in
     /// `[start_seq, end_seq]` is deleted/evicted — so the whole segment can be
     /// dropped in one op (unlink) instead of N per-record flips (the WHOLE-SEGMENT
-    /// optimization, DESIGN §7). `is_dead` is supplied by the box (its in-memory
+    /// optimization, DESIGN §7). `is_dead` is supplied by the topic (its in-memory
     /// liveness oracle). Oldest-first. The caller drops these via [`Self::drop_segment`]
     /// and flips the survivors of any partially-cleared segment via
     /// [`Self::flag_sealed_deleted`].
@@ -951,7 +951,7 @@ impl SegmentWriter {
 /// `.data` length on success. A `None`/`Err` leaves the HOT copy intact (the
 /// relocation simply did not advance — never a loss).
 pub fn copy_segment_to_cold(
-    tier: &Arc<BoxTier>,
+    tier: &Arc<TopicTier>,
     id: u64,
 ) -> Result<(), crate::storage::StoreError> {
     let Some(cold) = tier.cold() else {
@@ -1007,7 +1007,7 @@ mod tests {
     fn writer_with(cfg: SegmentConfig, clock: SharedClock) -> (SegmentWriter, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let hot = Box::new(LocalSegmentStore::open(dir.path()).unwrap());
-        let tier = Arc::new(BoxTier::new(hot, None));
+        let tier = Arc::new(TopicTier::new(hot, None));
         (SegmentWriter::new(tier, cfg, clock), dir)
     }
 
@@ -1081,7 +1081,7 @@ mod tests {
         // The idle path also seals when no further append arrives.
         clock.advance(6000);
         let idle = w.maybe_seal_idle();
-        assert_eq!(idle, vec![3], "idle box seals its partial segment on age");
+        assert_eq!(idle, vec![3], "idle topic seals its partial segment on age");
         assert_eq!(w.sealed_count(), 2);
     }
 
@@ -1176,7 +1176,7 @@ mod tests {
         let hot = Box::new(LocalSegmentStore::open(hot_dir.path()).unwrap());
         let cold: Box<dyn SegmentStore> =
             Box::new(LocalSegmentStore::open(cold_dir.path()).unwrap());
-        let tier = Arc::new(BoxTier::new(hot, Some(cold)));
+        let tier = Arc::new(TopicTier::new(hot, Some(cold)));
         (SegmentWriter::new(tier, cfg, clock), hot_dir, cold_dir)
     }
 
@@ -1390,7 +1390,7 @@ mod tests {
             gate: gate.clone(),
             armed: armed.clone(),
         });
-        let tier = Arc::new(BoxTier::new(hot, Some(cold)));
+        let tier = Arc::new(TopicTier::new(hot, Some(cold)));
         let mut w = SegmentWriter::new(tier.clone(), cfg_events(1, 1), clock);
         w.set_cache_cap(0);
         w.set_cold_cache_cap(0); // never cache so the read truly hits cold.
@@ -1406,7 +1406,7 @@ mod tests {
         // blocks on the gate until the test releases it.
         armed.store(true, Ordering::SeqCst);
 
-        // Put the writer behind a shared Mutex (mirroring `BoxState.segwriter`).
+        // Put the writer behind a shared Mutex (mirroring `TopicState.segwriter`).
         let writer = Arc::new(Mutex::new(w));
 
         // Thread 1: resolve seq 1 the off-lock way — capture the locator under the

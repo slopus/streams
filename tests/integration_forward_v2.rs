@@ -30,7 +30,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::types::{
-    BoxConfig, DiffRequest, Discard, RecordIn, RouterCreateRequest, TombstoneReason, WriteRequest,
+    TopicConfig, DiffRequest, Discard, RecordIn, RouterCreateRequest, TombstoneReason, WriteRequest,
 };
 
 /// Enable the async/derived path for THIS test process. Idempotent; every test in
@@ -82,10 +82,10 @@ fn router_req(source: &str, dest: &str) -> RouterCreateRequest {
     }
 }
 
-fn diff_all(engine: &Engine, box_name: &str) -> streams::types::DiffResponse {
+fn diff_all(engine: &Engine, topic_name: &str) -> streams::types::DiffResponse {
     engine
         .diff(
-            box_name,
+            topic_name,
             DiffRequest {
                 from_seq: 0,
                 limit: 1000,
@@ -107,18 +107,18 @@ fn one_source_append_to_n_dests_is_one_wal_append() {
     let (engine, _clock) = durable_engine(dir.path());
 
     // Fan a single source out to FIVE durable dests. Use the fsync class for every
-    // box so a `disk` box's R3 head-watermark reservation frame does not add to the
+    // topic so a `disk` topic's R3 head-watermark reservation frame does not add to the
     // count — the only frames a write then produces are Append frames, so the frame
     // delta IS the append count.
     let n_dests = 5;
-    let fsync_cfg = || BoxConfig {
+    let fsync_cfg = || TopicConfig {
         durable: true,
-        ..BoxConfig::default()
+        ..TopicConfig::default()
     };
-    engine.put_box("src", fsync_cfg()).unwrap();
+    engine.put_topic("src", fsync_cfg()).unwrap();
     for i in 0..n_dests {
         let dest = format!("dst{i}");
-        engine.put_box(&dest, fsync_cfg()).unwrap();
+        engine.put_topic(&dest, fsync_cfg()).unwrap();
         engine
             .put_router(
                 &format!("src->{dest}"),
@@ -130,7 +130,7 @@ fn one_source_append_to_n_dests_is_one_wal_append() {
             .unwrap();
     }
 
-    // Baseline WAL frame count AFTER all the control frames (box + router creates).
+    // Baseline WAL frame count AFTER all the control frames (topic + router creates).
     let frames_before = engine
         .wal_metrics()
         .unwrap()
@@ -187,12 +187,12 @@ fn backpressured_forward_is_retried_not_dropped() {
 
     // A tiny reject-on-full dest (cap_records = 2).
     engine
-        .put_box(
+        .put_topic(
             "dst",
-            BoxConfig {
+            TopicConfig {
                 cap_records: 2,
                 discard: Discard::Reject,
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             },
         )
         .unwrap();
@@ -274,7 +274,7 @@ fn dest_rematerializes_deterministically_across_restart() {
     let pre_data: Vec<serde_json::Value>;
     {
         let (engine, _clock) = durable_engine(dir.path());
-        engine.put_box("src", BoxConfig::default()).unwrap();
+        engine.put_topic("src", TopicConfig::default()).unwrap();
         engine
             .put_router("src->dst", router_req("src", "dst"))
             .unwrap();
@@ -300,7 +300,7 @@ fn dest_rematerializes_deterministically_across_restart() {
         engine.write_snapshot().unwrap();
     }
 
-    // Restart from the same data dir: the dest box has NO Append frames in the WAL
+    // Restart from the same data dir: the dest topic has NO Append frames in the WAL
     // (derived), so it is re-materialized by replaying forwarding from the
     // recovered cursor — with the SAME seqs.
     {
@@ -354,11 +354,11 @@ fn source_trim_surfaces_tombstone_not_silent_gap() {
     // A source with a TTL so records age out, and a router that has NOT yet
     // forwarded them (we never read the dest until after the trim).
     engine
-        .put_box(
+        .put_topic(
             "src",
-            BoxConfig {
+            TopicConfig {
                 ttl_ms: 1_000,
-                ..BoxConfig::default()
+                ..TopicConfig::default()
             },
         )
         .unwrap();
@@ -386,7 +386,7 @@ fn source_trim_surfaces_tombstone_not_silent_gap() {
     // then write a fresh record that is still live.
     clock.advance(2_000);
     // Force the source retention floor to advance (a state read enforces it).
-    let _ = engine.box_state("src", false).unwrap();
+    let _ = engine.topic_state("src", false).unwrap();
     engine
         .write(
             "src",
@@ -424,7 +424,7 @@ fn source_trim_surfaces_tombstone_not_silent_gap() {
 // ---------------------------------------------------------------------------
 // 5. No multi-source fan-in into a derived dest (codex P0 #2/#4): a SECOND router
 //    with a DIFFERENT source into the same dest is rejected (its derived seq
-//    stream must have a single owner for deterministic re-materialization). A box
+//    stream must have a single owner for deterministic re-materialization). A topic
 //    that ALSO takes direct writes / closes a cycle is still permitted (the /v0
 //    `allow_cycle` contract requires it), so only genuine fan-in is refused.
 // ---------------------------------------------------------------------------
@@ -435,14 +435,14 @@ fn derived_dest_rejects_multi_source_fan_in() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _clock) = durable_engine(dir.path());
 
-    engine.put_box("src", BoxConfig::default()).unwrap();
+    engine.put_topic("src", TopicConfig::default()).unwrap();
     engine
         .put_router("src->dst", router_req("src", "dst"))
         .unwrap();
 
     // (a) A SECOND router with a DIFFERENT source into the same dest (multi-source
     //     fan-in) is rejected (409): two derived seq streams cannot share a dest.
-    engine.put_box("src2", BoxConfig::default()).unwrap();
+    engine.put_topic("src2", TopicConfig::default()).unwrap();
     let fan_in = engine.put_router("src2->dst", router_req("src2", "dst"));
     assert!(
         fan_in.is_err(),
@@ -454,17 +454,17 @@ fn derived_dest_rejects_multi_source_fan_in() {
         .put_router("src->dst", router_req("src", "dst"))
         .expect("re-PUT of the same router is allowed");
 
-    // (c) A box that ALSO takes direct writes can still become a router dest, and a
+    // (c) A topic that ALSO takes direct writes can still become a router dest, and a
     //     direct write into a router dest still succeeds (the allow_cycle/`/v0`
-    //     contract: a box may be both a direct-write box and a router dest).
-    engine.put_box("mixed", BoxConfig::default()).unwrap();
+    //     contract: a topic may be both a direct-write topic and a router dest).
+    engine.put_topic("mixed", TopicConfig::default()).unwrap();
     engine
         .write(
             "mixed",
             write_req(vec![one(json!({"d": 1}), None, None)]),
             true,
         )
-        .expect("direct write into a not-yet-router box");
+        .expect("direct write into a not-yet-router topic");
     engine
         .put_router(
             "src->mixed",
@@ -473,8 +473,8 @@ fn derived_dest_rejects_multi_source_fan_in() {
                 ..router_req("src", "mixed")
             },
         )
-        .expect("a router onto a direct-write box is allowed (mixed box)");
-    // A further direct write into the now-router-dest box still succeeds.
+        .expect("a router onto a direct-write topic is allowed (mixed topic)");
+    // A further direct write into the now-router-dest topic still succeeds.
     engine
         .write(
             "mixed",
@@ -511,7 +511,7 @@ fn router_create_cursor_is_durable_without_snapshot() {
     {
         let (engine, _clock) = durable_engine(dir.path());
         // Source history BEFORE the router exists.
-        engine.put_box("src", BoxConfig::default()).unwrap();
+        engine.put_topic("src", TopicConfig::default()).unwrap();
         for i in 1..=3 {
             engine
                 .write(
@@ -570,7 +570,7 @@ fn snapshot_cursor_and_dest_stay_consistent_under_concurrency() {
 
     {
         let (engine, _clock) = durable_engine(dir.path());
-        engine.put_box("src", BoxConfig::default()).unwrap();
+        engine.put_topic("src", TopicConfig::default()).unwrap();
         engine
             .put_router("src->dst", router_req("src", "dst"))
             .unwrap();

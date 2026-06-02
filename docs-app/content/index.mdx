@@ -1,6 +1,6 @@
 ---
 title: streams — a persistent event engine in a single binary
-description: An append-only log service over a clean, JSON-first HTTP API. Boxes, routers, multiplexed SSE, lease queues, and per-box durability — one static binary, one machine. Data loss is always explicit, never silent.
+description: An append-only log service over a clean, JSON-first HTTP API. Topics, routers, multiplexed SSE, lease queues, and per-topic durability — one static binary, one machine. Data loss is always explicit, never silent.
 ---
 
 import { IconDisk, IconFlag, IconRoute, IconBolt, IconClock, IconCube } from '../components/icons'
@@ -16,8 +16,8 @@ import { withBase } from '../components/base'
 
 <p className="hero-sub">
 **streams** is an append-only log service over a clean, JSON-first HTTP API. Write
-events to named **boxes**, read them back by **sequence**, fan them out with
-**routers**, and watch many boxes at once over one **SSE** connection — all from one
+events to named **topics**, read them back by **sequence**, fan them out with
+**routers**, and watch many topics at once over one **SSE** connection — all from one
 static binary on one machine, backed by a write-ahead log on local NVMe. Data loss is
 always **explicit, never silent**.
 </p>
@@ -32,14 +32,14 @@ always **explicit, never silent**.
   <div className="term-bar"><i /><i /><i /><span className="term-title">bash — write an event, read it back</span></div>
 
 ```bash
-# Write a record (the server assigns its $seq). The box is created on first write.
-curl -X POST localhost:4000/v0/boxes/jobs \
+# Write a record (the server assigns its $seq). The topic is created on first write.
+curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
   -d '{ "records": [ { "data": { "url": "s3://b/a.png" }, "tag": "job-9001" } ] }'
-# → { "box": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1], "head_seq": 1, ... }
+# → { "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1], "head_seq": 1, ... }
 
 # Read everything after a cursor. The monotonic seq IS the cursor.
-curl -X POST localhost:4000/v0/boxes/jobs/diff -d '{ "from_seq": 0 }'
+curl -X POST localhost:4000/v0/topics/jobs/diff -d '{ "from_seq": 0 }'
 # → { "records": [ { "$seq": 1, "$ts": 1748470000123, "data": { "url": "s3://b/a.png" } } ],
 #     "next_from_seq": 1, "head_seq": 1, "caught_up": true, "tombstone": null }
 ```
@@ -58,7 +58,7 @@ endpoint is one of these doing its job.
 </p>
 
 <div className="concept-grid">
-  <div className="concept"><div className="c-name">Box</div><p className="c-desc">A named, append-only log of records ordered by a monotonic <code>seq</code>. Created lazily on first write.</p></div>
+  <div className="concept"><div className="c-name">Topic</div><p className="c-desc">A named, append-only log of records ordered by a monotonic <code>seq</code>. Created lazily on first write.</p></div>
   <div className="concept"><div className="c-name">Record</div><p className="c-desc">One immutable event. The server assigns <code>$seq</code> and <code>$ts</code>; you supply opaque <code>data</code>, an optional <code>tag</code> and <code>node</code>.</p></div>
   <div className="concept"><div className="c-name">seq</div><p className="c-desc">The cursor. Reads are “give me everything after <code>from_seq</code>.” The client owns its position; advancing it is the ack.</p></div>
   <div className="concept"><div className="c-name">Router</div><p className="c-desc">A server-side <code>source → dest</code> forwarding rule. Fan-out that preserves origin node, so N nodes mirror without echo.</p></div>
@@ -76,8 +76,8 @@ endpoint is one of these doing its job.
 
 <a className="feature-card" href={withBase("/guarantees/durability")}>
   <span className="fc-icon"><IconDisk /></span>
-  <h3>Per-box durability</h3>
-  <p>Three commit classes — <code>memory</code>, <code>disk</code> (group-commit WAL), and <code>fsync</code> (fsync-gated ack) — chosen per box. They coexist in one process.</p>
+  <h3>Per-topic durability</h3>
+  <p>Three commit classes — <code>memory</code>, <code>disk</code> (group-commit WAL), and <code>fsync</code> (fsync-gated ack) — chosen per topic. They coexist in one process.</p>
   <span className="fc-more">Durability classes →</span>
 </a>
 
@@ -98,7 +98,7 @@ endpoint is one of these doing its job.
 <a className="feature-card" href={withBase("/api/watch")}>
   <span className="fc-icon"><IconBolt /></span>
   <h3>Multiplexed SSE</h3>
-  <p>Watch dozens of boxes over one resumable connection with composite cursors, named events, heartbeats, and tombstones — woken on append, not polled.</p>
+  <p>Watch dozens of topics over one resumable connection with composite cursors, named events, heartbeats, and tombstones — woken on append, not polled.</p>
   <span className="fc-more">Watch (SSE) →</span>
 </a>
 
@@ -123,10 +123,10 @@ endpoint is one of these doing its job.
 <section className="section">
 
 <span className="section-eyebrow">The central tradeoff</span>
-<h2 className="section-title">Durability is per box — each box buys exactly the guarantee it needs</h2>
+<h2 className="section-title">Durability is per topic — each topic buys exactly the guarantee it needs</h2>
 <p className="section-lede">
 A best-effort cache, a group-committed pub/sub feed, and an fsync-gated job queue
-coexist in one process. Routers bridge them, honoring the destination box's class.
+coexist in one process. Routers bridge them, honoring the destination topic's class.
 </p>
 
 <div className="dura-grid">

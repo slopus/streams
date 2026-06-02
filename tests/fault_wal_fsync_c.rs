@@ -16,10 +16,10 @@
 //!    are durable on the underlying disk (the fsync returned). A regression that
 //!    acked-before-fsync would be caught the instant it happened.
 //!  - `F-PROP-DURABILITY-CLASS-MIX` — proptest-generated random mix of durable /
-//!    non-durable boxes & writes, `FakeDisk.crash()` at a random step: every
+//!    non-durable topics & writes, `FakeDisk.crash()` at a random step: every
 //!    durable acked write survives, a non-durable one may vanish but only as a
-//!    clean tail, and a cross-box group-commit never loses one box's acked frame
-//!    to another box's non-durable one.
+//!    clean tail, and a cross-topic group-commit never loses one topic's acked frame
+//!    to another topic's non-durable one.
 //!
 //! ```text
 //! cargo test --features test-fs --test fault_wal_fsync_c
@@ -48,7 +48,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, MonitorFs, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_batch1.rs)
@@ -89,7 +89,7 @@ fn fast_cfg() -> WalConfig {
 
 fn ap(seq: u64) -> WalRecord {
     WalRecord::Append {
-        box_id: 1,
+        topic_id: 1,
         seq,
         ts: 1_700_000_000_000 + seq,
         node: None,
@@ -469,20 +469,20 @@ fn f_monitor_wal_order() {
 
 // ===========================================================================
 // F-PROP-DURABILITY-CLASS-MIX
-// proptest drives a random mix of durable / non-durable boxes & writes through a
+// proptest drives a random mix of durable / non-durable topics & writes through a
 // REAL engine, mirrors only acked effects into a reference model, crashes the
 // disk at a random step (drop pending), then recovers and asserts:
 //   - every DURABLE acked write survives (acked⇒durable),
-//   - a non-durable box's survivors are a clean dense PREFIX (a tail may vanish),
-//   - no fabrication / no gap / seq monotone — cross-box group-commit never loses
-//     one box's acked durable frame to another box's non-durable one.
+//   - a non-durable topic's survivors are a clean dense PREFIX (a tail may vanish),
+//   - no fabrication / no gap / seq monotone — cross-topic group-commit never loses
+//     one topic's acked durable frame to another topic's non-durable one.
 // ===========================================================================
 
-/// The reference model of one box: whether it is durable, its acked records by
+/// The reference model of one topic: whether it is durable, its acked records by
 /// seq, and the head. (A pared-down version of `tests/crash_oracle.rs`'s model,
 /// sufficient for the durability-class-mix contract.)
 #[derive(Debug, Clone, Default)]
-struct PModelBox {
+struct PModelTopic {
     durable: bool,
     acked: BTreeMap<u64, String>,
     head: u64,
@@ -490,18 +490,18 @@ struct PModelBox {
 
 #[derive(Debug, Default)]
 struct PModel {
-    boxes: BTreeMap<String, PModelBox>,
+    topics: BTreeMap<String, PModelTopic>,
 }
 
 impl PModel {
     fn ensure(&mut self, name: &str, durable: bool) {
-        self.boxes.entry(name.to_string()).or_insert(PModelBox {
+        self.topics.entry(name.to_string()).or_insert(PModelTopic {
             durable,
             ..Default::default()
         });
     }
     fn ack(&mut self, name: &str, seq: u64, data: &str) {
-        let b = self.boxes.get_mut(name).expect("box modeled before append");
+        let b = self.topics.get_mut(name).expect("topic modeled before append");
         b.acked.insert(seq, data.to_string());
         b.head = b.head.max(seq);
     }
@@ -510,21 +510,21 @@ impl PModel {
 /// One proptest-generated op.
 #[derive(Debug, Clone)]
 enum POp {
-    /// Create box `bi` with the given durability class.
-    PutBox { bi: u8, durable: bool },
-    /// Append `data` to box `bi`. The box is durable per its create (or the
+    /// Create topic `bi` with the given durability class.
+    PutTopic { bi: u8, durable: bool },
+    /// Append `data` to topic `bi`. The topic is durable per its create (or the
     /// default non-durable if auto-created).
     Append { bi: u8, data: String },
 }
 
 fn pop_strategy() -> impl Strategy<Value = POp> {
     prop_oneof![
-        (0u8..3, any::<bool>()).prop_map(|(bi, durable)| POp::PutBox { bi, durable }),
+        (0u8..3, any::<bool>()).prop_map(|(bi, durable)| POp::PutTopic { bi, durable }),
         (0u8..3, "[a-z]{1,4}").prop_map(|(bi, data)| POp::Append { bi, data }),
     ]
 }
 
-fn box_name(bi: u8) -> String {
+fn topic_name(bi: u8) -> String {
     format!("b{bi}")
 }
 
@@ -544,9 +544,9 @@ fn one_write(data: &str) -> WriteRequest {
     }
 }
 
-/// Read back box `name`'s live records (seq → data) through the engine diff path.
+/// Read back topic `name`'s live records (seq → data) through the engine diff path.
 fn dump_records(engine: &Engine, name: &str) -> Option<BTreeMap<u64, String>> {
-    engine.box_state(name, false).ok()?;
+    engine.topic_state(name, false).ok()?;
     let mut out = BTreeMap::new();
     let mut from = 0u64;
     loop {
@@ -585,11 +585,11 @@ fn open_engine(disk: &FakeDisk) -> Arc<Engine> {
     Engine::with_data_dir_fs(cfg(), clock(), disk.arc()).expect("engine opens through FakeDisk")
 }
 
-/// Assert the durability-class-mix contract for one recovered box against the
-/// model. `survivors` is the recovered seq→data map (empty if the box is absent).
-fn assert_box_mix_contract(
+/// Assert the durability-class-mix contract for one recovered topic against the
+/// model. `survivors` is the recovered seq→data map (empty if the topic is absent).
+fn assert_topic_mix_contract(
     name: &str,
-    model: &PModelBox,
+    model: &PModelTopic,
     survivors: &BTreeMap<u64, String>,
     ops_log: &[POp],
 ) {
@@ -611,8 +611,8 @@ fn assert_box_mix_contract(
     }
 
     // (2) DURABLE acked writes ALL survive (acked⇒durable). The whole acked tail of
-    //     a durable box was fsynced before its ack returned, so a power loss keeps
-    //     every one — even if a *different* (non-durable) box's tail vanished in the
+    //     a durable topic was fsynced before its ack returned, so a power loss keeps
+    //     every one — even if a *different* (non-durable) topic's tail vanished in the
     //     same group-commit window.
     if model.durable {
         for (seq, data) in &model.acked {
@@ -626,7 +626,7 @@ fn assert_box_mix_contract(
 
     // (3) NO GAP — survivors are a dense prefix of the model's acked set up to the
     //     surviving high-water mark (a crash drops only a tail, never punches a hole
-    //     into the middle). Applies to durable and non-durable boxes alike.
+    //     into the middle). Applies to durable and non-durable topics alike.
     if let Some(&hi) = survivor_seqs.last() {
         let expected_prefix: Vec<u64> = model.acked.keys().copied().filter(|s| *s <= hi).collect();
         assert_eq!(
@@ -649,7 +649,7 @@ fn assert_box_mix_contract(
 proptest! {
     // Bounded: small op streams + few cases so each (engine open + per-op group
     // fsync + recovery) round trip keeps the whole test well under a minute, while
-    // proptest still explores the durable/non-durable × box × crash-step space.
+    // proptest still explores the durable/non-durable × topic × crash-step space.
     #![proptest_config(ProptestConfig {
         cases: 6,
         max_shrink_iters: 256,
@@ -657,7 +657,7 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Random mix of durable & non-durable boxes/writes, crash at a random step.
+    /// Random mix of durable & non-durable topics/writes, crash at a random step.
     #[test]
     fn f_prop_durability_class_mix(
         ops in prop::collection::vec(pop_strategy(), 1..7),
@@ -679,23 +679,23 @@ proptest! {
             let engine = open_engine(&disk);
             for op in &ops[..crash_at] {
                 match op {
-                    POp::PutBox { bi, durable } => {
-                        let name = box_name(*bi);
-                        let cfgb = BoxConfig {
-                            r#type: BoxType::Log,
+                    POp::PutTopic { bi, durable } => {
+                        let name = topic_name(*bi);
+                        let cfgb = TopicConfig {
+                            r#type: TopicType::Log,
                             durable: *durable,
                             cap_records: 0,
                             ..Default::default()
                         };
-                        if engine.put_box(&name, cfgb).is_ok() {
+                        if engine.put_topic(&name, cfgb).is_ok() {
                             model.ensure(&name, *durable);
                         }
                     }
                     POp::Append { bi, data } => {
-                        let name = box_name(*bi);
+                        let name = topic_name(*bi);
                         // Auto-create defaults to non-durable; model it so the diff
                         // applies the right durability relaxation.
-                        if !model.boxes.contains_key(&name) {
+                        if !model.topics.contains_key(&name) {
                             model.ensure(&name, false);
                         }
                         // A durable append blocks on its group fsync ⇒ returning Ok
@@ -703,10 +703,10 @@ proptest! {
                         // them). A non-durable append acks on the buffered write ⇒ its
                         // bytes may still be pending at the crash and vanish.
                         if let Ok(resp) = engine.write(&name, one_write(data), true) {
-                            // For a non-durable box the ack does not imply durability:
+                            // For a non-durable topic the ack does not imply durability:
                             // these seqs are best-effort and may be dropped as a clean
                             // tail. We still record them (the contract's upper bound:
-                            // survivors ⊆ acked); only durable boxes' acked sets are
+                            // survivors ⊆ acked); only durable topics' acked sets are
                             // the must-survive lower bound (checked in the contract).
                             let seqs = resp.seqs.clone().unwrap_or_else(|| vec![resp.last_seq]);
                             for s in &seqs {
@@ -727,30 +727,30 @@ proptest! {
         disk.reset_power();
 
         // Recover a fresh engine through the crashed image and assert the contract
-        // for every modeled box.
+        // for every modeled topic.
         let engine = open_engine(&disk);
-        for (name, mbox) in &model.boxes {
+        for (name, mbox) in &model.topics {
             if mbox.acked.is_empty() && mbox.head == 0 {
-                continue; // an empty phantom box need not exist post-recovery.
+                continue; // an empty phantom topic need not exist post-recovery.
             }
             let survivors = dump_records(&engine, name).unwrap_or_default();
-            // A DURABLE box with acked records must not vanish entirely (acked⇒durable
+            // A DURABLE topic with acked records must not vanish entirely (acked⇒durable
             // — its frames fsynced before the crash).
             if mbox.durable && !mbox.acked.is_empty() {
                 prop_assert!(
                     !survivors.is_empty(),
-                    "{}: durable box with acked records vanished after recovery\nops={:?}",
+                    "{}: durable topic with acked records vanished after recovery\nops={:?}",
                     name, ops
                 );
             }
-            assert_box_mix_contract(name, mbox, &survivors, &ops);
+            assert_topic_mix_contract(name, mbox, &survivors, &ops);
         }
 
         // IDEMPOTENT RECOVERY: a second recovery over the same image is identical
         // (recover(recover(x)) == recover(x)) — no acked frame gained or lost on a
         // second pass.
         let dumps1: BTreeMap<String, Option<BTreeMap<u64, String>>> = model
-            .boxes
+            .topics
             .keys()
             .map(|n| (n.clone(), dump_records(&engine, n)))
             .collect();

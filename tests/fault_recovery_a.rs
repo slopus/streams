@@ -41,7 +41,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
 use streams::storage::OpenOpts;
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 // WAL frame layout constants (mirrors src/storage/wal.rs; those are crate-private
 // so we re-declare the few we need for byte-poking).
@@ -63,7 +63,7 @@ struct ModelRecord {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ModelBox {
+struct ModelTopic {
     durable: bool,
     acked: BTreeMap<u64, ModelRecord>,
     ever_acked: BTreeMap<u64, ModelRecord>,
@@ -73,7 +73,7 @@ struct ModelBox {
     cap: u64,
 }
 
-impl ModelBox {
+impl ModelTopic {
     fn live_seqs(&self) -> Vec<u64> {
         let floor = self.delete_floor.max(self.evict_floor);
         self.acked.keys().copied().filter(|s| *s >= floor).collect()
@@ -85,19 +85,19 @@ impl ModelBox {
 
 #[derive(Debug, Default)]
 struct RefModel {
-    boxes: BTreeMap<String, ModelBox>,
+    topics: BTreeMap<String, ModelTopic>,
 }
 
 impl RefModel {
-    fn ensure_box(&mut self, name: &str, durable: bool, cap: u64) {
-        self.boxes.entry(name.to_string()).or_insert(ModelBox {
+    fn ensure_topic(&mut self, name: &str, durable: bool, cap: u64) {
+        self.topics.entry(name.to_string()).or_insert(ModelTopic {
             durable,
             cap,
             ..Default::default()
         });
     }
     fn ack_append(&mut self, name: &str, seqs: &[u64], recs: &[ModelRecord]) {
-        let b = self.boxes.get_mut(name).expect("box modeled before append");
+        let b = self.topics.get_mut(name).expect("topic modeled before append");
         for (s, r) in seqs.iter().zip(recs.iter()) {
             b.acked.insert(*s, r.clone());
             b.ever_acked.insert(*s, r.clone());
@@ -127,7 +127,7 @@ impl RefModel {
 
 #[derive(Debug, Clone)]
 enum Op {
-    PutBox {
+    PutTopic {
         name: String,
         durable: bool,
         cap: u64,
@@ -143,15 +143,15 @@ enum Op {
 fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
     for op in ops {
         match op {
-            Op::PutBox { name, durable, cap } => {
-                let cfg = BoxConfig {
-                    r#type: BoxType::Log,
+            Op::PutTopic { name, durable, cap } => {
+                let cfg = TopicConfig {
+                    r#type: TopicType::Log,
                     durable: *durable,
                     cap_records: *cap,
                     ..Default::default()
                 };
-                if engine.put_box(name, cfg).is_ok() {
-                    model.ensure_box(name, *durable, *cap);
+                if engine.put_topic(name, cfg).is_ok() {
+                    model.ensure_topic(name, *durable, *cap);
                 }
             }
             Op::Append {
@@ -173,8 +173,8 @@ fn run_ops(engine: &Engine, model: &mut RefModel, ops: &[Op]) {
                     config: None,
                     disable_backpressure: true,
                 };
-                if !model.boxes.contains_key(name) {
-                    model.ensure_box(name, false, 0);
+                if !model.topics.contains_key(name) {
+                    model.ensure_topic(name, false, 0);
                 }
                 if let Ok(resp) = engine.write(name, req, true) {
                     let seqs = resp.seqs.clone().unwrap_or_else(|| vec![resp.last_seq]);
@@ -216,7 +216,7 @@ fn stop(engine: Arc<Engine>) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -224,8 +224,8 @@ struct BoxDump {
     tombstone_reason: Option<String>,
 }
 
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone_reason = None;
     let mut from = 0u64;
@@ -268,7 +268,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -288,9 +288,9 @@ fn sync_wal_dir(disk: &FakeDisk) {
 // Oracle contract assertions — copied from tests/crash_oracle.rs.
 // ===========================================================================
 
-/// Assert the crash-consistency contract for one box (the post-corruption,
+/// Assert the crash-consistency contract for one topic (the post-corruption,
 /// torn-tail relaxation: `whole_tail_durable=false`).
-fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_durable: bool) {
+fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 
@@ -335,8 +335,8 @@ fn assert_box_contract(name: &str, model: &ModelBox, dump: &BoxDump, whole_tail_
         }
     }
 
-    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` box's head never exceeds
-    //     the acked head; a `disk` box (acked before fsync) recovers at its durable
+    // (4) HEAD MONOTONE / NO SEQ REUSE (R3). An `fsync` topic's head never exceeds
+    //     the acked head; a `disk` topic (acked before fsync) recovers at its durable
     //     head RESERVATION — its head may sit ABOVE the acked head by up to
     //     `DISK_HEAD_RESERVE_AHEAD` (dropped un-fsynced seqs become silent gaps),
     //     never regressing below an acked seq when the whole tail was durable.
@@ -453,12 +453,12 @@ fn frame_end(buf: &[u8], start: usize) -> usize {
 // model. The disk holds the durable WAL ready for byte-poking.
 // ===========================================================================
 
-/// Drive a fixed durable workload of `n` appends into box `b` and return the
+/// Drive a fixed durable workload of `n` appends into topic `b` and return the
 /// reference model. After this returns the engine is stopped and the WAL is
 /// durable on `disk`.
 fn run_durable_workload(disk: &FakeDisk, n: u64) -> RefModel {
     let mut model = RefModel::default();
-    let mut ops = vec![Op::PutBox {
+    let mut ops = vec![Op::PutTopic {
         name: "b".into(),
         durable: true,
         cap: 0,
@@ -507,8 +507,8 @@ fn f_wal_len_garbage_huge() {
 
     // Recovery must NOT OOM/panic and must truncate at the bad frame.
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "b").expect("box recovers");
-    assert_box_contract("b", &model.boxes["b"], &dump, false);
+    let dump = dump_topic(&engine, "b").expect("topic recovers");
+    assert_topic_contract("b", &model.topics["b"], &dump, false);
 
     // The 3 frames before the poked last one survive as a dense prefix [1..=3];
     // the overrun frame (seq 4) is truncated, never materialized.
@@ -546,8 +546,8 @@ fn f_wal_len_below_min() {
     rewrite_wal_durable(&disk, &buf);
 
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "b").expect("box recovers");
-    assert_box_contract("b", &model.boxes["b"], &dump, false);
+    let dump = dump_topic(&engine, "b").expect("topic recovers");
+    assert_topic_contract("b", &model.topics["b"], &dump, false);
 
     // Sub-min frame_len ⇒ Torn ⇒ the last frame and anything after is dropped;
     // the prior 3 frames are a dense prefix, no underflow/panic.
@@ -587,8 +587,8 @@ fn f_wal_crc_flip_tail() {
     rewrite_wal_durable(&disk, &buf);
 
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "b").expect("box recovers");
-    assert_box_contract("b", &model.boxes["b"], &dump, false);
+    let dump = dump_topic(&engine, "b").expect("topic recovers");
+    assert_topic_contract("b", &model.topics["b"], &dump, false);
 
     // The flipped last frame fails CRC ⇒ truncated; the prior 3 survive intact.
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
@@ -626,7 +626,7 @@ fn f_wal_crc_flip_midlog() {
     );
 
     // Flip a bit in the body of a MID-log frame (the 4th of 6+, i.e. seq 4). The
-    // create-box frame may be first, so index by the LAST 6 (the appends).
+    // create-topic frame may be first, so index by the LAST 6 (the appends).
     let appends: Vec<usize> = offs[offs.len() - 6..].to_vec();
     let mid = appends[3]; // the 4th append frame (seq 4)
     let flip_at = mid + FRAME_LEN_PREFIX + FRAME_HEADER_LEN;
@@ -638,13 +638,13 @@ fn f_wal_crc_flip_midlog() {
     rewrite_wal_durable(&disk, &buf);
 
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "b").expect("box recovers");
+    let dump = dump_topic(&engine, "b").expect("topic recovers");
 
     // DOCUMENTED BEHAVIOR: truncate-at-first-bad. Replay stops at the corrupt
     // mid-log frame; everything from it onward (seqs 4,5,6) is dropped. The
     // survivors are exactly the dense prefix [1..=3] — NO fabrication, NO gap,
     // NO skip-and-continue that would resurface seqs 5/6 over a hole at 4.
-    assert_box_contract("b", &model.boxes["b"], &dump, false);
+    assert_topic_contract("b", &model.topics["b"], &dump, false);
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
     assert_eq!(
         survivors,
@@ -683,8 +683,8 @@ fn f_wal_zeroed_frame() {
     rewrite_wal_durable(&disk, &buf);
 
     let engine = open_engine(&disk);
-    let dump = dump_box(&engine, "b").expect("box recovers");
-    assert_box_contract("b", &model.boxes["b"], &dump, false);
+    let dump = dump_topic(&engine, "b").expect("topic recovers");
+    assert_topic_contract("b", &model.topics["b"], &dump, false);
 
     // frame_len==0 (< MIN_FRAME_LEN) ⇒ Torn ⇒ the zeroed region stops replay; it
     // is NOT decoded as an empty record. Prior 3 frames are a dense prefix.

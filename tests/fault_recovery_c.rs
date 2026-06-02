@@ -54,7 +54,7 @@ use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage
 use streams::storage::{
     Fs, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, SegmentStore, StoreError,
 };
-use streams::types::{BoxConfig, BoxType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 
@@ -79,7 +79,7 @@ fn open_engine_fs(fs: Arc<dyn Fs>) -> std::result::Result<Arc<Engine>, String> {
     Engine::with_data_dir_fs(cfg(), clock(), fs).map_err(|e| e.to_string())
 }
 
-/// Append one durable record, returning the assigned seq. Auto-creates the box.
+/// Append one durable record, returning the assigned seq. Auto-creates the topic.
 fn append(engine: &Engine, name: &str, data: &str) -> u64 {
     let req = WriteRequest {
         records: vec![RecordIn {
@@ -98,16 +98,16 @@ fn append(engine: &Engine, name: &str, data: &str) -> u64 {
     resp.last_seq
 }
 
-fn put_durable_box(engine: &Engine, name: &str) {
-    let cfg = BoxConfig {
-        r#type: BoxType::Log,
+fn put_durable_topic(engine: &Engine, name: &str) {
+    let cfg = TopicConfig {
+        r#type: TopicType::Log,
         durable: true,
         ..Default::default()
     };
-    engine.put_box(name, cfg).expect("put_box");
+    engine.put_topic(name, cfg).expect("put_topic");
 }
 
-/// The recovered `(head, earliest, count, seq→data)` of one box read back through
+/// The recovered `(head, earliest, count, seq→data)` of one topic read back through
 /// the public state + diff path — the same bytes a consumer sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Dump {
@@ -118,7 +118,7 @@ struct Dump {
 }
 
 fn dump(engine: &Engine, name: &str) -> Option<Dump> {
-    let st = engine.box_state(name, false).ok()?;
+    let st = engine.topic_state(name, false).ok()?;
     let mut data = BTreeMap::new();
     let mut from = 0u64;
     loop {
@@ -168,7 +168,7 @@ fn sync_dirs(disk: &FakeDisk) {
 
 /// A dense contiguous prefix `[1..=k]` carrying the model payloads `"r{seq}"`,
 /// with no fabricated seq and no hole. The universal post-recovery survivor shape
-/// for these single-box durable workloads.
+/// for these single-topic durable workloads.
 fn assert_dense_prefix(d: &Dump, acked: &BTreeMap<u64, String>) {
     let mut seqs: Vec<u64> = d.data.keys().copied().collect();
     seqs.sort_unstable();
@@ -215,7 +215,7 @@ fn f_rec_crash_during_replay() {
     let mut acked: BTreeMap<u64, String> = BTreeMap::new();
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "b");
+        put_durable_topic(&engine, "b");
         for i in 1..=4u64 {
             let data = format!("r{i}");
             let seq = append(&engine, "b", &data);
@@ -323,7 +323,7 @@ fn f_rec_crash_before_truncate() {
     let mut acked: BTreeMap<u64, String> = BTreeMap::new();
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "b");
+        put_durable_topic(&engine, "b");
         for i in 1..=6u64 {
             let data = format!("r{i}");
             let seq = append(&engine, "b", &data);
@@ -430,7 +430,7 @@ fn f_rec_eio_truncate() {
     let mut acked: BTreeMap<u64, String> = BTreeMap::new();
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "b");
+        put_durable_topic(&engine, "b");
         for i in 1..=5u64 {
             let data = format!("r{i}");
             let seq = append(&engine, "b", &data);
@@ -482,7 +482,7 @@ fn f_rec_eio_truncate_fsync() {
     let mut acked: BTreeMap<u64, String> = BTreeMap::new();
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "b");
+        put_durable_topic(&engine, "b");
         for i in 1..=5u64 {
             let data = format!("r{i}");
             let seq = append(&engine, "b", &data);
@@ -533,7 +533,7 @@ fn f_rec_eio_truncate_fsync() {
 //   back to WAL/resident for that range (segments are derivable); does not crash;
 //   re-running converges; no live record lost.
 //
-//   The engine wires its per-box segment store via `LocalSegmentStore::open` on
+//   The engine wires its per-topic segment store via `LocalSegmentStore::open` on
 //   the REAL fs (it is not routed through the injected recovery_fs), so a fault
 //   on a seg `.idx` cannot be injected through `with_data_dir_fs`. We therefore
 //   exercise the segment store's `.idx` read path directly through a `FaultFs`
@@ -551,7 +551,7 @@ fn f_rec_idx_bulkload_eio() {
     let mut acked: BTreeMap<u64, String> = BTreeMap::new();
     {
         let engine = open_engine(&disk);
-        put_durable_box(&engine, "b");
+        put_durable_topic(&engine, "b");
         for i in 1..=5u64 {
             let data = format!("r{i}");
             let seq = append(&engine, "b", &data);

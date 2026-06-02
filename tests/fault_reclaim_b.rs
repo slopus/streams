@@ -44,7 +44,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{BoxConfig, BoxType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{TopicConfig, TopicType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
 
 // ===========================================================================
 // Plumbing (mirrors tests/crash_oracle.rs — reused, not reinvented)
@@ -93,10 +93,10 @@ struct Rec {
     node: Option<String>,
 }
 
-/// A flat dump of a recovered box: head / earliest / count, the live records by
+/// A flat dump of a recovered topic: head / earliest / count, the live records by
 /// seq, and any tombstone reason a from-0 read surfaces. `None` if absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoxDump {
+struct TopicDump {
     head: u64,
     earliest: u64,
     count: u64,
@@ -105,11 +105,11 @@ struct BoxDump {
 }
 
 /// Read the full recovered state of `name` through the public API (state + a
-/// paginated diff over every record from seq 0). The `box_state` + `diff` reads
+/// paginated diff over every record from seq 0). The `topic_state` + `diff` reads
 /// both run `enforce_retention` at the engine's *current* clock, so this is also
 /// what re-derives a cap/TTL floor lazily after a WAL-only recovery.
-fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
-    let st = engine.box_state(name, false).ok()?;
+fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
+    let st = engine.topic_state(name, false).ok()?;
     let mut records = BTreeMap::new();
     let mut tombstone_reason = None;
     let mut from = 0u64;
@@ -152,7 +152,7 @@ fn dump_box(engine: &Engine, name: &str) -> Option<BoxDump> {
         }
         from = d.next_from_seq;
     }
-    Some(BoxDump {
+    Some(TopicDump {
         head: st.head_seq,
         earliest: st.earliest_seq,
         count: st.count,
@@ -180,16 +180,16 @@ fn append(engine: &Engine, name: &str, data: &str, tag: Option<&str>) -> Option<
     engine.write(name, req, true).ok().map(|r| r.last_seq)
 }
 
-/// Create (or replace) a box with an explicit durable + cap_records + ttl_ms.
-fn put_box(engine: &Engine, name: &str, durable: bool, cap: u64, ttl_ms: u64) -> bool {
-    let cfg = BoxConfig {
-        r#type: BoxType::Log,
+/// Create (or replace) a topic with an explicit durable + cap_records + ttl_ms.
+fn put_topic(engine: &Engine, name: &str, durable: bool, cap: u64, ttl_ms: u64) -> bool {
+    let cfg = TopicConfig {
+        r#type: TopicType::Log,
         durable,
         cap_records: cap,
         ttl_ms,
         ..Default::default()
     };
-    engine.put_box(name, cfg).is_ok()
+    engine.put_topic(name, cfg).is_ok()
 }
 
 // ===========================================================================
@@ -319,18 +319,18 @@ impl Fs for CrashAfter {
 //   fault:  crash after an EvictWatermark (cap/TTL) fsync but before segment
 //           reclaim.
 //   inject: harness crash-point sweep — FakeDisk.crash() after each FS mutating
-//           (write_at) call of a durable cap-box workload (the eviction is
+//           (write_at) call of a durable cap-topic workload (the eviction is
 //           driven by appending past `cap_records`, which advances the
 //           involuntary evict_floor; the segment reclaim that would follow is
 //           what the crash interrupts).
 //   oracle: evict_floor recovers and never regresses; an involuntary cap
 //           tombstone STILL fires for a below-floor cursor after restart
-//           (involuntary loss is never silent — matches the capped-box
+//           (involuntary loss is never silent — matches the capped-topic
 //           assertion in crash_oracle::cap_evict_floor_survives_crash_with_*).
 //
 // NOTE on the engine model: the engine does not write `EvictWatermark` WAL
 // frames on the hot path — the involuntary cap floor is *durably re-derivable*
-// from the (durable) `cap_records` BoxConfig: a WAL-only recovery rebuilds the
+// from the (durable) `cap_records` TopicConfig: a WAL-only recovery rebuilds the
 // records, and the first `enforce_retention` (run by any state/diff read)
 // recomputes `evict_floor = head - cap_records` and re-materializes the
 // tombstone. So "crash after the watermark, before reclaim" is exercised here as
@@ -338,20 +338,20 @@ impl Fs for CrashAfter {
 // the floor + tombstone come back" — the floor is never lost and never regresses.
 // ===========================================================================
 
-/// The over-cap durable workload: a cap=3 box with 6 appends (so the newest 3
+/// The over-cap durable workload: a cap=3 topic with 6 appends (so the newest 3
 /// survive and seqs 1..=3 fall below the involuntary evict floor → tombstone).
 fn evict_workload(engine: &Engine) {
-    put_box(engine, "cap", true, 3, 0);
+    put_topic(engine, "cap", true, 3, 0);
     for i in 1..=6u64 {
         append(engine, "cap", &i.to_string(), None);
     }
 }
 
-/// Assert the cap recovery contract on a recovered `cap` box: only the newest 3
+/// Assert the cap recovery contract on a recovered `cap` topic: only the newest 3
 /// survive, head is 6, earliest is 4, and a from-0 read tombstones with reason
 /// `cap` (the involuntary floor is explicit, never silent), and the floor never
 /// regressed below 3.
-fn assert_cap_recovered(dump: &BoxDump) {
+fn assert_cap_recovered(dump: &TopicDump) {
     assert_eq!(dump.head, 6, "head recovered to the model");
     assert_eq!(
         dump.records.keys().copied().collect::<Vec<_>>(),
@@ -427,7 +427,7 @@ fn f_evict_floor_crash() {
         // Recover through the crashed image (fresh clock at T0 — no clock jump
         // here; that is F-CLOCK-FORWARD-TTL). The first read re-derives the floor.
         let engine = open_engine(&disk);
-        if let Some(dump) = dump_box(&engine, "cap") {
+        if let Some(dump) = dump_topic(&engine, "cap") {
             // ALWAYS-TRUE invariant at every crash point: survivors are a dense
             // window with NO record below the evict floor surfacing silently, and
             // no fabricated record. Whenever a cap floor advanced (more than `cap`
@@ -435,7 +435,7 @@ fn f_evict_floor_crash() {
             let survivors: Vec<u64> = dump.records.keys().copied().collect();
             assert!(
                 dump.count <= 3 || survivors.is_empty(),
-                "cap=3 box never retains more than 3 records (crash_point {crash_point}, got {})",
+                "cap=3 topic never retains more than 3 records (crash_point {crash_point}, got {})",
                 dump.count
             );
             if dump.head > 3 && !survivors.is_empty() {
@@ -457,7 +457,7 @@ fn f_evict_floor_crash() {
                 // The floor never regresses across a SECOND recovery (idempotent).
                 drop(engine);
                 let engine2 = open_engine(&disk);
-                let dump2 = dump_box(&engine2, "cap").expect("cap present on recovery #2");
+                let dump2 = dump_topic(&engine2, "cap").expect("cap present on recovery #2");
                 assert_eq!(
                     dump2, dump,
                     "recovery idempotent at crash_point {crash_point}"
@@ -484,7 +484,7 @@ fn f_evict_floor_crash() {
 //           deleted data, regress floors, or double-apply; tombstone/evict
 //           floors preserved; the idempotency window only shrinks.
 //
-// Workload: a durable TTL box. Records 1..=3 written at T0; a VOLUNTARY delete
+// Workload: a durable TTL topic. Records 1..=3 written at T0; a VOLUNTARY delete
 // of the seq-1 prefix (silent, no tombstone); records 4..=5 written at T0. We
 // then crash with everything acked-durable, and reopen on a clock jumped far
 // past the TTL so the first post-recovery read TTL-expires the survivors. The
@@ -505,7 +505,7 @@ fn f_clock_forward_ttl() {
     let disk = FakeDisk::new();
     {
         let engine = open_engine_clk(&disk, clock_at(T0));
-        assert!(put_box(&engine, "ttl", true, 0, TTL_MS));
+        assert!(put_topic(&engine, "ttl", true, 0, TTL_MS));
         assert_eq!(append(&engine, "ttl", "r1", Some("a")), Some(1));
         assert_eq!(append(&engine, "ttl", "r2", Some("a")), Some(2));
         assert_eq!(append(&engine, "ttl", "r3", Some("b")), Some(3));
@@ -533,7 +533,7 @@ fn f_clock_forward_ttl() {
     //     deleted prefix (seq 1) stays gone and SILENT; 2..=5 are live. ---------
     {
         let engine = open_engine_clk(&disk, clock_at(T0));
-        let base = dump_box(&engine, "ttl").expect("ttl box recovers");
+        let base = dump_topic(&engine, "ttl").expect("ttl topic recovers");
         assert_eq!(base.head, 5, "head recovered, never regresses");
         assert_eq!(
             base.records.keys().copied().collect::<Vec<_>>(),
@@ -560,7 +560,7 @@ fn f_clock_forward_ttl() {
     assert!(jumped.now_ms() - T0 > TTL_MS as i64, "jump exceeds TTL");
 
     let engine = open_engine_clk(&disk, jumped.clone());
-    let after = dump_box(&engine, "ttl").expect("ttl box recovers under a jumped clock");
+    let after = dump_topic(&engine, "ttl").expect("ttl topic recovers under a jumped clock");
 
     // (a) NO RESURRECTION: the voluntary-deleted seq 1 (and anything below the
     //     delete floor) never comes back, regardless of the clock jump.
@@ -611,7 +611,7 @@ fn f_clock_forward_ttl() {
     //     the horizon; re-running expires nothing new).
     drop(engine);
     let engine2 = open_engine_clk(&disk, jumped.clone());
-    let after2 = dump_box(&engine2, "ttl").expect("ttl box recovers on jumped recovery #2");
+    let after2 = dump_topic(&engine2, "ttl").expect("ttl topic recovers on jumped recovery #2");
     assert_eq!(
         after2, after,
         "recovery under a forward clock jump is idempotent (no double-apply)"
@@ -621,13 +621,13 @@ fn f_clock_forward_ttl() {
     //     never punched a gap nor reused a seq) and is itself immediately TTL-aged
     //     out (it was written 10 days ago in clock terms? no — it is written at
     //     `now`, so it is fresh): the new record is live, proving the floor only
-    //     advanced for the OLD records, never globally poisoned the box.
+    //     advanced for the OLD records, never globally poisoned the topic.
     let new_seq = append(&engine2, "ttl", "r6", None).expect("post-recovery append succeeds");
     assert_eq!(
         new_seq, 6,
         "a post-recovery append continues at head+1 — no gap, no seq reuse"
     );
-    let final_dump = dump_box(&engine2, "ttl").expect("ttl box after the fresh append");
+    let final_dump = dump_topic(&engine2, "ttl").expect("ttl topic after the fresh append");
     assert!(
         final_dump.records.contains_key(&6),
         "the fresh post-jump append (written at `now`) is live — TTL aged only the OLD records"

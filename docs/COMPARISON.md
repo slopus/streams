@@ -16,10 +16,10 @@ incorrect or risky — and an ordered plan.
 >   stub (M3); bounded graceful drain with SSE wind-down (M11); queue `lease_id` fencing —
 >   validate-when-supplied (R4); bounded WAL submission with `503` backpressure (R5); off-gate
 >   segment seal (R6); the **sharded** WAL (`STREAMS_WAL_SHARDS`); **async + derived** routers; the
->   `queue` box type. The WAL is **sharded**, not a single global writer.
+>   `queue` topic type. The WAL is **sharded**, not a single global writer.
 > - **Decided OUT OF SCOPE (will not be built):** multi-server / replication / HA / single-writer
->   fencing (M1); durable consumer groups as a server primitive (M4 — they are an app pattern: a box
->   per consumer + delete); LSM / keyed log compaction / compacted box type and any intra-segment
+>   fencing (M1); durable consumer groups as a server primitive (M4 — they are an app pattern: a topic
+>   per consumer + delete); LSM / keyed log compaction / compacted topic type and any intra-segment
 >   per-record reclaim (M5, the M8 compaction half); native TLS (terminate at a reverse proxy) and
 >   hard multi-tenancy beyond per-key scopes + prefix allowlists (M13). Deletion is **no compaction /
 >   no reclaim** by design.
@@ -32,7 +32,7 @@ crash-test harness (FakeDisk/FaultFs + ~60 enumerated faults + a model oracle
 that is an explicit `wal_consistency_checking` analog) match or beat mature
 engines on crash-correctness *for what it covers*. The gaps are not in the core —
 they are in (a) the **router/queue/list layers** built on top of it, (b) **operational
-surface** (metrics, backup, repair, replication), and (c) **box-cardinality scaling**.
+surface** (metrics, backup, repair, replication), and (c) **topic-cardinality scaling**.
 The cheapest high-value wins reuse machinery that already exists.
 
 Legend: severity is **high / med / low**. "Borrows from" names the battle-tested
@@ -70,13 +70,13 @@ analyses independently rank it #1–2.
 
 ### M3 — Observability / `/v0/metrics` is a stub  · **high** (low effort)
 > **UPDATE — RESOLVED (implemented).** `/v0/metrics` now exposes the full surface: process/aggregate
-> gauges, per-box gauges (head/earliest/records/bytes/queue), real `WalMetrics`, and a fsync-latency
+> gauges, per-topic gauges (head/earliest/records/bytes/queue), real `WalMetrics`, and a fsync-latency
 > histogram (`src/http/health.rs`). It is **not** a one-gauge stub. The text below describes the old
 > state.
 
-`render_prometheus` emits exactly **one** gauge (`streams_boxes`) with an in-code TODO
+`render_prometheus` emits exactly **one** gauge (`streams_topics`) with an in-code TODO
 (`src/http/health.rs:79-86`), even though the data already exists: `WalMetrics`
-(fsyncs/frames/batches/bytes/rotations, `src/storage/wal.rs:989`) and per-box
+(fsyncs/frames/batches/bytes/rotations, `src/storage/wal.rs:989`) and per-topic
 head/earliest/count/bytes/last_write/last_read/queue counters (`src/engine/mod.rs:1222`).
 No latency histograms, no recovery-progress/router-lag/queue-lease/SSE-connection gauges,
 no slow-op log, no request tracing spans (only coarse `info!`/`warn!`).
@@ -86,8 +86,8 @@ no slow-op log, no request tracing spans (only coarse `info!`/`warn!`).
 
 ### M4 — Durable consumer groups / committed offsets  · **high**
 > **UPDATE — OUT OF SCOPE (decided).** Durable consumer groups as a *server primitive* will not be
-> built. The supported pattern is application-level: a box per consumer (or per group) plus
-> delete-as-ack; the lease-based `queue` box type covers competing-worker delivery. The text below
+> built. The supported pattern is application-level: a topic per consumer (or per group) plus
+> delete-as-ack; the lease-based `queue` topic type covers competing-worker delivery. The text below
 > is the original analysis.
 
 Every consumer is bring-your-own-cursor: the `diff` path keeps **no** server-side
@@ -98,8 +98,8 @@ the only server-tracked delivery state. No named groups, no committed offsets, n
 - **Recommend:** add named stream groups with WAL-persisted cursor/ack state (the queue lease-log projection is a precedent for storing such state); keep the lease queue as a separate work-queue mode. Buys observability (lag) for free.
 - **Where:** `src/types.rs:410-434`, `src/engine/queue.rs:1-9`, `docs/API.md:612-617`.
 
-### M5 — Keyed log compaction / compacted box type  · **high**
-> **UPDATE — OUT OF SCOPE (decided).** LSM / keyed log compaction and a compacted box type will not
+### M5 — Keyed log compaction / compacted topic type  · **high**
+> **UPDATE — OUT OF SCOPE (decided).** LSM / keyed log compaction and a compacted topic type will not
 > be built; deletion is **no compaction / no per-record reclaim** by design (a delete-flag byte is
 > flipped in place; only a whole cleared segment is dropped). The last-value-per-key pattern is built
 > at the application level (a tag + a point-in-time `match` delete of prior versions). The text below
@@ -108,11 +108,11 @@ the only server-tracked delivery state. No named groups, no committed offsets, n
 No keyed last-value compaction; `before_seq` delete is snapshot-compaction, not keyed
 (`docs/DESIGN.md:429`). Records have no optional `key`. Already flagged as future
 (`docs/ROADMAP.md:196-203`). Combined with **no intra-segment reclaim** (see B3/storage),
-sparse-delete workloads pin dead bytes indefinitely. The per-box `tag` index is the
+sparse-delete workloads pin dead bytes indefinitely. The per-topic `tag` index is the
 natural compaction key. Three analyses converge here.
 - **Borrows from:** Kafka (`cleanup.policy=compact`), RocksDB (LSM drops obsolete versions), PostgreSQL/SQLite (VACUUM).
-- **Recommend:** add optional record `key` + key tombstones + a compacted box mode that rewrites segments to last-value-per-key. Unlocks Kafka-KTable / config-topic / materialized-current-state use cases an append-only log can't serve.
-- **Where:** `src/types.rs:246-258`, `src/engine/box_state.rs:1031-1089`, `docs/ROADMAP.md:196-203`.
+- **Recommend:** add optional record `key` + key tombstones + a compacted topic mode that rewrites segments to last-value-per-key. Unlocks Kafka-KTable / config-topic / materialized-current-state use cases an append-only log can't serve.
+- **Where:** `src/types.rs:246-258`, `src/engine/topic_state.rs:1031-1089`, `docs/ROADMAP.md:196-203`.
 
 ### M6 — Read-time filtering on `diff` / `watch`  · **med** (low effort)
 The `Eq`/`Glob` predicate language **already exists** (`src/engine/filters.rs`) and is
@@ -122,7 +122,7 @@ by tag-at-delete-time. The API analysis calls this the single highest-leverage *
 add (lowest cost, reuses existing machinery).
 - **Borrows from:** turbopuffer (attribute filters on query), Redis (`XRANGE` + client filter), Kafka (no native, so this is a differentiator).
 - **Recommend:** expose the existing filter tuples on `diff`/`watch` (`match`/`filter` param). Together with M5 this converts streams from a pure log into a queryable, materializable store with minimal new surface.
-- **Where:** `src/engine/filters.rs`, `src/http/boxes.rs`, `docs/API.md:122-124`.
+- **Where:** `src/engine/filters.rs`, `src/http/topics.rs`, `docs/API.md:122-124`.
 
 ### M7 — Admin verify / repair / scrub tooling  · **med**
 Checksum (XXH3-64) validation happens **only lazily on the read path** (`src/storage/wal.rs:564`,
@@ -136,36 +136,36 @@ records (overlaps R8). An operator cannot proactively scrub or salvage without b
 - **Recommend:** add startup/background full-scan XXH3 verification + offline `verify`/`dump-wal`/`scan-segments`/`repair-orphans`, reusing the XXH3-64 readers already in place. Turns lazy detection into proactive.
 - **Where:** `src/main.rs:16-174`, `src/storage/wal.rs:564`, `src/storage/segment.rs:204-208`, `docs/FAULT_TESTING.md:73`.
 
-### M8 — Box-cardinality scaling: file/inode explosion + no segment coalescing  · **med**
+### M8 — Topic-cardinality scaling: file/inode explosion + no segment coalescing  · **med**
 *(The storage deep-dive ranks this its #1 structural risk; codex did not surface it — noted disagreement.)*
 > **UPDATE — partially OUT OF SCOPE.** The file/inode-cardinality concern remains a real
 > single-node scaling note, but the **compaction half** of the recommendation (rewriting
 > sparsely-deleted segments to drop dead frames / intra-segment per-record reclaim) is **out of
 > scope** — deletion is no-compaction / no-reclaim by design (only whole cleared segments drop).
 
-Each box is its own directory (`src/engine/mod.rs:485`) with ≥2 files per sealed segment,
-mirrored under cold. With the 1h age trigger sealing partial segments, even idle boxes
-accrete tiny 2-file segments forever. 100k low-traffic boxes ⇒ 100k+ directories, O(files)
-`read_dir` per box per recovery (`reclaim_orphans_below`), dentry-cache churn. No segment
-coalescing, no per-box file budget, no column-family-style sharing.
+Each topic is its own directory (`src/engine/mod.rs:485`) with ≥2 files per sealed segment,
+mirrored under cold. With the 1h age trigger sealing partial segments, even idle topics
+accrete tiny 2-file segments forever. 100k low-traffic topics ⇒ 100k+ directories, O(files)
+`read_dir` per topic per recovery (`reclaim_orphans_below`), dentry-cache churn. No segment
+coalescing, no per-topic file budget, no column-family-style sharing.
 - **Borrows from:** RocksDB (column families share one LSM/WAL across logical streams), InnoDB/SQLite (single-file packing).
 - **Recommend:** (a) a bounded **segment-coalescing** pass that merges adjacent small sealed segments (and rewrites sparsely-deleted segments to drop dead frames — also closes the intra-segment reclaim gap, B3), and/or (b) a "packed" `SegmentStore` impl (the trait seam already exists) that packs cold/idle segments into a shared blob. Threshold-triggered so the common append-mostly case keeps its zero-rewrite property.
-- **Where:** `src/engine/mod.rs:485`, `src/storage/segment.rs:38-53`, `src/engine/segwriter.rs`, `src/engine/box_state.rs:1031-1089`.
+- **Where:** `src/engine/mod.rs:485`, `src/storage/segment.rs:38-53`, `src/engine/segwriter.rs`, `src/engine/topic_state.rs:1031-1089`.
 
 ### M9 — Subject / wildcard subscription  · **med**
-Box names are flat; `:` is a *convention* with no read-time meaning. Watch and routers
-require explicit box enumeration (`docs/API.md:919`); no `tenant42:*` subscribe. Biggest
+Topic names are flat; `:` is a *convention* with no read-time meaning. Watch and routers
+require explicit topic enumeration (`docs/API.md:919`); no `tenant42:*` subscribe. Biggest
 scaling-ergonomics gap vs JetStream.
 - **Borrows from:** NATS JetStream (subject hierarchy `a.b.*`).
 - **Recommend:** add prefix/wildcard subscribe to watch (and optionally a fan-out router group). Leverages the dangling `:` convention.
 - **Where:** `docs/API.md:919`, `src/http/watch.rs`, `src/engine/router.rs`.
 
-### M10 — Schema / content validation per box  · **med**
+### M10 — Schema / content validation per topic  · **med**
 `data`/`meta` are opaque verbatim JSON, never parsed/indexed/validated
-(`docs/API.md:122-124`, `src/engine/box_state.rs:66-83`). No way to reject malformed writes.
+(`docs/API.md:122-124`, `src/engine/topic_state.rs:66-83`). No way to reject malformed writes.
 - **Borrows from:** Kafka Schema Registry; PostgreSQL/SQLite constraints/CHECKs.
-- **Recommend:** optional per-box JSON-Schema validator (reject-on-write); purely additive. Optionally bounded secondary indexes over selected JSON fields / tag / key.
-- **Where:** `src/engine/box_state.rs:66-83,146-176`, `docs/API.md:122-124`.
+- **Recommend:** optional per-topic JSON-Schema validator (reject-on-write); purely additive. Optionally bounded secondary indexes over selected JSON fields / tag / key.
+- **Where:** `src/engine/topic_state.rs:66-83,146-176`, `docs/API.md:122-124`.
 
 ### M11 — Bounded drain / rolling-restart safety  · **med** (low effort)
 > **UPDATE — RESOLVED (implemented).** Graceful shutdown now races a `DRAIN_BUDGET` timeout and
@@ -187,13 +187,13 @@ cross-version compatibility is undefined. Limits/segment-policy/keys all need a 
 
 ### M13 — Multi-tenancy / TLS / quotas / audit  · **low**
 > **UPDATE — mostly OUT OF SCOPE.** Native TLS will not be built (terminate at a reverse proxy), and
-> hard multi-tenancy beyond per-key scopes + box-name-prefix allowlists is **out of scope**. Per-key
+> hard multi-tenancy beyond per-key scopes + topic-name-prefix allowlists is **out of scope**. Per-key
 > resource limits and a global total-bytes quota are implemented (§11); audit logging remains a
 > possible future op concern. The text below is the original analysis.
 
-"Tenancy" = per-key box-name prefix allowlist (a filter, not a partition;
+"Tenancy" = per-key topic-name prefix allowlist (a filter, not a partition;
 `docs/API.md:1578`, acknowledged future at `docs/API.md:108`); quotas are global
-(`max_boxes`/`max_total_bytes`), not per-tenant. No in-process TLS (plain HTTP, relies on
+(`max_topics`/`max_total_bytes`), not per-tenant. No in-process TLS (plain HTTP, relies on
 external proxy, `README.md:336`). No audit log.
 - **Borrows from:** PostgreSQL/MySQL (TLS + roles), Kafka (SASL/TLS/ACLs), managed turbopuffer (service-side auth boundaries).
 - **Recommend:** either ship rustls TLS or document reverse-proxy hardening; add tenant IDs + per-tenant quotas + audit logs. Lower priority than M1–M12.
@@ -213,11 +213,11 @@ external proxy, `README.md:336`). No audit log.
 
 ### B2 — Recovery is correct but not bounded; full-live-set snapshots  · **high**
 WAL replay does `read_to_end` (`src/storage/wal.rs:852-857`) — unbounded memory. Snapshots
-rewrite the **entire live record set of every box** each checkpoint
+rewrite the **entire live record set of every topic** each checkpoint
 (`src/engine/snapshot.rs:60-92`), so checkpoint cost and double-storage (segments + snapshot)
 grow with total live data. Three analyses converge.
 - **Borrows from:** PostgreSQL (checkpoint dirty pages from LSN), RocksDB (MANIFEST + SSTable metadata), InnoDB (redo checkpointing), Kafka (segment indexes).
-- **Recommend:** stream WAL replay (bounded memory); make snapshots **incremental** — only boxes changed since last snapshot, or lean on segments as the live-data store and shrink the snapshot to metadata + the un-sealed WAL tail.
+- **Recommend:** stream WAL replay (bounded memory); make snapshots **incremental** — only topics changed since last snapshot, or lean on segments as the live-data store and shrink the snapshot to metadata + the un-sealed WAL tail.
 - **Where:** `src/storage/wal.rs:852-857`, `src/engine/recovery.rs:82-181`, `src/engine/snapshot.rs:60-92`.
 
 ### B3 — Segment/tier store lacks LSM-style maintenance + intra-segment reclaim  · **med**
@@ -226,31 +226,31 @@ grow with total live data. Three analyses converge.
 > are retained on purpose (a delete-flag byte is flipped in place). Partial rewrite / LSM compaction
 > will not be built. The cold-path fd/block-cache and filter-block ideas remain valid perf notes.
 
-Reclaim is whole-segment only (`src/engine/box_state.rs:135,1046`): a `match`-delete killing
+Reclaim is whole-segment only (`src/engine/topic_state.rs:135,1046`): a `match`-delete killing
 99% of a 10k-record segment keeps the whole `.data`+`.idx` until the last record dies — dead
 bytes pinned indefinitely (space amplification). No MANIFEST, no Bloom/filter blocks, no
 partial rewrite. Cold reads are `open`+2-`pread` per record with no fd/block cache beyond a
 1024-entry LRU (`src/engine/segwriter.rs:133`). Overlaps M8.
 - **Borrows from:** RocksDB (MANIFEST, block index, Bloom filters, leveled/universal compaction, block cache), Kafka (segment indexes + retention).
 - **Recommend:** add partial rewrite for delete-heavy segments (shares the coalescing pass from M8), a per-segment cached `.idx` + fd LRU on the cold path, and optional Bloom/filter blocks.
-- **Where:** `src/storage/segment.rs:38-53`, `src/engine/box_state.rs:135,1046`, `src/engine/segwriter.rs:133`.
+- **Where:** `src/storage/segment.rs:38-53`, `src/engine/topic_state.rs:135,1046`, `src/engine/segwriter.rs:133`.
 
 ### B4 — In-memory tag index ages poorly under sparse deletes / high fanout  · **med**
-Tag postings are `BTreeMap<String, Vec<u64>>` (`src/engine/box_state.rs:81`); high-fanout tags
+Tag postings are `BTreeMap<String, Vec<u64>>` (`src/engine/topic_state.rs:81`); high-fanout tags
 and sparse base+offset holes (`VecDeque` deletions) age poorly. `range_all_dead` is O(range)
-per sealed segment (`src/engine/box_state.rs:135-144`) — see R/perf below.
+per sealed segment (`src/engine/topic_state.rs:135-144`) — see R/perf below.
 - **Borrows from:** PostgreSQL/MySQL (B-trees), RocksDB (compressed postings, prefix iteration), Redis (listpack/compact stream).
 - **Recommend:** chunked/bitmap postings, compact sparse holes, snapshot index state.
-- **Where:** `src/engine/box_state.rs:66-83,184-193,218-242`.
+- **Where:** `src/engine/topic_state.rs:66-83,184-193,218-242`.
 
 ### B5 — Diff/SSE waiting adds latency + lacks subscriber flow control  · **med**
 Waiters are registered *after* the final seq check (race window adding latency,
-`src/http/boxes.rs:192-212`); every watched box is scanned per wake; per-subscriber buffers/
+`src/http/topics.rs:192-212`); every watched topic is scanned per wake; per-subscriber buffers/
 overflow policy absent. SSE re-serializes the whole cursor `BTreeMap` per frame under a mutex
 (`src/http/watch.rs:759-762`).
 - **Borrows from:** Kafka (fetch sessions + quotas), JetStream (flow-control heartbeats), Redis (blocking reads).
-- **Recommend:** register waiters before the final seq check; add per-subscriber buffers + overflow policy; avoid scanning every box per wake; cache the encoded session id.
-- **Where:** `src/http/boxes.rs:192-212`, `src/http/watch.rs:712-725,759-762`, `src/engine/box_state.rs:654-655`.
+- **Recommend:** register waiters before the final seq check; add per-subscriber buffers + overflow policy; avoid scanning every topic per wake; cache the encoded session id.
+- **Where:** `src/http/topics.rs:192-212`, `src/http/watch.rs:712-725,759-762`, `src/engine/topic_state.rs:654-655`.
 
 ### B6 — Queue lease durability weaker than durable consumer state  · **med**
 `leases_durable` defaults `false` (`src/types.rs:73-76`); lease state is normally in-memory and
@@ -264,7 +264,7 @@ are not WAL-logged before being exposed (`src/engine/queue.rs:574-587`, `src/eng
 Make cursors opaque/versioned; implement-or-remove `watch.consistency`; persist or clearly mark
 idempotency as best-effort; align watch auth behavior with docs (see R/inconsistency below). Also:
 `diff` is POST-only (a `GET …/diff?from_seq=&limit=` alias would be cache/curl-friendly);
-no `XAUTOCLAIM`-style claim-a-specific-seq; no multi-box atomic write; `include_meta`
+no `XAUTOCLAIM`-style claim-a-specific-seq; no multi-topic atomic write; `include_meta`
 defaults true while `include_tags` defaults false (asymmetry, `docs/API.md:578-579`).
 - **Borrows from:** turbopuffer (explicit namespace/query/upsert/delete), Kafka (stable diagnostic offsets), PostgreSQL (stable SQLSTATEs).
 - **Recommend:** the above, prioritizing opaque cursors + resolving `watch.consistency`.
@@ -272,17 +272,17 @@ defaults true while `include_tags` defaults false (asymmetry, `docs/API.md:578-5
 
 ### B8 — Resource limits / accounting are coarse + `bytes_retained` can drift  · **low**
 Global, not per-tenant; `disable_backpressure` is not real; no token-bucket rate limit. Byte
-accounting uses load→`saturating_sub`/`store` not `fetch_sub` (`src/engine/box_state.rs:1020-1022,
+accounting uses load→`saturating_sub`/`store` not `fetch_sub` (`src/engine/topic_state.rs:1020-1022,
 1210-1212`), and the index lock is dropped before the byte store, so concurrent reclaim/delete can
 lose an update — and the byte-cap eviction loop reads this possibly-drifted gauge
-(`src/engine/box_state.rs:945`). Over/under-eviction by design, but drift makes it worse.
+(`src/engine/topic_state.rs:945`). Over/under-eviction by design, but drift makes it worse.
 - **Borrows from:** Kafka (quotas/write throttles), RocksDB (write stalls), PostgreSQL (connection/work-mem limits).
 - **Recommend:** token-bucket rate limits; use atomic `fetch_*` for byte accounting or reconcile exact live-bytes after eviction; implement real `disable_backpressure` semantics.
-- **Where:** `src/engine/mod.rs:401-418`, `src/types.rs:353-369`, `src/engine/box_state.rs:945,1020-1022,1210-1212`.
+- **Where:** `src/engine/mod.rs:401-418`, `src/types.rs:353-369`, `src/engine/topic_state.rs:945,1020-1022,1210-1212`.
 
-### B9 — `list_boxes` is O(N log N) over the whole registry per call  · **med**
+### B9 — `list_topics` is O(N log N) over the whole registry per call  · **med**
 `src/engine/mod.rs:1258-1266` iterates the entire `DashMap`, clones every key, sorts, *then*
-paginates — page 2 of a 1M-box registry still allocates+sorts 1M strings. `routers_for_source`
+paginates — page 2 of a 1M-topic registry still allocates+sorts 1M strings. `routers_for_source`
 clones owned `Router`s on the hot write path (`src/engine/router.rs:158-164`).
 - **Borrows from:** PostgreSQL/Kafka (indexed/paginated catalog scans).
 - **Recommend:** maintain a sorted index for listing, or cursor-paginate without full collect+sort; avoid cloning routers on the write path.
@@ -306,7 +306,7 @@ clones owned `Router`s on the hot write path (`src/engine/router.rs:158-164`).
 *Named the single biggest liability by both the codex pass and the perf deep-dive.*
 `write()` calls `forward_from` on the request thread *before* returning
 (`src/engine/mod.rs:1736-1747`); per route it does a full `durable_append` →
-`token.wait()` cycle (`src/engine/mod.rs:770-828,1783-1889`). One source write to a box with
+`token.wait()` cycle (`src/engine/mod.rs:770-828,1783-1889`). One source write to a topic with
 K routers (+ chains, recursion at `:1888`) blocks the caller through K serial group-commit
 fsync waits and physically writes 1+K WAL `Append` frames + 1+K segment copies — payload
 duplicated N+1× on disk. No batching across dests, no async handoff despite the `mark_dirty`
@@ -326,7 +326,7 @@ forward is never reconsidered; a dest `discard:reject` overflow drops the forwar
 (`src/engine/mod.rs:1854` `continue`). codex and the perf analysis agree this is a real
 correctness gap, not just perf.
 - **Borrows from:** Kafka Connect / outbox + consumer offsets, JetStream durable consumers, PostgreSQL logical replication slots.
-- **Recommend:** make routers durable consumers over source boxes with replay-from-cursor on restart; advance the cursor only after the dest append commits, and only by the count actually forwarded.
+- **Recommend:** make routers durable consumers over source topics with replay-from-cursor on restart; advance the cursor only after the dest append commits, and only by the count actually forwarded.
 - **Where:** `src/engine/mod.rs:1800-1804,1854,1885`, `src/engine/router.rs:177`, `src/engine/recovery.rs:241-293`.
 
 ### R3 — `disk` class can ack page-cache-only records, then recover an earlier head and reuse seqs  · **high**
@@ -335,7 +335,7 @@ and **reuse already-acknowledged seqs** (`src/engine/mod.rs:1637-1697`,
 `src/engine/recovery.rs:241-293`, `src/types.rs:207-218`). Seq monotonicity-across-restart is
 violated for the `disk` class. Coupled with B1.
 - **Borrows from:** PostgreSQL/InnoDB (never report durable commit before WAL flush), Kafka (committed offsets monotonic within a partition).
-- **Recommend:** persist a per-box high-water mark / periodic fsynced watermark so recovered head never goes backward; or document `disk` precisely as lossy-with-possible-seq-rollback.
+- **Recommend:** persist a per-topic high-water mark / periodic fsynced watermark so recovered head never goes backward; or document `disk` precisely as lossy-with-possible-seq-rollback.
 - **Where:** `src/engine/mod.rs:1637-1697`, `src/engine/recovery.rs:241-293`, `src/types.rs:207-218`.
 
 ### R4 — Queue ack/nack/extend keyed on `node`, not `lease_id` — stale-worker fencing gap  · **high**
@@ -370,30 +370,30 @@ configured `channel_cap` is not honored. (Related to B10's per-record sends.)
 > below describes the old state.
 
 `publish_staged` → `materialize_segment` → `seal_active` → `hot().put(...)` fsyncs inline
-(`src/engine/box_state.rs:652,762-831`, `src/engine/segwriter.rs:377`) *while the writer holds the
+(`src/engine/topic_state.rs:652,762-831`, `src/engine/segwriter.rs:377`) *while the writer holds the
 publish-gate turn* (`src/engine/mod.rs:1677-1696`). A slow seal fsync serializes every subsequent
-same-box writer's publish behind it — defeating the group-commit win whenever a seal boundary is
-crossed on a write-heavy durable box. (The index lock is correctly *not* held across it; the gate is.)
+same-topic writer's publish behind it — defeating the group-commit win whenever a seal boundary is
+crossed on a write-heavy durable topic. (The index lock is correctly *not* held across it; the gate is.)
 - **Borrows from:** PostgreSQL/InnoDB (background writer/checkpointer flush off the commit path).
 - **Recommend:** move segment seal/fsync off the publish gate (background seal, gate released first).
-- **Where:** `src/engine/box_state.rs:652,762-831`, `src/engine/segwriter.rs:377`, `src/engine/mod.rs:1677-1696`.
+- **Where:** `src/engine/topic_state.rs:652,762-831`, `src/engine/segwriter.rs:377`, `src/engine/mod.rs:1677-1696`.
 
 ### R7 — EvictWatermark / TTL / byte-cap eviction not always re-derivable  · **med**
 `log_evict_watermark` is best-effort and swallowed (`src/engine/mod.rs:685`). The comment claims
 eviction re-derives, but only the **records-cap** case is a pure function of `head-cap_records`. A
-**byte-cap or TTL** floor that advanced (`src/engine/box_state.rs:914-930,944-971`) and whose
+**byte-cap or TTL** floor that advanced (`src/engine/topic_state.rs:914-930,944-971`) and whose
 watermark frame is lost is **not** re-derivable — after a backward clock or relaxed `cap_bytes`,
 evicted records can resurrect on restart.
 - **Borrows from:** PostgreSQL/InnoDB (eviction/vacuum decisions are WAL-logged, replay-deterministic).
 - **Recommend:** make the evict watermark durable (not best-effort) for the TTL/byte-cap cases, or persist the resolved floor.
-- **Where:** `src/engine/mod.rs:675-685`, `src/engine/box_state.rs:914-930,944-971`.
+- **Where:** `src/engine/mod.rs:675-685`, `src/engine/topic_state.rs:914-930,944-971`.
 
 ### R8 — Mid-log corruption / recovery contiguity guard silently truncates  · **med**
 Two faces of the same hazard. (a) `F-WAL-CRC-FLIP-MIDLOG` (`docs/FAULT_TESTING.md:73`): a mid-log
 checksum (XXH3-64) flip on the active WAL is treated as logical EOF, silently discarding all later frames —
 including acked `disk`/`fsync` records — with no alarm. (b) Recovery ignores any Append whose
 `seq != head+1` (`src/engine/recovery.rs:279-281`): a torn *middle* (not just tail) drops the
-higher frame and every later frame for that box silently, converging to a truncated box rather than
+higher frame and every later frame for that topic silently, converging to a truncated topic rather than
 detecting corruption. Torn-tail handling is correct; torn-middle is the gap. The integrity scrub
 (M7) is the mitigation.
 - **Borrows from:** PostgreSQL/InnoDB (page checksums + explicit corruption errors), RocksDB (MANIFEST/SSTable metadata reject incomplete files).
@@ -404,10 +404,10 @@ detecting corruption. Torn-tail handling is correct; torn-middle is the gap. The
 `list/resolve` consider a segment complete on `.data` presence, but reads need the `.idx`
 (`src/storage/segstore.rs:268-282,377-389`, `src/engine/segwriter.rs:133-156`). A `.data`-without-`.idx`
 state can degrade into defensive `Null` payload fallback for sealed live records
-(`src/engine/box_state.rs:843-871`) — masking corruption as data loss.
+(`src/engine/topic_state.rs:843-871`) — masking corruption as data loss.
 - **Borrows from:** RocksDB (MANIFEST/SSTable metadata), InnoDB (page checksums reject incomplete files).
 - **Recommend:** require both `.data` and `.idx` for completeness; surface segment read corruption instead of `Null` fallback for sealed live records.
-- **Where:** `src/storage/segstore.rs:268-282,377-389`, `src/engine/segwriter.rs:133-156`, `src/engine/box_state.rs:843-871`.
+- **Where:** `src/storage/segstore.rs:268-282,377-389`, `src/engine/segwriter.rs:133-156`, `src/engine/topic_state.rs:843-871`.
 
 ### R10 — Single durable copy after checkpoint (no full-page/redo retention)  · **med**
 WAL frames are logical redo, not page images, and absorbed WAL is deleted at checkpoint. Once a
@@ -427,7 +427,7 @@ preallocated boundary (`src/storage/wal.rs:1415-1435`).
 - **Where:** `src/storage/wal.rs:1415-1435`.
 
 ### R12 — `forward_from` recursion: O(routes) relocks + unbounded synchronous stack on chains  · **med**
-Each recursion level re-locks `self.routers` (`src/engine/mod.rs:1789`) and `get_box` per route;
+Each recursion level re-locks `self.routers` (`src/engine/mod.rs:1789`) and `get_topic` per route;
 a chain A→B→C recurses synchronously up to `MAX_ROUTER_HOPS` deep on the request thread, each hop
 paying a fsync wait (R1). An `allow_cycle` diamond re-forwards the same record exponentially within
 the hop budget. Folds into the R1 fix (async + batched fanout).
@@ -444,16 +444,16 @@ handler, and docs (`src/http/mod.rs:135-141`, `src/http/watch.rs:126-142,431-434
 ### R14 — `quiesce_publishes` can hang if a ticketed writer panics in the gate gap  · **low**
 A panic after `next_publish_ticket` but before `publish_done` (`src/engine/mod.rs:1633`) leaves
 `publish_next` stuck; `quiesce_publishes` and every later writer block forever
-(`src/engine/box_state.rs:726-732,699-701`). Lock poisoning only triggers if the panic *holds the
+(`src/engine/topic_state.rs:726-732,699-701`). Lock poisoning only triggers if the panic *holds the
 gate mutex*, not in the ticket gap.
 - **Borrows from:** any system using poison-aware/condvar recovery on the commit sequencer.
 - **Recommend:** make the gate panic-safe (release/advance the ticket on unwind, e.g. a guard).
-- **Where:** `src/engine/mod.rs:1633`, `src/engine/box_state.rs:699-701,726-732`.
+- **Where:** `src/engine/mod.rs:1633`, `src/engine/topic_state.rs:699-701,726-732`.
 
 ---
 
 ## Disagreements / notes across sources
-- **Box-cardinality (M8)** is the storage deep-dive's #1 structural risk but absent from codex's list. Kept as high-impact **med** — it only bites at high box counts, but coalescing also closes the intra-segment-reclaim gap (B3), so it earns its place.
+- **Topic-cardinality (M8)** is the storage deep-dive's #1 structural risk but absent from codex's list. Kept as high-impact **med** — it only bites at high topic counts, but coalescing also closes the intra-segment-reclaim gap (B3), so it earns its place.
 - **Router fanout** appears as both a *perf* liability (R1/R12) and a *correctness* gap (R2). All three sources that touched it agree; merged into R1/R2/R12.
 - **Compaction (M5)**, **read-time filter (M6)**, and **snapshot incremental-ization (B2)** were each independently nominated as "single highest-leverage." They serve different goals (store-vs-log capability, ergonomics, checkpoint cost). Reconciled in the Top 8 below by effort.
 - The **crash core and supply chain** (CI, multi-arch Docker, SBOM/provenance, pinned lockfile) are praised by every source — do **not** rebuild these.
@@ -469,17 +469,17 @@ gate mutex*, not in the ticket gap.
 > file-cardinality / packed-cold-store concern remains a valid note). The list is kept as the
 > original prioritization record.
 
-1. **Flesh out `/v0/metrics`** (M3) — wire existing `WalMetrics` + per-box atomics + latency histograms + recovery/router-lag/queue/SSE gauges. *Days, huge ROI, zero new subsystems.* `src/http/health.rs:79-86`.
+1. **Flesh out `/v0/metrics`** (M3) — wire existing `WalMetrics` + per-topic atomics + latency histograms + recovery/router-lag/queue/SSE gauges. *Days, huge ROI, zero new subsystems.* `src/http/health.rs:79-86`.
 2. **Bounded drain + SSE wind-down** (M11) — timeout-race in `serve.rs` + signal SSE to close. *Small, fixes rolling-restart safety.* `src/serve.rs:146-149`.
 3. **Require `lease_id` on queue ack/nack/extend** (R4) — close the stale-worker fencing bug. *Small, correctness.* `src/engine/queue.rs:622-630`.
 4. **Bound WAL submission + per-batch commit token** (R5 + B10) — honor `channel_cap`, return 429/503, stop one-Arc-per-record. *Small–med, prevents OOM-under-stall.* `src/storage/wal.rs:911-912,1030-1041`.
 5. **Read-time `filter` on `diff`/`watch`** (M6) — expose the existing `filters.rs` `Eq`/`Glob` tuples on reads. *Med, biggest ergonomic unlock, reuses existing machinery.* `src/engine/filters.rs`.
 6. **Async + batched router forwarding, with a durable replay-from-cursor catch-up loop** (R1 + R2 + R12) — move fanout off the request thread, advance cursors only after dest commit, re-drive on restart. *Med–high, fixes the biggest perf liability AND a silent-loss correctness gap.* `src/engine/mod.rs:1736-1889`.
 7. **Backup / archived-WAL retention / PITR + offline `verify`/`fsck` scrub** (M2 + M7 + R10) — retain absorbed WAL behind an archive hook, keep N snapshots, add restore + replay-to-point, and a full-scan integrity check reusing the XXH3-64 readers. *High effort, closes the single-durable-copy risk and gives operators a recovery path.* `src/engine/recovery.rs:187-198`, `src/storage/snapshot.rs:232-237`.
-8. **Segment coalescing + intra-segment reclaim** (M8 + B3) — threshold-triggered merge of small/sparse sealed segments (and a packed cold store for many small boxes), preserving the append-mostly zero-rewrite property in the common case. *High effort, the structural fix for box-cardinality + sparse-delete space amplification.* `src/engine/box_state.rs:1031-1089`, `src/engine/segwriter.rs`.
+8. **Segment coalescing + intra-segment reclaim** (M8 + B3) — threshold-triggered merge of small/sparse sealed segments (and a packed cold store for many small topics), preserving the append-mostly zero-rewrite property in the common case. *High effort, the structural fix for topic-cardinality + sparse-delete space amplification.* `src/engine/topic_state.rs:1031-1089`, `src/engine/segwriter.rs`.
 
 *Out of scope (will not be built):* single-writer fencing / WAL shipping / replication / HA (M1),
-keyed / LSM compaction and a compacted box type (M5) plus intra-segment per-record reclaim (B3/M8),
+keyed / LSM compaction and a compacted topic type (M5) plus intra-segment per-record reclaim (B3/M8),
 durable consumer groups as a server primitive (M4 — an app pattern instead), native TLS (M13 —
 reverse proxy), and hard multi-tenancy beyond per-key scopes + prefix allowlists (M13). *Still a
 valid future op concern:* backup / archived-WAL / PITR + offline scrub (M2/M7), incremental snapshots
