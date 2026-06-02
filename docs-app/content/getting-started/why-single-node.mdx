@@ -1,117 +1,111 @@
 ---
 title: Why a Single Node
-description: streams runs on one machine on purpose. Why one big vertically-scaled box — no networking overhead, one binary, nothing to manage — beats a fleet of small ones, and the honest downtime tradeoff that buys.
+description: streams runs on one machine on purpose — the case for scaling up instead of out, what a single machine actually gives you today, the distributed-systems cost you avoid, and the honest availability tradeoff.
 ---
 
 import { Callout, Cards } from 'nextra/components'
 
 # Why a Single Node
 
-streams runs on **one machine, on purpose**. One big server, scaled up, beats a fleet of
-small ones you have to operate — and almost everything good about streams (the ~1 ms
-delivery, the million-events-a-second ceiling, the boring API, the crisp crash story)
-follows from that one decision.
+streams runs on one machine, and that is the most consequential decision in the project. It
+isn't a limitation we're working around — it's the choice that makes everything else
+possible: the small API, the millisecond latencies, the crisp answer to "what survives a
+crash." Choose distribution instead and you inherit its complexity in every one of those
+places.
 
-It is a deliberate trade: you give up horizontal scale and built-in high availability, and
-in return you get radical operational simplicity and a system you can actually hold in your
-head.
+This page makes the case for the choice, and is honest about what it costs.
 
-## The bet, in one line
+## Scaling out is usually a reflex, not a requirement
 
-> A single modern machine is enormous, and a distributed system is expensive to operate.
-> For most workloads, the right move is to **use the whole machine** and skip the cluster.
+The instinct, the moment a system starts to matter, is to spread it across nodes. But "more
+nodes" is rarely the answer to a question anyone has actually measured — it's a habit, and an
+expensive one, because the cost lands on the part of the system you operate forever, not the
+part you write once.
 
-The instinct to reach for twenty small nodes usually isn't about throughput — it's about
-fault tolerance and a fear of running out of room. streams takes the position that for the
-vast majority of event workloads, neither fear justifies the permanent cost of a
-distributed system.
+streams takes the opposite default: **use one machine well, and reach for more only once
+you can show you've outgrown it.** For most event workloads, that day simply never arrives.
 
-## What one node buys you
+## A single machine is bigger than you think
 
-### No networking overhead
+The mental picture of "one server" is stuck a decade in the past. A box you can rent by the
+hour today gives you, on a single predictable bill:
 
-There are no inter-node hops, no replication round-trips, no consensus protocol, no
-partition tolerance to reason about, and no rebalancing when membership changes. The disk
-is a **local sequential resource** the engine fully controls — which is exactly what makes
-single-digit-millisecond delivery and a high write ceiling realistic rather than
-aspirational. Every microsecond a distributed log spends coordinating, streams spends
-appending.
+- **a hundred or more cores,**
+- **multiple terabytes of RAM,** and
+- **local NVMe sustaining millions of IOPS** at sub-millisecond latency.
 
-### Nothing to manage
+That is more capacity than many distributed clusters had a few years ago. streams is built
+to actually use it: the write-ahead log is [sharded across cores](/how-it-works/wal-and-group-commit)
+so durable throughput scales with the hardware, reads are `O(1)` seq-indexed lookups, and a
+record delivered live over SSE is [serialized once](/how-it-works/performance) and shared
+across every watcher. The design targets — **~1,000,000 events/sec** batched and **~1 ms**
+delivery — come *from* staying on one machine, not in spite of it.
 
-One static binary, one process, one data directory. No JVM, no ZooKeeper, no broker quorum,
-no shard map, no sidecar, no external database. You build it once, point it at a directory,
-and run it. "Scaling up" is renting a bigger box — not standing up, monitoring, and
-upgrading more of them.
+## What you are not paying for
 
-### A simpler correctness story
+The real case for one node isn't the throughput — it's everything a distributed log spends
+to reach its throughput that streams simply never spends:
 
-A huge class of distributed-systems bugs simply cannot occur on one node: there is no
-split-brain, no cross-node clock skew, no partial-failure matrix, no "which replica is
-authoritative" question. The whole data model — the monotonic `seq`, the
-[dual watermark](/guarantees/tombstones), [WAL-first durability](/guarantees/durability) —
-is defined against a single sequential log, so its guarantees are ones you can actually
-verify.
-
-## Vertical scale is bigger than you think
-
-A single server you can rent today has dozens of cores, hundreds of gigabytes of RAM, and
-NVMe that sustains millions of operations per second. streams is built to use all of it:
-
-- **The WAL is sharded across cores** (`STREAMS_WAL_SHARDS`) into independent ordered
-  writers, each with adaptive group commit — so durable throughput scales with cores while
-  per-topic ordering still holds.
-- **Reads are `O(1)`** seq-indexed slot lookups, not hash or tree probes.
-- **SSE fan-out serializes each record once** and shares it ref-counted across every
-  watcher, so one append delivered to N subscribers pays serialization a single time.
-
-The design targets are **~1,000,000 events/sec** (batched) and **~1 ms** delivery/response
-on local NVMe. See [How It Works](/how-it-works) and [Performance](/how-it-works/performance)
-for the architecture and the honest measurement caveats.
-
-## The honest tradeoff: downtime
-
-A single node is a single point of failure for *availability*. It will be unavailable for a
-few seconds during a deploy, a kernel patch, or the rare crash. streams does not pretend
-otherwise — it makes that downtime **cheap and safe** instead of engineering it away:
-
-- **WAL-first durability.** An acknowledged `disk`/`fsync` write is already in the
-  write-ahead log, so a restart never loses acknowledged work — it replays it. See
-  [Durability](/guarantees/durability).
-- **Fast, gated recovery.** On start the engine loads the latest snapshot and replays the
-  WAL forward. `GET /v0/ready` returns `503` during replay and flips to `200` only once an
-  acknowledged durable write is fully recovered — so traffic never hits a half-recovered
-  server. See [Recovery](/how-it-works/recovery).
-- **Graceful shutdown.** On `SIGINT`/`SIGTERM` the server drains and writes a final
-  snapshot, so a clean restart starts from a current checkpoint with minimal WAL to replay.
+- **No coordination on the write path.** No replication round-trips, no consensus, no
+  partition or rebalance handling. A write is a sequential append to a local disk the engine
+  fully owns. Every microsecond a cluster spends agreeing, streams spends appending — which is
+  precisely why the latency floor is low enough to quote in milliseconds.
+- **No distributed failure modes.** Split brain, partial failure, stale replicas, cross-node
+  clock skew, "which node is authoritative" — none of these can occur when there is only one
+  node. A whole category of 3 a.m. incidents is defined out of existence.
+- **One thing to run.** A single process pointed at a single directory: one thing to deploy,
+  monitor, secure, and back up — not a quorum to keep healthy or a membership protocol to
+  babysit. The complexity you don't take on is the complexity you never debug.
 
 <Callout type="info">
-  The calculus: a few seconds of occasional, *planned* downtime on one machine you fully
-  understand is — for most workloads — a better deal than the permanent complexity and
-  subtle failure modes of a distributed system that's "always up." Buy a bigger box, keep
-  good backups, and restart fast.
+  None of this is free — it's a trade. You exchange horizontal scale and built-in high
+  availability for latency, simplicity, and a system small enough to fully understand. The
+  next section is the bill.
 </Callout>
 
-## When one node really isn't enough
+## The tradeoff: availability
 
-Be honest with yourself about requirements. If you need transparent high availability,
-multi-region writes, or write throughput beyond what the largest single box can sustain,
-streams is **not** that system — multi-server, replication, HA, and single-writer fencing
-are [out of scope by design](/getting-started#whats-implemented-today).
+Be clear-eyed about the cost. A single node is a single point of failure for *availability*:
+it goes away for a few seconds during a deploy, a kernel patch, or the occasional crash.
+streams doesn't pretend otherwise — it makes that downtime **cheap and safe** rather than
+engineering it away:
 
-What you *can* do on top of single nodes:
+- **Acknowledged work is never lost.** A `disk` or `fsync` write lands in the write-ahead log
+  before the ack, so a restart *replays* it instead of dropping it. See
+  [Durability](/guarantees/durability).
+- **Recovery is fast and gated.** On start the engine loads its latest snapshot and replays
+  the log forward; `GET /v0/ready` stays `503` until an acknowledged durable write is fully
+  recovered, then flips to `200`, so traffic never reaches a half-recovered server. See
+  [Recovery](/how-it-works/recovery).
+- **Shutdown is clean.** On `SIGINT`/`SIGTERM` the server drains and checkpoints, so the next
+  start has almost nothing left to replay.
 
-- **Mirror symmetric nodes with [routers](/api/routers).** Because the origin `$node` rides
-  through every forward and [loop-prevention](/guarantees/node-loop-prevention) filters a
-  node's own events, N nodes can mirror to each other **without echo** — useful for read
-  fan-out and geographic locality. This is asynchronous mirroring, not synchronous
-  replication or automatic failover. See the [Multi-master guide](/guides/multi-master).
-- **Partition by topic across machines at the application layer**, when distinct workloads
-  don't need to share a log.
+The honest calculus: **a few seconds of rare, mostly-planned downtime on a system you
+understand, against the permanent complexity and subtler failures of one that is "always
+up."** For most workloads that trade is worth making — and where it isn't, you mitigate at
+the edges (a warm standby behind a proxy, frequent backups) instead of dragging a consensus
+protocol into your data path.
+
+## If you genuinely need more than one node
+
+Don't argue yourself out of a real requirement. If you need transparent failover,
+multi-region writes, or throughput beyond the largest single box, streams is **not** that
+system — multi-server, replication, HA, and single-writer fencing are
+[out of scope by design](/getting-started#whats-implemented-today), not unfinished features.
+
+What you *can* build on top of independent nodes:
+
+- **Asynchronous mirroring with [routers](/api/routers).** Because a record's origin node
+  rides through every forward and [loop-prevention](/guarantees/node-loop-prevention) drops a
+  node's own events, several nodes can mirror to each other without echo — handy for read
+  fan-out and geographic locality. It buys you copies and proximity, not consistency or
+  failover. See the [multi-master guide](/guides/multi-master).
+- **Partitioning by topic across machines** at the application layer, when separate workloads
+  don't need to share a single log.
 
 <Callout type="warning">
-  Router mirroring is **at-least-once and asynchronous** — it gives you copies and locality,
-  not a consistency or availability guarantee. Don't mistake it for HA.
+  Router mirroring is **asynchronous and at-least-once** — it gives you copies and locality,
+  never an availability or consistency guarantee. Don't mistake it for HA.
 </Callout>
 
 ## Where to go next
@@ -124,7 +118,7 @@ What you *can* do on top of single nodes:
     The throughput and latency targets, the measured baselines, and their honest caveats.
   </Cards.Card>
   <Cards.Card title="Running streams" href="/deployment" arrow>
-    How the durable single binary starts, recovers, binds, and shuts down.
+    How the durable server starts, recovers, binds, and shuts down.
   </Cards.Card>
   <Cards.Card title="Durability" href="/guarantees/durability" arrow>
     Why a restart never loses acknowledged work on a `disk` or `fsync` topic.

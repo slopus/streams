@@ -104,14 +104,14 @@ than one fsync per record. See [WAL & group commit](/how-it-works/wal-and-group-
 Set the class with the `durability` field at create time:
 
 ```bash
-# An fsync-gated, unbounded job queue: every ack is a durable promise.
-curl -X PUT localhost:4000/v0/topics/jobs \
+# An fsync-gated ledger: every ack is a promise the write survives power loss.
+curl -X PUT $STREAMS/v0/topics/payments \
   -H 'content-type: application/json' \
   -d '{ "durability": "fsync", "cap_records": 0, "ttl_ms": 0 }'
 ```
 
 ```json
-{ "topic": "jobs", "created": true,
+{ "topic": "payments", "created": true,
   "config": { "ttl_ms": 0, "cap_records": 0, "cap_bytes": 0, "discard": "old",
               "durable": true, "durability": "fsync", "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true },

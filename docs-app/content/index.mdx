@@ -1,6 +1,6 @@
 ---
-title: streams — a persistent event engine in a single binary
-description: Create a topic, write to it, read it back by sequence, watch it live, delete from it — all over plain HTTP and JSON. One static binary, one machine, nothing to manage. Durability is a dial you turn per topic, and data loss is always explicit, never silent.
+title: streams — a persistent event log for one machine
+description: Write events to a topic, read them back by sequence number, follow them live, delete what you're done with. A small HTTP/JSON API, run on a single machine, with durability you decide topic by topic — and loss that is always explicit, never silent.
 ---
 
 import { IconLog, IconCube, IconDisk, IconBolt, IconClock } from '../components/icons'
@@ -10,15 +10,16 @@ import { withBase } from '../components/base'
 
 <section className="hero">
 
-<span className="hero-badge"><span className="dot" />One binary · one machine · JSON over HTTP</span>
+<span className="hero-badge"><span className="dot" />Single-node · durable · JSON over HTTP</span>
 
-# An event log you can run in a <span className="grad">single binary</span>
+# A persistent event log, <span className="grad">minus the cluster</span>
 
 <p className="hero-sub">
-Create a **topic**, write events to it, read them back by **sequence number**, watch
-them live, and delete what you don't need — all over plain HTTP and JSON. One static
-binary on one machine. No cluster to operate, no broker to babysit, and durability is a
-**dial you turn per topic**. Data loss is always **explicit, never silent**.
+Write events to a **topic**, read them back by **sequence number**, follow them live, and
+delete what you're done with — through an API small enough to learn in a sitting. streams
+runs on **one machine**, so there's no cluster to operate and no coordination to reason
+about, and you decide **per topic** how much crash-safety each write should buy. Nothing is
+ever lost without telling you.
 </p>
 
 <div className="hero-cta">
@@ -28,19 +29,21 @@ binary on one machine. No cluster to operate, no broker to babysit, and durabili
 </div>
 
 <div className="hero-terminal">
-  <div className="term-bar"><i /><i /><i /><span className="term-title">bash — write an event, read it back</span></div>
+  <div className="term-bar"><i /><i /><i /><span className="term-title">bash — record an order, read it back</span></div>
 
 ```bash
-# Write a record. The server numbers it and creates the topic on first write.
-curl -X POST localhost:4000/v0/topics/jobs \
+# Point $STREAMS at your server, then append an event. The topic is created
+# on first write, and the server assigns the sequence number.
+export STREAMS=http://localhost:4000
+curl -X POST $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
-  -d '{ "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
-# → { "topic": "jobs", "seqs": [1], "head_seq": 1, ... }
+  -d '{ "records": [ { "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 } } ] }'
+# → { "topic": "orders", "seqs": [1], "head_seq": 1, ... }
 
-# Read everything after sequence 0. The number IS the cursor.
-curl -X POST localhost:4000/v0/topics/jobs/diff -d '{ "from_seq": 0 }'
-# → { "records": [ { "$seq": 1, "$ts": 1748470000123, "data": { "url": "s3://b/a.png" } } ],
-#     "next_from_seq": 1, "head_seq": 1, "caught_up": true }
+# Read everything after sequence 0. The sequence number is the cursor.
+curl -X POST $STREAMS/v0/topics/orders/diff -d '{ "from_seq": 0 }'
+# → { "records": [ { "$seq": 1, "$ts": 1748470000123, "data": { "sku": "AEROPRESS-GO", ... } } ],
+#     "next_from_seq": 1, "caught_up": true }
 ```
 
 </div>
@@ -53,29 +56,29 @@ curl -X POST localhost:4000/v0/topics/jobs/diff -d '{ "from_seq": 0 }'
 <h2 className="section-title">Three ideas. That's the whole pitch.</h2>
 <p className="section-lede">
 A persistent event log doesn't have to mean a distributed system to operate or an SDK to
-learn. streams makes three deliberate bets — and everything else follows from them.
+learn. streams makes three deliberate bets, and everything else follows from them.
 </p>
 
 <div className="card-grid">
 
 <a className="feature-card" href={withBase("/api")}>
   <span className="fc-icon"><IconLog /></span>
-  <h3>A simple API</h3>
-  <p>Create a topic, write to it, read from it by sequence, watch it live, delete events. Six HTTP calls, JSON in and out, server-assigned IDs. <code>curl</code> is a complete client — there's nothing to install.</p>
+  <h3>A small API</h3>
+  <p>Create a topic, write to it, read it back by sequence, follow it live, delete what you don't need. A handful of HTTP calls, JSON in and out, IDs assigned for you. <code>curl</code> is a complete client — there is nothing to install.</p>
   <span className="fc-more">See the API →</span>
 </a>
 
 <a className="feature-card" href={withBase("/getting-started/why-single-node")}>
   <span className="fc-icon"><IconCube /></span>
-  <h3>One machine, scaled up</h3>
-  <p>One static binary, one process, one data directory — no cluster, no network hops, no consensus to reason about. Run one big machine instead of twenty small ones you'd have to manage.</p>
-  <span className="fc-more">Why a single node →</span>
+  <h3>One node, not a fleet</h3>
+  <p>It runs on a single machine, so you skip the distributed system entirely — no cluster, no quorum, no replication hops between nodes. Growing means a bigger machine, not more of them to keep alive.</p>
+  <span className="fc-more">Why one node →</span>
 </a>
 
 <a className="feature-card" href={withBase("/guarantees/durability")}>
   <span className="fc-icon"><IconDisk /></span>
-  <h3>Durability you dial in</h3>
-  <p>Pick the guarantee <em>per topic</em>: best-effort in memory, survives a crash on disk, or fsync-gated against power loss. Strong where it matters, fast where it doesn't.</p>
+  <h3>Durability you choose</h3>
+  <p>Decide <em>per topic</em> how much crash-safety a write buys: best-effort in memory, crash-survivable on disk, or fsync'd against power loss. And you are never lied to — lost data always comes with a signal.</p>
   <span className="fc-more">Durability classes →</span>
 </a>
 
@@ -88,17 +91,17 @@ learn. streams makes three deliberate bets — and everything else follows from 
 <span className="section-eyebrow">The API</span>
 <h2 className="section-title">The whole thing is a handful of HTTP calls</h2>
 <p className="section-lede">
-streams is a log you <code>POST</code> events to and read back by number. The server
-assigns each event a monotonic <code>seq</code>; reading is just "give me everything after
-this number." That sentence is the entire model — here is every verb it expands into.
+streams is a log you <code>POST</code> events to and read back by number. The server stamps
+each event with a monotonic <code>seq</code>; reading is just "give me everything after this
+number." That sentence is the entire model — here is every verb it expands into.
 </p>
 
 <div className="concept-grid">
   <div className="concept"><div className="c-name">create</div><p className="c-desc">A topic appears on first write — or <code>PUT /v0/topics/:topic</code> to set config up front. Nothing to provision.</p></div>
   <div className="concept"><div className="c-name">write</div><p className="c-desc"><code>POST /v0/topics/:topic</code> with a batch of records. The server numbers each one and returns the assigned seqs.</p></div>
   <div className="concept"><div className="c-name">read</div><p className="c-desc"><code>POST …/diff</code> with <code>from_seq</code>. Get the records after it plus the next cursor. The seq is the cursor — advancing it is the ack.</p></div>
-  <div className="concept"><div className="c-name">watch</div><p className="c-desc"><code>POST /v0/watch</code> then open the SSE stream. Follow many topics live over one resumable connection, woken on append.</p></div>
-  <div className="concept"><div className="c-name">delete</div><p className="c-desc"><code>POST …/delete</code> by seq range and/or tag. Permanent, immediate, point-in-time — it never touches future records.</p></div>
+  <div className="concept"><div className="c-name">watch</div><p className="c-desc"><code>POST /v0/watch</code>, then open the SSE stream. Follow many topics live over one resumable connection, woken on append.</p></div>
+  <div className="concept"><div className="c-name">delete</div><p className="c-desc"><code>POST …/delete</code> by seq range and/or tag. Permanent, immediate, point-in-time — it never touches records written later.</p></div>
   <div className="concept"><div className="c-name">fan out</div><p className="c-desc"><code>PUT /v0/routers/:r</code> to copy every record from one topic into another, server-side, preserving origin.</p></div>
 </div>
 
@@ -111,29 +114,29 @@ Read it at three levels of depth on the <a href={withBase("/api")}>API reference
 
 <section className="section">
 
-<span className="section-eyebrow">One machine, scaled up</span>
-<h2 className="section-title">One big machine beats twenty small ones</h2>
+<span className="section-eyebrow">Run it on one machine</span>
+<h2 className="section-title">Most workloads never outgrow a single machine</h2>
 <p className="section-lede">
-A single modern server has dozens of cores, hundreds of gigabytes of RAM, and local NVMe
-that does millions of ops a second. streams is built to use all of it — and to spare you
-the distributed system you'd otherwise operate to get there.
+The reflex to spread a log across a cluster is usually answering a question you haven't
+measured yet. streams takes the other side of that bet: use one machine well, and you
+trade away scale you probably don't need for simplicity you'll feel every day.
 </p>
 
 <div className="card-grid">
+  <a className="feature-card" href={withBase("/getting-started/why-single-node")}>
+    <span className="fc-icon"><IconCube /></span>
+    <h3>A single machine is bigger than you think</h3>
+    <p>A box you can rent today has a hundred-plus cores, terabytes of RAM, and NVMe sustaining millions of ops a second. Most event workloads fit inside one with years of headroom — sharding across many small nodes often solves a problem you don't have yet.</p>
+  </a>
   <a className="feature-card" href={withBase("/how-it-works")}>
     <span className="fc-icon"><IconBolt /></span>
-    <h3>No networking overhead</h3>
-    <p>No inter-node hops, no replication round-trips, no consensus, no rebalancing. The disk is a local sequential resource the engine fully controls — which is exactly what makes ~1 ms delivery and a million events/sec realistic.</p>
-  </a>
-  <a className="feature-card" href={withBase("/deployment")}>
-    <span className="fc-icon"><IconCube /></span>
-    <h3>Nothing to manage</h3>
-    <p>One binary, one process, one data directory. No ZooKeeper, no JVM, no broker quorum, no shard map. Scaling up is renting a bigger box, not standing up more of them.</p>
+    <h3>Distribution is a tax, not free capacity</h3>
+    <p>Spreading a log across nodes buys headroom by spending coordination — replication round-trips, consensus, rebalancing, clock skew — plus a class of failure modes that simply can't happen on one machine. Keeping the log on a local sequential disk is exactly what makes ~1 ms delivery realistic.</p>
   </a>
   <a className="feature-card" href={withBase("/how-it-works/recovery")}>
     <span className="fc-icon"><IconClock /></span>
-    <h3>Restarts, embraced — not engineered around</h3>
-    <p>A single node deploys, patches, and occasionally crashes — seconds of downtime. streams recovers fast from the WAL and gates readiness while it does. For most workloads, brief, honest downtime on one simple machine beats permanent operational complexity across a fleet.</p>
+    <h3>Restarts instead of orchestration</h3>
+    <p>The cost of one node is brief downtime on deploys, patches, and the rare crash. streams makes that cheap: it replays its write-ahead log and gates readiness until recovery finishes. You trade seconds of occasional downtime for a system you can hold in your head.</p>
   </a>
 </div>
 
@@ -141,13 +144,13 @@ the distributed system you'd otherwise operate to get there.
 
 <section className="section">
 
-<span className="section-eyebrow">Durability you dial in</span>
-<h2 className="section-title">Choose what an "ok" means — per topic</h2>
+<span className="section-eyebrow">Durability you choose</span>
+<h2 className="section-title">Decide what an "ok" means — one topic at a time</h2>
 <p className="section-lede">
-Every write travels the same road: your process → the kernel → the physical disk. The only
-question is how far along streams waits before it tells you "ok." You answer that
-<strong>per topic</strong>, so a throwaway cache and a financial ledger live happily in one
-process.
+Every write travels the same road: from your process, into the kernel, onto the physical
+disk. The only question is how far along that road streams waits before it answers "ok." You
+decide <strong>per topic</strong>, so a throwaway cache and a financial ledger can live side
+by side in one process without paying for each other's guarantees.
 </p>
 
 <div className="dura-grid">
@@ -159,18 +162,18 @@ process.
   <div className="dura">
     <span className="d-tag">disk</span>
     <h4>Survives a crash</h4>
-    <p>Written to a group-committed write-ahead log and handed off toward the kernel before the ack. <strong>Survives a process crash</strong>, minus the most recent not-yet-flushed tail. The pub/sub default.</p>
+    <p>Written to a group-committed write-ahead log before the ack. <strong>Survives a process crash</strong>, losing only the most recent not-yet-flushed tail. The everyday default.</p>
   </div>
   <div className="dura">
     <span className="d-tag">fsync</span>
     <h4>Survives power loss</h4>
-    <p>The ack waits for the data to be <strong>fsynced to the platter</strong>. An acknowledged write survives <em>any</em> crash, including power loss, and is replayed from the WAL on restart. For queues and ledgers.</p>
+    <p>The ack waits until the data is <strong>fsynced to the platter</strong>. An acknowledged write survives <em>any</em> crash, power loss included, and is replayed from the log on restart. For ledgers and queues.</p>
   </div>
 </div>
 
 <p className="section-lede" style={{ marginTop: '1.4rem' }}>
-And whatever the class, an acked write is published and nothing visible is ever un-durable.
-Read the full contract on <a href={withBase("/guarantees/durability")}>Durability Classes</a>.
+Whatever the class, an acked write is published and nothing visible is ever un-durable. Read
+the full contract on <a href={withBase("/guarantees/durability")}>Durability Classes</a>.
 </p>
 
 </section>
@@ -203,7 +206,7 @@ removal you did ask for is silent.</strong> Read it in full in the
 <section className="section">
 
 <span className="section-eyebrow">How it compares</span>
-<h2 className="section-title">The simplicity of one binary, with guarantees most systems leave to you</h2>
+<h2 className="section-title">The simplicity of one machine, with guarantees most systems leave to you</h2>
 <p className="section-lede">
 streams is a single-machine peer to Redis Streams, Kafka, NATS JetStream, and the cloud
 queues — trading horizontal scale for operational simplicity and an explicit, in-band loss
@@ -212,16 +215,16 @@ signal none of them provide.
 
 <div className="card-grid">
   <a className="feature-card" href={withBase("/comparisons/vs-redis")}><h3>vs Redis Streams</h3><p>Per-write durability classes instead of one global <code>appendfsync</code>; gap tombstones where Redis trims silently.</p><span className="fc-more">Compare →</span></a>
-  <a className="feature-card" href={withBase("/comparisons/vs-kafka")}><h3>vs Apache Kafka</h3><p>One binary, no JVM, no cluster — and in-band "you missed X..Y", which Kafka leaves to lag metrics.</p><span className="fc-more">Compare →</span></a>
-  <a className="feature-card" href={withBase("/comparisons/vs-nats")}><h3>vs NATS JetStream</h3><p>The closest single-binary peer. streams adds delivery-time gap signals and built-in dead-letter moves.</p><span className="fc-more">Compare →</span></a>
+  <a className="feature-card" href={withBase("/comparisons/vs-kafka")}><h3>vs Apache Kafka</h3><p>One process, no JVM, no cluster — and an in-band "you missed X..Y", which Kafka leaves to lag metrics.</p><span className="fc-more">Compare →</span></a>
+  <a className="feature-card" href={withBase("/comparisons/vs-nats")}><h3>vs NATS JetStream</h3><p>The closest single-machine peer. streams adds delivery-time gap signals and built-in dead-letter moves.</p><span className="fc-more">Compare →</span></a>
   <a className="feature-card" href={withBase("/comparisons/vs-cloud-queues")}><h3>vs SQS / Kinesis / Pub/Sub</h3><p>Log + queue + fan-out in one self-hosted API, with fixed cost and full data locality.</p><span className="fc-more">Compare →</span></a>
 </div>
 
 </section>
 
 <div className="cta-band">
-  <h2>A durable event log, in one <code>docker run</code></h2>
-  <p>Stand up streams on one machine and write your first record in under a minute. Turn the durability dial up only where you need it.</p>
+  <h2>A durable event log, up and running in a minute</h2>
+  <p>Start streams on one machine and write your first record before your coffee's cold. Turn the durability dial up only where you need it.</p>
   <div className="hero-cta">
     <a className="btn btn-primary" href={withBase("/getting-started/quickstart")}>Get started<span className="btn-arrow">→</span></a>
     <a className="btn btn-ghost" href={withBase("/guarantees")}>Read the guarantees</a>
