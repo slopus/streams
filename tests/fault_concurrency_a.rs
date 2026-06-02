@@ -71,7 +71,7 @@ use serde_json::json;
 use topics::clock::{SharedClock, TestClock};
 use topics::config::{SegmentConfig, ServerConfig};
 use topics::engine::segwriter::SegmentWriter;
-use topics::engine::topic_state::{StoredRecord, TopicState};
+use topics::engine::topic_state::{PublishPermit, StoredRecord, TopicState};
 use topics::engine::Engine;
 use topics::storage::testfs::{FakeDisk, TornDamage};
 use topics::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
@@ -264,7 +264,7 @@ fn f_pub_reader_observes_partial() {
                     b.head_seq() < first,
                     "staged batch leaked visibility (head advanced before publish)"
                 );
-                b.publish_staged(staged, 1_700_000_000_000);
+                b.publish_staged(staged, 1_700_000_000_000, PublishPermit::resident());
             }
             done.store(true, Ordering::Relaxed);
         })

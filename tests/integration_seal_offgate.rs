@@ -28,7 +28,7 @@ use serde_json::json;
 use topics::clock::{SharedClock, TestClock};
 use topics::config::SegmentConfig;
 use topics::engine::segwriter::SegmentWriter;
-use topics::engine::topic_state::{StoredRecord, TopicState};
+use topics::engine::topic_state::{PublishPermit, StoredRecord, TopicState};
 use topics::storage::{File, Fs, LocalSegmentStore, OpenOpts, RealFs, TopicTier};
 use topics::types::TopicConfig;
 
@@ -155,7 +155,9 @@ fn slow_seal_does_not_block_same_topic_visibility() {
             let _g = b.append_lock.lock();
             b.stage_append(vec![rec(1)])
         };
-        let range = b.publish_staged_no_seal(staged, 1_000_000).unwrap();
+        let range = b
+            .publish_staged_no_seal(staged, 1_000_000, PublishPermit::resident())
+            .unwrap();
         b.materialize_published(range.0, range.1); // record 1 active, no seal.
     }
     assert_eq!(b.head_seq(), 1, "record 1 published");
@@ -168,7 +170,9 @@ fn slow_seal_does_not_block_same_topic_visibility() {
         };
         // publish_staged_no_seal advances head to 2 + wakes readers (gate released),
         // THEN materialize_published seals segment-1 — parking in the blocked rename.
-        let range = b1.publish_staged_no_seal(staged, 1_000_000).unwrap();
+        let range = b1
+            .publish_staged_no_seal(staged, 1_000_000, PublishPermit::resident())
+            .unwrap();
         b1.materialize_published(range.0, range.1);
     });
 

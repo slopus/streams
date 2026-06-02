@@ -27,7 +27,7 @@ use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use topic_state::{DedupeEntry, RetentionAdvance, StoredRecord, TopicState};
+use topic_state::{DedupeEntry, PublishPermit, RetentionAdvance, StoredRecord, TopicState};
 
 mod recovery;
 pub mod snapshot;
@@ -1199,9 +1199,11 @@ impl Engine {
         // skip the fsync), and `fsync` resolves after the group fdatasync.
         // `ephemeral` is resident-only and has no token.
         let mut fsync_failed: Option<String> = None;
+        let mut commit_proof = None;
         if let Some(token) = token {
-            if let Err(e) = token.wait() {
-                fsync_failed = Some(format!("WAL commit failed: {e}"));
+            match token.wait() {
+                Ok(proof) => commit_proof = Some(proof),
+                Err(e) => fsync_failed = Some(format!("WAL commit failed: {e}")),
             }
         }
         let mut ticket = ticket;
@@ -1235,7 +1237,10 @@ impl Engine {
         // R6: publish (advance head, wake readers) UNDER the gate, but seal/fsync
         // the segment AFTER releasing the gate so a slow seal `put` never serializes
         // same-topic writers (the gate now orders only head advances).
-        let pub_range = dest.publish_staged_no_seal(staged, now);
+        let permit = commit_proof
+            .map(PublishPermit::wal_committed)
+            .unwrap_or_else(PublishPermit::resident);
+        let pub_range = dest.publish_staged_no_seal(staged, now, permit);
         ticket.done();
         if class != Durability::Ephemeral {
             if let Some((start, end)) = pub_range {
@@ -1301,7 +1306,7 @@ impl Engine {
         // same-topic writers).
         let mut ticket = ticket;
         ticket.wait_turn();
-        let pub_range = dest.publish_staged_no_seal(staged, now);
+        let pub_range = dest.publish_staged_no_seal(staged, now, PublishPermit::derived());
         ticket.done();
         if class != Durability::Ephemeral {
             if let Some((start, end)) = pub_range {
@@ -2330,11 +2335,13 @@ impl Engine {
             //     (its frames may persist or be lost — best-effort, §0.10).
             // Many writers' waits overlap and group-commit together (throughput).
             let mut fsync_failed: Option<String> = None;
+            let mut commit_proof = None;
             let fsync_ms = {
                 if let Some(token) = commit_token {
                     let t1 = Instant::now();
-                    if let Err(e) = token.wait() {
-                        fsync_failed = Some(format!("WAL commit failed: {e}"));
+                    match token.wait() {
+                        Ok(proof) => commit_proof = Some(proof),
+                        Err(e) => fsync_failed = Some(format!("WAL commit failed: {e}")),
                     }
                     // Only the fsync class pays (and reports) the sync latency; a
                     // disk write's token resolves at the buffered write, not a sync.
@@ -2402,7 +2409,10 @@ impl Engine {
             // staged records, making them visible + notifying waiters. R6: seal the
             // segment AFTER releasing the publish gate (below) so a slow seal `put`
             // fsync never serializes same-topic writers behind the gate.
-            let pub_range = b.publish_staged_no_seal(staged, now);
+            let permit = commit_proof
+                .map(PublishPermit::wal_committed)
+                .unwrap_or_else(PublishPermit::resident);
+            let pub_range = b.publish_staged_no_seal(staged, now, permit);
             let head = b.head_seq();
             ticket.done();
             // Materialize/seal off the gate for persistent topics (purely derivable

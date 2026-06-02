@@ -16,6 +16,9 @@ use crate::engine::broadcast::BroadcastCache;
 use crate::engine::eviction::Floors;
 use crate::engine::queue::QueueProjection;
 use crate::engine::segwriter::{read_locator, ResolvedPayload, SealedResolve, SegmentWriter};
+use crate::storage::CommitProof;
+#[cfg(debug_assertions)]
+use crate::types::Durability;
 use crate::types::{Filter, TopicConfig};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -304,6 +307,63 @@ impl StagedAppend {
             0
         } else {
             self.start + self.count - 1
+        }
+    }
+}
+
+/// Capability required to make staged records visible by advancing `head_seq`.
+///
+/// The permit is intentionally lightweight: Rust cannot prove that storage
+/// hardware persisted bytes, but requiring this value at the publish boundary
+/// prevents casual callers from advancing visibility without first choosing one
+/// of the trusted paths.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishPermit {
+    kind: PublishPermitKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublishPermitKind {
+    /// Resident-only publication: pure in-memory engines, tests, and ephemeral
+    /// topics whose record path intentionally skips the WAL.
+    Resident,
+    /// Publication after the WAL writer has resolved the batch's commit token.
+    WalCommitted { fsynced: bool },
+    /// Derived router publication; reconstructed from source WAL + router cursor.
+    Derived,
+    /// Recovery restored a durable head watermark and is padding lost disk tail.
+    Recovery,
+}
+
+impl PublishPermit {
+    /// Permit resident-only publication. This is public because some integration
+    /// tests exercise `TopicState` directly without an `Engine`/WAL.
+    pub fn resident() -> Self {
+        Self {
+            kind: PublishPermitKind::Resident,
+        }
+    }
+
+    /// Permit publication after a WAL commit token resolved successfully.
+    pub(crate) fn wal_committed(proof: CommitProof) -> Self {
+        Self {
+            kind: PublishPermitKind::WalCommitted {
+                fsynced: proof.is_fsynced(),
+            },
+        }
+    }
+
+    /// Permit publication of records derived from already-committed source state.
+    pub(crate) fn derived() -> Self {
+        Self {
+            kind: PublishPermitKind::Derived,
+        }
+    }
+
+    /// Permit recovery-only publication of durable head watermark padding.
+    fn recovery() -> Self {
+        Self {
+            kind: PublishPermitKind::Recovery,
         }
     }
 }
@@ -616,6 +676,23 @@ impl TopicState {
         self.head_seq.load(Ordering::Acquire)
     }
 
+    fn publish_head_seq(&self, new_head: u64, permit: PublishPermit) {
+        #[cfg(debug_assertions)]
+        if let PublishPermitKind::WalCommitted { fsynced } = permit.kind {
+            let class = self.config.read().durability_class();
+            if class == Durability::Disk {
+                debug_assert!(
+                    new_head <= self.reserved_head(),
+                    "disk publish requires a durable head reservation"
+                );
+            }
+            if class == Durability::Fsync {
+                debug_assert!(fsynced, "fsync publish requires an fsynced WAL proof");
+            }
+        }
+        self.head_seq.store(new_head, Ordering::Release);
+    }
+
     /// The highest seq durably reserved via a fsynced `HeadWatermark` (R3).
     pub fn reserved_head(&self) -> u64 {
         self.reserved_head.load(Ordering::Acquire)
@@ -652,7 +729,7 @@ impl TopicState {
                 next += 1;
             }
         }
-        self.head_seq.store(reserved, Ordering::Release);
+        self.publish_head_seq(reserved, PublishPermit::recovery());
     }
 
     /// Acquire the in-flight gate for an idempotency `key`, serializing all
@@ -771,7 +848,7 @@ impl TopicState {
         }
         let hole_seq = staged.start;
         // Publish the hole (advances head) and raise the source-trim floor to it.
-        self.head_seq.store(hole_seq, Ordering::Release);
+        self.publish_head_seq(hole_seq, PublishPermit::derived());
         {
             let mut floors = self.floors.write();
             if hole_seq > floors.source_trim_floor {
@@ -810,7 +887,7 @@ impl TopicState {
             return Vec::new();
         }
         let seqs = staged.seqs();
-        self.publish_staged(staged, now_ms);
+        self.publish_staged(staged, now_ms, PublishPermit::resident());
         seqs
     }
 
@@ -873,11 +950,11 @@ impl TopicState {
     /// **Publish** a previously [`stage`](Self::stage_append)d batch: advance
     /// `head_seq` (making the records visible), account retained bytes/live
     /// count, set the write-recency clock, materialize the records into the HOT
-    /// segment writer, and wake SSE/diff long-pollers. Called only AFTER the
-    /// batch's WAL frame is durably committed (for a durable topic), so an
-    /// acknowledged write is always already durable.
-    pub fn publish_staged(&self, staged: StagedAppend, now_ms: i64) {
-        if let Some((start, end)) = self.publish_staged_no_seal(staged, now_ms) {
+    /// segment writer, and wake SSE/diff long-pollers. The caller must provide a
+    /// [`PublishPermit`] showing which trusted path made visibility legal: WAL
+    /// commit, resident-only publication, derived replay, or recovery padding.
+    pub fn publish_staged(&self, staged: StagedAppend, now_ms: i64, permit: PublishPermit) {
+        if let Some((start, end)) = self.publish_staged_no_seal(staged, now_ms, permit) {
             // Materialize + seal inline (the convenience path: `append`, in-memory
             // helpers, tests). Routed through the ORDERED seam (R6 / codex P1 #7) so
             // the inline path and the gated path share one materialization cursor —
@@ -895,17 +972,23 @@ impl TopicState {
     /// [`Self::materialize_segment`] **after releasing the publish gate** (R6: the
     /// segment seal `put` fsync no longer serializes same-topic writers behind the
     /// gate, which only orders head advances now). Returns `None` for an empty
-    /// batch. Crash-safety is preserved: the WAL already made the records durable
-    /// (a segment is a derivable materialization), and resident payloads are freed
-    /// only after the seal `put` returns Ok inside `materialize_segment`.
-    pub fn publish_staged_no_seal(&self, staged: StagedAppend, now_ms: i64) -> Option<(u64, u64)> {
+    /// batch. Crash-safety is preserved for WAL-backed callers by requiring a
+    /// commit-derived permit before visibility advances; a segment is a derivable
+    /// materialization, and resident payloads are freed only after the seal `put`
+    /// returns Ok inside `materialize_segment`.
+    pub fn publish_staged_no_seal(
+        &self,
+        staged: StagedAppend,
+        now_ms: i64,
+        permit: PublishPermit,
+    ) -> Option<(u64, u64)> {
         if staged.is_empty() {
             return None;
         }
         let new_head = staged.start + staged.count - 1;
         // Publish the new head_seq after the records are in the index so a
         // concurrent reader that observes the higher head also finds the slots.
-        self.head_seq.store(new_head, Ordering::Release);
+        self.publish_head_seq(new_head, permit);
 
         self.bytes_retained
             .fetch_add(staged.added_bytes, Ordering::Relaxed);
@@ -2094,7 +2177,7 @@ mod tests {
             }]);
             let mut t = b.next_publish_ticket();
             t.wait_turn();
-            b.publish_staged(staged, 2);
+            b.publish_staged(staged, 2, PublishPermit::resident());
             t.done();
         }
         assert!(

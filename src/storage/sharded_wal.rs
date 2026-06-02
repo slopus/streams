@@ -140,7 +140,7 @@ impl ShardedWalWriter {
 
     /// Submit and block until commit, in one call (routes by `record.topic_id()`).
     pub fn append(&self, record: WalRecord, durable: bool) -> Result<(), WalError> {
-        self.submit(record, durable)?.wait()
+        self.submit(record, durable)?.wait().map(drop)
     }
 
     /// Write a durable `CheckpointMark` flush barrier to **every** shard and block

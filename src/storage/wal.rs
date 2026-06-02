@@ -1074,16 +1074,40 @@ enum CommitOutcome {
 /// fsync completes; a non-durable write may drop the token (fire-and-forget).
 pub struct CommitToken {
     state: Arc<CommitState>,
+    fsynced: bool,
+}
+
+/// Proof that a submitted WAL batch reached the writer's commit boundary.
+///
+/// For fsync-gated submissions this means the group `fdatasync` returned `Ok`.
+/// For non-durable submissions this means the batch reached the buffered-write
+/// boundary. The fields are private so only the WAL writer can manufacture it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitProof {
+    fsynced: bool,
+    _private: (),
+}
+
+impl CommitProof {
+    /// Whether this proof came from a fsync-gated WAL commit.
+    pub fn is_fsynced(self) -> bool {
+        self.fsynced
+    }
 }
 
 impl CommitToken {
     /// Block the calling thread until the submission is committed. Returns
     /// `Err(WalError::WriterGone)` if the writer failed/exited before commit.
-    pub fn wait(self) -> Result<(), WalError> {
+    pub fn wait(self) -> Result<CommitProof, WalError> {
         let mut guard = self.state.committed.lock().unwrap();
         loop {
             match *guard {
-                CommitOutcome::Ok => return Ok(()),
+                CommitOutcome::Ok => {
+                    return Ok(CommitProof {
+                        fsynced: self.fsynced,
+                        _private: (),
+                    });
+                }
                 CommitOutcome::Failed => return Err(WalError::WriterGone),
                 CommitOutcome::Pending => {
                     guard = self.state.cv.wait(guard).unwrap();
@@ -1267,6 +1291,7 @@ impl WalWriter {
                     committed: Mutex::new(CommitOutcome::Ok),
                     cv: Condvar::new(),
                 }),
+                fsynced: durable,
             });
         }
         let state = Arc::new(CommitState {
@@ -1317,12 +1342,15 @@ impl WalWriter {
                     mpsc::TrySendError::Disconnected(_) => WalError::WriterGone,
                 }
             })?;
-        Ok(CommitToken { state })
+        Ok(CommitToken {
+            state,
+            fsynced: durable,
+        })
     }
 
     /// Submit and block until the commit completes, in one call.
     pub fn append(&self, record: WalRecord, durable: bool) -> Result<(), WalError> {
-        self.submit(record, durable)?.wait()
+        self.submit(record, durable)?.wait().map(drop)
     }
 
     /// Snapshot of writer metrics (group-commit batching factor, etc.).
@@ -2430,6 +2458,32 @@ mod tests {
         assert_eq!(seqs, vec![1]);
     }
 
+    #[test]
+    fn commit_proof_marks_fsync_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Wal::open(WalConfig::new(dir.path())).unwrap();
+        let w = wal.writer();
+
+        let buffered = w
+            .submit(append(1, 1, None, None, b"buffered"), false)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            !buffered.is_fsynced(),
+            "non-durable proof stops at buffered write"
+        );
+
+        let fsynced = w
+            .submit(append(1, 2, None, None, b"fsynced"), true)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(fsynced.is_fsynced(), "durable proof crosses fdatasync");
+
+        wal.shutdown();
+    }
+
     // -----------------------------------------------------------------------
     // R5 — bounded ingest queue / backpressure under a stalled writer.
     // -----------------------------------------------------------------------
@@ -2786,7 +2840,7 @@ mod tests {
                         let r = match w
                             .submit(append(1, t as u64 * 50 + seq + 1, None, None, b"x"), true)
                         {
-                            Ok(tok) => tok.wait(),
+                            Ok(tok) => tok.wait().map(drop),
                             Err(e) => Err(e),
                         };
                         let _ = tx.send(r);

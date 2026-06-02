@@ -57,6 +57,7 @@ pub use snapshot::{
     SnapshotTopic,
 };
 pub use wal::{
-    CommitToken, LeaseEvent, MatchSel, RouterOp, TopicConfigOp, Wal, WalConfig, WalError, WalFrame,
-    WalMetrics, WalReader, WalRecord, WalWriter, FRAME_CRC_LEN, FRAME_HEADER_LEN, FSYNC_BUCKETS_US,
+    CommitProof, CommitToken, LeaseEvent, MatchSel, RouterOp, TopicConfigOp, Wal, WalConfig,
+    WalError, WalFrame, WalMetrics, WalReader, WalRecord, WalWriter, FRAME_CRC_LEN,
+    FRAME_HEADER_LEN, FSYNC_BUCKETS_US,
 };
