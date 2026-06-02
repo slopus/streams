@@ -1,30 +1,29 @@
 ---
 title: streams — a persistent event engine in a single binary
-description: An append-only log service over a clean, JSON-first HTTP API. Topics, routers, multiplexed SSE, lease queues, and per-topic durability — one static binary, one machine. Data loss is always explicit, never silent.
+description: Create a topic, write to it, read it back by sequence, watch it live, delete from it — all over plain HTTP and JSON. One static binary, one machine, nothing to manage. Durability is a dial you turn per topic, and data loss is always explicit, never silent.
 ---
 
-import { IconDisk, IconFlag, IconRoute, IconBolt, IconClock, IconCube } from '../components/icons'
+import { IconLog, IconCube, IconDisk, IconBolt, IconClock } from '../components/icons'
 import { withBase } from '../components/base'
 
 <div className="landing">
 
 <section className="hero">
 
-<span className="hero-badge"><span className="dot" />Durable · single binary · JSON over HTTP</span>
+<span className="hero-badge"><span className="dot" />One binary · one machine · JSON over HTTP</span>
 
-# A persistent event engine in a <span className="grad">single binary</span>
+# An event log you can run in a <span className="grad">single binary</span>
 
 <p className="hero-sub">
-**streams** is an append-only log service over a clean, JSON-first HTTP API. Write
-events to named **topics**, read them back by **sequence**, fan them out with
-**routers**, and watch many topics at once over one **SSE** connection — all from one
-static binary on one machine, backed by a write-ahead log on local NVMe. Data loss is
-always **explicit, never silent**.
+Create a **topic**, write events to it, read them back by **sequence number**, watch
+them live, and delete what you don't need — all over plain HTTP and JSON. One static
+binary on one machine. No cluster to operate, no broker to babysit, and durability is a
+**dial you turn per topic**. Data loss is always **explicit, never silent**.
 </p>
 
 <div className="hero-cta">
   <a className="btn btn-primary" href={withBase("/getting-started/quickstart")}>Quickstart<span className="btn-arrow">→</span></a>
-  <a className="btn btn-ghost" href={withBase("/api")}>API reference</a>
+  <a className="btn btn-ghost" href={withBase("/api")}>The API</a>
   <a className="btn btn-ghost" href="https://github.com/slopus/streams" target="_blank" rel="noreferrer">GitHub</a>
 </div>
 
@@ -32,16 +31,16 @@ always **explicit, never silent**.
   <div className="term-bar"><i /><i /><i /><span className="term-title">bash — write an event, read it back</span></div>
 
 ```bash
-# Write a record (the server assigns its $seq). The topic is created on first write.
+# Write a record. The server numbers it and creates the topic on first write.
 curl -X POST localhost:4000/v0/topics/jobs \
   -H 'content-type: application/json' \
-  -d '{ "records": [ { "data": { "url": "s3://b/a.png" }, "tag": "job-9001" } ] }'
-# → { "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1], "head_seq": 1, ... }
+  -d '{ "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
+# → { "topic": "jobs", "seqs": [1], "head_seq": 1, ... }
 
-# Read everything after a cursor. The monotonic seq IS the cursor.
+# Read everything after sequence 0. The number IS the cursor.
 curl -X POST localhost:4000/v0/topics/jobs/diff -d '{ "from_seq": 0 }'
 # → { "records": [ { "$seq": 1, "$ts": 1748470000123, "data": { "url": "s3://b/a.png" } } ],
-#     "next_from_seq": 1, "head_seq": 1, "caught_up": true, "tombstone": null }
+#     "next_from_seq": 1, "head_seq": 1, "caught_up": true }
 ```
 
 </div>
@@ -50,70 +49,34 @@ curl -X POST localhost:4000/v0/topics/jobs/diff -d '{ "from_seq": 0 }'
 
 <section className="section">
 
-<span className="section-eyebrow">Mental model</span>
-<h2 className="section-title">Five concepts. That's the whole product.</h2>
+<span className="section-eyebrow">Why streams</span>
+<h2 className="section-title">Three ideas. That's the whole pitch.</h2>
 <p className="section-lede">
-streams is deliberately small. Learn five nouns and you know the system — every
-endpoint is one of these doing its job.
+A persistent event log doesn't have to mean a distributed system to operate or an SDK to
+learn. streams makes three deliberate bets — and everything else follows from them.
 </p>
-
-<div className="concept-grid">
-  <div className="concept"><div className="c-name">Topic</div><p className="c-desc">A named, append-only log of records ordered by a monotonic <code>seq</code>. Created lazily on first write.</p></div>
-  <div className="concept"><div className="c-name">Record</div><p className="c-desc">One immutable event. The server assigns <code>$seq</code> and <code>$ts</code>; you supply opaque <code>data</code>, an optional <code>tag</code> and <code>node</code>.</p></div>
-  <div className="concept"><div className="c-name">seq</div><p className="c-desc">The cursor. Reads are “give me everything after <code>from_seq</code>.” The client owns its position; advancing it is the ack.</p></div>
-  <div className="concept"><div className="c-name">Router</div><p className="c-desc">A server-side <code>source → dest</code> forwarding rule. Fan-out that preserves origin node, so N nodes mirror without echo.</p></div>
-  <div className="concept"><div className="c-name">Tombstone</div><p className="c-desc">The explicit “you missed data” signal. Cap/TTL loss returns an in-band gap range — at HTTP 200, never silently.</p></div>
-</div>
-
-</section>
-
-<section className="section">
-
-<span className="section-eyebrow">What you get</span>
-<h2 className="section-title">A persistence layer for queues, pub/sub, and durable streams</h2>
 
 <div className="card-grid">
 
+<a className="feature-card" href={withBase("/api")}>
+  <span className="fc-icon"><IconLog /></span>
+  <h3>A simple API</h3>
+  <p>Create a topic, write to it, read from it by sequence, watch it live, delete events. Six HTTP calls, JSON in and out, server-assigned IDs. <code>curl</code> is a complete client — there's nothing to install.</p>
+  <span className="fc-more">See the API →</span>
+</a>
+
+<a className="feature-card" href={withBase("/getting-started/why-single-node")}>
+  <span className="fc-icon"><IconCube /></span>
+  <h3>One machine, scaled up</h3>
+  <p>One static binary, one process, one data directory — no cluster, no network hops, no consensus to reason about. Run one big machine instead of twenty small ones you'd have to manage.</p>
+  <span className="fc-more">Why a single node →</span>
+</a>
+
 <a className="feature-card" href={withBase("/guarantees/durability")}>
   <span className="fc-icon"><IconDisk /></span>
-  <h3>Per-topic durability</h3>
-  <p>Three commit classes — <code>memory</code>, <code>disk</code> (group-commit WAL), and <code>fsync</code> (fsync-gated ack) — chosen per topic. They coexist in one process.</p>
+  <h3>Durability you dial in</h3>
+  <p>Pick the guarantee <em>per topic</em>: best-effort in memory, survives a crash on disk, or fsync-gated against power loss. Strong where it matters, fast where it doesn't.</p>
   <span className="fc-more">Durability classes →</span>
-</a>
-
-<a className="feature-card" href={withBase("/guarantees/tombstones")}>
-  <span className="fc-icon"><IconFlag /></span>
-  <h3>Explicit loss, never silent</h3>
-  <p>Involuntary cap/TTL eviction that crosses your cursor always returns a tombstone with the exact <code>[gap_from, gap_to]</code> range. Voluntary deletes are silent by design.</p>
-  <span className="fc-more">Tombstones →</span>
-</a>
-
-<a className="feature-card" href={withBase("/api/routers")}>
-  <span className="fc-icon"><IconRoute /></span>
-  <h3>Server-side routers</h3>
-  <p>Copy every record from <code>source</code> to <code>dest</code>, at-least-once and per-source FIFO. Origin node rides through, so N-way multi-master fan-out is echo-free by construction.</p>
-  <span className="fc-more">Routers →</span>
-</a>
-
-<a className="feature-card" href={withBase("/api/watch")}>
-  <span className="fc-icon"><IconBolt /></span>
-  <h3>Multiplexed SSE</h3>
-  <p>Watch dozens of topics over one resumable connection with composite cursors, named events, heartbeats, and tombstones — woken on append, not polled.</p>
-  <span className="fc-more">Watch (SSE) →</span>
-</a>
-
-<a className="feature-card" href={withBase("/api/queues")}>
-  <span className="fc-icon"><IconClock /></span>
-  <h3>Lease-based queues</h3>
-  <p>Set <code>type: "queue"</code> for claim/ack/nack/extend with visibility-timeout leases, fair cohort claims, redelivery, and dead-lettering — layered on the same log.</p>
-  <span className="fc-more">Queues →</span>
-</a>
-
-<a className="feature-card" href={withBase("/deployment")}>
-  <span className="fc-icon"><IconCube /></span>
-  <h3>One static binary</h3>
-  <p>WAL + segments + snapshots on local NVMe, restartable at any instant. Loopback-default bind, one Docker image. Only data not yet in the WAL is ever lost.</p>
-  <span className="fc-more">Deployment →</span>
 </a>
 
 </div>
@@ -122,30 +85,118 @@ endpoint is one of these doing its job.
 
 <section className="section">
 
-<span className="section-eyebrow">The central tradeoff</span>
-<h2 className="section-title">Durability is per topic — each topic buys exactly the guarantee it needs</h2>
+<span className="section-eyebrow">The API</span>
+<h2 className="section-title">The whole thing is a handful of HTTP calls</h2>
 <p className="section-lede">
-A best-effort cache, a group-committed pub/sub feed, and an fsync-gated job queue
-coexist in one process. Routers bridge them, honoring the destination topic's class.
+streams is a log you <code>POST</code> events to and read back by number. The server
+assigns each event a monotonic <code>seq</code>; reading is just "give me everything after
+this number." That sentence is the entire model — here is every verb it expands into.
+</p>
+
+<div className="concept-grid">
+  <div className="concept"><div className="c-name">create</div><p className="c-desc">A topic appears on first write — or <code>PUT /v0/topics/:topic</code> to set config up front. Nothing to provision.</p></div>
+  <div className="concept"><div className="c-name">write</div><p className="c-desc"><code>POST /v0/topics/:topic</code> with a batch of records. The server numbers each one and returns the assigned seqs.</p></div>
+  <div className="concept"><div className="c-name">read</div><p className="c-desc"><code>POST …/diff</code> with <code>from_seq</code>. Get the records after it plus the next cursor. The seq is the cursor — advancing it is the ack.</p></div>
+  <div className="concept"><div className="c-name">watch</div><p className="c-desc"><code>POST /v0/watch</code> then open the SSE stream. Follow many topics live over one resumable connection, woken on append.</p></div>
+  <div className="concept"><div className="c-name">delete</div><p className="c-desc"><code>POST …/delete</code> by seq range and/or tag. Permanent, immediate, point-in-time — it never touches future records.</p></div>
+  <div className="concept"><div className="c-name">fan out</div><p className="c-desc"><code>PUT /v0/routers/:r</code> to copy every record from one topic into another, server-side, preserving origin.</p></div>
+</div>
+
+<p className="section-lede" style={{ marginTop: '1.4rem' }}>
+No connection modes, no binary framing, no consumer-group bookkeeping on the server.
+Read it at three levels of depth on the <a href={withBase("/api")}>API reference</a>.
+</p>
+
+</section>
+
+<section className="section">
+
+<span className="section-eyebrow">One machine, scaled up</span>
+<h2 className="section-title">One big machine beats twenty small ones</h2>
+<p className="section-lede">
+A single modern server has dozens of cores, hundreds of gigabytes of RAM, and local NVMe
+that does millions of ops a second. streams is built to use all of it — and to spare you
+the distributed system you'd otherwise operate to get there.
+</p>
+
+<div className="card-grid">
+  <a className="feature-card" href={withBase("/how-it-works")}>
+    <span className="fc-icon"><IconBolt /></span>
+    <h3>No networking overhead</h3>
+    <p>No inter-node hops, no replication round-trips, no consensus, no rebalancing. The disk is a local sequential resource the engine fully controls — which is exactly what makes ~1 ms delivery and a million events/sec realistic.</p>
+  </a>
+  <a className="feature-card" href={withBase("/deployment")}>
+    <span className="fc-icon"><IconCube /></span>
+    <h3>Nothing to manage</h3>
+    <p>One binary, one process, one data directory. No ZooKeeper, no JVM, no broker quorum, no shard map. Scaling up is renting a bigger box, not standing up more of them.</p>
+  </a>
+  <a className="feature-card" href={withBase("/how-it-works/recovery")}>
+    <span className="fc-icon"><IconClock /></span>
+    <h3>Restarts, embraced — not engineered around</h3>
+    <p>A single node deploys, patches, and occasionally crashes — seconds of downtime. streams recovers fast from the WAL and gates readiness while it does. For most workloads, brief, honest downtime on one simple machine beats permanent operational complexity across a fleet.</p>
+  </a>
+</div>
+
+</section>
+
+<section className="section">
+
+<span className="section-eyebrow">Durability you dial in</span>
+<h2 className="section-title">Choose what an "ok" means — per topic</h2>
+<p className="section-lede">
+Every write travels the same road: your process → the kernel → the physical disk. The only
+question is how far along streams waits before it tells you "ok." You answer that
+<strong>per topic</strong>, so a throwaway cache and a financial ledger live happily in one
+process.
 </p>
 
 <div className="dura-grid">
   <div className="dura">
     <span className="d-tag">memory</span>
-    <h4>Disk-like, best-effort, fastest</h4>
-    <p>Same group-committed WAL path as <code>disk</code> and fully queryable, but with no durability guarantee: after a restart its records may survive or be lost (config always survives). Never fsync-gated. For caches, scratch, ephemeral fan-out.</p>
+    <h4>Fastest — no promise</h4>
+    <p>Acked the instant streams accepts it, with <strong>no durability guarantee</strong>: after a restart its records may survive or may be gone. For caches, scratch, and ephemeral fan-out where losing a little is fine.</p>
   </div>
   <div className="dura">
     <span className="d-tag">disk</span>
-    <h4>Group-committed WAL</h4>
-    <p>One fsync amortized across a batch of concurrent writers. Survives a crash minus the un-fsynced tail. The pub/sub default.</p>
+    <h4>Survives a crash</h4>
+    <p>Written to a group-committed write-ahead log and handed off toward the kernel before the ack. <strong>Survives a process crash</strong>, minus the most recent not-yet-flushed tail. The pub/sub default.</p>
   </div>
   <div className="dura">
     <span className="d-tag">fsync</span>
-    <h4>fsync-gated ack</h4>
-    <p>The ack waits for the group fsync. An acknowledged write survives any crash and is recovered by WAL replay. For queues and ledgers.</p>
+    <h4>Survives power loss</h4>
+    <p>The ack waits for the data to be <strong>fsynced to the platter</strong>. An acknowledged write survives <em>any</em> crash, including power loss, and is replayed from the WAL on restart. For queues and ledgers.</p>
   </div>
 </div>
+
+<p className="section-lede" style={{ marginTop: '1.4rem' }}>
+And whatever the class, an acked write is published and nothing visible is ever un-durable.
+Read the full contract on <a href={withBase("/guarantees/durability")}>Durability Classes</a>.
+</p>
+
+</section>
+
+<section className="section">
+
+<span className="section-eyebrow">Mental model</span>
+<h2 className="section-title">Five nouns and you know the system</h2>
+<p className="section-lede">
+streams is deliberately small. Learn five concepts and every endpoint is just one of them
+doing its job.
+</p>
+
+<div className="concept-grid">
+  <div className="concept"><div className="c-name">Topic</div><p className="c-desc">A named, append-only log of records ordered by a monotonic <code>seq</code>. Created lazily on first write.</p></div>
+  <div className="concept"><div className="c-name">Record</div><p className="c-desc">One immutable event. The server assigns <code>$seq</code> and <code>$ts</code>; you supply opaque <code>data</code>, an optional <code>tag</code> and <code>node</code>.</p></div>
+  <div className="concept"><div className="c-name">seq</div><p className="c-desc">The cursor. Reads are "give me everything after <code>from_seq</code>." The client owns its position; advancing it is the ack.</p></div>
+  <div className="concept"><div className="c-name">Router</div><p className="c-desc">A server-side <code>source → dest</code> forwarding rule. Fan-out that preserves origin node, so N nodes mirror without echo.</p></div>
+  <div className="concept"><div className="c-name">Tombstone</div><p className="c-desc">The explicit "you missed data" signal. Cap/TTL loss returns an in-band gap range — at HTTP 200, never silently.</p></div>
+</div>
+
+<p className="section-lede" style={{ marginTop: '1.4rem' }}>
+The load-bearing rule connecting them: <strong>loss you didn't ask for is always announced;
+removal you did ask for is silent.</strong> Read it in full in the
+<a href={withBase("/getting-started/mental-model")}>mental model</a>.
+</p>
 
 </section>
 
@@ -154,14 +205,14 @@ coexist in one process. Routers bridge them, honoring the destination topic's cl
 <span className="section-eyebrow">How it compares</span>
 <h2 className="section-title">The simplicity of one binary, with guarantees most systems leave to you</h2>
 <p className="section-lede">
-streams is a single-machine peer to Redis Streams, Kafka, NATS JetStream, and the
-cloud queues — trading horizontal scale for operational simplicity and an explicit,
-in-band loss signal none of them provide.
+streams is a single-machine peer to Redis Streams, Kafka, NATS JetStream, and the cloud
+queues — trading horizontal scale for operational simplicity and an explicit, in-band loss
+signal none of them provide.
 </p>
 
 <div className="card-grid">
   <a className="feature-card" href={withBase("/comparisons/vs-redis")}><h3>vs Redis Streams</h3><p>Per-write durability classes instead of one global <code>appendfsync</code>; gap tombstones where Redis trims silently.</p><span className="fc-more">Compare →</span></a>
-  <a className="feature-card" href={withBase("/comparisons/vs-kafka")}><h3>vs Apache Kafka</h3><p>One binary, no JVM, no cluster — and in-band “you missed X..Y”, which Kafka leaves to lag metrics.</p><span className="fc-more">Compare →</span></a>
+  <a className="feature-card" href={withBase("/comparisons/vs-kafka")}><h3>vs Apache Kafka</h3><p>One binary, no JVM, no cluster — and in-band "you missed X..Y", which Kafka leaves to lag metrics.</p><span className="fc-more">Compare →</span></a>
   <a className="feature-card" href={withBase("/comparisons/vs-nats")}><h3>vs NATS JetStream</h3><p>The closest single-binary peer. streams adds delivery-time gap signals and built-in dead-letter moves.</p><span className="fc-more">Compare →</span></a>
   <a className="feature-card" href={withBase("/comparisons/vs-cloud-queues")}><h3>vs SQS / Kinesis / Pub/Sub</h3><p>Log + queue + fan-out in one self-hosted API, with fixed cost and full data locality.</p><span className="fc-more">Compare →</span></a>
 </div>
@@ -169,8 +220,8 @@ in-band loss signal none of them provide.
 </section>
 
 <div className="cta-band">
-  <h2>Persistence that makes data loss a decision, not an accident</h2>
-  <p>Stand up a durable event store in one <code>docker run</code>. Write your first record in under a minute.</p>
+  <h2>A durable event log, in one <code>docker run</code></h2>
+  <p>Stand up streams on one machine and write your first record in under a minute. Turn the durability dial up only where you need it.</p>
   <div className="hero-cta">
     <a className="btn btn-primary" href={withBase("/getting-started/quickstart")}>Get started<span className="btn-arrow">→</span></a>
     <a className="btn btn-ghost" href={withBase("/guarantees")}>Read the guarantees</a>
