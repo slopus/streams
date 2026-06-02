@@ -14,14 +14,17 @@
 //! The crate is deliberately black-topic: it does NOT depend on the `topics`
 //! crate — only its public HTTP contract.
 
-use std::process::ExitCode;
+use std::collections::{HashMap, HashSet};
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use argh::FromArgs;
-use futures_util::StreamExt;
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// topics-probe: black-topic conformance + benchmark tool for a live topics server.
 #[derive(FromArgs, Debug)]
@@ -37,6 +40,7 @@ enum Subcommand {
     Bench(BenchCmd),
     BenchDurable(BenchDurableCmd),
     Broadcast(BroadcastCmd),
+    Media(MediaCmd),
     Distribution(DistributionCmd),
     Queue(QueueCmd),
     Actors(ActorsCmd),
@@ -134,6 +138,60 @@ struct BroadcastCmd {
     pulse_gap_ms: u64,
 
     /// emit a machine-readable JSON summary to stdout (for BENCHMARKS.md)
+    #[argh(switch)]
+    json: bool,
+}
+
+/// MEDIA workload: Opus-like room audio over one capped room topic. N speakers
+/// all publish while N watchers receive everyone except their own node.
+#[derive(FromArgs, Debug)]
+#[argh(subcommand, name = "media")]
+struct MediaCmd {
+    /// base URL of the live server, e.g. http://127.0.0.1:4000
+    #[argh(positional)]
+    base_url: String,
+
+    /// bearer token to send on every request (optional)
+    #[argh(option)]
+    token: Option<String>,
+
+    /// participants/speakers/listeners in the room (default 100)
+    #[argh(option, default = "100")]
+    participants: usize,
+
+    /// real-time send duration in seconds per batch tier (default 10)
+    #[argh(option, default = "10")]
+    duration_s: u64,
+
+    /// opus packet duration in ms (default 20)
+    #[argh(option, default = "20")]
+    packet_ms: u64,
+
+    /// raw Opus bytes per packet before base64-like expansion (default 80)
+    #[argh(option, default = "80")]
+    payload_bytes: usize,
+
+    /// comma-separated packets per stored record to sweep (default 1,2,3,5)
+    #[argh(option, default = "String::from(\"1,2,3,5\")")]
+    batches: String,
+
+    /// server process id for best-effort ps-based cpu/rss sampling (optional)
+    #[argh(option)]
+    pid: Option<u32>,
+
+    /// receive own audio too and discard it in the probe instead of server-side node filtering
+    #[argh(switch)]
+    client_self_filter: bool,
+
+    /// use HTTP/2 prior knowledge (h2c) for the media probe client
+    #[argh(switch)]
+    http2_prior_knowledge: bool,
+
+    /// use one bidirectional WebSocket per participant instead of HTTP writes + SSE watches
+    #[argh(switch)]
+    websocket: bool,
+
+    /// emit a machine-readable JSON summary to stdout
     #[argh(switch)]
     json: bool,
 }
@@ -258,6 +316,7 @@ fn main() -> ExitCode {
         Subcommand::Bench(b) => rt.block_on(run_bench(b)),
         Subcommand::BenchDurable(b) => rt.block_on(run_bench_durable(b)),
         Subcommand::Broadcast(b) => rt.block_on(run_broadcast(b)),
+        Subcommand::Media(m) => rt.block_on(run_media(m)),
         Subcommand::Distribution(d) => rt.block_on(run_distribution(d)),
         Subcommand::Queue(q) => rt.block_on(run_queue(q)),
         Subcommand::Actors(a) => rt.block_on(run_actors(a)),
@@ -286,12 +345,18 @@ struct Resp {
 
 impl Client {
     fn new(base: &str, token: Option<String>) -> Self {
-        let http = reqwest::Client::builder()
+        Self::new_with_http2(base, token, false)
+    }
+
+    fn new_with_http2(base: &str, token: Option<String>, http2_prior_knowledge: bool) -> Self {
+        let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(256)
             .tcp_nodelay(true)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client");
+            .timeout(Duration::from_secs(30));
+        if http2_prior_knowledge {
+            builder = builder.http2_prior_knowledge();
+        }
+        let http = builder.build().expect("build reqwest client");
         Client {
             http,
             base: base.trim_end_matches('/').to_string(),
@@ -3310,6 +3375,1204 @@ async fn run_broadcast(cmd: BroadcastCmd) -> ExitCode {
         println!();
     }
     ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// 1b. MEDIA — Opus-like 100-person room audio over one capped room topic
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct MediaWatcherReport {
+    listener: usize,
+    connected: bool,
+    delivered: u64,
+    duplicates: u64,
+    tombstones: u64,
+    record_frames: u64,
+    latencies_ms: Vec<f64>,
+    jitter_ms: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcSample {
+    cpu_pct: f64,
+    rss_kib: u64,
+}
+
+async fn run_media(cmd: MediaCmd) -> ExitCode {
+    let c = Client::new_with_http2(&cmd.base_url, cmd.token.clone(), cmd.http2_prior_knowledge);
+    if !preflight(&c, &cmd.base_url).await {
+        return ExitCode::FAILURE;
+    }
+
+    let participants = cmd.participants.max(2);
+    let packet_ms = cmd.packet_ms.max(1);
+    let duration_s = cmd.duration_s.max(1);
+    let batch_tiers: Vec<usize> = cmd
+        .batches
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .collect();
+    if batch_tiers.is_empty() {
+        eprintln!("error: --batches did not contain any positive integers");
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!(
+        "media {} (participants={}, duration={}s, packet_ms={}, payload_bytes={}, batches={:?}, h2c={})",
+        cmd.base_url,
+        participants,
+        duration_s,
+        packet_ms,
+        cmd.payload_bytes,
+        batch_tiers,
+        cmd.http2_prior_knowledge
+    );
+
+    let ns = format!("media{}", std::process::id());
+    let epoch = Arc::new(Instant::now());
+    let mut tiers = serde_json::Map::new();
+    let mut recommendations = Vec::<Value>::new();
+
+    for &packets_per_record in &batch_tiers {
+        let tier = if cmd.websocket {
+            run_media_ws_tier(
+                &c,
+                &cmd.base_url,
+                cmd.token.as_deref(),
+                &ns,
+                epoch.clone(),
+                participants,
+                duration_s,
+                packet_ms,
+                cmd.payload_bytes,
+                packets_per_record,
+                cmd.pid,
+                !cmd.client_self_filter,
+            )
+            .await
+        } else {
+            run_media_tier(
+                &c,
+                &ns,
+                epoch.clone(),
+                participants,
+                duration_s,
+                packet_ms,
+                cmd.payload_bytes,
+                packets_per_record,
+                cmd.pid,
+                !cmd.client_self_filter,
+            )
+            .await
+        };
+        let key = format!("packets_per_record_{packets_per_record}");
+        recommendations.push(json!({
+            "packets_per_record": packets_per_record,
+            "delivery_loss_pct": tier.get("delivery_loss_pct").and_then(|v| v.as_f64()).unwrap_or(100.0),
+            "write_fail_pct": tier.get("write_fail_pct").and_then(|v| v.as_f64()).unwrap_or(100.0),
+            "latency_p99_ms": tier
+                .get("packet_latency")
+                .and_then(|v| v.get("p99_ms"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            "write_posts_per_s": tier.get("write_posts_per_s").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        }));
+        tiers.insert(key, tier);
+    }
+
+    cleanup(&c, &ns).await;
+
+    let recommended = choose_media_recommendation(&recommendations);
+    let summary = json!({
+        "base_url": cmd.base_url,
+        "workload": "media",
+        "participants": participants,
+        "duration_s": duration_s,
+        "packet_ms": packet_ms,
+        "payload_bytes": cmd.payload_bytes,
+        "pid_sampled": cmd.pid,
+        "server_node_filter": !cmd.client_self_filter,
+        "client_self_filter": cmd.client_self_filter,
+        "http2_prior_knowledge": cmd.http2_prior_knowledge,
+        "transport": if cmd.websocket { "websocket" } else { "http_sse" },
+        "recommended": recommended,
+        "tiers": Value::Object(tiers.clone()),
+    });
+
+    if cmd.json {
+        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    } else {
+        println!("\n=== topics-probe media: {} ===", cmd.base_url);
+        println!(
+            "{} people, everyone talking, {}ms Opus-like packets, 10s room buffer:",
+            participants, packet_ms
+        );
+        let mut keys: Vec<&String> = tiers.keys().collect();
+        keys.sort_by_key(|k| {
+            k.trim_start_matches("packets_per_record_")
+                .parse::<usize>()
+                .unwrap_or(0)
+        });
+        for k in keys {
+            let v = &tiers[k];
+            println!(
+                "  batch {:>2} packet(s)/record: loss={:.3}% write_fail={:.3}% posts/s={:.0} deliveries/s={:.0}",
+                v["packets_per_record"].as_u64().unwrap_or(0),
+                v["delivery_loss_pct"].as_f64().unwrap_or(0.0),
+                v["write_fail_pct"].as_f64().unwrap_or(0.0),
+                v["write_posts_per_s"].as_f64().unwrap_or(0.0),
+                v["packet_deliveries_per_s"].as_f64().unwrap_or(0.0),
+            );
+            println!(
+                "      packet latency {} | jitter {}",
+                fmt_latency(&v["packet_latency"]),
+                fmt_latency(&v["packet_jitter"]),
+            );
+            if let Some(proc_) = v.get("process") {
+                println!(
+                    "      process cpu avg/max {:.1}/{:.1}% rss max {:.1} MiB (samples={})",
+                    proc_
+                        .get("avg_cpu_pct")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0),
+                    proc_
+                        .get("max_cpu_pct")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0),
+                    proc_
+                        .get("max_rss_mib")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0),
+                    proc_.get("samples").and_then(|x| x.as_u64()).unwrap_or(0),
+                );
+            }
+        }
+        println!("  recommended: {}", recommended);
+        println!();
+    }
+
+    ExitCode::SUCCESS
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_media_tier(
+    c: &Client,
+    ns: &str,
+    epoch: Arc<Instant>,
+    participants: usize,
+    duration_s: u64,
+    packet_ms: u64,
+    payload_bytes: usize,
+    packets_per_record: usize,
+    sample_pid: Option<u32>,
+    server_node_filter: bool,
+) -> Value {
+    let topic = format!("{ns}-b{packets_per_record}");
+    let path = format!("/v0/topics/{topic}");
+    let packets_per_speaker = ((duration_s * 1000) / packet_ms).max(1);
+    let packets_in_10s_per_speaker = (10_000u64 + packet_ms - 1) / packet_ms;
+    let buffer_packet_capacity = participants as u64 * packets_in_10s_per_speaker;
+    let cap_records = (buffer_packet_capacity + packets_per_record as u64 - 1)
+        / packets_per_record as u64
+        + participants as u64;
+
+    let _ = c
+        .put(
+            &path,
+            &json!({
+                "durability": "ephemeral",
+                "ttl_ms": 10_000,
+                "cap_records": cap_records,
+                "discard": "old"
+            }),
+        )
+        .await;
+
+    let (watch_stop_tx, watch_stop_rx) = tokio::sync::watch::channel(false);
+    let mut watcher_handles = Vec::with_capacity(participants);
+    for listener in 0..participants {
+        let node = media_node(listener);
+        let mut watch_req = json!({
+            "topics": { topic.clone(): { "tail": true } },
+            "limit": 1000,
+            "max_batch_bytes": 8 * 1024 * 1024,
+            "heartbeat_ms": 2000,
+            "include_data": true,
+            "include_tags": false,
+            "include_meta": false
+        });
+        if server_node_filter {
+            watch_req["node"] = json!(node);
+        }
+        let watch = c.post("/v0/watch", &watch_req).await;
+        let Some(stream_url) = watch.ok().and_then(|r| {
+            r.body
+                .get("stream_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        }) else {
+            continue;
+        };
+        let cc = c.clone();
+        let rx = watch_stop_rx.clone();
+        let epoch = epoch.clone();
+        let expected = (participants as u64 - 1) * packets_per_speaker;
+        watcher_handles.push(tokio::spawn(async move {
+            media_watcher_loop(cc, stream_url, listener, expected, epoch, rx).await
+        }));
+    }
+
+    // Let the streams open and reach caught-up before audio starts.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let (proc_stop_tx, proc_stop_rx) = tokio::sync::watch::channel(false);
+    let proc_handle = sample_pid.map(|pid| tokio::spawn(process_sampler(pid, proc_stop_rx)));
+
+    let payload_len = ((payload_bytes + 2) / 3) * 4;
+    let payload = Arc::new("A".repeat(payload_len));
+    let write_latencies = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let posts_ok = Arc::new(AtomicU64::new(0));
+    let posts_failed = Arc::new(AtomicU64::new(0));
+    let sent_by_speaker = Arc::new(
+        (0..participants)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
+
+    let start_wall = Instant::now();
+    let start_tick = tokio::time::Instant::now();
+    let mut writers = Vec::with_capacity(participants);
+    for speaker in 0..participants {
+        let cc = c.clone();
+        let path = format!("{path}?return_seqs=false");
+        let epoch = epoch.clone();
+        let payload = payload.clone();
+        let write_latencies = write_latencies.clone();
+        let posts_ok = posts_ok.clone();
+        let posts_failed = posts_failed.clone();
+        let sent_by_speaker = sent_by_speaker.clone();
+        writers.push(tokio::spawn(async move {
+            let mut local_lat = Vec::<f64>::new();
+            let mut next_packet = 0u64;
+            while next_packet < packets_per_speaker {
+                let remaining = (packets_per_speaker - next_packet) as usize;
+                let batch_len = remaining.min(packets_per_record);
+                let send_at = start_tick
+                    + Duration::from_millis((next_packet + batch_len as u64) * packet_ms);
+                tokio::time::sleep_until(send_at).await;
+
+                let send_ns = epoch.elapsed().as_nanos() as u64;
+                let mut packets = Vec::with_capacity(batch_len);
+                for i in 0..batch_len {
+                    let seq = next_packet + i as u64;
+                    let held_back_ms = (batch_len - 1 - i) as u64 * packet_ms;
+                    let t = send_ns.saturating_sub(held_back_ms * 1_000_000);
+                    packets.push(json!({
+                        "s": speaker,
+                        "q": seq,
+                        "t": t,
+                        "p": payload.as_str()
+                    }));
+                }
+
+                let node = media_node(speaker);
+                let body = json!({
+                    "records": [{
+                        "node": node,
+                        "data": {
+                            "speaker": speaker,
+                            "packets": packets
+                        }
+                    }]
+                });
+                let t0 = Instant::now();
+                let ok = cc
+                    .post(&path, &body)
+                    .await
+                    .map(|r| r.status == 200 || r.status == 201)
+                    .unwrap_or(false);
+                local_lat.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if ok {
+                    posts_ok.fetch_add(1, Ordering::Relaxed);
+                    sent_by_speaker[speaker].fetch_add(batch_len as u64, Ordering::Relaxed);
+                } else {
+                    posts_failed.fetch_add(1, Ordering::Relaxed);
+                }
+                next_packet += batch_len as u64;
+            }
+            if !local_lat.is_empty() {
+                write_latencies.lock().unwrap().extend(local_lat);
+            }
+        }));
+    }
+
+    for h in writers {
+        let _ = h.await;
+    }
+    let writers_elapsed_s = start_wall.elapsed().as_secs_f64();
+
+    // Allow the tail to drain, but do not pay a fixed 5s tax when every watcher
+    // has already received the expected packets.
+    let drain_start = Instant::now();
+    let drain_deadline = Duration::from_secs(5);
+    while !watcher_handles.iter().all(|h| h.is_finished()) && drain_start.elapsed() < drain_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let drain_wait_s = drain_start.elapsed().as_secs_f64();
+    let _ = watch_stop_tx.send(true);
+    let _ = proc_stop_tx.send(true);
+
+    let mut reports = Vec::new();
+    for h in watcher_handles {
+        if let Ok(Ok(report)) = tokio::time::timeout(Duration::from_secs(5), h).await {
+            reports.push(report);
+        }
+    }
+    let proc_samples = match proc_handle {
+        Some(h) => h.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let elapsed_s = start_wall.elapsed().as_secs_f64();
+    let _ = c.delete(&path).await;
+
+    let sent_by_speaker_vals: Vec<u64> = sent_by_speaker
+        .iter()
+        .map(|x| x.load(Ordering::Relaxed))
+        .collect();
+    let sent_packets: u64 = sent_by_speaker_vals.iter().sum();
+    let planned_packets = participants as u64 * packets_per_speaker;
+    let write_failed_packets = planned_packets.saturating_sub(sent_packets);
+    let connected_watchers = reports.iter().filter(|r| r.connected).count() as u64;
+    let expected_deliveries: u64 = reports
+        .iter()
+        .filter(|r| r.connected)
+        .map(|r| sent_packets.saturating_sub(sent_by_speaker_vals[r.listener]))
+        .sum();
+    let delivered_packets: u64 = reports.iter().map(|r| r.delivered).sum();
+    let duplicate_packets: u64 = reports.iter().map(|r| r.duplicates).sum();
+    let tombstones: u64 = reports.iter().map(|r| r.tombstones).sum();
+    let record_frames: u64 = reports.iter().map(|r| r.record_frames).sum();
+    let delivery_loss = expected_deliveries.saturating_sub(delivered_packets);
+
+    let mut latencies = Vec::new();
+    let mut jitters = Vec::new();
+    for mut r in reports {
+        latencies.append(&mut r.latencies_ms);
+        jitters.append(&mut r.jitter_ms);
+    }
+
+    let posts_ok_n = posts_ok.load(Ordering::Relaxed);
+    let posts_failed_n = posts_failed.load(Ordering::Relaxed);
+    let total_posts = posts_ok_n + posts_failed_n;
+    let write_lat = Arc::try_unwrap(write_latencies)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .unwrap_or_default();
+    let batching_floor_ms = packets_per_record.saturating_sub(1) as u64 * packet_ms;
+
+    json!({
+        "uses_routers": false,
+        "topology": "single_room_topic_direct_sse_watchers",
+        "server_node_filter": server_node_filter,
+        "packets_per_record": packets_per_record,
+        "batching_floor_ms": batching_floor_ms,
+        "participants": participants,
+        "watchers_connected": connected_watchers,
+        "duration_s": duration_s,
+        "writers_elapsed_s": round3(writers_elapsed_s),
+        "packet_ms": packet_ms,
+        "payload_base64_bytes": payload_len,
+        "cap_records": cap_records,
+        "ttl_ms": 10_000,
+        "buffer_packet_capacity": buffer_packet_capacity,
+        "packets_per_speaker": packets_per_speaker,
+        "planned_packets": planned_packets,
+        "sent_packets": sent_packets,
+        "write_failed_packets": write_failed_packets,
+        "write_fail_pct": pct(write_failed_packets, planned_packets),
+        "expected_packet_deliveries": expected_deliveries,
+        "delivered_packets": delivered_packets,
+        "delivery_loss": delivery_loss,
+        "delivery_loss_pct": pct(delivery_loss, expected_deliveries),
+        "duplicate_packets": duplicate_packets,
+        "tombstones": tombstones,
+        "record_frames": record_frames,
+        "elapsed_s": round3(elapsed_s),
+        "drain_wait_s": round3(drain_wait_s),
+        "write_posts_ok": posts_ok_n,
+        "write_posts_failed": posts_failed_n,
+        "write_posts_per_s": round3(if writers_elapsed_s > 0.0 { posts_ok_n as f64 / writers_elapsed_s } else { 0.0 }),
+        "write_posts_per_audio_s": round3(posts_ok_n as f64 / duration_s as f64),
+        "packet_deliveries_per_s": round3(if elapsed_s > 0.0 { delivered_packets as f64 / elapsed_s } else { 0.0 }),
+        "packet_latency": summarize(latencies),
+        "packet_jitter": summarize(jitters),
+        "writer_append_latency": summarize(write_lat),
+        "process": summarize_proc(proc_samples),
+        "total_posts": total_posts,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_media_ws_tier(
+    c: &Client,
+    base_url: &str,
+    token: Option<&str>,
+    ns: &str,
+    epoch: Arc<Instant>,
+    participants: usize,
+    duration_s: u64,
+    packet_ms: u64,
+    payload_bytes: usize,
+    packets_per_record: usize,
+    sample_pid: Option<u32>,
+    server_node_filter: bool,
+) -> Value {
+    let topic = format!("{ns}-ws-b{packets_per_record}");
+    let path = format!("/v0/topics/{topic}");
+    let packets_per_speaker = ((duration_s * 1000) / packet_ms).max(1);
+    let packets_in_10s_per_speaker = (10_000u64 + packet_ms - 1) / packet_ms;
+    let buffer_packet_capacity = participants as u64 * packets_in_10s_per_speaker;
+    let cap_records = (buffer_packet_capacity + packets_per_record as u64 - 1)
+        / packets_per_record as u64
+        + participants as u64;
+
+    let _ = c
+        .put(
+            &path,
+            &json!({
+                "durability": "ephemeral",
+                "ttl_ms": 10_000,
+                "cap_records": cap_records,
+                "discard": "old"
+            }),
+        )
+        .await;
+
+    let ws_url = media_ws_url(base_url);
+    let (watch_stop_tx, watch_stop_rx) = tokio::sync::watch::channel(false);
+    let (start_tx, _start_rx) = tokio::sync::watch::channel(false);
+    let pending_acks = Arc::new(std::sync::Mutex::new(HashMap::<
+        String,
+        (Instant, usize, u64),
+    >::new()));
+    let write_latencies = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let posts_ok = Arc::new(AtomicU64::new(0));
+    let posts_failed = Arc::new(AtomicU64::new(0));
+    let posts_per_speaker =
+        (packets_per_speaker + packets_per_record as u64 - 1) / packets_per_record as u64;
+    let sent_by_speaker = Arc::new(
+        (0..participants)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
+    let payload_len = ((payload_bytes + 2) / 3) * 4;
+    let payload = Arc::new("A".repeat(payload_len));
+
+    let mut watcher_handles = Vec::with_capacity(participants);
+    let mut writer_handles = Vec::with_capacity(participants);
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<usize>(participants);
+    for participant in 0..participants {
+        let Some(mut socket) = connect_media_ws(&ws_url, token).await else {
+            continue;
+        };
+        let node = media_node(participant);
+        let mut sub = json!({
+            "op": "subscribe",
+            "topic": topic,
+            "tail": true,
+            "limit": 1000,
+            "max_batch_bytes": 8 * 1024 * 1024,
+            "include_data": true,
+            "include_tags": false,
+            "include_meta": false
+        });
+        if server_node_filter {
+            sub["node"] = json!(node);
+        }
+        if socket
+            .send(WsMessage::Text(sub.to_string().into()))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+
+        let (sink, stream) = socket.split();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<String>(1024);
+        tokio::spawn(media_ws_sender_loop(sink, cmd_rx, watch_stop_rx.clone()));
+        let expected = (participants as u64 - 1) * packets_per_speaker;
+        let rx = watch_stop_rx.clone();
+        let epoch_for_reader = epoch.clone();
+        let pending_for_reader = pending_acks.clone();
+        let write_lat_for_reader = write_latencies.clone();
+        let ok_for_reader = posts_ok.clone();
+        let fail_for_reader = posts_failed.clone();
+        let ready_for_reader = ready_tx.clone();
+        let sent_by_speaker_for_reader = sent_by_speaker.clone();
+        watcher_handles.push(tokio::spawn(async move {
+            media_ws_reader_loop(
+                stream,
+                participant,
+                expected,
+                posts_per_speaker,
+                epoch_for_reader,
+                rx,
+                pending_for_reader,
+                write_lat_for_reader,
+                ok_for_reader,
+                fail_for_reader,
+                ready_for_reader,
+                sent_by_speaker_for_reader,
+            )
+            .await
+        }));
+
+        let mut start_rx = start_tx.subscribe();
+        let topic_for_writer = topic.clone();
+        let epoch_for_writer = epoch.clone();
+        let payload_for_writer = payload.clone();
+        let pending_for_writer = pending_acks.clone();
+        let failed_for_writer = posts_failed.clone();
+        writer_handles.push(tokio::spawn(async move {
+            let _ = start_rx.changed().await;
+            let start_tick = tokio::time::Instant::now();
+            let mut next_packet = 0u64;
+            while next_packet < packets_per_speaker {
+                let remaining = (packets_per_speaker - next_packet) as usize;
+                let batch_len = remaining.min(packets_per_record);
+                let send_at = start_tick
+                    + Duration::from_millis((next_packet + batch_len as u64) * packet_ms);
+                tokio::time::sleep_until(send_at).await;
+
+                let send_ns = epoch_for_writer.elapsed().as_nanos() as u64;
+                let mut packets = Vec::with_capacity(batch_len);
+                for i in 0..batch_len {
+                    let seq = next_packet + i as u64;
+                    let held_back_ms = (batch_len - 1 - i) as u64 * packet_ms;
+                    let t = send_ns.saturating_sub(held_back_ms * 1_000_000);
+                    packets.push(json!({
+                        "s": participant,
+                        "q": seq,
+                        "t": t,
+                        "p": payload_for_writer.as_str()
+                    }));
+                }
+
+                let req_id = format!("{participant}-{next_packet}");
+                let body = json!({
+                    "op": "publish",
+                    "request_id": req_id,
+                    "topic": topic_for_writer,
+                    "return_seqs": false,
+                    "records": [{
+                        "node": media_node(participant),
+                        "data": {
+                            "speaker": participant,
+                            "packets": packets
+                        }
+                    }]
+                });
+                pending_for_writer.lock().unwrap().insert(
+                    req_id.clone(),
+                    (Instant::now(), participant, batch_len as u64),
+                );
+                if cmd_tx.send(body.to_string()).await.is_err() {
+                    pending_for_writer.lock().unwrap().remove(&req_id);
+                    failed_for_writer.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                next_packet += batch_len as u64;
+            }
+        }));
+    }
+    drop(ready_tx);
+
+    // Wait until every connected socket has processed its tail subscription and
+    // received the server's initial caught-up marker. A fixed sleep can still race
+    // at high connection counts and report false delivery loss for the first packet.
+    let mut ready = HashSet::<usize>::new();
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ready.len() < watcher_handles.len() {
+        let remaining = ready_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, ready_rx.recv()).await {
+            Ok(Some(participant)) => {
+                ready.insert(participant);
+            }
+            _ => break,
+        }
+    }
+    let ws_ready_participants = ready.len() as u64;
+    let (proc_stop_tx, proc_stop_rx) = tokio::sync::watch::channel(false);
+    let proc_handle = sample_pid.map(|pid| tokio::spawn(process_sampler(pid, proc_stop_rx)));
+
+    let start_wall = Instant::now();
+    let _ = start_tx.send(true);
+    for h in writer_handles {
+        let _ = h.await;
+    }
+    let writers_elapsed_s = start_wall.elapsed().as_secs_f64();
+
+    let drain_start = Instant::now();
+    let drain_deadline = Duration::from_secs(5);
+    while !watcher_handles.iter().all(|h| h.is_finished()) && drain_start.elapsed() < drain_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let drain_wait_s = drain_start.elapsed().as_secs_f64();
+    let _ = watch_stop_tx.send(true);
+    let _ = proc_stop_tx.send(true);
+
+    let mut reports = Vec::new();
+    for h in watcher_handles {
+        if let Ok(Ok(report)) = tokio::time::timeout(Duration::from_secs(5), h).await {
+            reports.push(report);
+        }
+    }
+    let proc_samples = match proc_handle {
+        Some(h) => h.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let elapsed_s = start_wall.elapsed().as_secs_f64();
+    let _ = c.delete(&path).await;
+
+    let sent_by_speaker_vals: Vec<u64> = sent_by_speaker
+        .iter()
+        .map(|x| x.load(Ordering::Relaxed))
+        .collect();
+    let sent_packets: u64 = sent_by_speaker_vals.iter().sum();
+    let planned_packets = participants as u64 * packets_per_speaker;
+    let write_failed_packets = planned_packets.saturating_sub(sent_packets);
+    let connected_watchers = reports.iter().filter(|r| r.connected).count() as u64;
+    let expected_deliveries: u64 = reports
+        .iter()
+        .filter(|r| r.connected)
+        .map(|r| sent_packets.saturating_sub(sent_by_speaker_vals[r.listener]))
+        .sum();
+    let delivered_packets: u64 = reports.iter().map(|r| r.delivered).sum();
+    let duplicate_packets: u64 = reports.iter().map(|r| r.duplicates).sum();
+    let tombstones: u64 = reports.iter().map(|r| r.tombstones).sum();
+    let record_frames: u64 = reports.iter().map(|r| r.record_frames).sum();
+    let delivery_loss = expected_deliveries.saturating_sub(delivered_packets);
+
+    let mut latencies = Vec::new();
+    let mut jitters = Vec::new();
+    for mut r in reports {
+        latencies.append(&mut r.latencies_ms);
+        jitters.append(&mut r.jitter_ms);
+    }
+
+    let posts_ok_n = posts_ok.load(Ordering::Relaxed);
+    let posts_failed_n = posts_failed.load(Ordering::Relaxed);
+    let posts_unacked_n = pending_acks.lock().unwrap().len() as u64;
+    let total_posts = posts_ok_n + posts_failed_n + posts_unacked_n;
+    let write_lat = Arc::try_unwrap(write_latencies)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .unwrap_or_default();
+    let batching_floor_ms = packets_per_record.saturating_sub(1) as u64 * packet_ms;
+
+    json!({
+        "uses_routers": false,
+        "topology": "single_room_topic_bidirectional_websockets",
+        "transport": "websocket",
+        "server_node_filter": server_node_filter,
+        "packets_per_record": packets_per_record,
+        "batching_floor_ms": batching_floor_ms,
+        "participants": participants,
+        "watchers_connected": connected_watchers,
+        "ws_ready_participants": ws_ready_participants,
+        "duration_s": duration_s,
+        "writers_elapsed_s": round3(writers_elapsed_s),
+        "packet_ms": packet_ms,
+        "payload_base64_bytes": payload_len,
+        "cap_records": cap_records,
+        "ttl_ms": 10_000,
+        "buffer_packet_capacity": buffer_packet_capacity,
+        "packets_per_speaker": packets_per_speaker,
+        "planned_packets": planned_packets,
+        "sent_packets": sent_packets,
+        "write_failed_packets": write_failed_packets,
+        "write_fail_pct": pct(write_failed_packets, planned_packets),
+        "expected_packet_deliveries": expected_deliveries,
+        "delivered_packets": delivered_packets,
+        "delivery_loss": delivery_loss,
+        "delivery_loss_pct": pct(delivery_loss, expected_deliveries),
+        "duplicate_packets": duplicate_packets,
+        "tombstones": tombstones,
+        "record_frames": record_frames,
+        "write_posts_ok": posts_ok_n,
+        "write_posts_failed": posts_failed_n,
+        "write_posts_unacked": posts_unacked_n,
+        "write_posts_per_audio_s": round3(total_posts as f64 / duration_s as f64),
+        "write_posts_per_s": round3(total_posts as f64 / writers_elapsed_s.max(0.001)),
+        "packet_deliveries_per_s": round3(delivered_packets as f64 / elapsed_s.max(0.001)),
+        "elapsed_s": round3(elapsed_s),
+        "drain_wait_s": round3(drain_wait_s),
+        "packet_latency": summarize(latencies),
+        "packet_jitter": summarize(jitters),
+        "writer_append_latency": summarize(write_lat),
+        "process": summarize_proc(proc_samples),
+        "total_posts": total_posts,
+    })
+}
+
+fn media_ws_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}/v0/ws")
+    } else if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}/v0/ws")
+    } else {
+        format!("{base}/v0/ws")
+    }
+}
+
+async fn connect_media_ws(
+    ws_url: &str,
+    token: Option<&str>,
+) -> Option<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let mut req = ws_url.to_string().into_client_request().ok()?;
+    if let Some(token) = token {
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().ok()?);
+    }
+    tokio_tungstenite::connect_async(req)
+        .await
+        .ok()
+        .map(|(ws, _)| ws)
+}
+
+async fn media_ws_sender_loop<S, E>(
+    mut sink: S,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) where
+    S: Sink<WsMessage, Error = E> + Unpin,
+{
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_ok() && *stop.borrow() {
+                    let _ = sink.close().await;
+                    return;
+                }
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Some(text) => {
+                        if sink.send(WsMessage::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => {
+                        // Writers finished; keep the socket open for inbound drain
+                        // until the probe stop signal closes it.
+                        let _ = stop.changed().await;
+                        let _ = sink.close().await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn media_ws_reader_loop<S>(
+    mut stream: S,
+    listener: usize,
+    expected_packets: u64,
+    expected_posts: u64,
+    epoch: Arc<Instant>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    pending_acks: Arc<std::sync::Mutex<HashMap<String, (Instant, usize, u64)>>>,
+    write_latencies: Arc<std::sync::Mutex<Vec<f64>>>,
+    posts_ok: Arc<AtomicU64>,
+    posts_failed: Arc<AtomicU64>,
+    ready_tx: tokio::sync::mpsc::Sender<usize>,
+    sent_by_speaker: Arc<Vec<AtomicU64>>,
+) -> MediaWatcherReport
+where
+    S: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut report = MediaWatcherReport {
+        listener,
+        connected: true,
+        ..Default::default()
+    };
+    let mut seen = HashSet::<u64>::new();
+    let mut last_latency_by_speaker = HashMap::<usize, f64>::new();
+    let mut ready_sent = false;
+    let mut own_posts_done = 0u64;
+
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_ok() && *stop.borrow() {
+                    return report;
+                }
+            }
+            msg = stream.next() => {
+                let Some(Ok(msg)) = msg else { return report };
+                let WsMessage::Text(text) = msg else { continue };
+                let recv_ns = epoch.elapsed().as_nanos() as u64;
+                let Ok(payload): Result<Value, _> = serde_json::from_str(&text) else {
+                    continue;
+                };
+                match payload.get("op").and_then(|v| v.as_str()) {
+                    Some("caught_up") => {
+                        if !ready_sent {
+                            let _ = ready_tx.send(listener).await;
+                            ready_sent = true;
+                        }
+                    }
+                    Some("ack") => {
+                        if let Some(id) = payload.get("request_id").and_then(|v| v.as_str()) {
+                            if ws_request_speaker(id) == Some(listener) {
+                                own_posts_done += 1;
+                            }
+                            if let Some((t0, speaker, batch_len)) = pending_acks.lock().unwrap().remove(id) {
+                                write_latencies
+                                    .lock()
+                                    .unwrap()
+                                    .push(t0.elapsed().as_secs_f64() * 1000.0);
+                                posts_ok.fetch_add(1, Ordering::Relaxed);
+                                sent_by_speaker[speaker].fetch_add(batch_len, Ordering::Relaxed);
+                            }
+                            if report.delivered >= expected_packets && own_posts_done >= expected_posts {
+                                return report;
+                            }
+                        }
+                    }
+                    Some("error") => {
+                        if let Some(id) = payload.get("request_id").and_then(|v| v.as_str()) {
+                            if ws_request_speaker(id) == Some(listener) {
+                                own_posts_done += 1;
+                            }
+                            pending_acks.lock().unwrap().remove(id);
+                            posts_failed.fetch_add(1, Ordering::Relaxed);
+                            if report.delivered >= expected_packets && own_posts_done >= expected_posts {
+                                return report;
+                            }
+                        }
+                    }
+                    Some("tombstone") => {
+                        report.tombstones += 1;
+                    }
+                    Some("record") => {
+                        report.record_frames += 1;
+                        let Some(records) = payload.get("records").and_then(|v| v.as_array()) else {
+                            continue;
+                        };
+                        for rec in records {
+                            let data = rec.get("data").unwrap_or(&Value::Null);
+                            let fallback_speaker = data
+                                .get("speaker")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize);
+                            let Some(packets) = data.get("packets").and_then(|v| v.as_array()) else {
+                                continue;
+                            };
+                            for packet in packets {
+                                let speaker = packet
+                                    .get("s")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize)
+                                    .or(fallback_speaker)
+                                    .unwrap_or(usize::MAX);
+                                if speaker == listener {
+                                    continue;
+                                }
+                                let seq = packet.get("q").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let key = (speaker as u64) << 40 | seq;
+                                if !seen.insert(key) {
+                                    report.duplicates += 1;
+                                    continue;
+                                }
+                                let Some(stamp) = packet.get("t").and_then(|v| v.as_u64()) else {
+                                    continue;
+                                };
+                                let latency_ms = recv_ns.saturating_sub(stamp) as f64 / 1_000_000.0;
+                                if let Some(last) = last_latency_by_speaker.insert(speaker, latency_ms) {
+                                    report.jitter_ms.push((latency_ms - last).abs());
+                                }
+                                report.latencies_ms.push(latency_ms);
+                                report.delivered += 1;
+                            }
+                        }
+                        if report.delivered >= expected_packets && own_posts_done >= expected_posts {
+                            return report;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn ws_request_speaker(id: &str) -> Option<usize> {
+    id.split_once('-')?.0.parse().ok()
+}
+
+async fn media_watcher_loop(
+    c: Client,
+    stream_url: String,
+    listener: usize,
+    expected_packets: u64,
+    epoch: Arc<Instant>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> MediaWatcherReport {
+    let mut report = MediaWatcherReport {
+        listener,
+        ..Default::default()
+    };
+    let mut rb = c
+        .http
+        .get(c.url(&stream_url))
+        .header("accept", "text/event-stream");
+    if let Some(t) = &c.token {
+        rb = rb.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match rb.send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return report,
+    };
+    report.connected = true;
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut seen = HashSet::<u64>::new();
+    let mut last_latency_by_speaker = HashMap::<usize, f64>::new();
+
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_ok() && *stop.borrow() {
+                    return report;
+                }
+            }
+            chunk = stream.next() => {
+                let Some(Ok(bytes)) = chunk else { return report };
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(idx) = buf.find("\n\n") {
+                    let block: String = buf.drain(..idx + 2).collect();
+                    let Some(frame) = parse_sse_block(&block) else {
+                        continue;
+                    };
+                    if frame.event == "tombstone" {
+                        report.tombstones += 1;
+                        continue;
+                    }
+                    if frame.event != "record" {
+                        continue;
+                    }
+                    report.record_frames += 1;
+                    let recv_ns = epoch.elapsed().as_nanos() as u64;
+                    let Ok(payload): Result<Value, _> = serde_json::from_str(&frame.data) else {
+                        continue;
+                    };
+                    let Some(records) = payload.get("records").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    for rec in records {
+                        let data = rec.get("data").unwrap_or(&Value::Null);
+                        let fallback_speaker = data
+                            .get("speaker")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize);
+                        let Some(packets) = data.get("packets").and_then(|v| v.as_array()) else {
+                            continue;
+                        };
+                        for packet in packets {
+                            let speaker = packet
+                                .get("s")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize)
+                                .or(fallback_speaker)
+                                .unwrap_or(usize::MAX);
+                            if speaker == listener {
+                                continue;
+                            }
+                            let seq = packet.get("q").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let key = (speaker as u64) << 40 | seq;
+                            if !seen.insert(key) {
+                                report.duplicates += 1;
+                                continue;
+                            }
+                            let Some(stamp) = packet.get("t").and_then(|v| v.as_u64()) else {
+                                continue;
+                            };
+                            let latency_ms = recv_ns.saturating_sub(stamp) as f64 / 1_000_000.0;
+                            if let Some(last) = last_latency_by_speaker.insert(speaker, latency_ms) {
+                                report.jitter_ms.push((latency_ms - last).abs());
+                            }
+                            report.latencies_ms.push(latency_ms);
+                            report.delivered += 1;
+                        }
+                    }
+                    if report.delivered >= expected_packets {
+                        return report;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn process_sampler(
+    pid: u32,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Vec<ProcSample> {
+    let mut samples = Vec::new();
+    loop {
+        if let Some(sample) = sample_process(pid) {
+            samples.push(sample);
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_ok() && *stop.borrow() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+    samples
+}
+
+fn sample_process(pid: u32) -> Option<ProcSample> {
+    let pid_s = pid.to_string();
+    let output = Command::new("ps")
+        .args(["-o", "pcpu=", "-o", "rss=", "-p", pid_s.as_str()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace();
+    let cpu_pct = parts.next()?.parse::<f64>().ok()?;
+    let rss_kib = parts.next()?.parse::<u64>().ok()?;
+    Some(ProcSample { cpu_pct, rss_kib })
+}
+
+fn summarize_proc(samples: Vec<ProcSample>) -> Value {
+    if samples.is_empty() {
+        return json!({
+            "samples": 0,
+            "avg_cpu_pct": 0.0,
+            "max_cpu_pct": 0.0,
+            "avg_rss_mib": 0.0,
+            "max_rss_mib": 0.0
+        });
+    }
+    let n = samples.len() as f64;
+    let sum_cpu: f64 = samples.iter().map(|s| s.cpu_pct).sum();
+    let max_cpu = samples.iter().map(|s| s.cpu_pct).fold(0.0, f64::max);
+    let sum_rss: u64 = samples.iter().map(|s| s.rss_kib).sum();
+    let max_rss = samples.iter().map(|s| s.rss_kib).max().unwrap_or(0);
+    json!({
+        "samples": samples.len(),
+        "avg_cpu_pct": round3(sum_cpu / n),
+        "max_cpu_pct": round3(max_cpu),
+        "avg_rss_mib": round3(sum_rss as f64 / n / 1024.0),
+        "max_rss_mib": round3(max_rss as f64 / 1024.0),
+    })
+}
+
+fn media_node(idx: usize) -> String {
+    format!("u{idx:03}")
+}
+
+fn pct(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        round3(part as f64 * 100.0 / total as f64)
+    }
+}
+
+fn choose_media_recommendation(candidates: &[Value]) -> Value {
+    // For live audio, keep p99 under 60ms when possible, then prefer fewer write
+    // posts/s. If no tier meets that latency/loss bar, choose the lowest-loss,
+    // lowest-latency tier.
+    let mut viable: Vec<&Value> = candidates
+        .iter()
+        .filter(|v| {
+            v.get("delivery_loss_pct")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(1.0)
+                == 0.0
+                && v.get("write_fail_pct")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1.0)
+                    == 0.0
+                && v.get("latency_p99_ms")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(f64::MAX)
+                    <= 60.0
+        })
+        .collect();
+    if viable.is_empty() {
+        viable = candidates.iter().collect();
+        viable.sort_by(|a, b| {
+            let al = a
+                .get("delivery_loss_pct")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(f64::MAX);
+            let bl = b
+                .get("delivery_loss_pct")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(f64::MAX);
+            al.partial_cmp(&bl)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let ap = a
+                        .get("latency_p99_ms")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(f64::MAX);
+                    let bp = b
+                        .get("latency_p99_ms")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(f64::MAX);
+                    ap.partial_cmp(&bp).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+    } else {
+        viable.sort_by(|a, b| {
+            let ap = a
+                .get("write_posts_per_s")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(f64::MAX);
+            let bp = b
+                .get("write_posts_per_s")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(f64::MAX);
+            ap.partial_cmp(&bp)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let al = a
+                        .get("latency_p99_ms")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(f64::MAX);
+                    let bl = b
+                        .get("latency_p99_ms")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(f64::MAX);
+                    al.partial_cmp(&bl).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+    }
+    viable.first().cloned().cloned().unwrap_or(Value::Null)
 }
 
 // ---------------------------------------------------------------------------

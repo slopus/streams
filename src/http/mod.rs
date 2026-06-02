@@ -8,6 +8,7 @@ pub mod queue;
 pub mod routers;
 pub mod topics;
 pub mod watch;
+pub mod ws;
 
 use crate::auth::{KeyStore, Principal, Scope};
 use crate::engine::Engine;
@@ -119,6 +120,8 @@ pub fn build_router_with_shutdown(
         // Watch / SSE
         .route("/watch", post(watch::create_watch))
         .route("/watch/{wid}", get(watch::stream_watch))
+        // WebSocket dynamic subscribe/publish
+        .route("/ws", get(ws::websocket))
         // Health / readiness / metrics
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
@@ -336,6 +339,14 @@ fn route_requirement<'a>(method: &Method, path: &'a str) -> Option<(Scope, Optio
     // body's topic map); the GET stream is capability-gated. Require read here.
     if rest == "/watch" {
         return Some((Scope::READ, None));
+    }
+
+    // GET /v0/ws — open a dynamic WebSocket. The concrete operation is carried in
+    // each WebSocket message, so the handler enforces read/write/admin and prefix
+    // checks per command. This lets write-only clients publish without also holding
+    // read scope, while read-only clients can subscribe but not publish.
+    if rest == "/ws" && method == Method::GET {
+        return None;
     }
 
     // GET /v0/metrics — operational telemetry (topic count). Gated behind auth by

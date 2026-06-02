@@ -625,7 +625,7 @@ fn build_stream(
                         // bytes so one frame cannot balloon to limit×record-cap.
                         max_batch_bytes: session.req.max_batch_bytes,
                     };
-                    let Ok(d) = engine.diff(name, req) else {
+                    let Ok(d) = engine.diff_shared_frames(name, req, variant) else {
                         // Diff only fails with topic_not_found here.
                         deleted.insert(name.clone());
                         let id = encode_session_id(&session);
@@ -674,26 +674,13 @@ fn build_stream(
                     // Advance the authoritative cursor past everything examined.
                     let to_seq = d.next_from_seq;
                     if !d.records.is_empty() {
-                        // Zero-copy broadcast: each record frame is serialized
-                        // ONCE per topic and shared (ref-counted `Arc<RawValue>`)
-                        // across all watchers via the topic's broadcast cache,
-                        // instead of re-serializing per connection. The envelope
-                        // (`topic`/`from_seq`/`to_seq`/`head_seq`) and the composite
-                        // `id:` cursor are still per-connection (they depend on
-                        // this session's cursor map). The struct's field order is
-                        // sorted to stay byte-identical to the old `json!` map.
-                        let records: Vec<Arc<RawValue>> = d
-                            .records
-                            .iter()
-                            .map(|r| b.broadcast.frame(r.seq, r, variant))
-                            .collect();
                         session.cursors.lock().insert(name.clone(), to_seq);
                         let id = encode_session_id(&session);
                         let payload = RecordEnvelope {
                             topic_name: name.as_str(),
                             from_seq,
                             head_seq: d.head_seq,
-                            records,
+                            records: d.records,
                             to_seq,
                         };
                         let body = serde_json::to_string(&payload)

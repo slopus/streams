@@ -397,7 +397,7 @@ exercise the engine + HTTP + SSE + scheduler path, not the fsync floor.
 
 ## Methodology (Phase 5 additions)
 
-Four `topics-probe` subcommands drive a LIVE server; each prints a table and a
+Five `topics-probe` subcommands drive a LIVE server; each prints a table and a
 `--json` summary. Wall-clock latencies; percentiles by sort + linear
 interpolation. The SSE write→deliver latency uses a shared monotonic `epoch`
 stamped into each pulse payload (writer and watchers share one process clock), so
@@ -413,6 +413,15 @@ it is a true end-to-end write-to-delivery interval with no clock skew.
   latency-paced aggregate (`≈ watchers × pulse-rate`), **not** a saturation
   throughput figure — the saturation story is the latency headroom (see the
   millions/sec discussion below).
+- `media <url> --participants 100 --packet-ms 20 --payload-bytes 80 --batches ...`
+  — Opus-like room audio over one capped room topic: N speakers all publish while
+  N watchers receive everyone except their own `node`. By default writers use HTTP
+  POSTs and watchers use SSE; `--websocket` uses one bidirectional WebSocket per
+  participant for dynamic subscribe + publish. The topic is configured with
+  `ttl_ms=10000` plus a computed `cap_records` for a 10 s packet buffer. The probe
+  reports packet delivery loss, tombstones, duplicate packets, packet latency,
+  inter-packet jitter, writer append latency, unacked WebSocket publishes, and
+  best-effort `ps` CPU/RSS for the server process.
 - `distribution <url> --topics N --batch B --writers W` — round-robins batched
   appends across many topics via W concurrent writer tasks; aggregate appends/sec.
 - `queue <url> --workers N --jobs J --claim-max K [--jitter ms]` — producers
@@ -449,9 +458,161 @@ p99 from 1 → 100 watchers (a 100× fan-out) and only reaches ~5 ms p99 at 1000
 Because each pulse is serialized **once** and ref-counted, the marginal cost of an
 extra watcher is a bounded-channel send (tens to hundreds of ns), which is exactly
 why the per-delivery latency does not blow up with N. The aggregate `deliveries/s`
-columns are latency-paced, not saturated (see §5 on millions/sec).
+columns are latency-paced, not saturated (see §6 on millions/sec).
 
-## 2. DISTRIBUTION — 1 source → many topics (batched, sharded fan-out)
+## 2. MEDIA / AUDIO — all-talking room over one topic
+
+**Current-machine benchmark. Update this section in place when the media path
+improves.** Captured 2026-06-02 on the same Apple M4 Max / macOS / APFS machine.
+Server: release binary on `127.0.0.1`, fresh temp `TOPICS_DATA_DIR`, auth disabled
+on loopback, sampled with `ps` using the server PID. Probe: `topics-probe media`.
+
+Scenario: everyone talks at once, **20 ms Opus-like packets**, **80 raw
+bytes/packet** (stored as a 108-byte base64-like string in JSON), one room topic,
+and each listener filters out its own `node`. **No routers are created or used in
+this workload**: every speaker appends directly to the room topic and every
+listener opens a direct SSE watch or WebSocket subscription on that same topic. The
+room topic keeps a **10 s buffer** using `ttl_ms=10000` and `cap_records =
+ceil(participants × 10 s × 50 packets/s ÷ packets_per_record) + participants`.
+
+Current implementation notes:
+
+- `durability:"ephemeral"` records are resident-only: no append WAL, no HOT
+  segment materialization, and no snapshot/recovery of record payloads. The topic
+  config still persists.
+- Existing ephemeral-topic writes run inline instead of hopping to the blocking pool.
+  Persistent disk/fsync writes still use the blocking pool.
+- SSE/WebSocket use a shared-frame diff path: high-fanout watchers check the
+  broadcast cache before cloning payload JSON. Cache lookup is O(1) and batched per
+  diff frame, so cache hits avoid per-watcher payload clones and per-record cache
+  locks.
+- `/v0/ws` is available beside SSE. It supports dynamic JSON `subscribe`,
+  `unsubscribe`, `publish`, and `ping` commands on one socket; publish commands
+  enforce write scope, subscribe commands enforce read scope, and config-on-publish
+  still requires admin scope.
+- WebSocket delivery registers topic notifications before draining to avoid missed
+  tail wakeups. Each socket has a 4-message outbound queue, and record frames reserve
+  queue capacity before serializing large JSON strings so overload is backpressured
+  earlier.
+
+### 100 participants, 3 s
+
+3 s of audio is 15 000 produced packets and **1 485 000 expected listener-packet
+deliveries** (`100 speakers × 150 packets × 99 listeners`).
+
+| Packets / stored record | HTTP POSTs | cap_records | Delivered listener-packets | Loss | Tombstones | p50 latency | p99 latency | p999 latency | p99 jitter | writer ACK p50 | writer ACK p99 | server CPU avg / max | RSS max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **1** | **15 000** | **50 100** | **1 485 000** | **0.000%** | **0** | **4.21 ms** | **8.72 ms** | **11.46 ms** | **6.79 ms** | **2.95 ms** | **7.74 ms** | **149.6% / 264.1%** | **42.8 MiB** |
+| 2 | 7 500 | 25 100 | 1 485 000 | 0.000% | 0 | 20.38 ms | 30.69 ms | 33.85 ms | 27.24 ms | 3.94 ms | 10.25 ms | 92.6% / 174.2% | 46.3 MiB |
+| 3 | 5 000 | 16 767 | 1 485 000 | 0.000% | 0 | 28.07 ms | 54.46 ms | 57.15 ms | 48.76 ms | 5.65 ms | 14.27 ms | 57.6% / 114.2% | 48.2 MiB |
+| 4 | 3 800 | 12 600 | 1 485 000 | 0.000% | 0 | 36.97 ms | 76.54 ms | 78.78 ms | 69.24 ms | 7.35 ms | 16.57 ms | 38.3% / 78.8% | 49.9 MiB |
+| 5 | 3 000 | 10 100 | 1 485 000 | 0.000% | 0 | 52.62 ms | 98.84 ms | 100.94 ms | 89.33 ms | 8.97 ms | 19.03 ms | 31.1% / 71.5% | 51.6 MiB |
+| 8 | 1 900 | 6 350 | 1 485 000 | 0.000% | 0 | 80.88 ms | 160.26 ms | 162.71 ms | 149.56 ms | 9.21 ms | 21.42 ms | 20.3% / 48.3% | 54.5 MiB |
+
+For 100 participants, **batch=1 is now the best live-latency setting** and is
+stable: zero loss at 5 000 HTTP POSTs/s and 495k expected listener-packet
+deliveries/s. Larger batches reduce CPU but add real packet age: batch=3 has a
+40 ms oldest-packet batching floor, and batch=8 has a 140 ms floor.
+
+### 200 participants, 3 s
+
+3 s of audio is 30 000 produced packets. With every participant hearing 199
+others, the fan-out target is about **5.97 M listener-packet deliveries** per
+tier.
+
+| Participants | Packets / stored record | HTTP POSTs | Expected listener-packets | Delivered listener-packets | Loss | p50 latency | p99 latency | writer ACK p50 | writer ACK p99 | server CPU avg / max | RSS max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **200** | **1** | **30 000** | **5 970 000** | **5 970 000** | **0.000%** | **9.46 ms** | **19.68 ms** | **6.50 ms** | **17.85 ms** | **311.4% / 551.5%** | **86.9 MiB** |
+| 200 | 3 | 10 000 | 5 970 000 | 5 970 000 | 0.000% | 31.88 ms | 61.84 ms | 8.15 ms | 21.47 ms | 108.2% / 192.5% | 90.8 MiB |
+
+The 200-participant unbatched tier now reaches **~1.19 M listener-packet
+deliveries/s** including drain time with zero loss, while absorbing ~10k writes/s.
+Batch=3 keeps the same zero-loss delivery count with much lower CPU, but adds the
+40 ms oldest-packet batching floor.
+
+### WebSocket transport, 3 s
+
+These rows use `topics-probe media --websocket`: one bidirectional WebSocket per
+participant, dynamic `subscribe` on connect, then `publish` commands over the same
+socket. The topology is still a single room topic and **uses zero routers**.
+
+| Participants | Packets / record | WS publishes | ACKed / unacked publishes | Expected listener-packets | Delivered listener-packets | Loss | p50 latency | p99 latency | p999 latency | p99 jitter | writer ACK p50 | writer ACK p99 | server CPU avg / max | RSS max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **100** | **1** | **15 000** | **15 000 / 0** | **1 485 000** | **1 485 000** | **0.000%** | **3.85 ms** | **7.58 ms** | **13.07 ms** | **7.61 ms** | **2.41 ms** | **6.16 ms** | **143.3% / 171.1%** | **56.3 MiB** |
+| **200** | **1** | **30 000** | **30 000 / 0** | **5 970 000** | **5 970 000** | **0.000%** | **6.48 ms** | **11.10 ms** | **13.42 ms** | **8.52 ms** | **2.86 ms** | **9.85 ms** | **264.2% / 315.1%** | **109.5 MiB** |
+| **250** | **1** | **37 500** | **37 500 / 0** | **9 337 500** | **9 337 500** | **0.000%** | **8.57 ms** | **15.12 ms** | **18.08 ms** | **11.71 ms** | **3.44 ms** | **13.29 ms** | **318.1% / 382.2%** | **138.7 MiB** |
+| **300** | **1** | **45 000** | **45 000 / 0** | **13 455 000** | **13 455 000** | **0.000%** | **12.13 ms** | **30.81 ms** | **40.97 ms** | **20.52 ms** | **4.34 ms** | **19.41 ms** | **335.6% / 401.6%** | **177.5 MiB** |
+
+Current zero-loss ceiling on this machine is between **300 and 350** unbatched
+all-talking participants. At 300 participants, the transport delivers about
+**4.45 M listener-packets/s** with zero loss, but p99 is already ~31 ms.
+
+Overload rows, kept here so future work can update the failure boundary in place:
+
+| Participants | Packets / record | WS publishes | ACKed / unacked publishes | ACKed packets | Expected listener-packets from ACKed writes | Delivered listener-packets | Loss | p50 latency | p99 latency | writer ACK p50 | writer ACK p99 | RSS max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 350 | 1 | 52 500 | 48 349 / 4 151 | 48 349 | 16 873 801 | 14 656 318 | 13.142% | 2324.80 ms | 6399.47 ms | 1105.61 ms | 6100.67 ms | 2742.2 MiB |
+
+### Why latency is still not sub-millisecond
+
+The delay is **not router forwarding**. This workload uses zero routers. After the
+ephemeral, SSE fast-path, and WebSocket fixes, the remaining delay is mostly the
+JSON media shape:
+
+1. **HTTP POST per audio record is expensive.** At 100 participants SSE batch=1, the
+   probe drives 5 000 request/response cycles per second into one topic. The server
+   now ACKs ephemeral writes at p50 3.0 ms / p99 7.7 ms; that is much faster than the
+   previous hundreds-of-ms overload, but it is not a sub-ms transport.
+2. **WebSocket removes HTTP request setup, not JSON/text fanout.** The WebSocket
+   rows avoid per-packet HTTP POSTs, but every participant still receives JSON text
+   frames, parses JSON, and writes through one socket per listener.
+3. **SSE still has per-connection envelope and socket work.** Record payload bytes
+   are shared through the broadcast cache, but each listener still needs its own SSE
+   event envelope, cursor id, and socket write.
+4. **Every payload is JSON, not binary media.** `RecordIn.data` is a
+   `serde_json::Value`, and the probe stores each packet as JSON fields plus a
+   base64-sized string. RTP/WebRTC would not pay that parse/serialize/expand cost.
+5. **Batching trades CPU for real packet age.** Batch=3 at 200 participants can
+   exceed 1M listener-packet deliveries/s with no loss, but the oldest packet has a
+   40 ms batching floor before the server sees it.
+6. **The benchmark client is also a stressor.** One process runs all writers and all
+   SSE/WebSocket JSON parsers over loopback. This is useful as a fixed machine
+   benchmark, but it includes client-side scheduling and parsing pressure.
+
+The 10 s buffer is working as a loss boundary, but it cannot turn JSON text frames
+over HTTP/SSE/WebSocket into a sub-ms media plane. For live Opus, the practical split
+remains: use `topics` for room control, chat, metadata, durable history, recording
+indexes, and replay; use WebRTC/RTP/SFU or a binary UDP/QUIC media plane for live
+audio packets.
+
+Reproduce the current benchmark:
+
+```bash
+cargo build --release -p topics -p topics-probe
+D=$(mktemp -d)
+TOPICS_PORT=0 TOPICS_PORT_FILE=$D/port TOPICS_DATA_DIR=$D/data ./target/release/topics &
+PID=$!
+while [ ! -s "$D/port" ]; do sleep 0.05; done
+U=http://$(cat $D/port)
+./target/release/topics-probe media $U \
+  --participants 100 --duration-s 3 --packet-ms 20 --payload-bytes 80 \
+  --batches 1,2,3,4,5,8 --pid $PID --json
+./target/release/topics-probe media $U \
+  --participants 200 --duration-s 3 --packet-ms 20 --payload-bytes 80 \
+  --batches 1,3 --pid $PID --json
+./target/release/topics-probe media $U --websocket \
+  --participants 250 --duration-s 3 --packet-ms 20 --payload-bytes 80 \
+  --batches 1 --pid $PID --json
+./target/release/topics-probe media $U --websocket \
+  --participants 300 --duration-s 3 --packet-ms 20 --payload-bytes 80 \
+  --batches 1 --pid $PID --json
+kill $PID
+```
+
+Use the same section/tables above for later improvements; update the rows in place
+instead of appending a new media section every time.
+
+## 3. DISTRIBUTION — 1 source → many topics (batched, sharded fan-out)
 
 5000 destination topics, batch 100, 32 concurrent writer tasks, 500 000 records.
 
@@ -464,9 +625,9 @@ write path is lock-free across distinct topics (sharded), so this is bounded by 
 **single client process's HTTP request rate over loopback** (32 in-flight batched
 requests), not the engine — the per-request latency (p50 7.7 ms with 32 writers in
 flight) is the HTTP round-trip + queueing, not append cost (the micro-bench append
-is sub-µs/record). See §5.
+is sub-µs/record). See §6.
 
-## 3. QUEUE — Phase-5A lease queue, N workers claim/ack
+## 4. QUEUE — Phase-5A lease queue, N workers claim/ack
 
 100 worker nodes, 20 000 jobs, claim-max 8, greedy (`jitter=0`).
 
@@ -480,7 +641,7 @@ acked (`jobs_acked == jobs_produced`); evenness across 100 workers is good
 With `--jitter > 0` the coalescing claim pass (DESIGN §10.3) trades a little claim
 latency for near-perfect evenness — the documented §10.2 tradeoff.
 
-## 4. ACTORS / INFERENCE — per-actor topic, event chains + snapshot compaction
+## 5. ACTORS / INFERENCE — per-actor topic, event chains + snapshot compaction
 
 1000 actor topics, 5 inferences each, chain length 5 (model-answer + tool-call + 3
 tool-results), snapshot-compact (`delete before_seq=head`) every 2 inferences, 32
@@ -495,7 +656,7 @@ snapshot-compactions ran inline without stalling the append path (logical delete
 immediate, physical reclaim is the background reclaimer, ARCHITECTURE §3.5). Per-topic
 scaling holds across 1000 simultaneously-active actor topics.
 
-## 5. h2c effect, and are the millions/sec + 1–5 ms targets met?
+## 6. h2c effect, and are the millions/sec + 1–5 ms targets met?
 
 **h2c (HTTP/2 cleartext, prior-knowledge).** The server auto-detects h1 vs h2 per
 connection on the same port. Verified live: an `--http2-prior-knowledge` client

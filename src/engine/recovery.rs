@@ -659,6 +659,9 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
                     .get_topic_by_id(topic_id)
                     .expect("topic materialized for replay")
             });
+            if !b.config.read().uses_persistent_record_store() {
+                return;
+            }
             // Idempotent overlap: a frame whose seq is already covered by the
             // snapshot (<= head) was materialized — skip it (ARCHITECTURE §4).
             //
@@ -701,6 +704,9 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             ts,
         } => {
             if let Some(b) = engine.get_topic_by_id(topic_id) {
+                if !b.config.read().uses_persistent_record_store() {
+                    return;
+                }
                 if !seqs.is_empty() {
                     // Explicit seq set (queue ack / dead-letter delete): remove
                     // exactly these seqs (deterministic replay, DESIGN §10.4).
@@ -776,12 +782,10 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // default non-durable leases log nothing replays here and every
             // in-flight job is claimable again (self-healing, DESIGN §10.6).
             //
-            // A `memory`-class queue now takes the same disk-like best-effort path
-            // (§0.10): its records may survive a restart, so a replayed lease is no
-            // longer necessarily a ghost — replay it generically with no class
-            // special-casing (the self-healing visibility timeout, DESIGN §10.6,
-            // still makes any genuinely-orphaned lease claimable again).
             if let Some(b) = engine.get_topic_by_id(topic_id) {
+                if !b.config.read().uses_persistent_record_store() {
+                    return;
+                }
                 if let Some(q) = &b.queue {
                     let mut q = q.lock();
                     q.apply_lease_event(event, seq, node, lease_id, deadline as i64, deliveries);
@@ -798,10 +802,11 @@ fn replay_frame(engine: &Engine, record: WalRecord) {
             // only raise the (monotone) reservation ceiling; the final
             // `apply_head_watermarks` pass (after every Append replayed) pads any
             // reserved-but-unwritten tail as deleted gaps and advances head, so an
-            // already-acked `disk` seq is never re-handed. (A `memory` topic never
-            // logs a HeadWatermark — it forgoes the seq-ceiling fsync, §0.10 — but
-            // recovery applies any frame generically, no class special-casing.)
+            // already-acked `disk` seq is never re-handed.
             if let Some(b) = engine.get_topic_by_id(topic_id) {
+                if !b.config.read().uses_persistent_record_store() {
+                    return;
+                }
                 b.set_reserved_head(head_seq);
             }
         }

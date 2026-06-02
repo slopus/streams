@@ -24,6 +24,7 @@
 use crate::types::RecordOut;
 use parking_lot::Mutex;
 use serde_json::value::RawValue;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -57,12 +58,15 @@ impl FrameVariant {
 /// Number of distinct projection variants (2^3).
 const N_VARIANTS: usize = 8;
 
-/// One cached record frame: the seq plus a lazily-filled `Arc<RawValue>` per
-/// projection variant. The `Arc` is the shared, ref-counted buffer handed to
-/// every watcher.
-struct CachedFrame {
-    seq: u64,
-    variants: [Option<Arc<RawValue>>; N_VARIANTS],
+type CachedVariants = [Option<Arc<RawValue>>; N_VARIANTS];
+
+#[derive(Default)]
+struct CacheState {
+    /// In insertion/seq order for bounded eviction.
+    order: VecDeque<u64>,
+    /// Per-seq lazily-filled projection variants. Hash lookup avoids a linear ring
+    /// scan for every watcher×record cache hit in high-fanout media streams.
+    frames: HashMap<u64, CachedVariants>,
 }
 
 /// Per-topic bounded ring of recently-serialized record frames. Cheap to clone the
@@ -71,13 +75,13 @@ struct CachedFrame {
 /// watchers pay nothing).
 #[derive(Default)]
 pub struct BroadcastCache {
-    ring: Mutex<VecDeque<CachedFrame>>,
+    state: Mutex<CacheState>,
 }
 
 impl BroadcastCache {
     pub fn new() -> Self {
         BroadcastCache {
-            ring: Mutex::new(VecDeque::new()),
+            state: Mutex::new(CacheState::default()),
         }
     }
 
@@ -85,42 +89,76 @@ impl BroadcastCache {
     /// serializing-and-caching once on a miss. Returns an `Arc` clone (a refcount
     /// bump) so N watchers share one buffer.
     pub fn frame(&self, seq: u64, rec: &RecordOut, variant: FrameVariant) -> Arc<RawValue> {
-        let v = variant.idx();
-        {
-            let ring = self.ring.lock();
-            // The ring is ordered by seq ascending (push_back on delivery); a
-            // small linear scan from the back finds a near-head hit fast.
-            if let Some(found) = ring.iter().rev().find(|f| f.seq == seq) {
-                if let Some(arc) = &found.variants[v] {
-                    return arc.clone();
-                }
-            }
-        }
-
-        // Miss: serialize once (outside the lock), then publish into the ring.
-        let arc: Arc<RawValue> = serialize_frame(rec, variant.include_data);
-
-        let mut ring = self.ring.lock();
-        // Re-check: another watcher may have filled it while we serialized.
-        if let Some(found) = ring.iter_mut().rev().find(|f| f.seq == seq) {
-            if let Some(existing) = &found.variants[v] {
-                return existing.clone();
-            }
-            found.variants[v] = Some(arc.clone());
+        if let Some(arc) = self.get(seq, variant) {
             return arc;
         }
-        // New seq: keep the ring seq-ordered and bounded.
-        let mut variants: [Option<Arc<RawValue>>; N_VARIANTS] = Default::default();
-        variants[v] = Some(arc.clone());
-        // Common case: seq is the new max ⇒ push_back. Otherwise insert in order.
-        if ring.back().map(|f| f.seq < seq).unwrap_or(true) {
-            ring.push_back(CachedFrame { seq, variants });
-        } else {
-            let pos = ring.partition_point(|f| f.seq < seq);
-            ring.insert(pos, CachedFrame { seq, variants });
+
+        // Miss: serialize once, then publish into the ring.
+        let arc: Arc<RawValue> = serialize_frame(rec, variant.include_data);
+        self.insert_serialized(seq, variant, arc)
+    }
+
+    /// Return a cached shared frame without serializing. Used by the SSE fast path so
+    /// cache hits avoid cloning the record payload into a temporary `RecordOut`.
+    pub fn get(&self, seq: u64, variant: FrameVariant) -> Option<Arc<RawValue>> {
+        let v = variant.idx();
+        self.state
+            .lock()
+            .frames
+            .get(&seq)
+            .and_then(|variants| variants[v].as_ref().cloned())
+    }
+
+    /// Return cached shared frames for a batch of seqs using one cache lock. This
+    /// is the high-fanout hot path: a WebSocket/SSE diff commonly returns tens to
+    /// hundreds of records, and taking one mutex per record dominates under many
+    /// watchers.
+    pub fn get_many(&self, seqs: &[u64], variant: FrameVariant) -> Vec<Option<Arc<RawValue>>> {
+        let v = variant.idx();
+        let state = self.state.lock();
+        seqs.iter()
+            .map(|seq| {
+                state
+                    .frames
+                    .get(seq)
+                    .and_then(|variants| variants[v].as_ref().cloned())
+            })
+            .collect()
+    }
+
+    /// Insert an already serialized frame, racing safely with another watcher that
+    /// may have filled the same `(seq, variant)` while the caller serialized.
+    pub fn insert_serialized(
+        &self,
+        seq: u64,
+        variant: FrameVariant,
+        arc: Arc<RawValue>,
+    ) -> Arc<RawValue> {
+        let v = variant.idx();
+        let mut state = self.state.lock();
+        // Re-check: another watcher may have filled it while we serialized.
+        if let Some(variants) = state.frames.get_mut(&seq) {
+            if let Some(existing) = &variants[v] {
+                return existing.clone();
+            }
+            variants[v] = Some(arc.clone());
+            return arc;
         }
-        while ring.len() > RING_CAP {
-            ring.pop_front();
+
+        // New seq: keep the eviction order seq-sorted in the common tailing case.
+        let mut variants: CachedVariants = Default::default();
+        variants[v] = Some(arc.clone());
+        if state.order.back().map(|last| *last < seq).unwrap_or(true) {
+            state.order.push_back(seq);
+        } else {
+            let pos = state.order.partition_point(|existing| *existing < seq);
+            state.order.insert(pos, seq);
+        }
+        state.frames.insert(seq, variants);
+        while state.order.len() > RING_CAP {
+            if let Some(old) = state.order.pop_front() {
+                state.frames.remove(&old);
+            }
         }
         arc
     }
@@ -193,13 +231,11 @@ mod tests {
         for seq in 1..=(RING_CAP as u64 + 50) {
             let _ = cache.frame(seq, &rec(seq), variant);
         }
-        assert!(cache.ring.lock().len() <= RING_CAP);
+        let state = cache.state.lock();
+        assert!(state.order.len() <= RING_CAP);
+        assert!(state.frames.len() <= RING_CAP);
         // The oldest seqs were evicted (front-dropped).
-        assert!(cache
-            .ring
-            .lock()
-            .front()
-            .map(|f| f.seq > 1)
-            .unwrap_or(false));
+        assert!(state.order.front().map(|seq| *seq > 1).unwrap_or(false));
+        assert!(!state.frames.contains_key(&1));
     }
 }

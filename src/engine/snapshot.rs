@@ -154,10 +154,29 @@ fn capture_topic(b: &TopicState) -> SnapshotTopic {
     let config = b.config.read().clone();
     let config_json = serde_json::to_vec(&config).unwrap_or_default();
 
-    // A `memory`-class topic is captured exactly like a `disk` topic: it shares the
-    // disk-like best-effort path (§0.10), so its live records are snapshotted and
-    // MAY survive a restart — the contract is only that there is no durability
-    // GUARANTEE (records may persist OR be lost). No empty-capture special-casing.
+    // An `ephemeral` topic has durable config but resident-only records. Capture
+    // the topic shell without payloads, but preserve the published head so a
+    // checkpointed topic keeps monotonic sequence allocation after restart.
+    if !config.uses_persistent_record_store() {
+        let head_seq = b.head_seq();
+        return SnapshotTopic {
+            name: b.name.clone(),
+            topic_id: b.topic_id,
+            epoch: b.epoch(),
+            config_json,
+            base_seq: head_seq.saturating_add(1),
+            head_seq,
+            evict_floor: 0,
+            expiry_floor: 0,
+            delete_floor: 0,
+            delete_below: 0,
+            bytes_retained: 0,
+            live_count: 0,
+            records: Vec::new(),
+            source_trim_floor: 0,
+        };
+    }
+
     let floors = *b.floors.read();
     // The published head: never persist a staged-but-unpublished (invisible) tail.
     let head_seq = b.head_seq();
@@ -286,18 +305,15 @@ pub fn restore(engine: &Engine, snapshot: Snapshot) -> Checkpoint {
 
     for sb in snapshot.topics {
         let config: TopicConfig = serde_json::from_slice(&sb.config_json).unwrap_or_default();
+        let persistent_records = config.uses_persistent_record_store();
         let topic_id = sb.topic_id;
         let mut state = restore_topic(sb, config);
-        // Attach a HOT segment writer for a durable engine so post-restore
-        // appends materialize into segments (Phase 6 Stage 2). `attach_segwriter`
-        // pre-seeds the writer's active segment with the restored live records so
-        // its sealed/active state is consistent with the index. Idempotent `put`s
-        // make re-materializing a previously-sealed range safe. A `memory`-class topic
-        // gets a writer too — it shares the disk-like best-effort path (§0.10), so
-        // whatever the snapshot captured for it is restored just like a disk topic
-        // (best-effort: it MAY have persisted records or MAY come back empty).
-        if let Some(writer) = engine.build_segment_writer(topic_id) {
-            state.attach_segwriter(writer);
+        // Attach a HOT segment writer only for persistent record classes. An
+        // ephemeral topic restores as an empty resident-only shell.
+        if persistent_records {
+            if let Some(writer) = engine.build_segment_writer(topic_id) {
+                state.attach_segwriter(writer);
+            }
         }
         let bx = Arc::new(state);
         // Keep the live gauges in lockstep with the restored registry so the

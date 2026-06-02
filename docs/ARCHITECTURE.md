@@ -214,10 +214,11 @@ change between restarts. `TOPICS_WAL_SHARDS=1` is the legacy single-writer / fla
 
 ### 2.3 Durability classes & group commit
 
-Durability is per-topic. **Three commit classes, one writer per WAL shard:**
+Durability is per-topic. **Four commit classes, one writer per WAL shard:**
 
 | Class (`durable` alias) | Commit class | Behavior |
 |---|---|---|
+| `ephemeral` | resident-only | Appends/deletes skip the WAL and HOT segment writer even in a durable engine. Records are fully queryable while the process is running and intentionally lost on restart; the topic config still persists. Checkpoints preserve the published head without payloads, so post-checkpoint writes do not reuse seqs. Never fsync-gated (`fsync_ms` 0). Reachable only via an explicit `durability:"ephemeral"`. |
 | `memory` | group-commit, best-effort | Takes the **same** group-committed WAL write + recovery path as `disk` (no special-casing) and is fully queryable, but carries **NO durability guarantee**: after a restart its records **may survive or be lost**, recovery is gradual/best-effort and never blocks readiness. Never fsync-gated (`fsync_ms` 0). It forgoes the disk-class seq-ceiling fsync, so on a lost tail `head_seq` may regress — but never above the acked head. Reachable only via an explicit `durability:"memory"`. |
 | `disk` (`durable:false`) | group-commit, no wait | `write()`-en to the page cache and acked **on frame enqueue** (not fsync-gated). A background `fdatasync()` runs on the shard's group-commit tick; writers do not wait. Loss window on crash = un-fsynced tail. |
 | `fsync` (`durable:true`) | fsync-on-commit | Acked only after `fdatasync()` returns. Still **group-committed**: the shard writer coalesces all pending durable frames in a small window into one `write()` + one `fdatasync()`, then acks them all. |
@@ -701,13 +702,18 @@ single WAL writer.
 | **SSE push** | worker draining the topic pushes frames to each watcher's bounded channel; slow consumer's channel full → degrade that connection, not the topic | per-topic during drain; per-connection channel isolates a slow client |
 | **Router** | **async, off the write/ack path** (the shipped default): a background per-router worker forwards from a durable cursor; forwarded copies are **derived** (not WAL-logged — one WAL write per source append regardless of fan-out); each derived dest is single-source (a different second source ⇒ `409 topic_exists_incompatible`, `error.detail.reason: "router_dest_fan_in"`); dest scheduling/priority applies; node filtering at dest read time. **Legacy opt-out** `TOPICS_FORWARD_V2=0`: synchronous in-line forward on the ack path — durable-by-construction but WAL-amplified (N WAL writes per N-way fan-out) and it permits multi-source fan-in | no cross-shard lock on the source ack path; recovery replays from the per-router cursor |
 
-### 8.4 Slow-consumer isolation (SSE)
+### 8.4 Slow-consumer isolation (SSE / WebSocket)
 
 Each SSE connection has a bounded outbound channel (default 1024 frames). If a worker can't enqueue,
 it does **not** block the topic drain; the connection is marked **lagged**, the server stops buffering
 for it, records the last-delivered composite cursor, and on the next successful send emits a tombstone
 for the skipped range (for lossy topics) so the client catches up via `getDifference`. One slow client
 is contained to its own connection; the topic and all other watchers proceed at full speed.
+
+The JSON WebSocket endpoint uses the same diff/write engine paths as SSE/HTTP, but its per-socket
+outbound queue is intentionally small (4 messages), and record delivery reserves queue capacity
+before serializing large JSON strings. Overload should backpressure close to the socket instead of
+accumulating seconds of JSON frames and unbounded RAM.
 
 ### 8.5 Mapping onto tokio + a bounded compute pool
 

@@ -23,6 +23,7 @@ use dashmap::DashMap;
 use eviction::AdmitDecision;
 use parking_lot::Mutex;
 use router::RouterGraph;
+use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -222,6 +223,7 @@ pub struct EngineMetrics {
     /// Summed retained payload bytes across all topics.
     pub bytes_live: u64,
     /// Topics by durability class.
+    pub topics_ephemeral: u64,
     pub topics_memory: u64,
     pub topics_disk: u64,
     pub topics_fsync: u64,
@@ -229,6 +231,17 @@ pub struct EngineMetrics {
     pub queue_topics: u64,
     /// Jobs with an active (un-expired) lease across all queue topics.
     pub leases_in_flight: u64,
+}
+
+/// Internal SSE diff result that carries shared serialized record frames instead
+/// of public `RecordOut` values. This lets high-fanout streams hit the broadcast
+/// cache before cloning payload JSON for each watcher.
+pub(crate) struct SharedFrameDiff {
+    pub records: Vec<Arc<RawValue>>,
+    pub next_from_seq: u64,
+    pub head_seq: u64,
+    pub caught_up: bool,
+    pub tombstone: Option<Tombstone>,
 }
 
 /// Per-topic gauge snapshot for the Prometheus exporter (M3 / codex P2 #1). One
@@ -642,6 +655,7 @@ impl Engine {
             m.records_live = m.records_live.saturating_add(b.count());
             m.bytes_live = m.bytes_live.saturating_add(b.bytes());
             match b.config.read().durability_class() {
+                Durability::Ephemeral => m.topics_ephemeral += 1,
                 Durability::Memory => m.topics_memory += 1,
                 Durability::Disk => m.topics_disk += 1,
                 Durability::Fsync => m.topics_fsync += 1,
@@ -1011,18 +1025,23 @@ impl Engine {
     }
 
     /// Run retention on `b` and, when a NON-RE-DERIVABLE involuntary floor (TTL
-    /// expiry or byte-cap eviction) advances, durably persist the resolved floor
-    /// (R7 / codex P0 #4) — fsyncing the `EvictWatermark` **before** the in-memory
-    /// floor advances and the records are reclaimed, so a watermark fsync failure
-    /// (or a crash in the window) can never leave consumers having seen
-    /// `earliest_seq` move past a floor that a restart would regress (resurrecting
-    /// the evicted records). On a hardening failure NOTHING is evicted and the
-    /// error is RETURNED — the caller propagates it instead of silently serving a
-    /// tombstone for an un-hardened floor. A re-derivable advance (records-cap)
-    /// needs no watermark and never fails here. A `memory` topic takes the same path
-    /// (it shares the disk-like best-effort write path, §0.10): it logs the same
-    /// best-effort watermark — its loss merely re-derives on the next pass.
+    /// expiry or byte-cap eviction) advances on a persistent topic, durably persist
+    /// the resolved floor (R7 / codex P0 #4) — fsyncing the `EvictWatermark`
+    /// **before** the in-memory floor advances and the records are reclaimed, so a
+    /// watermark fsync failure (or a crash in the window) can never leave consumers
+    /// having seen `earliest_seq` move past a floor that a restart would regress
+    /// (resurrecting the evicted records). On a hardening failure NOTHING is evicted
+    /// and the error is RETURNED — the caller propagates it instead of silently
+    /// serving a tombstone for an un-hardened floor. A re-derivable advance
+    /// (records-cap) needs no watermark and never fails here. An `ephemeral` topic is
+    /// resident-only and has no records to protect across restart, so it takes the
+    /// non-hardened in-memory retention path.
     fn enforce_retention_durable(&self, b: &TopicState, now: i64) -> Result<()> {
+        if !b.config.read().uses_persistent_record_store() {
+            let adv = b.enforce_retention(now);
+            self.release_total_bytes(adv.bytes_reclaimed);
+            return Ok(());
+        }
         let topic_id = b.topic_id;
         let adv = b.enforce_retention_hardened(now, |plan| {
             self.log_evict_watermark(topic_id, plan, now)
@@ -1136,8 +1155,13 @@ impl Engine {
         }
         let class = dest.config.read().durability_class();
         let durable = class == Durability::Fsync;
+        let need_wal = self.wal.is_some() && class != Durability::Ephemeral;
         let topic_id = dest.topic_id;
-        let snapshot = records.clone();
+        let snapshot = if need_wal {
+            records.clone()
+        } else {
+            Vec::new()
+        };
         // Stage + enqueue + ticket UNDER the append lock (seq-order critical
         // section); fsync `wait()` then runs OFF the lock so concurrent durable
         // appends to `dest` coalesce into one group commit, and publish is gated
@@ -1147,20 +1171,20 @@ impl Engine {
             let _guard = dest.append_lock.lock();
             let staged = dest.stage_append(records);
             let seqs = staged.seqs();
-            // A `memory`-class destination takes the SAME disk-like best-effort
-            // path: forwarded / dead-lettered copies into it are group-committed to
-            // the WAL (NOT fsync-gated) exactly like a direct memory write — they
-            // MAY survive a restart or MAY be lost (no durability GUARANTEE, §0.10).
-            let token = match self.wal_enqueue_batch(topic_id, &seqs, &snapshot, now, durable) {
-                Ok((_wal_ms, token)) => token,
-                Err(e) => {
-                    // No ticket taken yet: tail truncation is still safe.
-                    dest.rollback_staged(staged);
-                    if bytes_reserved {
-                        self.release_total_bytes(incoming_bytes);
+            let token = if need_wal {
+                match self.wal_enqueue_batch(topic_id, &seqs, &snapshot, now, durable) {
+                    Ok((_wal_ms, token)) => token,
+                    Err(e) => {
+                        // No ticket taken yet: tail truncation is still safe.
+                        dest.rollback_staged(staged);
+                        if bytes_reserved {
+                            self.release_total_bytes(incoming_bytes);
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
+            } else {
+                None
             };
             // Arm the guard to roll this staged batch back on an unexpected unwind
             // (R14 / codex P0 #2) — identical to the user write path.
@@ -1169,12 +1193,11 @@ impl Engine {
             (staged, seqs, ticket, token)
         };
 
-        // Block on the commit token for EVERY class — `memory`, `disk` AND `fsync`
-        // (codex P0 #2): a `disk`/`memory` token resolves after the buffered WAL
-        // write (so we never publish a forwarded/dead-lettered copy the WAL writer
-        // hasn't accepted yet, just skip the fsync), a `fsync` token after the group
-        // fdatasync. `memory` is `disk` with no durability GUARANTEE — same path,
-        // best-effort (§0.10).
+        // Block on the commit token for WAL-backed classes: `memory` and `disk`
+        // resolve after the buffered WAL write (so we never publish a
+        // forwarded/dead-lettered copy the WAL writer hasn't accepted yet, just
+        // skip the fsync), and `fsync` resolves after the group fdatasync.
+        // `ephemeral` is resident-only and has no token.
         let mut fsync_failed: Option<String> = None;
         if let Some(token) = token {
             if let Err(e) = token.wait() {
@@ -1214,8 +1237,10 @@ impl Engine {
         // same-topic writers (the gate now orders only head advances).
         let pub_range = dest.publish_staged_no_seal(staged, now);
         ticket.done();
-        if let Some((start, end)) = pub_range {
-            dest.materialize_published(start, end);
+        if class != Durability::Ephemeral {
+            if let Some((start, end)) = pub_range {
+                dest.materialize_published(start, end);
+            }
         }
         Ok(seqs)
     }
@@ -1255,6 +1280,7 @@ impl Engine {
                     })),
             );
         }
+        let class = dest.config.read().durability_class();
         // Stage + take a publish ticket UNDER the append lock (the seq-order critical
         // section), so this batch's ticket orders strictly after any direct write
         // that staged earlier and strictly before any that stages later — identical
@@ -1277,8 +1303,10 @@ impl Engine {
         ticket.wait_turn();
         let pub_range = dest.publish_staged_no_seal(staged, now);
         ticket.done();
-        if let Some((start, end)) = pub_range {
-            dest.materialize_published(start, end);
+        if class != Durability::Ephemeral {
+            if let Some((start, end)) = pub_range {
+                dest.materialize_published(start, end);
+            }
         }
         Ok(seqs)
     }
@@ -1330,13 +1358,7 @@ impl Engine {
         }
 
         // `type` is immutable once a topic exists (API §0.10): a `PUT` that would
-        // change it is rejected with `409 topic_exists_incompatible`. The durability
-        // class is freely mutable in place across ALL three classes: `memory` now
-        // shares the disk-like write/snapshot/segment path (§0.10), so every class
-        // has a segment writer and is treated identically by the snapshot/recovery
-        // path — a `memory`↔`disk`↔`fsync` flip is just a config swap (no stale or
-        // missing segment writer, no resurrected/dropped records). The common
-        // "auto-create then set durability" flow works for any class.
+        // change it is rejected with `409 topic_exists_incompatible`.
         if let Some(existing) = self.get_topic(name) {
             let cur_cfg = existing.config.read();
             let cur_type = cur_cfg.r#type;
@@ -1518,14 +1540,14 @@ impl Engine {
                 Ok(false)
             }
             Entry::Vacant(e) => {
+                let persistent_records = config.uses_persistent_record_store();
                 let mut state = TopicState::new(name.to_string(), topic_id, config, SEQ_BASE, 1);
-                // Attach a HOT segment writer on a durable engine (Phase 6 Stage 2)
-                // — for EVERY class including `memory`: a memory topic now takes the
-                // same disk-like write/recovery path (best-effort, §0.10), so its
-                // records materialize into segments and are fully queryable. A pure
-                // in-memory engine still attaches none (no segment store).
-                if let Some(writer) = self.build_segment_writer(topic_id) {
-                    state.attach_segwriter(writer);
+                // Attach a HOT segment writer only for persistent record classes. A
+                // `ephemeral` topic is resident-only and must not pay segment work.
+                if persistent_records {
+                    if let Some(writer) = self.build_segment_writer(topic_id) {
+                        state.attach_segwriter(writer);
+                    }
                 }
                 e.insert(Arc::new(state));
                 Ok(true)
@@ -1603,6 +1625,7 @@ impl Engine {
                         }
                     }
                 }
+                let persistent_records = config.uses_persistent_record_store();
                 let mut state = TopicState::new(
                     name.to_string(),
                     topic_id,
@@ -1610,15 +1633,12 @@ impl Engine {
                     SEQ_BASE,
                     forced_epoch.unwrap_or(1),
                 );
-                // Attach a HOT segment writer for a durable engine so committed
-                // records are materialized into segments (Phase 6 Stage 2). A pure
-                // in-memory engine attaches none → payloads stay resident and the
-                // read path is unchanged by construction. A `memory`-class topic gets
-                // a writer too: it shares the disk-like best-effort path (§0.10), so
-                // its records materialize + are fully queryable + may persist (its
-                // on-disk trace is allowed — recovery is best-effort, never forced).
-                if let Some(writer) = self.build_segment_writer(topic_id) {
-                    state.attach_segwriter(writer);
+                // Attach a HOT segment writer only for persistent record classes. A
+                // `ephemeral` topic is resident-only and must not pay segment work.
+                if persistent_records {
+                    if let Some(writer) = self.build_segment_writer(topic_id) {
+                        state.attach_segwriter(writer);
+                    }
                 }
                 e.insert(Arc::new(state));
                 Some((true, topic_id))
@@ -2237,12 +2257,8 @@ impl Engine {
         // get the actual routes, so a momentarily-stale flag never drops/duplicates a
         // record; it only decides whether to snapshot the payloads for forwarding.
         //
-        // A `memory`-class topic now takes the SAME disk-like write path (group-
-        // committed WAL, NO fsync gate) — it is `disk` with NO durability GUARANTEE:
-        // its records MAY survive a restart or MAY be lost, recovery is best-effort
-        // (§0.10). So `memory` writes to the WAL exactly like `disk`.
         let need_forward = b.is_router_source.load(Ordering::Relaxed);
-        let need_wal = self.wal.is_some();
+        let need_wal = self.wal.is_some() && class != Durability::Ephemeral;
         let stored_snapshot = if need_wal || need_forward {
             stored.clone()
         } else {
@@ -2264,12 +2280,10 @@ impl Engine {
             let _guard = b.append_lock.lock();
             let staged = b.stage_append(stored);
             let seqs = staged.seqs();
-            // Enqueue the WAL frame(s) for the staged seqs (still under the lock,
+            // Enqueue the WAL frame(s) for persistent topics (still under the lock,
             // so a topic's frames are enqueued in exactly their seq order). A
-            // `memory`-class topic takes this disk-like path too (group-committed,
-            // best-effort, NOT fsync-gated): its frames may persist or be lost, but
-            // it shares the exact write path so it is fully queryable + recoverable.
-            let (wal_append_ms, commit_token) =
+            // `ephemeral` topic is resident-only and skips WAL work.
+            let (wal_append_ms, commit_token) = if need_wal {
                 match self.wal_enqueue_batch(topic_id, &seqs, &stored_snapshot, now, durable) {
                     Ok(v) => v,
                     Err(e) => {
@@ -2282,7 +2296,10 @@ impl Engine {
                         }
                         return Err(e);
                     }
-                };
+                }
+            } else {
+                (0.0, None)
+            };
             // Take the publish ticket UNDER the lock, in enqueue order. From here
             // on a later writer may stage past us once we drop the lock, so any
             // rollback below must target THIS batch's seqs (not a tail truncation).
@@ -2388,10 +2405,13 @@ impl Engine {
             let pub_range = b.publish_staged_no_seal(staged, now);
             let head = b.head_seq();
             ticket.done();
-            // Materialize/seal off the gate (purely derivable from the published
-            // in-memory index; payloads freed only after the seal `put` is Ok).
-            if let Some((start, end)) = pub_range {
-                b.materialize_published(start, end);
+            // Materialize/seal off the gate for persistent topics (purely derivable
+            // from the published in-memory index; payloads freed only after the seal
+            // `put` is Ok). `ephemeral` topics are resident-only.
+            if class != Durability::Ephemeral {
+                if let Some((start, end)) = pub_range {
+                    b.materialize_published(start, end);
+                }
             }
             (head, fsync_ms)
         };
@@ -2984,6 +3004,179 @@ impl Engine {
     // Diff (API §3)
     // -----------------------------------------------------------------------
 
+    /// Internal SSE diff that returns shared serialized frames. It mirrors
+    /// [`Self::diff`] but checks the per-topic broadcast cache before cloning payload
+    /// JSON, which removes the dominant per-watcher cost in high-fanout streams.
+    pub(crate) fn diff_shared_frames(
+        &self,
+        name: &str,
+        req: DiffRequest,
+        variant: crate::engine::broadcast::FrameVariant,
+    ) -> Result<SharedFrameDiff> {
+        let b = self
+            .get_topic(name)
+            .ok_or_else(|| Error::topic_not_found(name))?;
+        self.catch_up_dest(name);
+        let now = self.clock.now_ms();
+        self.enforce_retention_durable(&b, now)?;
+
+        b.last_read_ms.store(now, Ordering::Relaxed);
+        b.last_consumed_ms.store(now, Ordering::Relaxed);
+
+        let limit = if req.limit == 0 {
+            config::DEFAULT_LIMIT
+        } else {
+            req.limit.min(config::MAX_LIMIT)
+        } as usize;
+        let max_batch_bytes = if req.max_batch_bytes == 0 {
+            config::DEFAULT_MAX_BATCH_BYTES
+        } else {
+            req.max_batch_bytes.min(config::MAX_BATCH_BYTES)
+        };
+
+        let head = b.head_seq();
+        let earliest = b.earliest_seq();
+        let evict_earliest = b.evict_earliest_seq();
+        let from_seq = req.from_seq;
+
+        let cfg = b.config.read();
+        let ttl_ms = cfg.ttl_ms;
+        let dedupe_node = cfg.dedupe_node;
+        drop(cfg);
+        let node_filter = if dedupe_node { req.node.as_ref() } else { None };
+
+        let mut tombstone: Option<Tombstone> = None;
+        let mut cursor = from_seq;
+        if from_seq > head {
+            tombstone = Some(Tombstone {
+                gap_from: b.seq_base,
+                gap_to: head,
+                reason: TombstoneReason::Recreated,
+                missed_estimate: head.saturating_sub(b.seq_base).saturating_add(1),
+                earliest_seq: earliest,
+                head_seq: head,
+            });
+            cursor = earliest.saturating_sub(1);
+        } else if from_seq.saturating_add(1) < evict_earliest {
+            let reason = b.floors.read().reason_for_gap(from_seq.saturating_add(1));
+            tombstone = Some(eviction::build_tombstone(
+                from_seq,
+                evict_earliest,
+                head,
+                reason,
+            ));
+            cursor = earliest.saturating_sub(1).max(from_seq);
+        }
+
+        let mut seqs: Vec<u64> = Vec::with_capacity(limit.min(64));
+        let mut next_from_seq = cursor;
+        let mut batch_bytes: u64 = 0;
+        {
+            let index = b.index.read();
+            let mut seq = cursor.saturating_add(1);
+            while seq <= head && seqs.len() < limit {
+                let Some(rec) = index.get(seq) else {
+                    next_from_seq = seq;
+                    seq += 1;
+                    continue;
+                };
+                let decision = filters::evaluate(
+                    node_filter,
+                    ttl_ms,
+                    now,
+                    rec.ts,
+                    rec.deleted,
+                    rec.node.as_deref(),
+                );
+                if decision == filters::ReadDecision::Deliver {
+                    if !seqs.is_empty() && batch_bytes.saturating_add(rec.bytes) > max_batch_bytes {
+                        break;
+                    }
+                    batch_bytes = batch_bytes.saturating_add(rec.bytes);
+                    seqs.push(seq);
+                }
+                next_from_seq = seq;
+                seq += 1;
+            }
+        }
+
+        let mut frames = b.broadcast.get_many(&seqs, variant);
+        let mut to_serialize: Vec<(usize, u64, RecordOut, bool)> = Vec::new();
+        if frames.iter().any(|frame| frame.is_none()) {
+            let index = b.index.read();
+            for (idx, seq) in seqs.iter().copied().enumerate() {
+                if frames[idx].is_some() {
+                    continue;
+                }
+                let Some(rec) = index.get(seq) else {
+                    continue;
+                };
+                let decision = filters::evaluate(
+                    node_filter,
+                    ttl_ms,
+                    now,
+                    rec.ts,
+                    rec.deleted,
+                    rec.node.as_deref(),
+                );
+                if decision != filters::ReadDecision::Deliver {
+                    continue;
+                }
+                let (data, meta, sealed) = if rec.payload_resident {
+                    (
+                        rec.data.clone(),
+                        if req.include_meta {
+                            rec.meta.clone()
+                        } else {
+                            None
+                        },
+                        false,
+                    )
+                } else {
+                    (serde_json::Value::Null, None, true)
+                };
+                to_serialize.push((
+                    idx,
+                    seq,
+                    RecordOut {
+                        seq,
+                        ts: rec.ts,
+                        node: rec.node.clone(),
+                        tag: if req.include_tags {
+                            rec.tag.clone()
+                        } else {
+                            None
+                        },
+                        type_: None,
+                        data,
+                        meta,
+                    },
+                    sealed,
+                ));
+            }
+        }
+
+        let mut cold_segments_read: u64 = 0;
+        for (idx, seq, mut out, sealed) in to_serialize {
+            if sealed {
+                let (data, meta) =
+                    resolve_sealed_off_lock(b.as_ref(), seq, &mut cold_segments_read);
+                out.data = data;
+                out.meta = if req.include_meta { meta } else { None };
+            }
+            frames[idx] = Some(b.broadcast.frame(seq, &out, variant));
+        }
+
+        let records = frames.into_iter().flatten().collect();
+        Ok(SharedFrameDiff {
+            records,
+            next_from_seq,
+            head_seq: head,
+            caught_up: next_from_seq == head,
+            tombstone,
+        })
+    }
+
     /// `POST /v0/topics/:topic/diff` — read difference from a cursor. Never
     /// auto-creates.
     pub fn diff(&self, name: &str, req: DiffRequest) -> Result<DiffResponse> {
@@ -3264,7 +3457,7 @@ impl Engine {
             self.enforce_retention_durable(&b, now)?;
             bound_head = b.head_seq().saturating_add(1);
             commit_token = match &self.wal {
-                Some(w) => {
+                Some(w) if class != Durability::Ephemeral => {
                     match w.submit(
                         WalRecord::Delete {
                             topic_id,
@@ -3282,8 +3475,9 @@ impl Engine {
                         }
                     }
                 }
-                // Pure in-memory engine: no WAL to wait on.
+                // Pure in-memory engine or resident-only ephemeral topic: no WAL to wait on.
                 None => None,
+                Some(_) => None,
             };
             // Reserve the publish ticket in the same seq-order critical section so
             // the delete's memory-apply is ordered relative to in-flight appends
@@ -5108,7 +5302,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_class_write_serves_in_ram_and_is_queryable() {
+    fn memory_class_write_is_queryable_and_not_fsync_gated() {
         let (engine, _clock) = engine_with_clock();
         engine
             .put_topic(
@@ -5126,10 +5320,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        // A `memory` topic takes the disk-like best-effort path (§0.10), but it is
-        // never fsync-gated, so `fsync_ms` is 0. On a pure in-memory engine there is
-        // no WAL, so timings are 0 here regardless; the record is served from RAM
-        // and is fully queryable via diff exactly like a disk topic.
+        // A `memory` topic is never fsync-gated, so `fsync_ms` is 0. The record is
+        // queryable before restart.
         assert_eq!(resp.performance.fsync_ms, Some(0.0));
         let d = engine.diff("mem", diff_from(0)).unwrap();
         assert_eq!(d.records.len(), 1);

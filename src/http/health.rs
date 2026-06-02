@@ -109,6 +109,7 @@ fn render_json(state: &AppState) -> serde_json::Value {
     let eng = state.engine.metrics_snapshot();
     let mut snap = serde_json::json!({
         "topics": state.engine.topic_count(),
+        "topics_ephemeral": eng.topics_ephemeral,
         "topics_memory": eng.topics_memory,
         "topics_disk": eng.topics_disk,
         "topics_fsync": eng.topics_fsync,
@@ -163,6 +164,11 @@ fn render_prometheus(state: &AppState) -> String {
     // Topics broken down by durability class (single multi-series gauge).
     out.push_str("# HELP topics_topics_by_class Number of topics by durability class.\n");
     out.push_str("# TYPE topics_topics_by_class gauge\n");
+    let _ = writeln!(
+        out,
+        "topics_topics_by_class{{class=\"ephemeral\"}} {}",
+        eng.topics_ephemeral
+    );
     let _ = writeln!(
         out,
         "topics_topics_by_class{{class=\"memory\"}} {}",

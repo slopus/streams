@@ -159,7 +159,8 @@ impl TopicConfig {
     /// Resolve the single authoritative durability commit class for this topic
     /// (API §0.10). An explicit `durability` always wins; otherwise it is derived
     /// from the legacy `durable` bool: `durable:true ⇒ fsync`, `durable:false ⇒
-    /// disk`. (`memory` is reachable only via an explicit `durability:"memory"`.)
+    /// disk`. (`memory` and `ephemeral` are reachable only via explicit
+    /// `durability` values.)
     pub fn durability_class(&self) -> Durability {
         match self.durability {
             Some(d) => d,
@@ -180,6 +181,14 @@ impl TopicConfig {
         self.durability_class() == Durability::Fsync
     }
 
+    /// Whether record payloads for this topic should use the persistent record store
+    /// (WAL + HOT segments) in a durable engine. `ephemeral` topics are resident-only:
+    /// their config is durable, but their records are intentionally not WALed,
+    /// snapshotted, or segment-materialized.
+    pub fn uses_persistent_record_store(&self) -> bool {
+        self.durability_class() != Durability::Ephemeral
+    }
+
     /// Normalize the config so the resolved `durability` is reported and the
     /// legacy `durable` bool stays consistent with it (`durable == (class ==
     /// fsync)`). Called on create/update so responses always carry the resolved
@@ -194,12 +203,13 @@ impl TopicConfig {
 /// The durability commit class of a topic (API §0.10). Selects where a write lands
 /// and when it is acknowledged — the durability/performance tradeoff:
 ///
-/// - `memory` — "disk-like but best-effort". Takes the SAME group-committed WAL
-///   write + recovery path as `disk` (fully queryable via getState/getDifference/
-///   SSE; records MAY persist) but carries NO durability GUARANTEE: after a restart
-///   data MAY survive OR be lost, and recovery is gradual/best-effort (it does not
-///   block readiness or guarantee completeness/emptiness). Never fsync-gated, so
-///   `fsync_ms == 0`. Effectively `disk` minus the durability promise.
+/// - `ephemeral` — resident-only records. The topic config is durable, but record
+///   appends/deletes skip the WAL and HOT segment writer even in a durable engine.
+///   Records are fully queryable while the process is running and are intentionally
+///   lost on restart. Checkpoints preserve the published head without payloads, so
+///   post-checkpoint writes do not reuse seqs. Never fsync-gated, so `fsync_ms == 0`.
+/// - `memory` — same group-committed WAL write + recovery path as `disk`, but with
+///   no durability guarantee. Never fsync-gated, so `fsync_ms == 0`.
 /// - `disk` — written to the WAL and group-committed (no per-write fsync).
 ///   Survives a crash minus the un-fsynced tail. (The legacy `durable:false`.)
 /// - `fsync` — fsync-gated ack: the response is held until the WAL frame is
@@ -207,9 +217,12 @@ impl TopicConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Durability {
+    /// Resident-only records: config persists, records skip WAL/segments/snapshots
+    /// and are lost on restart.
+    Ephemeral,
     /// Disk-like but best-effort: same group-committed WAL write+recovery path as
     /// `Disk`, fully queryable, but NO durability guarantee — data may survive or be
-    /// lost on restart (recovery is best-effort).
+    /// lost on restart.
     Memory,
     /// Group-committed WAL; survives a crash minus the un-fsynced tail.
     Disk,

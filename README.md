@@ -16,8 +16,9 @@ Three deliberate bets define it:
   you point at a directory, not a distributed system to operate. Scaling up is a bigger
   machine, not more of them. In-process the engine appends and projects records at millions a
   second.
-- **Durability you choose** — per topic: best-effort `memory`, crash-surviving `disk`, or
-  fsync-gated `fsync`. Strong where it matters, fast where it doesn't.
+- **Durability you choose** — per topic: resident-only `ephemeral`, best-effort
+  `memory`, crash-surviving `disk`, or fsync-gated `fsync`. Strong where it
+  matters, fast where it doesn't.
 
 > Status: **implemented and durable.** The full `/v0` API is built and tested
 > (topics, diff reads, deletes, routers, multiplexed SSE, and lease-based queues),
@@ -97,22 +98,24 @@ What topics **aims** for — the design targets the implementation is built and 
   **latency, never in correctness** (the elastic scheduler), and a long-poll/SSE consumer is
   woken on append rather than polling.
 
-The central tradeoff is the **three durability commit classes**, chosen per topic, so each topic
+The central tradeoff is the **four durability commit classes**, chosen per topic, so each topic
 buys exactly the guarantee it needs without taxing the others:
 
+- **`ephemeral`** — resident-only records. The topic config survives, but record
+  payloads never enter the WAL/segment path and are intentionally empty after restart.
+  For live fan-out where RAM is the buffer and monotonic seqs still matter.
 - **`memory`** — _"disk-like but best-effort"_. Takes the **same** group-committed WAL write +
   recovery path as `disk` and is fully queryable, but with **no durability guarantee**: after a
   restart data **may survive or be lost** (recovery is gradual/best-effort — it never blocks
-  readiness). Never fsync-gated. For caches / scratch / ephemeral fan-out where occasional loss
-  is fine.
+  readiness). Never fsync-gated. For caches / scratch where occasional loss is fine.
 - **`disk`** — WAL + **group commit**, no per-write fsync. Survives a crash minus the
   un-fsynced tail. The pub/sub default.
 - **`fsync`** — **fsync-gated** ack. Survives any crash; an acked write is always recovered.
   For queues / ledgers / anything that must not lose acknowledged work.
 
-These are **not** global modes: a `memory` cache topic, a `disk` pub/sub feed, and an `fsync`
-ledger coexist in one process, and routers bridge them (forwarding honors the destination
-topic's class).
+These are **not** global modes: an `ephemeral` live fan-out topic, a `memory`
+cache topic, a `disk` pub/sub feed, and an `fsync` ledger coexist in one
+process, and routers bridge them (forwarding honors the destination topic's class).
 
 ---
 
@@ -317,27 +320,30 @@ Configuration is read from the environment:
 | `TOPICS_MAX_TOPICS` | `100000` | Max topics (DoS hardening). `0` = unlimited. Creating past it ⇒ `429 throttled`. |
 | `TOPICS_MAX_ROUTERS` | `10000` | Max routers. `0` = unlimited. |
 | `TOPICS_MAX_WATCH_SESSIONS` | `10000` | Max live watch sessions. `0` = unlimited. |
-| `TOPICS_MAX_SSE_CONNECTIONS` | `10000` | Max concurrent SSE connections, server-wide. `0` = unlimited. |
-| `TOPICS_MAX_SSE_CONNECTIONS_PER_KEY` | `1000` | Max concurrent SSE connections per api key. `0` = unlimited. |
+| `TOPICS_MAX_SSE_CONNECTIONS` | `10000` | Max concurrent SSE/WebSocket long-lived connections, server-wide. `0` = unlimited. |
+| `TOPICS_MAX_SSE_CONNECTIONS_PER_KEY` | `1000` | Max concurrent SSE/WebSocket long-lived connections per api key. `0` = unlimited. |
 | `TOPICS_MAX_INFLIGHT_PER_KEY` | `1000` | Max concurrent in-flight requests per api key. `0` = unlimited. |
 | `TOPICS_MAX_TOTAL_BYTES` | `0` (unlimited) | Global quota on total retained record bytes across all topics. A write past it ⇒ `429 throttled`. |
 | `RUST_LOG` | `info` | Tracing filter. |
 
-Durability is **per topic**, in three commit classes (`durability`, §0.10) — the
+Durability is **per topic**, in four commit classes (`durability`, §0.10) — the
 durability/performance tradeoff:
 
 | Class | Where it lands | Ack timing | Survives a crash? |
 |---|---|---|---|
+| `ephemeral` | resident-only records; config/control frames still durable | immediate, not WAL- or fsync-gated (`fsync_ms` 0) | records: **no**; config survives and checkpointed heads prevent seq reuse. |
 | `memory` | WAL, **group-committed** (same path as `disk`) | on WAL-frame enqueue, not fsync-gated (`fsync_ms` 0) | **best-effort — no guarantee.** Disk-like but lossy: records **MAY survive OR be lost** on restart (recovery is gradual/best-effort, never blocks readiness); the topic is fully queryable and its CONFIG always survives. Lowest-latency, for caches/scratch. |
 | `disk` | WAL, **group-committed** (no per-write fsync) | on WAL-frame enqueue, not fsync-gated (`fsync_ms` 0) | yes, **minus the un-fsynced tail** (the not-yet-group-committed frames). |
 | `fsync` | WAL, **fsync-gated** | after the group `fsync` (real `fsync_ms`) | **yes, any crash** — an acked write is recovered by WAL replay. |
 
 The legacy `durable` bool is a back-compat alias: `durable:true` ⇒ `fsync`,
-`durable:false` ⇒ `disk` (set `durability:"memory"` explicitly for the
-best-effort/lossy class). The resolved `durability` is reported on every topic-state
+`durable:false` ⇒ `disk` (set `durability:"ephemeral"` explicitly for
+resident-only live fan-out, or `durability:"memory"` for the best-effort/lossy
+disk-like class). The resolved `durability` is reported on every topic-state
 response, and `durable` is normalized to `durable == (class == "fsync")`.
 Router-forwarded and dead-lettered copies honor the **destination** topic's class (a
-`memory` dest persists a best-effort copy — it may survive or be lost). Regardless
+`memory` dest persists a best-effort copy that may survive or be lost; an
+`ephemeral` dest keeps records resident-only). Regardless
 of class, **an acknowledged write is published; a
 write that fails to commit publishes nothing visible** (no readable-but-not-durable
 state). The server shuts down gracefully on `SIGINT`/`SIGTERM`, writing a final
@@ -487,11 +493,13 @@ cursor and replay from the last acked `from_seq`. If a cap is ever configured an
   coalesced fair fan-out, redelivery, and optional dead-lettering (see API §10).
 - **Multiplexed SSE** — watch many topics over one resumable connection with composite
   cursors, named events, heartbeats, and tombstones.
-- **Per-topic durability, three commit classes** — `memory` (disk-like but best-effort: same WAL
-  write+recovery path, fully queryable, but data may survive or be lost on restart), `disk`
-  (group-committed WAL, survives a crash minus the un-fsynced tail), and `fsync` (fsync-gated
-  ack, survives any crash). WAL-first: a `disk`/`fsync`-acknowledged write is committed and
-  nothing visible is ever un-durable. Crash-recovery via snapshot + WAL replay on start.
+- **Per-topic durability, four commit classes** — `ephemeral` (resident-only
+  records, durable config, monotonic seqs), `memory` (disk-like but best-effort:
+  same WAL write+recovery path, fully queryable, but data may survive or be lost
+  on restart), `disk` (group-committed WAL, survives a crash minus the
+  un-fsynced tail), and `fsync` (fsync-gated ack, survives any crash).
+  WAL-first: a `memory`/`disk`/`fsync` acknowledged write is accepted by the
+  WAL path before publish; `ephemeral` publishes from RAM by design.
 - **Priority + elastic throttling** — manual or recency-based auto priority; under CPU
   pressure delivery degrades in latency, never in correctness.
 - **Single-machine, self-contained** — one server you point at a directory (it ships as a
@@ -514,7 +522,8 @@ partial or planned):
   WAL-logged so one source append is one WAL write, durable per-router cursor with
   replay-from-cursor recovery, single-source-per-dest enforced via `409 topic_exists_incompatible`
   with `error.detail.reason: "router_dest_fan_in"`);
-  the three durability commit classes (`memory`/`disk`/`fsync`); segments + snapshots +
+  the four durability commit classes (`ephemeral`/`memory`/`disk`/`fsync`);
+  segments + snapshots +
   crash-recovery replay (including the directory-fsync hardening so a rotated/first WAL
   file's entry is durable before an ack); advisory **single-writer fencing** on the data
   directory; per-topic tag index; node loop-prevention; bearer

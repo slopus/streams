@@ -31,7 +31,7 @@ test-fs = []
 
 [dependencies]
 async-stream = "0.3.6"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22.1"
 bytes = "1.11.1"
 dashmap = "6.2.1"
@@ -68,6 +68,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "s
 serial_test = "3"
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+tokio-tungstenite = "0.29"
 tower = { version = "0.5.3", features = ["util"] }
 
 [[bench]]

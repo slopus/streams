@@ -193,6 +193,7 @@
     border-radius: 20px;
     white-space: nowrap;
   }
+  .pill.eph { background: rgba(255,255,255,.08); color: var(--ink-soft); border: 1px solid rgba(255,255,255,.18); }
   .pill.mem { background: rgba(242,193,78,.14); color: var(--amber); border: 1px solid rgba(242,193,78,.3); }
   .pill.disk { background: rgba(110,168,254,.14); color: var(--accent); border: 1px solid rgba(110,168,254,.3); }
   .pill.fsync { background: rgba(84,209,140,.14); color: var(--green); border: 1px solid rgba(84,209,140,.3); }
@@ -392,7 +393,7 @@ guarantees writers still <em>publish</em> in strict seq order even though they w
 in <a href="#off-lock">§3.3</a>.)</p>
 
 <!-- ---- Durability classes ---- -->
-<h3 id="durability-classes" class="anchor-pad">2.1 — Three durability classes</h3>
+<h3 id="durability-classes" class="anchor-pad">2.1 — Four durability classes</h3>
 
 <p>Not every topic wants the same trade between speed and safety. Each topic picks a
 <code>Durability</code> class that decides <em>how far down the stack</em> a write must reach before the
@@ -401,6 +402,12 @@ engine answers <code>200 OK</code>.</p>
 <table>
   <thead><tr><th>Class</th><th>What "ack" means</th><th>Survives a crash?</th><th>Cost</th></tr></thead>
   <tbody>
+    <tr>
+      <td><span class="pill eph">ephemeral</span></td>
+      <td>Records are resident-only; appends skip the WAL and segment writer. Topic config/control frames still persist.</td>
+      <td><strong>Records: no.</strong> Config survives, and checkpointed heads prevent seq reuse after restart.</td>
+      <td>No WAL write and never fsync-gated.</td>
+    </tr>
     <tr>
       <td><span class="pill mem">memory</span></td>
       <td>Takes the <strong>same group-committed WAL write path as <code>disk</code></strong> (a frame <em>is</em> written); fully queryable.</td>
@@ -852,7 +859,8 @@ mechanism that backs each.</p>
   <p>An <span class="pill fsync">fsync</span>-acked write survives <strong>any</strong> crash, including power
   loss. A <span class="pill disk">disk</span>-acked write survives a process crash and survives power loss
   <em>except</em> for an un-fsynced tail. A <span class="pill mem">memory</span> write makes no durability
-  promise. <em>Backed by:</em> WAL group commit + the durability gate + tail-rewind-on-error.</p>
+  promise while still using the WAL path. An <span class="pill eph">ephemeral</span> write is resident-only by
+  contract. <em>Backed by:</em> WAL group commit + the durability gate + tail-rewind-on-error.</p>
 </div>
 
 <div class="call guarantee">

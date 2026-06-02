@@ -162,9 +162,18 @@ pub async fn write(
     }
 
     let return_seqs = query_bool(&params, "return_seqs", true);
-    // A durable write blocks on the group fsync; run it on the blocking pool so
-    // the fsync wait never parks a reactor thread (ARCHITECTURE §8.5).
-    let resp = {
+    // Persistent writes can block on WAL write/fsync, so keep them on the blocking
+    // pool. Existing `ephemeral` topics do no WAL/segment work, so run those inline
+    // to avoid a blocking-pool hop on the low-latency media path. Missing topics
+    // still use the blocking path because create-on-write durably logs the topic config.
+    let inline_ephemeral = state
+        .engine
+        .get_topic(&topic_name)
+        .map(|topic| !topic.config.read().uses_persistent_record_store())
+        .unwrap_or(false);
+    let resp = if inline_ephemeral {
+        state.engine.write(&topic_name, req, return_seqs)?
+    } else {
         let engine = state.engine.clone();
         let name = topic_name.clone();
         run_blocking(move || engine.write(&name, req, return_seqs)).await?

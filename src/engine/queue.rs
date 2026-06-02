@@ -449,11 +449,9 @@ impl Engine {
         let topic_lease_ms = cfg.lease_ms;
         let max_deliveries = cfg.max_deliveries;
         let dead_letter = cfg.dead_letter.clone();
-        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
-        // so it logs lease events exactly like a `disk` queue when `leases_durable`
-        // is set (best-effort: a lost lease frame self-heals — the job becomes
-        // claimable again on restart, DESIGN §10.6).
-        let leases_durable = cfg.leases_durable;
+        // An `ephemeral` queue is resident-only; its jobs are lost on restart, so
+        // lease frames would be ghosts. Only persistent queues log durable lease events.
+        let leases_durable = cfg.leases_durable && cfg.uses_persistent_record_store();
         let topic_id = b.topic_id;
         drop(cfg);
 
@@ -661,13 +659,9 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let topic_id = b.topic_id;
-        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
-        // so it logs lease events exactly like a `disk` queue when `leases_durable`
-        // is set (best-effort: a lost lease frame self-heals — the in-flight job
-        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable
+            cfg.leases_durable && cfg.uses_persistent_record_store()
         };
 
         let mut acked_seqs: Vec<(u64, u64)> = Vec::new(); // (seq, lease_id)
@@ -774,13 +768,9 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let topic_id = b.topic_id;
-        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
-        // so it logs lease events exactly like a `disk` queue when `leases_durable`
-        // is set (best-effort: a lost lease frame self-heals — the in-flight job
-        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable
+            cfg.leases_durable && cfg.uses_persistent_record_store()
         };
         let delay = delay_ms.min(config::MAX_NACK_DELAY_MS) as i64;
 
@@ -863,13 +853,9 @@ impl Engine {
         let b = self.get_queue(name)?;
         let now = self.clock.now_ms();
         let topic_id = b.topic_id;
-        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
-        // so it logs lease events exactly like a `disk` queue when `leases_durable`
-        // is set (best-effort: a lost lease frame self-heals — the in-flight job
-        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable
+            cfg.leases_durable && cfg.uses_persistent_record_store()
         };
         let effective = lease_ms.clamp(config::MIN_LEASE_MS, config::MAX_LEASE_MS) as i64;
         let deadline = now.saturating_add(effective);
@@ -1157,13 +1143,9 @@ impl Engine {
         }
         let now = self.clock.now_ms();
         let topic_id = b.topic_id;
-        // A `memory`-class queue takes the same disk-like best-effort path (§0.10),
-        // so it logs lease events exactly like a `disk` queue when `leases_durable`
-        // is set (best-effort: a lost lease frame self-heals — the in-flight job
-        // becomes claimable again on restart, DESIGN §10.6).
         let leases_durable = {
             let cfg = b.config.read();
-            cfg.leases_durable
+            cfg.leases_durable && cfg.uses_persistent_record_store()
         };
 
         let mut released: Vec<(u64, String, u64)> = Vec::new(); // (seq, node, lease_id)

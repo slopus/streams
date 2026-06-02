@@ -53,11 +53,11 @@ key::prefixes             # empty scopes field = ALL scopes, prefix-restricted
   scopes. Per-route requirements:
   | Scope | Routes |
   |---|---|
-  | `read` | `GET /v0/topics`, `GET /v0/topics/:topic`, `POST /v0/topics/:topic/diff`, `GET /v0/routers`, `GET /v0/routers/:r`, `POST /v0/watch` (+ the SSE GET, capability-gated) |
-  | `write` | `POST /v0/topics/:topic` (records), queue `ack`/`nack`/`extend` |
+  | `read` | `GET /v0/topics`, `GET /v0/topics/:topic`, `POST /v0/topics/:topic/diff`, `GET /v0/routers`, `GET /v0/routers/:r`, `POST /v0/watch` (+ the SSE GET, capability-gated), WebSocket `subscribe` commands |
+  | `write` | `POST /v0/topics/:topic` (records), queue `ack`/`nack`/`extend`, WebSocket `publish` commands |
   | `read`+`write` | queue `claim` and the `GET /v0/topics/:q/work` stream (a lease *mutates* then returns jobs) |
   | `delete` | `DELETE /v0/topics/:topic`, `DELETE /v0/routers/:r`, `POST /v0/topics/:topic/delete` |
-  | `admin` | `PUT /v0/topics/:topic`, `PUT /v0/routers/:r` (control-plane create/configure) |
+  | `admin` | `PUT /v0/topics/:topic`, `PUT /v0/routers/:r` (control-plane create/configure), WebSocket `publish` with `config` |
   The `read` scope additionally gates `GET /v0/metrics` (§8.3).
 - **`prefixes`** — a `|`-separated list of topic/router-name prefixes the key may touch
   (e.g. `tenant42:|shared.`). An **empty** prefixes field means **any** name. The match is a
@@ -117,7 +117,8 @@ deployment rather than built in:
 
 - **Request bodies:** `Content-Type: application/json; charset=utf-8`, required on every
   `POST`/`PUT` with a body.
-- **Response bodies:** `application/json`, except the SSE stream which is `text/event-stream`.
+- **Response bodies:** `application/json`, except the SSE stream which is `text/event-stream`
+  and `/v0/ws`, which is JSON text frames over WebSocket.
 - **`data` payloads** are arbitrary JSON (object, array, string, number, bool, null),
   stored and returned **verbatim** — never parsed, indexed, or validated for shape. For
   binary, put a base64 string in `data` and a hint in `meta`.
@@ -280,7 +281,7 @@ optional on create; omitted fields take the documented default.
 | `cap_bytes` | `u64` | `0` (off) | Max retained payload bytes (`data` + `meta` + framing). `0` = unbounded. Whichever of `cap_records`/`cap_bytes` is hit first triggers eviction. |
 | `discard` | `"old" \| "reject"` | `"old"` | Full-topic policy. `old` = evict oldest (pub/sub friendly). `reject` = refuse the write with `422 topic_full` so durable queues fail loudly rather than dropping unconsumed work. |
 | `durable` | `bool` | `false` | **Back-compat alias** for `durability` (below). On create: `durable:true` ⇒ class `fsync`, `durable:false` ⇒ class `disk` (only consulted when `durability` is absent). On every response it is reported as `durable == (durability == "fsync")`, so a legacy client reading `durable` still sees the right boolean. Prefer `durability` for new clients. |
-| `durability` | `"memory" \| "disk" \| "fsync"` | _(resolved from `durable`)_ | The **durability commit class** — where a write lands and when it is acked (the durability/perf tradeoff). **`memory`** — _"disk-like but best-effort"_: takes the **same** group-committed WAL write **and** recovery path as `disk` and is fully queryable (getState / getDifference / SSE), but carries **NO durability GUARANTEE**. After a restart its records **MAY survive OR be lost** (recovery is gradual / best-effort: it does **not** block readiness and does **not** guarantee completeness or emptiness). The topic CONFIG always survives. Never `fsync`-gated, so `fsync_ms` is `0`. Effectively `disk` minus the durability promise — for caches / scratch where occasional loss is fine. **`disk`**: written to the WAL and **group-committed** (no per-write `fsync`); acked on frame enqueue (the ack is **not** `fsync`-gated — group-committed shortly after by its topic's WAL-shard writer; the WAL is sharded — see ARCHITECTURE §2); survives a crash **minus the un-fsynced tail**; reports `fsync_ms` as `0` (the fast path). **`fsync`**: the ack is **`fsync`-gated** (held until the WAL frame is durably synced, real `fsync_ms`); survives any crash. **Resolution:** an explicit `durability` always wins; otherwise it is derived from `durable` (`true`⇒`fsync`, `false`⇒`disk`) — so `memory` is reachable only by setting `durability:"memory"` explicitly. The resolved class is always reported in topic-state/topic-create responses, and the class is freely mutable in place. Router-forwarded / dead-lettered copies honor the **destination** topic's class (a `memory` dest persists a best-effort copy — it may survive or be lost). |
+| `durability` | `"ephemeral" \| "memory" \| "disk" \| "fsync"` | _(resolved from `durable`)_ | The **durability commit class** — where a write lands and when it is acked (the durability/perf tradeoff). **`ephemeral`**: record payloads are resident-only, even when the server has `TOPICS_DATA_DIR`; appends/deletes skip the WAL and HOT segment writer, are fully queryable while the process is running, and are intentionally lost on restart. Checkpoints preserve the published head without payloads, so post-checkpoint writes do not reuse seqs. The topic CONFIG always survives. Never `fsync`-gated, so `fsync_ms` is `0`. **`memory`** — _"disk-like but best-effort"_: takes the **same** group-committed WAL write **and** recovery path as `disk` and is fully queryable (getState / getDifference / SSE), but carries **NO durability GUARANTEE**. After a restart its records **MAY survive OR be lost** (recovery is gradual / best-effort: it does **not** block readiness and does **not** guarantee completeness or emptiness). The topic CONFIG always survives. Never `fsync`-gated, so `fsync_ms` is `0`. Effectively `disk` minus the durability promise — for caches / scratch where occasional loss is fine. **`disk`**: written to the WAL and **group-committed** (no per-write `fsync`); acked on frame enqueue (the ack is **not** `fsync`-gated — group-committed shortly after by its topic's WAL-shard writer; the WAL is sharded — see ARCHITECTURE §2); survives a crash **minus the un-fsynced tail**; reports `fsync_ms` as `0` (the fast path). **`fsync`**: the ack is **`fsync`-gated** (held until the WAL frame is durably synced, real `fsync_ms`); survives any crash. **Resolution:** an explicit `durability` always wins; otherwise it is derived from `durable` (`true`⇒`fsync`, `false`⇒`disk`) — so `ephemeral` and `memory` are reachable only by setting `durability` explicitly. The resolved class is always reported in topic-state/topic-create responses, and the class is freely mutable in place. Router-forwarded / dead-lettered copies honor the **destination** topic's class. |
 | `priority` | `i32 \| null` | `null` | Manual delivery priority (higher served first under pressure), clamped `[-1000, 1000]`. `null` ⇒ use auto-priority. |
 | `auto_priority` | `bool` | `true` | If `priority` is `null`, derive effective priority from recency of the last read/SSE/state call on this topic. A manual `priority` always overrides. |
 | `auto_create` | `bool` | `true` | Whether a write to this topic name may lazily create it. The per-write `create` flag can override downward. |
@@ -311,8 +312,8 @@ earliest_seq` always, and a purely-deleted gap (below `earliest_seq` but at/abov
 Create a topic, or update its config. Idempotent and upsertable.
 
 **Path** — `:topic`, name `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts
-alphanumeric, allows `. _ : -`; `:` enables namespacing like `jobs:tenantA`). Case-sensitive,
-byte-exact.
+alphanumeric, allows `. _ : -`; `:` enables namespacing like `render-queue:tenantA`).
+Case-sensitive, byte-exact.
 
 **Request body** — the Topic config object (§0.10). All fields optional; empty `{}` creates
 all-default. Set `"type":"queue"` to make this a queue (enables §10); the queue tuning
@@ -1108,6 +1109,46 @@ created **without auth** (dev mode) the `wid` alone authorizes and no bearer is 
 `EventSource` case). See §7.1. `404 not_found` (wid GC'd or unknown → POST again);
 `406 not_acceptable` (Accept not `text/event-stream`); `429 throttled`.
 
+### 7.7 WebSocket data plane — `GET /v0/ws`
+
+`/v0/ws` is a JSON-over-WebSocket endpoint for clients that want one bidirectional
+connection instead of separate HTTP writes plus an SSE stream. It uses the same engine
+write and diff paths as HTTP/SSE, so durability, node filtering, cursors, tombstones,
+and prefix checks stay identical.
+
+Opening the socket requires a valid bearer token when auth is enabled, but no read/write
+scope is consumed at upgrade time. Each command is authorized by operation: `subscribe`
+requires read scope, `publish` requires write scope, `publish` with `config` also
+requires admin scope, and every topic name is checked against the key's prefix allowlist.
+WebSocket connections count against the same long-lived connection limits as SSE streams.
+
+Client commands are JSON text messages:
+
+```json
+{ "op": "subscribe", "request_id": "s1", "topic": "voice-room:green", "tail": true, "node": "u017", "limit": 1000, "max_batch_bytes": 8388608, "include_data": true, "include_tags": false, "include_meta": false }
+{ "op": "unsubscribe", "request_id": "u1", "topic": "voice-room:green" }
+{ "op": "publish", "request_id": "p1", "topic": "voice-room:green", "return_seqs": false, "records": [{ "node": "u017", "data": { "packet": 1 } }] }
+{ "op": "ping", "request_id": "ping-1" }
+```
+
+`subscribe` also accepts a `topics` map with the same per-topic `{from_seq, tail}` shape
+as `POST /v0/watch`; top-level `from_seq`/`tail` are used when `topic` is supplied.
+`publish` accepts the same record fields as `POST /v0/topics/:topic`, plus optional
+`create`, `config`, `idempotency_key`, `node`, `disable_backpressure`, and
+`return_seqs`.
+
+Server frames are JSON text messages:
+
+```json
+{ "op": "subscribed", "request_id": "s1", "topics": { "voice-room:green": { "from_seq": 42, "head_seq": 42, "earliest_seq": 1 } } }
+{ "op": "record", "topic": "voice-room:green", "from_seq": 42, "to_seq": 43, "head_seq": 43, "records": [{ "$seq": 43, "$ts": 1780420000000, "$node": "u018", "data": { "packet": 1 } }] }
+{ "op": "caught_up", "topic": "voice-room:green", "head_seq": 43 }
+{ "op": "ack", "request_id": "p1", "topic": "voice-room:green", "last_seq": 43, "head_seq": 43, "performance": { "fsync_ms": 0.0 } }
+{ "op": "tombstone", "topic": "voice-room:green", "reason": "cap", "gap_from": 1, "gap_to": 10, "earliest_seq": 11, "head_seq": 43 }
+{ "op": "topic_deleted", "topic": "voice-room:green", "head_seq": 0, "reason": "deleted" }
+{ "op": "error", "request_id": "p2", "code": "forbidden", "message": "api key lacks write scope" }
+```
+
 ---
 
 ## 8. Health / readiness / metrics
@@ -1185,6 +1226,7 @@ surface is gauges + WAL counters + the fsync histogram above.)
 | `DELETE` | `/v0/routers/:router` | Delete router |
 | `POST` | `/v0/watch` | Create a multiplexed SSE watch session |
 | `GET` | `/v0/watch/:wid` | Open the SSE stream for a session |
+| `GET` | `/v0/ws` | Open JSON-over-WebSocket subscribe/publish data plane |
 | `POST` | `/v0/topics/:q/claim` | **Queue:** lease up to N claimable jobs to a node (§10.2) |
 | `POST` | `/v0/topics/:q/ack` | **Queue:** complete jobs (ack == permanent delete) (§10.4) |
 | `POST` | `/v0/topics/:q/nack` | **Queue:** release leased jobs for (delayed) reclaim (§10.5) |
@@ -1526,7 +1568,7 @@ loopback behaves exactly as before.
 | Max topics | `TOPICS_MAX_TOPICS` | `100000` | instance | every topic **creation** (`PUT /v0/topics/:topic` and write auto-create) |
 | Max routers | `TOPICS_MAX_ROUTERS` | `10000` | instance | every router **creation** (`PUT /v0/routers/:r`) |
 | Max watch sessions | `TOPICS_MAX_WATCH_SESSIONS` | `10000` | instance | `POST /v0/watch` |
-| Max SSE connections | `TOPICS_MAX_SSE_CONNECTIONS` | `10000` | instance | every SSE stream GET (`/v0/watch/:wid`, `/v0/topics/:q/work`) |
+| Max SSE connections | `TOPICS_MAX_SSE_CONNECTIONS` | `10000` | instance | every SSE stream GET (`/v0/watch/:wid`, `/v0/topics/:q/work`) and WebSocket (`/v0/ws`) |
 | Max SSE connections / key | `TOPICS_MAX_SSE_CONNECTIONS_PER_KEY` | `1000` | per key | same, attributed to the authenticated key |
 | Max in-flight requests / key | `TOPICS_MAX_INFLIGHT_PER_KEY` | `1000` | per key | every request — a per-key **concurrency** cap (held for the request's duration) |
 | Max total bytes | `TOPICS_MAX_TOTAL_BYTES` | `0` (unlimited) | instance | every **write** — a global disk/RAM growth quota over the sum of retained record bytes across all topics |
@@ -1558,10 +1600,10 @@ Two additional, **non-configurable** hard bounds protect the read/response paths
 - Idle **watch sessions** are reclaimed after `session_ttl_ms` of no active stream (§7.1), so an
   abandoned session does not pin a `max_watch_sessions` slot until restart.
 - **Concurrency caps free their slot when the request/stream ends** (the response is sent, or
-  the SSE connection closes — clean close, broken pipe, or cancel), via RAII guards, so a
-  dropped stream or a panicking handler can never permanently consume capacity. SSE streams are
-  long-lived and are bounded by the **SSE-connection** caps, not the per-key in-flight cap (so
-  holding a stream open does not block ordinary requests for that key).
+  the SSE/WebSocket connection closes — clean close, broken pipe, or cancel), via RAII guards,
+  so a dropped stream or a panicking handler can never permanently consume capacity. SSE streams
+  and WebSockets are long-lived and are bounded by the **SSE-connection** caps, not the per-key
+  in-flight cap (so holding a stream open does not block ordinary requests for that key).
 - The **per-key** caps apply only when **auth is enabled** (there is a key to attribute use
   to). In dev mode (no keys) only the instance-wide caps apply. An SSE connection on a watch
   session is attributed to the **session's creating key** (constant across reconnects).

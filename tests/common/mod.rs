@@ -21,10 +21,10 @@
 //! let url = h.base_url();                     // e.g. "http://127.0.0.1:53124"
 //!
 //! // JSON helpers -> (StatusCode, serde_json::Value):
-//! let (status, body) = h.put("/v0/topics/jobs", json!({ "durable": true }));
-//! let (status, body) = h.post("/v0/topics/jobs", json!({ "records": [{ "data": 1 }] }));
-//! let (status, body) = h.get("/v0/topics/jobs");
-//! let (status, body) = h.delete("/v0/topics/jobs");
+//! let (status, body) = h.put("/v0/topics/thumbnail-tasks", json!({ "durable": true }));
+//! let (status, body) = h.post("/v0/topics/thumbnail-tasks", json!({ "records": [{ "data": 1 }] }));
+//! let (status, body) = h.get("/v0/topics/thumbnail-tasks");
+//! let (status, body) = h.delete("/v0/topics/thumbnail-tasks");
 //! // `post`/`put`/`delete` send `Content-Type: application/json` automatically.
 //! // For an explicit empty body use `post_empty(path)`.
 //!

@@ -2,10 +2,13 @@
 //! [`Engine`] through an in-memory [`FakeDisk`] (the same harness
 //! `tests/crash_oracle.rs` uses — [`FakeDisk`]/[`FaultFs`] from
 //! `topics::storage::testfs` injected via [`Engine::with_data_dir_fs`]) and a
-//! pure-Rust reference model, then assert the three durability classes behave
+//! pure-Rust reference model, then assert the four durability classes behave
 //! exactly to contract across snapshot + WAL replay + a crash mid-write:
 //!
 //! ```text
+//!   ephemeral — resident-only records: fully queryable before restart, never
+//!               fsync-gated, and intentionally lost on restart. (The config
+//!               always survives — it is a control-frame mutation.)
 //!   memory  — "disk-like but best-effort" (§0.10): takes the SAME group-committed
 //!             WAL write + recovery path as disk and is fully queryable, but with
 //!             NO durability GUARANTEE — recovered records MAY survive OR be lost.
@@ -90,6 +93,7 @@ struct ModelTopic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Class {
+    Ephemeral,
     Memory,
     #[default]
     Disk,
@@ -99,6 +103,7 @@ enum Class {
 impl Class {
     fn durability(self) -> Durability {
         match self {
+            Class::Ephemeral => Durability::Ephemeral,
             Class::Memory => Durability::Memory,
             Class::Disk => Durability::Disk,
             Class::Fsync => Durability::Fsync,
@@ -366,8 +371,9 @@ fn assert_topic_contract(
     // (3) NO GAP — survivors are a dense prefix of the model's live set. A `memory`
     //     topic is EXEMPT: it is best-effort/lossy (§0.10), so it may lose ANY records
     //     (not just a tail) — a hole below the surviving high-water is permitted.
-    //     Only the no-fabrication (1) + head-monotone (4) checks bind it.
-    if model.class != Class::Memory {
+    //     `ephemeral` is exact-empty after restart. Only the no-fabrication (1) +
+    //     head-monotone (4) checks bind these classes.
+    if !matches!(model.class, Class::Memory | Class::Ephemeral) {
         if let Some(&hi) = survivors.last() {
             if whole_tail_durable {
                 let expected_prefix: Vec<u64> = live.iter().copied().filter(|s| *s <= hi).collect();
@@ -427,6 +433,16 @@ fn assert_topic_contract(
                 "{name}: disk recovered head {} exceeds reservation ceiling {}",
                 dump.head,
                 ceiling
+            );
+        }
+        Class::Ephemeral => {
+            assert_eq!(
+                dump.head, 0,
+                "{name}: ephemeral recovered head must be empty"
+            );
+            assert!(
+                dump.records.is_empty(),
+                "{name}: ephemeral records must not recover"
             );
         }
         Class::Memory => {
@@ -545,11 +561,89 @@ impl Fs for CrashAfter {
 }
 
 // ===========================================================================
-// 1) MEMORY class: "disk-like but best-effort" (§0.10). Takes the same WAL write +
-//    recovery path as disk and is fully queryable, but with NO durability
-//    GUARANTEE: records MAY survive OR be lost. The WEAK contract: config always
-//    survives; recovered records are a no-fabrication subset of the writes; head
-//    never exceeds the acked head. NO exact empty-on-restart / full-survival.
+// 1) EPHEMERAL class: resident-only records. Config always survives; records are
+//    fully queryable before restart and intentionally lost on restart.
+// ===========================================================================
+
+/// An `ephemeral` topic loses records across a CLEAN restart: the config survives, the
+/// topic is fully queryable pre-restart, and the acked write is never fsync-gated.
+#[test]
+fn ephemeral_topic_records_are_ram_only_across_clean_restart() {
+    let disk = FakeDisk::new();
+    let mut model = RefModel::default();
+    let ops = vec![
+        Op::PutTopic {
+            name: "eph".into(),
+            class: Class::Ephemeral,
+            cap: 0,
+        },
+        Op::Append {
+            name: "eph".into(),
+            data: "a".into(),
+            tag: Some("t".into()),
+            node: None,
+        },
+        Op::Append {
+            name: "eph".into(),
+            data: "b".into(),
+            tag: None,
+            node: Some("n".into()),
+        },
+        Op::Append {
+            name: "eph".into(),
+            data: "c".into(),
+            tag: None,
+            node: None,
+        },
+    ];
+    {
+        let engine = open_engine(&disk);
+        run_ops(&engine, &mut model, &ops);
+        let pre = dump_topic(&engine, "eph").expect("ephemeral topic live pre-restart");
+        assert_eq!(pre.head, 3, "ephemeral topic head advances + is queryable");
+        assert_eq!(pre.count, 3);
+        sync_wal_dir(&disk);
+        drop(engine);
+    }
+
+    let engine = open_engine(&disk);
+    let st = engine.topic_state("eph", false).unwrap();
+    assert_eq!(
+        st.config.durability_class(),
+        Durability::Ephemeral,
+        "ephemeral class config persisted"
+    );
+    let dump = dump_topic(&engine, "eph").expect("ephemeral topic config persists across restart");
+    assert_topic_contract("eph", &model.topics["eph"], &dump, true);
+
+    let before = engine.topic_state("eph", false).unwrap().head_seq;
+    let req = WriteRequest {
+        records: vec![RecordIn {
+            data: json!({ "v": "z" }),
+            tag: None,
+            node: None,
+            meta: None,
+        }],
+        node: None,
+        idempotency_key: None,
+        create: Some(true),
+        config: None,
+        disable_backpressure: true,
+    };
+    engine.write("eph", req, true).unwrap();
+    assert_eq!(
+        engine.topic_state("eph", false).unwrap().head_seq,
+        before + 1,
+        "a post-restart ephemeral write advances head by 1"
+    );
+}
+
+// ===========================================================================
+// 1b) MEMORY class: "disk-like but best-effort" (§0.10). Takes the same WAL write +
+//     recovery path as disk and is fully queryable, but with NO durability
+//     GUARANTEE: records MAY survive OR be lost. The WEAK contract: config always
+//     survives; recovered records are a no-fabrication subset of the writes; head
+//     never exceeds the acked head. NO exact empty-on-restart / full-survival.
 // ===========================================================================
 
 /// A `memory` topic is best-effort across a CLEAN restart: the config always
@@ -636,8 +730,6 @@ fn memory_topic_best_effort_across_clean_restart() {
         "memory class config persisted"
     );
     let dump = dump_topic(&engine, "mem").expect("memory topic config persists across restart");
-    // whole_tail_durable=false: the WEAK contract (no fabrication + head monotone;
-    // a memory topic may lose any records, even a non-tail hole).
     assert_topic_contract("mem", &model.topics["mem"], &dump, false);
 
     // The topic is fully functional post-restart: a fresh write advances head by 1.

@@ -36,7 +36,7 @@ ways (pure passthrough). `$node`/`$tag`/`meta` are omitted from a response when 
 not `null`); `data` is always present (may be JSON `null`). A read-returned record:
 
 ```json
-{ "$seq": 4096, "$ts": 1748470000123, "$node": "worker-7", "$tag": "job:tenantA:1234",
+{ "$seq": 4096, "$ts": 1748470000123, "$node": "worker-7", "$tag": "render:tenantA:1234",
   "meta": { "content-type": "application/json" },
   "data": { "url": "https://...", "attempts": 0 } }
 ```
@@ -45,7 +45,7 @@ not `null`); `data` is always present (may be JSON `null`). A read-returned reco
 
 | Limit | Default | Justification |
 |---|---|---|
-| `data`+`meta` (canonical bytes) | 1 MiB | Fat job payloads / batched events, yet small enough that one record can't blow a WAL frame or group-commit budget. |
+| `data`+`meta` (canonical bytes) | 1 MiB | Large task payloads / batched events, yet small enough that one record can't blow a WAL frame or group-commit budget. |
 | `tag` length | 256 bytes | Bounds the per-entry cost of the tag index (§7) and keeps prefix matching cheap. |
 | `node` length | 128 bytes | Node ids are identifiers, not data. |
 | `meta` total | 16 KiB, ≤ 64 keys | "Small metadata." |
@@ -65,7 +65,7 @@ watermarks.
 
 - Addressed by **name** in the path: `/v0/topics/:topic`. The name *is* the identity.
 - Naming rule: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` (1–255 chars, starts alphanumeric, allows
-  `. _ : -`; `:` enables namespacing like `jobs:tenantA`). Case-sensitive, byte-exact, no Unicode
+  `. _ : -`; `:` enables namespacing like `render-queue:tenantA`). Case-sensitive, byte-exact, no Unicode
   normalization.
 - **Creation policy** is per-request, defaulting to lazy-create (turbopuffer ergonomics) with an
   opt-out (Redis `NOMKSTREAM` lesson against typo-topics):
@@ -86,11 +86,17 @@ auto_priority, auto_create, idempotency_window_ms, dedupe_node }`. Defaults: `tt
 `durability` resolved from `durable`, `priority=null` + `auto_priority=true`, `auto_create=true`,
 `dedupe_node=true`.
 
-**Durability commit class (`durability`).** A topic has one of three commit classes — the
+**Durability commit class (`durability`).** A topic has one of four commit classes — the
 durability/performance tradeoff — resolved from its current config as `durability_class()`
 (the topic `type` is immutable, but durability/config can be updated in place, and the resolved
 class always reflects the current config):
 
+- **`ephemeral`** — resident-only record payloads. The topic CONFIG always survives (a control
+  frame), but appends/deletes skip the WAL and HOT segment writer even in a durable engine.
+  Records are fully queryable while the process is running and are intentionally lost on
+  restart. Checkpoints preserve the published head without payloads, so post-checkpoint writes
+  do not reuse seqs. Never `fsync`-gated, so `fsync_ms` is `0`. A router / dead-letter copy whose
+  **destination** is an ephemeral topic is resident-only too.
 - **`memory`** — _"disk-like but best-effort"_. Takes the **same** group-committed WAL write
   **and** recovery path as `disk` (the SAME write/recovery code — no special-casing) and is
   fully queryable (getState / getDifference / SSE; its records may persist), but carries **NO
@@ -112,11 +118,11 @@ class always reflects the current config):
   `fsync_ms`). Survives **any** crash. This is today's `durable:true`.
 
 **Resolution & back-compat.** An explicit `durability` always wins; absent it, the class is
-derived from the legacy `durable` bool (`true ⇒ fsync`, `false ⇒ disk`) — so `memory` is
-reachable only by setting `durability:"memory"`. The resolved class is reported on every
-topic-state / topic-create response, and `durable` is normalized to `durable == (class == fsync)`
-so a legacy client reading `durable` still sees the right boolean. `is_durable()` is
-`class == fsync`.
+derived from the legacy `durable` bool (`true ⇒ fsync`, `false ⇒ disk`) — so `ephemeral` and
+`memory` are reachable only by setting `durability` explicitly. The resolved class is reported
+on every topic-state / topic-create response, and `durable` is normalized to
+`durable == (class == fsync)` so a legacy client reading `durable` still sees the right boolean.
+`is_durable()` is `class == fsync`.
 
 **Defaults rationale.**
 - All caps/TTL off ⇒ an out-of-the-topic topic loses nothing. The safe default for a persistence
@@ -126,9 +132,10 @@ so a legacy client reading `durable` still sees the right boolean. `is_durable()
   durable-queue users flip to `"reject"`. With both caps off, `discard` is inert.
 - `durable=false` (class `disk`): the 1–5 ms target on NVMe means fsync-by-default would make
   the common pub/sub case pay for a guarantee it doesn't want. One bool (or `durability`) away
-  from `fsync`. The third class, `memory`, is `disk` with **no durability guarantee** —
-  best-effort/lossy caches/scratch topics that take the same write+recovery path but where data
-  MAY survive OR be lost on restart (recovery is gradual, never blocks readiness).
+  from `fsync`. `memory` is `disk` with **no durability guarantee** — best-effort/lossy
+  caches/scratch topics that take the same write+recovery path but where data MAY survive OR be
+  lost on restart (recovery is gradual, never blocks readiness). `ephemeral` is the explicit
+  RAM-only class for transient streams that must skip record WAL/segment work.
 - `priority=null` + `auto_priority=true`: most users never think about priority; recency-based
   auto does the right thing. Power users pin an integer.
 
@@ -566,8 +573,8 @@ recommended (one WAL write per source append, off the ack path, no silent loss).
   idempotent consumption practical. **Consumers must be idempotent** (BullMQ at-least-once
   lesson).
 - Because forwarding is async and the copies are derived (not WAL-logged), the source ack never
-  waits on the destination; a `memory`/`disk`/`fsync` dest governs only how/whether the *re-derived*
-  copy is retained and recovered, not when the source write acks.
+  waits on the destination; an `ephemeral`/`memory`/`disk`/`fsync` dest governs only how/whether
+  the *re-derived* copy is retained and recovered, not when the source write acks.
 
 ### 8.3 What carries through a forward
 

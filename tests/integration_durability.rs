@@ -2109,9 +2109,11 @@ fn acked_durable_write_is_recovered_and_fsync_gated() {
 }
 
 // ===========================================================================
-// Durability commit classes (memory / disk / fsync) — Stage 2.
+// Durability commit classes (ephemeral / memory / disk / fsync) — Stage 2.
 //
 // A topic's `durability` selects where its records land and when an ack returns:
+//   - ephemeral: resident-only records; config survives, records are queryable while
+//     the process is running and intentionally lost on restart.
 //   - memory: "disk-like but best-effort" — takes the SAME group-committed WAL
 //     write + recovery path as disk (fully queryable), but with NO durability
 //     GUARANTEE: records MAY survive a restart OR be lost; recovery is best-effort.
@@ -2221,6 +2223,75 @@ fn memory_topic_best_effort_recovery_no_fabrication() {
     );
 }
 
+/// An `ephemeral` topic is the explicit RAM-only class: records are fully queryable
+/// before restart, sequence numbers increase monotonically while live, and only the
+/// config survives restart.
+#[test]
+fn ephemeral_topic_records_are_ram_only_and_live_seq_monotone() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = engine_at(dir.path());
+        engine
+            .put_topic(
+                "scratch",
+                TopicConfig {
+                    durability: Some(Durability::Ephemeral),
+                    cap_records: 99,
+                    ..TopicConfig::default()
+                },
+            )
+            .unwrap();
+        for i in 1..=5 {
+            let resp = engine
+                .write("scratch", one(json!({ "i": i }), None), true)
+                .unwrap();
+            assert_eq!(
+                resp.last_seq, i as u64,
+                "ephemeral seqs are monotone while live"
+            );
+            assert_eq!(
+                resp.performance.fsync_ms,
+                Some(0.0),
+                "ephemeral is never fsync-gated"
+            );
+        }
+        let st = engine.topic_state("scratch", false).unwrap();
+        assert_eq!(st.head_seq, 5);
+        assert_eq!(st.count, 5);
+        assert_eq!(
+            engine.diff("scratch", diff_from(0)).unwrap().records.len(),
+            5,
+            "ephemeral topic is fully queryable pre-restart"
+        );
+        assert!(engine.write_snapshot().unwrap());
+    }
+
+    let engine = engine_at(dir.path());
+    let st = engine.topic_state("scratch", false).unwrap();
+    assert_eq!(st.config.durability, Some(Durability::Ephemeral));
+    assert_eq!(st.config.cap_records, 99, "config survives");
+    assert_eq!(
+        st.head_seq, 5,
+        "ephemeral snapshot preserves the head without recovering payloads"
+    );
+    assert_eq!(st.count, 0, "ephemeral records are intentionally lost");
+    assert!(
+        engine
+            .diff("scratch", diff_from(0))
+            .unwrap()
+            .records
+            .is_empty(),
+        "ephemeral restart is an empty topic shell"
+    );
+    let resp = engine
+        .write("scratch", one(json!({ "i": 100 }), None), true)
+        .unwrap();
+    assert_eq!(
+        resp.last_seq, 6,
+        "post-snapshot ephemeral seqs do not regress"
+    );
+}
+
 /// A `disk`-class topic (today's durable:false) survives a CLEAN restart (the WAL
 /// writer drains + fsyncs on a clean teardown). It reports `fsync_ms == 0` (no
 /// per-write fsync), and resolves to `durable:false` for back-compat.
@@ -2326,6 +2397,14 @@ fn durability_resolution_and_back_compat_reporting() {
     let d = engine.topic_state("d", false).unwrap().config;
     assert_eq!(d.durability, Some(Durability::Memory));
     assert!(!d.durable);
+
+    // Explicit ephemeral ⇒ durable:false; is_durable()==false.
+    engine
+        .put_topic("e", class_topic(Durability::Ephemeral))
+        .unwrap();
+    let e = engine.topic_state("e", false).unwrap().config;
+    assert_eq!(e.durability, Some(Durability::Ephemeral));
+    assert!(!e.durable);
 }
 
 /// A router forwarding into a `memory` destination takes the same disk-like
