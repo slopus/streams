@@ -1,6 +1,6 @@
 ---
-title: streams — a persistent event log for one machine
-description: Write events to a topic, read them back by sequence number, follow them live, delete what you're done with. A small HTTP/JSON API, run on a single machine, with durability you decide topic by topic — and loss that is always explicit, never silent.
+title: streams — millions of events per second, with the simplicity of SQLite
+description: A persistent event log that runs as one process on one machine — no cluster, no coordination, the way SQLite is one file instead of a database fleet — yet moves millions of events a second over a small HTTP/JSON API. Durability you choose per topic; loss that is always explicit.
 ---
 
 import { IconLog, IconCube, IconDisk, IconBolt, IconClock } from '../components/icons'
@@ -10,16 +10,16 @@ import { withBase } from '../components/base'
 
 <section className="hero">
 
-<span className="hero-badge"><span className="dot" />Single-node · durable · JSON over HTTP</span>
+<span className="hero-badge"><span className="dot" />Single-node · millions of events/sec · JSON over HTTP</span>
 
-# A persistent event log, <span className="grad">minus the cluster</span>
+# Millions of events a second, with the simplicity of <span className="grad">SQLite</span>
 
 <p className="hero-sub">
-Write events to a **topic**, read them back by **sequence number**, follow them live, and
-delete what you're done with — through an API small enough to learn in a sitting. streams
-runs on **one machine**, so there's no cluster to operate and no coordination to reason
-about, and you decide **per topic** how much crash-safety each write should buy. Nothing is
-ever lost without telling you.
+streams is a persistent event log that runs as **one process on one machine** — no cluster,
+no coordination, the way SQLite is one file instead of a database fleet. Yet the engine
+moves **millions of events a second** over a small HTTP/JSON API. Write to a **topic**, read
+it back by **sequence number**, follow it live, delete what you're done with — and choose,
+per topic, how durable each write should be. Nothing is ever lost without telling you.
 </p>
 
 <div className="hero-cta">
@@ -71,7 +71,7 @@ learn. streams makes three deliberate bets, and everything else follows from the
 <a className="feature-card" href={withBase("/getting-started/why-single-node")}>
   <span className="fc-icon"><IconCube /></span>
   <h3>One node, not a fleet</h3>
-  <p>It runs on a single machine, so you skip the distributed system entirely — no cluster, no quorum, no replication hops between nodes. Growing means a bigger machine, not more of them to keep alive.</p>
+  <p>It runs on a single machine, so you skip the distributed system entirely — no cluster, no quorum, no replication hops — the way SQLite is a file, not a database fleet. Growing means a bigger machine, not more of them to keep alive.</p>
   <span className="fc-more">Why one node →</span>
 </a>
 
@@ -115,28 +115,29 @@ Read it at three levels of depth on the <a href={withBase("/api")}>API reference
 <section className="section">
 
 <span className="section-eyebrow">Run it on one machine</span>
-<h2 className="section-title">Most workloads never outgrow a single machine</h2>
+<h2 className="section-title">Like SQLite: huge capability, almost nothing to operate</h2>
 <p className="section-lede">
-The reflex to spread a log across a cluster is usually answering a question you haven't
-measured yet. streams takes the other side of that bet: use one machine well, and you
-trade away scale you probably don't need for simplicity you'll feel every day.
+SQLite became the most-deployed database on earth by refusing to be a server you run — it's
+a library and a file. streams brings that operating model to event streaming: a Kafka-shaped
+job done with an SQLite-shaped footprint. It <em>is</em> a networked server, so every service
+can share it — but running it is one process and one directory, not a cluster to coordinate.
 </p>
 
 <div className="card-grid">
+  <a className="feature-card" href={withBase("/how-it-works/performance")}>
+    <span className="fc-icon"><IconBolt /></span>
+    <h3>Millions of events a second</h3>
+    <p>The engine appends and projects records at millions a second in-process, and a non-durable write acks in well under a millisecond — because the log lives on one local sequential disk it fully owns, with nothing to replicate or agree on first.</p>
+  </a>
   <a className="feature-card" href={withBase("/getting-started/why-single-node")}>
     <span className="fc-icon"><IconCube /></span>
-    <h3>A single machine is bigger than you think</h3>
-    <p>A box you can rent today has a hundred-plus cores, terabytes of RAM, and NVMe sustaining millions of ops a second. Most event workloads fit inside one with years of headroom — sharding across many small nodes often solves a problem you don't have yet.</p>
-  </a>
-  <a className="feature-card" href={withBase("/how-it-works")}>
-    <span className="fc-icon"><IconBolt /></span>
-    <h3>Distribution is a tax, not free capacity</h3>
-    <p>Spreading a log across nodes buys headroom by spending coordination — replication round-trips, consensus, rebalancing, clock skew — plus a class of failure modes that simply can't happen on one machine. Keeping the log on a local sequential disk is exactly what makes ~1 ms delivery realistic.</p>
+    <h3>Nothing to coordinate</h3>
+    <p>One process, one data directory — no ZooKeeper, no quorum, no partitions, no rebalancing, no JVM. Like SQLite, the hard part (a correct, durable log) is on the inside; the outside is just a thing you run.</p>
   </a>
   <a className="feature-card" href={withBase("/how-it-works/recovery")}>
     <span className="fc-icon"><IconClock /></span>
-    <h3>Restarts instead of orchestration</h3>
-    <p>The cost of one node is brief downtime on deploys, patches, and the rare crash. streams makes that cheap: it replays its write-ahead log and gates readiness until recovery finishes. You trade seconds of occasional downtime for a system you can hold in your head.</p>
+    <h3>Restarts, not orchestration</h3>
+    <p>The cost of one node is brief downtime on deploys, patches, and the rare crash. streams makes it cheap: it replays its write-ahead log and gates readiness until recovery finishes. You trade seconds of occasional downtime for a system you can hold in your head.</p>
   </a>
 </div>
 
@@ -206,7 +207,7 @@ removal you did ask for is silent.</strong> Read it in full in the
 <section className="section">
 
 <span className="section-eyebrow">How it compares</span>
-<h2 className="section-title">The simplicity of one machine, with guarantees most systems leave to you</h2>
+<h2 className="section-title">SQLite is to a database cluster what streams is to Kafka</h2>
 <p className="section-lede">
 streams is a single-machine peer to Redis Streams, Kafka, NATS JetStream, and the cloud
 queues — trading horizontal scale for operational simplicity and an explicit, in-band loss

@@ -9,8 +9,10 @@ import { Callout } from 'nextra/components'
 
 Apache Kafka is a distributed commit-log cluster built for horizontal scale, replicated HA,
 and exactly-once processing. streams is a single-machine server built for operational simplicity and
-an explicit in-band loss signal. They solve different scale problems; this page compares them
-dimension by dimension and is honest about where Kafka is the right tool.
+an explicit in-band loss signal. The one-line framing: **SQLite is to a database cluster what
+streams is to Kafka** — much the same job, done with the operational footprint of one process
+and a directory instead of a fleet to run. They solve different scale problems; this page
+compares them dimension by dimension and is honest about where Kafka is the right tool.
 
 <Callout type="important">
   The word **"tombstone" means the opposite thing** in each system. In Kafka a tombstone is a

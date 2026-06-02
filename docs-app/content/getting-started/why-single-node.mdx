@@ -15,6 +15,25 @@ places.
 
 This page makes the case for the choice, and is honest about what it costs.
 
+## The SQLite model, for an event log
+
+The useful comparison isn't another message broker — it's **SQLite**. SQLite became the
+most-deployed database in the world by making a deliberate trade: no server to run, no daemon,
+no cluster, no configuration — just a library and a file — in exchange for living on one
+machine. That trade fit an enormous fraction of real workloads, and it turned the database
+into something you *embed and forget* rather than operate.
+
+streams takes the same trade for an append-only event log. The hard part — a correct,
+crash-safe, ordered log with millisecond delivery — lives inside the engine; the outside is a
+single process pointed at a single directory. The one difference from SQLite is deliberate:
+streams is a **networked server**, not an in-process library, so many services across your
+fleet can read and write the same log over HTTP. Think of it as one step out from embedded —
+SQLite's operating model, with a network port.
+
+So the mental model is "SQLite for events," and the payoff is the same: you get the capability
+— here, a durable log doing **millions of events a second** — without signing up to run the
+distributed system that usually comes with it.
+
 ## Scaling out is usually a reflex, not a requirement
 
 The instinct, the moment a system starts to matter, is to spread it across nodes. But "more
@@ -38,8 +57,10 @@ That is more capacity than many distributed clusters had a few years ago. stream
 to actually use it: the write-ahead log is [sharded across cores](/how-it-works/wal-and-group-commit)
 so durable throughput scales with the hardware, reads are `O(1)` seq-indexed lookups, and a
 record delivered live over SSE is [serialized once](/how-it-works/performance) and shared
-across every watcher. The design targets — **~1,000,000 events/sec** batched and **~1 ms**
-delivery — come *from* staying on one machine, not in spite of it.
+across every watcher. In-process the engine already appends and projects records at
+**millions a second**, and delivery targets **~1 ms** — numbers that come *from* staying on
+one machine, not in spite of it. (The realistic end-to-end HTTP ceiling, lower and measured
+honestly, is on the [Performance](/how-it-works/performance) page.)
 
 ## What you are not paying for
 
