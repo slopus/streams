@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use streams::clock::{SharedClock, TestClock};
 use streams::config::SegmentConfig;
-use streams::engine::topic_state::{TopicState, StoredRecord};
 use streams::engine::segwriter::SegmentWriter;
-use streams::storage::{TopicTier, File, Fs, LocalSegmentStore, OpenOpts, RealFs};
+use streams::engine::topic_state::{StoredRecord, TopicState};
+use streams::storage::{File, Fs, LocalSegmentStore, OpenOpts, RealFs, TopicTier};
 use streams::types::TopicConfig;
 
 /// An `Fs` wrapper that BLOCKS the first `rename` whose destination is a segment

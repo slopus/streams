@@ -48,10 +48,10 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp};
 use streams::storage::wal::encode_frame;
 use streams::storage::{
-    write_snapshot_with, TopicConfigOp, Checkpoint, File, Fs, OpenOpts, Snapshot, WalReader,
+    write_snapshot_with, Checkpoint, File, Fs, OpenOpts, Snapshot, TopicConfigOp, WalReader,
     WalRecord,
 };
-use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_wal_append_b.rs)

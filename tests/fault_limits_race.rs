@@ -58,7 +58,7 @@ use streams::engine::Engine;
 use streams::limits::Limits;
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::types::{
-    TopicConfig, TopicType, DiffRequest, Durability, RecordIn, RouterCreateRequest, WriteRequest,
+    DiffRequest, Durability, RecordIn, RouterCreateRequest, TopicConfig, TopicType, WriteRequest,
 };
 
 // ===========================================================================
@@ -594,7 +594,9 @@ fn l_total_bytes_quota_race_stays_under_cap() {
     );
     // One durable topic; every writer appends to it (the total is summed across all
     // topics, but a single topic keeps the accounting crisp).
-    engine.put_topic("quota", durable_topic()).expect("quota topic");
+    engine
+        .put_topic("quota", durable_topic())
+        .expect("quota topic");
 
     let start = Arc::new(Barrier::new(RACERS));
     let committed = Arc::new(AtomicU64::new(0));

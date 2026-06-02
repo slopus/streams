@@ -49,7 +49,7 @@ use streams::engine::Engine;
 use streams::storage::snapshot::{load_latest_with, write_snapshot_with, Checkpoint, Snapshot};
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs, tests/fault_batch1.rs)

@@ -30,7 +30,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::types::{
-    TopicConfig, DiffRequest, Discard, RecordIn, RouterCreateRequest, TombstoneReason, WriteRequest,
+    DiffRequest, Discard, RecordIn, RouterCreateRequest, TombstoneReason, TopicConfig, WriteRequest,
 };
 
 /// Enable the async/derived path for THIS test process. Idempotent; every test in

@@ -42,8 +42,8 @@ use std::sync::Arc;
 
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::{
-    decode_data_frame, idx_name, lookup, TopicTier, File, Fs, LocalSegmentStore, OpenOpts,
-    SegmentBuilder, SegmentId, SegmentPart, SegmentRecord, SegmentStore, StoreError, Tier,
+    decode_data_frame, idx_name, lookup, File, Fs, LocalSegmentStore, OpenOpts, SegmentBuilder,
+    SegmentId, SegmentPart, SegmentRecord, SegmentStore, StoreError, Tier, TopicTier,
 };
 
 const ROOT: &str = "/seg";

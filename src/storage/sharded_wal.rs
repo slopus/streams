@@ -427,7 +427,8 @@ mod tests {
                 let mut seen = false;
                 for f in files {
                     for fr in WalReader::open(&f).unwrap() {
-                        if matches!(&fr.record, WalRecord::Append { topic_id, .. } if *topic_id == id) {
+                        if matches!(&fr.record, WalRecord::Append { topic_id, .. } if *topic_id == id)
+                        {
                             seen = true;
                         }
                     }
@@ -436,7 +437,11 @@ mod tests {
                     found_in.push(s);
                 }
             }
-            assert_eq!(found_in, vec![expect], "topic {id} routed to shard {expect}");
+            assert_eq!(
+                found_in,
+                vec![expect],
+                "topic {id} routed to shard {expect}"
+            );
         }
     }
 
@@ -548,8 +553,12 @@ mod tests {
     fn a_stalled_shard_does_not_block_others() {
         let n = 4usize;
         // Find two topic ids on different shards (one of them shard 0).
-        let id_a = (1..1000u32).find(|&id| shard_for_topic(id, n) == 0).unwrap();
-        let id_b = (1..1000u32).find(|&id| shard_for_topic(id, n) != 0).unwrap();
+        let id_a = (1..1000u32)
+            .find(|&id| shard_for_topic(id, n) == 0)
+            .unwrap();
+        let id_b = (1..1000u32)
+            .find(|&id| shard_for_topic(id, n) != 0)
+            .unwrap();
         let stalled_sub = shard_subdir(0);
 
         let dir = tempfile::tempdir().unwrap();

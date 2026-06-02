@@ -41,7 +41,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
 use streams::storage::OpenOpts;
-use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // WAL frame layout constants (mirrors src/storage/wal.rs; those are crate-private
 // so we re-declare the few we need for byte-poking).
@@ -97,7 +97,10 @@ impl RefModel {
         });
     }
     fn ack_append(&mut self, name: &str, seqs: &[u64], recs: &[ModelRecord]) {
-        let b = self.topics.get_mut(name).expect("topic modeled before append");
+        let b = self
+            .topics
+            .get_mut(name)
+            .expect("topic modeled before append");
         for (s, r) in seqs.iter().zip(recs.iter()) {
             b.acked.insert(*s, r.clone());
             b.ever_acked.insert(*s, r.clone());
@@ -290,7 +293,12 @@ fn sync_wal_dir(disk: &FakeDisk) {
 
 /// Assert the crash-consistency contract for one topic (the post-corruption,
 /// torn-tail relaxation: `whole_tail_durable=false`).
-fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
+fn assert_topic_contract(
+    name: &str,
+    model: &ModelTopic,
+    dump: &TopicDump,
+    whole_tail_durable: bool,
+) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 

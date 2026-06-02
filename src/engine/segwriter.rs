@@ -38,8 +38,8 @@
 
 use crate::clock::SharedClock;
 use crate::storage::{
-    decode_data_frame, decode_data_frame_full, lookup, TopicTier, SegmentBuilder, SegmentPart,
-    SegmentRecord, Tier,
+    decode_data_frame, decode_data_frame_full, lookup, SegmentBuilder, SegmentPart, SegmentRecord,
+    Tier, TopicTier,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;

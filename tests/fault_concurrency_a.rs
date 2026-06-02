@@ -70,13 +70,13 @@ use serde_json::json;
 
 use streams::clock::{SharedClock, TestClock};
 use streams::config::{SegmentConfig, ServerConfig};
-use streams::engine::topic_state::{TopicState, StoredRecord};
 use streams::engine::segwriter::SegmentWriter;
+use streams::engine::topic_state::{StoredRecord, TopicState};
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
-use streams::storage::{TopicTier, LocalSegmentStore};
-use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
+use streams::storage::{LocalSegmentStore, TopicTier};
+use streams::types::{RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_wal_*.rs).
@@ -757,7 +757,10 @@ fn f_wal_double_writer_fencing() {
             // itself already validated the CRC; we assert the decoded fields are
             // ones a writer actually attempted.)
             if let WalRecord::Append {
-                topic_id, seq, data, ..
+                topic_id,
+                seq,
+                data,
+                ..
             } = &frame.record
             {
                 assert!(

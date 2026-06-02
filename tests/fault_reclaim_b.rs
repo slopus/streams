@@ -44,7 +44,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{TopicConfig, TopicType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DeleteRequest, DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Plumbing (mirrors tests/crash_oracle.rs — reused, not reinvented)

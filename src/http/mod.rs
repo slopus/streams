@@ -2,11 +2,11 @@
 //! content-type / body-size guards, the `Error` → HTTP envelope mapping, and
 //! the per-response `performance` block plumbing.
 
-pub mod topics;
 pub mod delete;
 pub mod health;
 pub mod queue;
 pub mod routers;
+pub mod topics;
 pub mod watch;
 
 use crate::auth::{KeyStore, Principal, Scope};

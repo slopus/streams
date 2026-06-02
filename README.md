@@ -502,7 +502,8 @@ partial or planned):
   with `error.detail.reason: "router_dest_fan_in"`);
   the three durability commit classes (`memory`/`disk`/`fsync`); segments + snapshots +
   crash-recovery replay (including the directory-fsync hardening so a rotated/first WAL
-  file's entry is durable before an ack); per-topic tag index; node loop-prevention; bearer
+  file's entry is durable before an ack); advisory **single-writer fencing** on the data
+  directory; per-topic tag index; node loop-prevention; bearer
   auth with **keys hashed at rest** (SHA-256, constant-time compare, plaintext zeroized after
   startup), **optional per-key scopes + topic-name prefix allowlist** (enforced on path, request
   body, and list results), **resource/rate limits** (topics / routers / watch sessions / SSE
@@ -510,9 +511,10 @@ partial or planned):
   length bound, idle watch-session GC), the `wid`-plus-key watch-stream binding, and the
   loopback-default bind.
 - **Partial:** the cap-vs-TTL tombstone **reason** is best-effort across a restart (the gap
-  *range* is always authoritative). The throughput/latency targets above are design goals
-  validated by the in-memory baseline benchmarks, not yet a tuned production SLO on durable
-  topics.
+  *range* is always authoritative). The throughput/latency targets above are backed by the
+  current durable benchmark notes in `docs/BENCHMARKS.md`, but they are not a universal
+  production SLO; operators should benchmark on the target filesystem/device because
+  `fsync` latency is hardware-dependent.
   With `leases_durable:true`, a queue **claim** durably logs its lease BUT the lease-log
   append is best-effort: if it fails (a transient WAL error), the claim still succeeds and the
   job degrades to the queue's baseline **at-least-once** guarantee (it becomes reclaimable
@@ -522,8 +524,8 @@ partial or planned):
   propagating the error) is planned.
 - **Out of scope (by design, not on the roadmap):** native TLS (terminate at a reverse
   proxy — see Security below), hard multi-tenant *namespace* isolation beyond the per-key
-  scope + topic-name-prefix allowlist that ships today, multi-server / replication / HA /
-  single-writer fencing, LSM / keyed log compaction, and durable consumer groups as a server
+  scope + topic-name-prefix allowlist that ships today, multi-server / replication / HA
+  beyond the single-process data-dir lock, LSM / keyed log compaction, and durable consumer groups as a server
   primitive (the consumer-group pattern is built at the application level with a topic per
   consumer plus delete). See `docs/API.md` §0.2 / §0.11 and `docs/ROADMAP.md`.
 
@@ -557,4 +559,4 @@ criteria.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — storage, WAL, group commit, segments,
   recovery, scheduler, concurrency, crate choices, latency budget.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build phases, acceptance criteria, benchmark plan.
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — recorded Phase-2/3 in-memory baseline numbers (hardware, methodology, every applicable benchmark-plan metric).
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — benchmark history and current durable/storage measurements, with reproduction commands.

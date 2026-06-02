@@ -50,7 +50,11 @@ fn max_topics_cap_via_put() {
     assert_eq!(s, StatusCode::CREATED);
     // Third NEW topic is refused with 429 throttled + Retry-After detail.
     let (s, body) = h.put("/v0/topics/c", json!({}));
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "3rd topic over cap: {body}");
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "3rd topic over cap: {body}"
+    );
     assert_eq!(code(&body), "throttled");
     assert_eq!(body["error"]["detail"]["limit"], json!("max_topics"));
     assert_eq!(body["error"]["detail"]["max"], json!(2));

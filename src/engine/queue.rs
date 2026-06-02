@@ -220,8 +220,8 @@ impl QueueProjection {
 // ===========================================================================
 
 use crate::config;
-use crate::engine::topic_state::TopicState;
 use crate::engine::segwriter::SealedResolve;
+use crate::engine::topic_state::TopicState;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::storage::{LeaseEvent, WalRecord};
@@ -291,7 +291,12 @@ impl Engine {
                 dead_lettered: 0,
             };
         };
-        b.enforce_retention(now);
+        if let Err(e) = self.enforce_retention_durable(b, now) {
+            tracing::warn!(
+                topic = %b.name, error = %e,
+                "queue counters: retention harden failed; using prior floor"
+            );
+        }
         let mut q = q.lock();
         q.sweep_expired(now);
         let (ready, in_flight) = self.ready_in_flight_locked(b, &mut q, now);
@@ -438,7 +443,7 @@ impl Engine {
         lease_ms: Option<u64>,
     ) -> Result<(Vec<Vec<LeasedJob>>, u64)> {
         let now = self.clock.now_ms();
-        b.enforce_retention(now);
+        self.enforce_retention_durable(b, now)?;
 
         let cfg = b.config.read();
         let topic_lease_ms = cfg.lease_ms;
@@ -947,7 +952,8 @@ impl Engine {
                 },
                 true,
             )?;
-            b.delete_seqs(&[seq], now);
+            let stats = b.delete_seqs_stats(&[seq], now);
+            self.release_total_bytes(stats.bytes_freed);
             return Ok(fsync_ms);
         }
         // Disk / memory class: the in-memory removal first, then a best-effort
@@ -955,7 +961,8 @@ impl Engine {
         // §10.6, at-least-once). A `memory`-class queue logs the same best-effort
         // frame: it shares the disk-like path (§0.10), just with no durability
         // GUARANTEE (the frame may persist or be lost).
-        b.delete_seqs(&[seq], now);
+        let stats = b.delete_seqs_stats(&[seq], now);
+        self.release_total_bytes(stats.bytes_freed);
         self.wal_log_delete_seqs(topic_id, vec![seq], now, false);
         Ok(0.0)
     }
@@ -1089,7 +1096,12 @@ impl Engine {
                 requeue_diverted(src);
                 return;
             }
-            dl.enforce_retention(now);
+            if let Err(e) = self.enforce_retention_durable(&dl, now) {
+                tracing::warn!(
+                    src = %src.name, dead_letter = %dl_topic, error = %e,
+                    "dead-letter: DL retention harden failed; deferring eviction"
+                );
+            }
         }
         // Permanently delete the dead-lettered jobs from the source jobs log. The
         // DL copy is already durably appended; a failure to durably log the source
@@ -1137,7 +1149,9 @@ impl Engine {
     /// Lease expiry (§10.3) still covers hard crashes where the disconnect is
     /// never observed.
     pub fn release_work_conn(&self, name: &str, conn: u64) {
-        let Some(b) = self.get_topic(name) else { return };
+        let Some(b) = self.get_topic(name) else {
+            return;
+        };
         if !b.is_queue() {
             return;
         }
@@ -1635,7 +1649,11 @@ mod tests {
             .unwrap();
         assert_eq!(a2.acked, 1);
         assert!(a2.skipped.is_empty());
-        assert_eq!(engine.topic_state("jobs", false).unwrap().count, 0, "deleted");
+        assert_eq!(
+            engine.topic_state("jobs", false).unwrap().count,
+            0,
+            "deleted"
+        );
     }
 
     #[test]
@@ -1779,7 +1797,9 @@ mod tests {
         let (engine, _clock) = engine_with_clock();
         engine.put_topic("jobs", queue_cfg()).unwrap();
         // Re-PUT as a log ⇒ 409 topic_exists_incompatible.
-        let err = engine.put_topic("jobs", TopicConfig::default()).unwrap_err();
+        let err = engine
+            .put_topic("jobs", TopicConfig::default())
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::TopicExistsIncompatible);
         // Re-PUT as a queue (same type) is fine (idempotent config update).
         assert!(engine.put_topic("jobs", queue_cfg()).is_ok());

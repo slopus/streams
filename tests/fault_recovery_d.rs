@@ -43,7 +43,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
 use streams::storage::wal::{encode_frame, WalRecord};
 use streams::storage::OpenOpts;
-use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Plumbing shared by every test (adapted from tests/crash_oracle.rs — the

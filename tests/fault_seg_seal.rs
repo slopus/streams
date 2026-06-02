@@ -44,7 +44,7 @@ use streams::config::SegmentConfig;
 use streams::engine::segwriter::{SealedResolve, SegmentWriter};
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
-use streams::storage::{TopicTier, Fs, LocalSegmentStore};
+use streams::storage::{Fs, LocalSegmentStore, TopicTier};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs + tests/fault_wal_append_b.rs)

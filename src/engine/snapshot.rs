@@ -20,10 +20,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::engine::topic_state::{TopicState, StoredRecord};
+use crate::engine::topic_state::{StoredRecord, TopicState};
 use crate::engine::{Engine, SEQ_BASE};
-use crate::storage::{Checkpoint, Snapshot, SnapshotTopic, SnapshotRecord, SnapshotRouter};
-use crate::types::{TopicConfig, Filter, FilterOp, Router};
+use crate::storage::{Checkpoint, Snapshot, SnapshotRecord, SnapshotRouter, SnapshotTopic};
+use crate::types::{Filter, FilterOp, Router, TopicConfig};
 
 /// Capture the engine's current durable state into a [`Snapshot`].
 ///
@@ -104,8 +104,14 @@ pub fn capture(engine: &Engine, id: u64) -> Option<Snapshot> {
     let mut max_seq = 0u64;
     for entry in engine.topics.iter() {
         let b = entry.value();
-        // Enforce retention so the captured floors/records are current.
-        b.enforce_retention(engine.clock.now_ms());
+        // Enforce retention so the captured floors/records are current. A
+        // non-re-derivable floor must be hardened before it enters the snapshot.
+        if engine
+            .enforce_retention_durable(b, engine.clock.now_ms())
+            .is_err()
+        {
+            return None;
+        }
         let _append_guard = b.append_lock.lock();
         // Drain in-flight (ticketed-but-unpublished) durable writes so head_seq
         // covers every frame at/before the checkpoint offset captured above.

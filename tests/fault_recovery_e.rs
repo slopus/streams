@@ -48,7 +48,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
 use streams::types::{
-    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    DeleteRequest, DiffRequest, Filter, RecordIn, TopicConfig, TopicType, WriteRequest,
 };
 
 // ===========================================================================
@@ -105,7 +105,10 @@ impl RefModel {
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], rec: &ModelRecord) {
-        let b = self.topics.get_mut(name).expect("topic modeled before append");
+        let b = self
+            .topics
+            .get_mut(name)
+            .expect("topic modeled before append");
         for s in seqs {
             b.acked.insert(*s, rec.clone());
             b.ever_acked.insert(*s, rec.clone());
@@ -314,7 +317,12 @@ fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
 /// Assert the crash-consistency contract for one topic. `whole_tail_durable` is
 /// true only when every acked write's fsync was guaranteed to have returned
 /// (a clean stop / all-durable crash).
-fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
+fn assert_topic_contract(
+    name: &str,
+    model: &ModelTopic,
+    dump: &TopicDump,
+    whole_tail_durable: bool,
+) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 

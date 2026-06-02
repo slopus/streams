@@ -2964,7 +2964,9 @@ async fn bench_router(c: &Client, ns: &str) -> Value {
 
     // Direct baseline: write to a plain topic + read it back (no router).
     let direct_topic = format!("{ns}-direct");
-    let _ = c.put(&format!("/v0/topics/{direct_topic}"), &json!({})).await;
+    let _ = c
+        .put(&format!("/v0/topics/{direct_topic}"), &json!({}))
+        .await;
     let dpath = format!("/v0/topics/{direct_topic}");
     let ddiff = format!("/v0/topics/{direct_topic}/diff");
     let mut direct = Vec::with_capacity(iters);

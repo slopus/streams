@@ -46,8 +46,8 @@ use std::sync::Arc;
 
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::{
-    decode_data_frame, lookup, TopicTier, LocalSegmentStore, SegmentBuilder, SegmentPart,
-    SegmentRecord, Tier,
+    decode_data_frame, lookup, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, Tier,
+    TopicTier,
 };
 
 // ===========================================================================

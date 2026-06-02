@@ -270,7 +270,11 @@ pub enum WalRecord {
     /// un-fsynced frame. Recovery sets `head = max(replayed head, watermark)` and
     /// pads any reserved-but-unwritten seqs as silent deleted gaps, so the seq
     /// counter never regresses and an acked seq is never reused.
-    HeadWatermark { topic_id: u32, head_seq: u64, ts: u64 },
+    HeadWatermark {
+        topic_id: u32,
+        head_seq: u64,
+        ts: u64,
+    },
 }
 
 /// The kind of a leases-log lifecycle event (the `event` byte of

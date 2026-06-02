@@ -54,7 +54,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
 use streams::types::{
-    TopicConfig, TopicType, DiffRequest, Durability, RecordIn, RouterCreateRequest, WriteRequest,
+    DiffRequest, Durability, RecordIn, RouterCreateRequest, TopicConfig, TopicType, WriteRequest,
 };
 
 // ===========================================================================
@@ -131,7 +131,10 @@ impl RefModel {
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], recs: &[ModelRecord]) {
-        let b = self.topics.get_mut(name).expect("topic modeled before append");
+        let b = self
+            .topics
+            .get_mut(name)
+            .expect("topic modeled before append");
         for (s, r) in seqs.iter().zip(recs.iter()) {
             b.acked.insert(*s, r.clone());
             b.ever_acked.insert(*s, r.clone());
@@ -327,7 +330,12 @@ fn sync_wal_dir(disk: &FakeDisk) {
 // `whole_tail_durable` is true on a clean stop or an all-acked-fsync crash.
 // ===========================================================================
 
-fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
+fn assert_topic_contract(
+    name: &str,
+    model: &ModelTopic,
+    dump: &TopicDump,
+    whole_tail_durable: bool,
+) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 

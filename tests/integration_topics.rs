@@ -292,7 +292,10 @@ fn list_summary_shape_and_prefix_filter() {
     assert_eq!(status, StatusCode::OK);
     let topics = body["topics"].as_array().unwrap();
     assert_eq!(topics.len(), 2, "prefix must filter to jobs:* only");
-    let names: Vec<&str> = topics.iter().map(|b| b["topic"].as_str().unwrap()).collect();
+    let names: Vec<&str> = topics
+        .iter()
+        .map(|b| b["topic"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["jobs:a", "jobs:b"], "list is sorted by name");
 
     // Summary entry shape (API §1.3): the documented per-topic fields are present.
@@ -328,7 +331,7 @@ fn list_paginates_with_opaque_cursor() {
     let h = Harness::start();
     // Create 5 topics with sortable names box0..box4.
     for i in 0..5 {
-        let (s, _) = h.put(&format!("/v0/topics/topic{i}"), json!({}));
+        let (s, _) = h.put(&format!("/v0/topics/box{i}"), json!({}));
         assert!(s == StatusCode::CREATED);
     }
 

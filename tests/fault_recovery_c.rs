@@ -54,7 +54,7 @@ use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage
 use streams::storage::{
     Fs, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, SegmentStore, StoreError,
 };
-use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 

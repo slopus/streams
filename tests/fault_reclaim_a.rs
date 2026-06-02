@@ -55,9 +55,9 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
 use streams::storage::{
-    data_name, TopicTier, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, Tier,
+    data_name, LocalSegmentStore, SegmentBuilder, SegmentPart, SegmentRecord, Tier, TopicTier,
 };
-use streams::types::{TopicConfig, TopicType, DeleteRequest, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DeleteRequest, DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Segment-store-level helpers (mirror tests/fault_cold_flip.rs): a real segment

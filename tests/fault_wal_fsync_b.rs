@@ -49,7 +49,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Reference model (the oracle) — copied from tests/crash_oracle.rs, trimmed to
@@ -97,7 +97,10 @@ impl RefModel {
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], rec: &ModelRecord) {
-        let b = self.topics.get_mut(name).expect("topic modeled before append");
+        let b = self
+            .topics
+            .get_mut(name)
+            .expect("topic modeled before append");
         for s in seqs {
             b.acked.insert(*s, rec.clone());
             b.ever_acked.insert(*s, rec.clone());
@@ -277,7 +280,12 @@ fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
 /// Assert the contract for one topic. `whole_tail_durable=true` ⇒ the survivor set
 /// must equal the model's live set; `false` ⇒ a clean dense prefix is allowed
 /// (an acked-but-unflushed/in-window tail may be missing).
-fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
+fn assert_topic_contract(
+    name: &str,
+    model: &ModelTopic,
+    dump: &TopicDump,
+    whole_tail_durable: bool,
+) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 

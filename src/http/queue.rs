@@ -128,7 +128,10 @@ impl ClaimCoordinator {
 
         if is_leader {
             // Wait the window so concurrent claimers gather, then run one pass.
-            tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+            tokio::time::sleep(Duration::from_millis(
+                jitter_ms.min(config::MAX_CLAIM_JITTER_MS),
+            ))
+            .await;
 
             // Drain under the cohort lock and mark it closed, so a late joiner
             // racing this drain opens a fresh cohort. Remove the (now-closed)
@@ -191,7 +194,11 @@ async fn run_claim(
     if !b.is_queue() {
         return Err(Error::not_a_queue(topic_name));
     }
-    let jitter = b.config.read().claim_jitter_ms;
+    let jitter = b
+        .config
+        .read()
+        .claim_jitter_ms
+        .min(config::MAX_CLAIM_JITTER_MS);
 
     if jitter == 0 {
         // Greedy path: one engine claim. Validate node here (the cohort pass
@@ -291,7 +298,8 @@ pub async fn claim(
         parse_json_body(&headers, &body)?
     };
 
-    let (jobs, ready) = run_claim(&state, &topic_name, req.node, req.max, req.lease_ms, None).await?;
+    let (jobs, ready) =
+        run_claim(&state, &topic_name, req.node, req.max, req.lease_ms, None).await?;
     let claimed: Vec<ClaimedJob> = jobs.into_iter().map(to_claimed_job).collect();
     let count = claimed.len() as u64;
     Ok(Json(ClaimResponse {
@@ -315,9 +323,10 @@ pub async fn ack(
     let req: AckRequest = parse_json_body(&headers, &body)?;
     let lease_ids = parse_lease_ids(&req.lease_ids)?;
     let engine = state.engine.clone();
-    let resp =
-        super::run_blocking(move || engine.ack_fenced(&topic_name, &req.node, &req.seqs, &lease_ids))
-            .await?;
+    let resp = super::run_blocking(move || {
+        engine.ack_fenced(&topic_name, &req.node, &req.seqs, &lease_ids)
+    })
+    .await?;
     Ok(Json(resp))
 }
 

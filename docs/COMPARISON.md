@@ -16,9 +16,10 @@ incorrect or risky — and an ordered plan.
 >   stub (M3); bounded graceful drain with SSE wind-down (M11); queue `lease_id` fencing —
 >   validate-when-supplied (R4); bounded WAL submission with `503` backpressure (R5); off-gate
 >   segment seal (R6); the **sharded** WAL (`STREAMS_WAL_SHARDS`); **async + derived** routers; the
->   `queue` topic type. The WAL is **sharded**, not a single global writer.
-> - **Decided OUT OF SCOPE (will not be built):** multi-server / replication / HA / single-writer
->   fencing (M1); durable consumer groups as a server primitive (M4 — they are an app pattern: a topic
+>   `queue` topic type; advisory data-dir single-writer fencing. The WAL is **sharded**,
+>   not a single global writer.
+> - **Decided OUT OF SCOPE (will not be built):** multi-server / replication / HA
+>   beyond the single-process data-dir lock (M1); durable consumer groups as a server primitive (M4 — they are an app pattern: a topic
 >   per consumer + delete); LSM / keyed log compaction / compacted topic type and any intra-segment
 >   per-record reclaim (M5, the M8 compaction half); native TLS (terminate at a reverse proxy) and
 >   hard multi-tenancy beyond per-key scopes + prefix allowlists (M13). Deletion is **no compaction /
@@ -43,17 +44,17 @@ system that does it well and how.
 ## (1) MISSING
 
 ### M1 — Replication / HA / failover  · **high**
-> **UPDATE — OUT OF SCOPE (decided).** Multi-server / replication / HA / failover and single-writer
-> fencing are **not** on the roadmap; streams is single-server by design. The text below is retained
-> as the original analysis only.
+> **UPDATE — OUT OF SCOPE (decided).** Multi-server / replication / HA / failover are
+> **not** on the roadmap; streams is single-server by design. Single-writer data-dir
+> fencing is now implemented with an advisory lock. The text below is retained as the
+> original analysis only.
 
 No replication, standby, or failover anywhere (`grep replicat|raft|failover|standby`
 → nothing). Any node loss = downtime; checkpointed-but-unreplicated data is exposed
-to single-disk loss. The single-writer assumption is also *unfenced* —
-`F-WAL-DOUBLE-WRITER-FENCING` (`docs/FAULT_TESTING.md:82`) documents that two processes
-can open the same data dir with no epoch/lease guard.
+to single-disk loss. Single-writer ownership is now guarded by an advisory data-dir
+lock; it is still not a distributed leader lease or failover mechanism.
 - **Borrows from:** Kafka (replicated partitions + ISR), NATS JetStream (RAFT streams/consumers), PostgreSQL (streaming WAL replication), MySQL (binlog replicas).
-- **Recommend:** the append-only monotonic-seq WAL is the natural shipping unit. Build in stages — (1) **single-writer fencing** (lockfile/epoch/lease) to make the documented double-writer gap a guard, (2) **WAL shipping** to a read replica, (3) leader epoch + quorum commit for the `fsync` class. Fencing is a prerequisite for any of the rest.
+- **Recommend:** the append-only monotonic-seq WAL is the natural shipping unit. Build in stages — (1) WAL shipping to a read replica, (2) leader epoch + quorum commit for the `fsync` class. The local lock is only a single-host guard; distributed fencing would still be needed for HA.
 - **Where:** `docs/ARCHITECTURE.md:8-11`, `src/engine/mod.rs:40-107`, `docs/FAULT_TESTING.md:82`.
 
 ### M2 — Backup / restore / PITR / WAL archiving  · **high**
@@ -478,7 +479,7 @@ gate mutex*, not in the ticket gap.
 7. **Backup / archived-WAL retention / PITR + offline `verify`/`fsck` scrub** (M2 + M7 + R10) — retain absorbed WAL behind an archive hook, keep N snapshots, add restore + replay-to-point, and a full-scan integrity check reusing the XXH3-64 readers. *High effort, closes the single-durable-copy risk and gives operators a recovery path.* `src/engine/recovery.rs:187-198`, `src/storage/snapshot.rs:232-237`.
 8. **Segment coalescing + intra-segment reclaim** (M8 + B3) — threshold-triggered merge of small/sparse sealed segments (and a packed cold store for many small topics), preserving the append-mostly zero-rewrite property in the common case. *High effort, the structural fix for topic-cardinality + sparse-delete space amplification.* `src/engine/topic_state.rs:1031-1089`, `src/engine/segwriter.rs`.
 
-*Out of scope (will not be built):* single-writer fencing / WAL shipping / replication / HA (M1),
+*Out of scope (will not be built):* WAL shipping / replication / HA (M1),
 keyed / LSM compaction and a compacted topic type (M5) plus intra-segment per-record reclaim (B3/M8),
 durable consumer groups as a server primitive (M4 — an app pattern instead), native TLS (M13 —
 reverse proxy), and hard multi-tenancy beyond per-key scopes + prefix allowlists (M13). *Still a

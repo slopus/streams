@@ -31,7 +31,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::types::{
-    TopicConfig, DeleteRequest, DiffRequest, Discard, Filter, NodeFilter, RecordIn, WriteRequest,
+    DeleteRequest, DiffRequest, Discard, Filter, NodeFilter, RecordIn, TopicConfig, WriteRequest,
 };
 
 // ---------------------------------------------------------------------------

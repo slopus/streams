@@ -20,7 +20,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::types::{TopicConfig, DiffRequest, RecordIn, RouterCreateRequest, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, RouterCreateRequest, TopicConfig, WriteRequest};
 
 /// Force the legacy synchronous forwarding path for THIS test process. Idempotent;
 /// every test in this binary wants it off, and the engine captures the flag at

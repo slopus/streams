@@ -35,7 +35,9 @@ pub async fn put_topic(
     let created = {
         let engine = state.engine.clone();
         let name = topic_name.clone();
-        run_blocking(move || engine.put_topic(&name, config)).await?.0
+        run_blocking(move || engine.put_topic(&name, config))
+            .await?
+            .0
     };
     // Re-read the merged config so the response reflects the topic's current state.
     let stored = state

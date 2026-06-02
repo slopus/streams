@@ -31,7 +31,7 @@ use streams::config::{self, ServerConfig};
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp};
 use streams::storage::Fs;
-use streams::types::{TopicConfig, TopicType, DiffRequest, Durability, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, Durability, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 

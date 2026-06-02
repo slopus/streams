@@ -993,6 +993,22 @@ loss (verified live below: 8 → 3 → 1 restarts, all acked durable records rec
 Bench: `benches/wal_scaling.rs` — 64 concurrent writers across 256 topics, 256 B
 payload, aggregate write-ack throughput; `cargo bench --bench wal_scaling`.
 
+### Current hardening smoke (2026-06-02)
+
+After the production hardening changes for durable retention, exact total-byte quota
+release, and the data-dir single-writer lock, the durable WAL benchmark path was
+run in a bounded smoke configuration:
+
+```bash
+WAL_BENCH_SHARDS=1 WAL_BENCH_WRITERS=8 WAL_BENCH_TOPICS=32 \
+  WAL_BENCH_OPS=1000 WAL_BENCH_REPEAT=1 cargo bench --bench wal_scaling
+```
+
+Result on the same Apple M4 Max/APFS environment: **~831 fsync-class acks/sec**
+for 1 shard, 8 writers, 32 topics, 256 B payload, batch=1. This is a smoke check
+that the durable benchmark remains runnable after the hardening work; use the
+full commands below for release/SLO comparison.
+
 ## The hardware ceiling: fsync-class is device-bound, not software-bound
 
 On this single-APFS-volume Mac, **durable (`fsync`-class) throughput does not scale

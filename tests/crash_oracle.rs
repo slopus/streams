@@ -43,7 +43,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
 use streams::types::{
-    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    DeleteRequest, DiffRequest, Filter, RecordIn, TopicConfig, TopicType, WriteRequest,
 };
 
 // ===========================================================================
@@ -123,7 +123,10 @@ impl RefModel {
     /// Record an acked append of `recs` at the engine-assigned `seqs`. Advances
     /// `head` and applies the cap (eviction) the engine would.
     fn ack_append(&mut self, name: &str, seqs: &[u64], recs: &[ModelRecord]) {
-        let b = self.topics.get_mut(name).expect("topic modeled before append");
+        let b = self
+            .topics
+            .get_mut(name)
+            .expect("topic modeled before append");
         for (s, r) in seqs.iter().zip(recs.iter()) {
             b.acked.insert(*s, r.clone());
             b.ever_acked.insert(*s, r.clone());
@@ -374,7 +377,12 @@ fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
 /// guaranteed every acked write's fsync returned (a clean stop or an
 /// all-durable-acked crash) so the survivor set must equal the model's live set;
 /// otherwise a non-durable tail may be missing (still a dense prefix).
-fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
+fn assert_topic_contract(
+    name: &str,
+    model: &ModelTopic,
+    dump: &TopicDump,
+    whole_tail_durable: bool,
+) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 

@@ -16,7 +16,7 @@ use crate::engine::broadcast::BroadcastCache;
 use crate::engine::eviction::Floors;
 use crate::engine::queue::QueueProjection;
 use crate::engine::segwriter::{read_locator, ResolvedPayload, SealedResolve, SegmentWriter};
-use crate::types::{TopicConfig, Filter};
+use crate::types::{Filter, TopicConfig};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -342,6 +342,9 @@ pub struct RetentionAdvance {
     /// The TTL expiry floor after this pass (carried SEPARATELY so the durable
     /// watermark preserves the cap-vs-ttl tombstone reason across restart, R7).
     pub expiry_floor: u64,
+    /// Bytes physically reclaimed from the topic front during this pass. The engine
+    /// uses this to keep the global `max_total_bytes` reservation gauge exact.
+    pub bytes_reclaimed: u64,
 }
 
 impl RetentionAdvance {
@@ -351,7 +354,17 @@ impl RetentionAdvance {
         durable_advance: false,
         evict_floor: 0,
         expiry_floor: 0,
+        bytes_reclaimed: 0,
     };
+}
+
+/// Result of a permanent delete pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeleteStats {
+    /// Live records removed by this delete.
+    pub deleted: u64,
+    /// Payload bytes freed by this delete and any retention front-reclaim it drove.
+    pub bytes_freed: u64,
 }
 
 /// The full in-memory state of one topic.
@@ -509,7 +522,13 @@ pub const TS_NEVER: i64 = i64::MIN;
 
 impl TopicState {
     /// Create a fresh topic with the given config, interned id, and epoch.
-    pub fn new(name: String, topic_id: u32, config: TopicConfig, seq_base: u64, epoch: u64) -> Self {
+    pub fn new(
+        name: String,
+        topic_id: u32,
+        config: TopicConfig,
+        seq_base: u64,
+        epoch: u64,
+    ) -> Self {
         // A queue topic carries a materialized lease projection (DESIGN §10); a
         // plain log does not. The claim cursor starts at `seq_base` (the first
         // job seq this topic instance will assign).
@@ -1337,6 +1356,7 @@ impl TopicState {
                 durable_advance,
                 evict_floor,
                 expiry_floor,
+                bytes_reclaimed: 0,
             }
         };
 
@@ -1371,15 +1391,16 @@ impl TopicState {
         // Lazy front reclaim: pop the dead prefix physically (below the current
         // floor), advancing base_seq. Cheap no-op (`drop_n == 0`) when the front is
         // already clean.
-        self.reclaim_front(head);
-        Ok(plan)
+        let mut result = plan;
+        result.bytes_reclaimed = self.reclaim_front(head);
+        Ok(result)
     }
 
     /// Physically pop the fully-dead front prefix (below `earliest_seq` or a run
     /// of already-deleted slots at the front), advancing `base_seq` and pruning
     /// their tag postings. Lazy reclaim shared by cap/TTL eviction and deletes
     /// (DESIGN §7, ARCHITECTURE §1.1). `head` is the topic head at call time.
-    fn reclaim_front(&self, head: u64) {
+    fn reclaim_front(&self, head: u64) -> u64 {
         let earliest = {
             let floors = self.floors.read();
             floors.earliest_seq(self.seq_base, head)
@@ -1398,7 +1419,7 @@ impl TopicState {
             drop_n += 1;
         }
         if drop_n == 0 {
-            return;
+            return 0;
         }
         let mut freed: u64 = 0;
         for rec in index.records.iter().take(drop_n) {
@@ -1417,6 +1438,7 @@ impl TopicState {
             self.live_count
                 .store(prev.saturating_sub(live_popped), Ordering::Relaxed);
         }
+        freed
     }
 
     /// Segment-granular physical reclaim (ARCHITECTURE §3.3, §5.6): drop whole
@@ -1601,8 +1623,20 @@ impl TopicState {
         bound_head: Option<u64>,
         now_ms: i64,
     ) -> u64 {
+        self.apply_delete_stats(before_seq, match_, bound_head, now_ms)
+            .deleted
+    }
+
+    /// As [`Self::apply_delete`], with byte-free accounting for engine quota gauges.
+    pub fn apply_delete_stats(
+        &self,
+        before_seq: Option<u64>,
+        match_: Option<&Filter>,
+        bound_head: Option<u64>,
+        now_ms: i64,
+    ) -> DeleteStats {
         // Sync floors first so we operate on the current logical state.
-        self.enforce_retention(now_ms);
+        let retention = self.enforce_retention(now_ms);
 
         let head = self.head_seq();
         let earliest = self.earliest_seq();
@@ -1692,7 +1726,7 @@ impl TopicState {
         }
 
         // Lazy physical reclaim of the now-dead front prefix.
-        self.reclaim_front(head);
+        let front_freed = self.reclaim_front(head);
         // Segment-granular reclaim: drop whole sealed segments cleared by this
         // delete — a prefix delete below the floor, or an interior segment all of
         // whose records were point-deleted (a `match` delete). Silent (voluntary).
@@ -1704,7 +1738,13 @@ impl TopicState {
         // segment file and survives a WAL trim/checkpoint. A seq whose whole segment
         // was just dropped above, or that is still in the active tail, is a no-op.
         self.flag_sealed_deletes(&deleted_seqs);
-        deleted
+        DeleteStats {
+            deleted,
+            bytes_freed: retention
+                .bytes_reclaimed
+                .saturating_add(freed_bytes)
+                .saturating_add(front_freed),
+        }
     }
 
     /// Permanently delete an explicit set of seqs (the queue ack / dead-letter
@@ -1713,6 +1753,11 @@ impl TopicState {
     /// now-dead front. Silent (never advances `evict_floor`). Returns the count
     /// actually removed (a seq that is absent / already dead is skipped).
     pub fn delete_seqs(&self, seqs: &[u64], now_ms: i64) -> u64 {
+        self.delete_seqs_stats(seqs, now_ms).deleted
+    }
+
+    /// As [`Self::delete_seqs`], with byte-free accounting for engine quota gauges.
+    pub fn delete_seqs_stats(&self, seqs: &[u64], now_ms: i64) -> DeleteStats {
         let head = self.head_seq();
         let mut freed_bytes: u64 = 0;
         let mut deleted: u64 = 0;
@@ -1737,7 +1782,7 @@ impl TopicState {
             self.live_count
                 .store(prev.saturating_sub(deleted), Ordering::Relaxed);
         }
-        self.reclaim_front(head);
+        let front_freed = self.reclaim_front(head);
         // Segment-granular reclaim for the queue ack / dead-letter delete path:
         // an acked job whose whole sealed segment is now dead drops that file
         // (the WHOLE-SEGMENT optimization, one unlink instead of N flips).
@@ -1746,7 +1791,10 @@ impl TopicState {
         // partially-cleared sealed segment, so the ack survives a WAL trim.
         self.flag_sealed_deletes(&deleted_seqs);
         let _ = now_ms;
-        deleted
+        DeleteStats {
+            deleted,
+            bytes_freed: freed_bytes.saturating_add(front_freed),
+        }
     }
 }
 

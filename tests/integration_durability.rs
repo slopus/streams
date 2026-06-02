@@ -2229,7 +2229,9 @@ fn disk_topic_survives_clean_restart_and_is_not_fsync_gated() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_at(dir.path());
-        engine.put_topic("evts", class_topic(Durability::Disk)).unwrap();
+        engine
+            .put_topic("evts", class_topic(Durability::Disk))
+            .unwrap();
         for i in 1..=4 {
             let resp = engine
                 .write("evts", one(json!({ "i": i }), None), true)
@@ -2318,7 +2320,9 @@ fn durability_resolution_and_back_compat_reporting() {
     assert!(!c.durable, "durable normalized to match the resolved class");
 
     // Explicit memory ⇒ durable:false; is_durable()==false.
-    engine.put_topic("d", class_topic(Durability::Memory)).unwrap();
+    engine
+        .put_topic("d", class_topic(Durability::Memory))
+        .unwrap();
     let d = engine.topic_state("d", false).unwrap().config;
     assert_eq!(d.durability, Some(Durability::Memory));
     assert!(!d.durable);

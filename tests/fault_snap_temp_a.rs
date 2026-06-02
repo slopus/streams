@@ -41,7 +41,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
 use streams::storage::{File, Fs, OpenOpts};
-use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
+use streams::types::{RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // TmpFaulter — inject an io::Error on the FIRST write_at (or sync_all) to a

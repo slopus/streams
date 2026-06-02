@@ -45,12 +45,12 @@ use serde_json::json;
 
 use streams::clock::{SharedClock, TestClock};
 use streams::config::SegmentConfig;
-use streams::engine::topic_state::{TopicState, StoredRecord};
 use streams::engine::segwriter::SegmentWriter;
+use streams::engine::topic_state::{StoredRecord, TopicState};
 use streams::storage::testfs::FakeDisk;
 use streams::storage::{
-    decode_data_frame_full, frame_is_deleted, lookup, TopicTier, Fs, LocalSegmentStore, SegmentPart,
-    SegmentStore,
+    decode_data_frame_full, frame_is_deleted, lookup, Fs, LocalSegmentStore, SegmentPart,
+    SegmentStore, TopicTier,
 };
 use streams::types::TopicConfig;
 

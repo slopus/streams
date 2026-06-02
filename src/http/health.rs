@@ -223,7 +223,9 @@ fn render_prometheus(state: &AppState) -> String {
             m.earliest_seq
         );
     }
-    out.push_str("# HELP streams_topic_records_live Per-topic live (net-of-delete) record count.\n");
+    out.push_str(
+        "# HELP streams_topic_records_live Per-topic live (net-of-delete) record count.\n",
+    );
     out.push_str("# TYPE streams_topic_records_live gauge\n");
     for m in &per_topic {
         let _ = writeln!(

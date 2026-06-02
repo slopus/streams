@@ -49,11 +49,11 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::snapshot::{
-    load_latest_with, write_snapshot_with, Checkpoint, Snapshot, SnapshotTopic, SnapshotRecord,
+    load_latest_with, write_snapshot_with, Checkpoint, Snapshot, SnapshotRecord, SnapshotTopic,
 };
 use streams::storage::testfs::FakeDisk;
 use streams::storage::{Fs, OpenOpts};
-use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
+use streams::types::{RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ---------------------------------------------------------------------------
 // On-disk snapshot framing layout (mirrors src/storage/snapshot.rs; the

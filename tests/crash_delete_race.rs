@@ -30,9 +30,9 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, TornDamage};
-use streams::storage::{TopicConfigOp, MatchSel, Wal, WalConfig, WalRecord};
+use streams::storage::{MatchSel, TopicConfigOp, Wal, WalConfig, WalRecord};
 use streams::types::{
-    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    DeleteRequest, DiffRequest, Filter, RecordIn, TopicConfig, TopicType, WriteRequest,
 };
 
 const DATA_DIR: &str = "/data";

@@ -77,7 +77,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalError, WalReader, WalRecord};
 use streams::storage::Fs;
-use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
+use streams::types::{RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/fault_wal_*.rs — reused, not reinvented).
@@ -601,6 +601,9 @@ fn f_pub_rollback_invisible() {
     // head still 3.
     let st = engine.topic_state("roll", false).unwrap();
     assert_eq!(st.head_seq, 3, "head_seq unchanged after every rollback");
-    assert_eq!(st.count, 3, "no rolled-back record left a trace in the topic");
+    assert_eq!(
+        st.count, 3,
+        "no rolled-back record left a trace in the topic"
+    );
     drop(engine);
 }

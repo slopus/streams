@@ -39,7 +39,7 @@ use streams::clock::{SharedClock, TestClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::FakeDisk;
-use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
+use streams::types::{RecordIn, TopicConfig, TopicType, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 
@@ -219,7 +219,11 @@ fn f_clock_backward_lease() {
     //      boot time would still show it held here. Then rewind so the rest of the
     //      checks run at `t_back` as before.
     tc2.set(deadline + 1);
-    let q_expired = engine.topic_state("q", false).unwrap().queue.expect("queue");
+    let q_expired = engine
+        .topic_state("q", false)
+        .unwrap()
+        .queue
+        .expect("queue");
     assert_eq!(
         q_expired.in_flight, 0,
         "past the durable absolute deadline {deadline} the lease expires — proving \

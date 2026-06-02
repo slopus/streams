@@ -5,13 +5,13 @@
 //! single lock over the router graph. Module boundaries are kept clean so a
 //! WAL/storage layer can slide underneath in phase 4.
 
-pub mod topic_state;
 pub mod broadcast;
 pub mod eviction;
 pub mod filters;
 pub mod queue;
 pub mod router;
 pub mod segwriter;
+pub mod topic_state;
 
 use crate::clock::SharedClock;
 use crate::config::{self, ServerConfig};
@@ -19,7 +19,6 @@ use crate::error::{Error, Result};
 use crate::sched::Scheduler;
 use crate::storage::{MatchSel, RouterOp, ShardedWalWriter, WalRecord};
 use crate::types::*;
-use topic_state::{TopicState, DedupeEntry, RetentionAdvance, StoredRecord};
 use dashmap::DashMap;
 use eviction::AdmitDecision;
 use parking_lot::Mutex;
@@ -27,11 +26,74 @@ use router::RouterGraph;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use topic_state::{DedupeEntry, RetentionAdvance, StoredRecord, TopicState};
 
 mod recovery;
 pub mod snapshot;
 pub mod wal_glue;
 pub use wal_glue::WalHandle;
+
+#[cfg(unix)]
+mod data_dir_lock {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Write};
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    /// Advisory single-writer lock held for the lifetime of a durable engine.
+    pub(super) struct DataDirLock {
+        file: File,
+    }
+
+    impl DataDirLock {
+        pub(super) fn acquire(dir: &Path) -> io::Result<Self> {
+            std::fs::create_dir_all(dir)?;
+            let path = dir.join(".streams.lock");
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            file.set_len(0)?;
+            writeln!(file, "pid={}", std::process::id())?;
+            file.sync_data()?;
+            Ok(Self { file })
+        }
+    }
+
+    impl Drop for DataDirLock {
+        fn drop(&mut self) {
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod data_dir_lock {
+    use std::io;
+    use std::path::Path;
+
+    pub(super) struct DataDirLock;
+
+    impl DataDirLock {
+        pub(super) fn acquire(_dir: &Path) -> io::Result<Self> {
+            Ok(Self)
+        }
+    }
+}
 
 /// Default first seq for a fresh topic instance (`0` is reserved for "no
 /// records").
@@ -85,6 +147,9 @@ pub struct Engine {
     /// The resolved data directory (durable mode only). Snapshots are written
     /// under `<data_dir>/meta`; `None` in pure in-memory mode.
     data_dir: Option<std::path::PathBuf>,
+    /// Advisory single-writer lock for the real data directory. Skipped for the
+    /// injected fake filesystem harness.
+    _data_dir_lock: Option<data_dir_lock::DataDirLock>,
     /// The filesystem seam snapshot writes route through when set — the crash
     /// harness installs a [`FakeDisk`] here (via [`Engine::with_data_dir_fs`]) so
     /// `write_snapshot` lands on the same fake the WAL does. `None` in production
@@ -199,6 +264,7 @@ impl Engine {
             wal: None,
             _wal_owner: None,
             data_dir: None,
+            _data_dir_lock: None,
             recovery_fs: None,
             last_snapshot_bytes: AtomicU64::new(0),
             last_snapshot_ms: AtomicU64::new(0),
@@ -260,6 +326,17 @@ impl Engine {
             .data_dir
             .clone()
             .unwrap_or_else(|| config::DEFAULT_DATA_DIR.to_string());
+        let dir_path = std::path::PathBuf::from(&data_dir);
+        let data_dir_lock = if fs.is_none() {
+            Some(data_dir_lock::DataDirLock::acquire(&dir_path).map_err(|e| {
+                Error::internal(format!(
+                    "data directory {} is already in use or cannot be locked: {e}",
+                    dir_path.display()
+                ))
+            })?)
+        } else {
+            None
+        };
 
         let engine = Arc::new(Engine {
             topics: DashMap::new(),
@@ -270,7 +347,8 @@ impl Engine {
             total_bytes_live: AtomicU64::new(0),
             wal: None,
             _wal_owner: None,
-            data_dir: Some(std::path::PathBuf::from(&data_dir)),
+            data_dir: Some(dir_path.clone()),
+            _data_dir_lock: data_dir_lock,
             recovery_fs: fs.clone(),
             last_snapshot_bytes: AtomicU64::new(0),
             last_snapshot_ms: AtomicU64::new(0),
@@ -295,10 +373,9 @@ impl Engine {
         // table BEFORE we mark ready and accept data-plane traffic. An injected
         // `fs` (the crash harness) routes recovery + the resumed writer through a
         // fake disk; `None` (production) uses `RealFs` transparently.
-        let dir_path = std::path::Path::new(&data_dir);
         let (handle, writer) = match fs {
-            Some(fs) => recovery::recover_and_open_with(fs, &engine, dir_path),
-            None => recovery::recover_and_open(&engine, dir_path),
+            Some(fs) => recovery::recover_and_open_with(fs, &engine, &dir_path),
+            None => recovery::recover_and_open(&engine, &dir_path),
         }
         .map_err(|e| Error::internal(format!("WAL recovery failed: {e}")))?;
 
@@ -492,15 +569,11 @@ impl Engine {
     /// that observed a total within the cap commits, so concurrent writers can never
     /// push the committed total over the cap (the prior `total_bytes()` read-then-
     /// write was a TOCTOU that admitted everything). The gauge is a reservation
-    /// counter (incremented at admission, released on write failure, decremented on
-    /// topic delete). It also COUNTS in-flight reservations (a write that reserved but
-    /// has not yet published), so a hard reservation cap is correct under
-    /// concurrency. `discard:"old"` eviction reduces *actual* topic bytes without
-    /// touching the gauge, which can only make the gauge an OVER-estimate — the
-    /// quota then errs strict (refuses slightly early), never loose (it can never
-    /// overshoot the cap). The authoritative `total_bytes()` sum reconciles the
-    /// gauge on recovery; a long-lived process with heavy eviction trades a little
-    /// headroom for a hard guarantee. `max_total_bytes == 0` ⇒ unlimited.
+    /// counter: it includes in-flight reservations, releases failed writes, and is
+    /// decremented when retention/delete/topic-delete physically frees bytes. That
+    /// keeps the cap exact in long-lived discard-old/TTL deployments while still
+    /// preserving the hard concurrent reservation guarantee. `max_total_bytes == 0`
+    /// ⇒ unlimited.
     fn try_reserve_total_bytes(&self, incoming: u64) -> bool {
         let cap = self.config.limits.max_total_bytes;
         if cap == 0 {
@@ -532,6 +605,9 @@ impl Engine {
     /// reserved capacity then failed/aborted before committing). Saturating so it
     /// can never underflow.
     fn release_total_bytes(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         let mut cur = self.total_bytes_live.load(Ordering::Relaxed);
         loop {
             let next = cur.saturating_sub(bytes);
@@ -630,7 +706,7 @@ impl Engine {
     /// fully functional via resident in-memory payloads — sealing/relocation is
     /// derivable, never load-bearing for correctness.
     fn build_segment_writer(&self, topic_id: u32) -> Option<segwriter::SegmentWriter> {
-        use crate::storage::{TopicTier, LocalSegmentStore};
+        use crate::storage::{LocalSegmentStore, TopicTier};
         let data_dir = self.data_dir.as_ref()?;
         let sub = format!("topics/{topic_id:08X}");
         let hot = LocalSegmentStore::open(data_dir.join(&sub)).ok()?;
@@ -830,7 +906,13 @@ impl Engine {
     /// (at-least-once redelivery), not a silent data loss — so the swallow is the
     /// documented, correct choice for the leases projection, distinct from the
     /// (propagated) API §5 `delete`.
-    pub(crate) fn wal_log_delete_seqs(&self, topic_id: u32, seqs: Vec<u64>, now: i64, durable: bool) {
+    pub(crate) fn wal_log_delete_seqs(
+        &self,
+        topic_id: u32,
+        seqs: Vec<u64>,
+        now: i64,
+        durable: bool,
+    ) {
         self.wal_log_best_effort(
             WalRecord::Delete {
                 topic_id,
@@ -942,7 +1024,10 @@ impl Engine {
     /// best-effort watermark — its loss merely re-derives on the next pass.
     fn enforce_retention_durable(&self, b: &TopicState, now: i64) -> Result<()> {
         let topic_id = b.topic_id;
-        b.enforce_retention_hardened(now, |plan| self.log_evict_watermark(topic_id, plan, now))?;
+        let adv = b.enforce_retention_hardened(now, |plan| {
+            self.log_evict_watermark(topic_id, plan, now)
+        })?;
+        self.release_total_bytes(adv.bytes_reclaimed);
         Ok(())
     }
 
@@ -1037,6 +1122,18 @@ impl Engine {
         if records.is_empty() {
             return Ok(Vec::new());
         }
+        let incoming_bytes: u64 = records.iter().map(|r| r.bytes).sum();
+        let bytes_reserved = self.config.limits.max_total_bytes != 0;
+        if bytes_reserved && !self.try_reserve_total_bytes(incoming_bytes) {
+            return Err(
+                Error::new(ErrorCode::Throttled, "server total-bytes quota reached")
+                    .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+                    .with_detail(serde_json::json!({
+                        "limit": "max_total_bytes",
+                        "max": self.config.limits.max_total_bytes,
+                    })),
+            );
+        }
         let class = dest.config.read().durability_class();
         let durable = class == Durability::Fsync;
         let topic_id = dest.topic_id;
@@ -1059,6 +1156,9 @@ impl Engine {
                 Err(e) => {
                     // No ticket taken yet: tail truncation is still safe.
                     dest.rollback_staged(staged);
+                    if bytes_reserved {
+                        self.release_total_bytes(incoming_bytes);
+                    }
                     return Err(e);
                 }
             };
@@ -1086,6 +1186,9 @@ impl Engine {
         if let Some(msg) = fsync_failed {
             dest.rollback_staged_by_seqs(&staged);
             ticket.done();
+            if bytes_reserved {
+                self.release_total_bytes(incoming_bytes);
+            }
             return Err(Error::internal(msg));
         }
         // R3 (codex P0 #3): a forwarded/dead-lettered append into a `disk` dest is
@@ -1100,6 +1203,9 @@ impl Engine {
             if let Err(e) = self.ensure_disk_head_reserved(topic_id, dest, publish_head, now) {
                 dest.rollback_staged_by_seqs(&staged);
                 ticket.done();
+                if bytes_reserved {
+                    self.release_total_bytes(incoming_bytes);
+                }
                 return Err(e);
             }
         }
@@ -1128,9 +1234,26 @@ impl Engine {
     /// direct write. The ticket serializes all `head_seq` advances for the topic into
     /// stage order, so the head is monotonic regardless of writer kind. The
     /// seal/fsync still runs off the gate. Returns the assigned dest seqs.
-    fn derived_append(&self, dest: &TopicState, records: Vec<StoredRecord>, now: i64) -> Vec<u64> {
+    fn derived_append(
+        &self,
+        dest: &TopicState,
+        records: Vec<StoredRecord>,
+        now: i64,
+    ) -> Result<Vec<u64>> {
         if records.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
+        }
+        let incoming_bytes: u64 = records.iter().map(|r| r.bytes).sum();
+        let bytes_reserved = self.config.limits.max_total_bytes != 0;
+        if bytes_reserved && !self.try_reserve_total_bytes(incoming_bytes) {
+            return Err(
+                Error::new(ErrorCode::Throttled, "server total-bytes quota reached")
+                    .with_retry_after(crate::limits::LIMIT_RETRY_AFTER_S)
+                    .with_detail(serde_json::json!({
+                        "limit": "max_total_bytes",
+                        "max": self.config.limits.max_total_bytes,
+                    })),
+            );
         }
         // Stage + take a publish ticket UNDER the append lock (the seq-order critical
         // section), so this batch's ticket orders strictly after any direct write
@@ -1157,7 +1280,7 @@ impl Engine {
         if let Some((start, end)) = pub_range {
             dest.materialize_published(start, end);
         }
-        seqs
+        Ok(seqs)
     }
 
     /// Compute the effective priority of a topic right now (DESIGN §3.1).
@@ -1183,13 +1306,16 @@ impl Engine {
     /// WAL frame so config survives restart.
     pub fn put_topic(&self, name: &str, config: TopicConfig) -> Result<(bool, TopicConfig)> {
         if !config::is_valid_name(name) {
-            return Err(Error::invalid_request(format!("invalid topic name {name:?}")));
+            return Err(Error::invalid_request(format!(
+                "invalid topic name {name:?}"
+            )));
         }
-        validate_config(&config)?;
         // Resolve + pin the durability class so the persisted config and every
         // response carry the resolved `durability` (and `durable` stays consistent
         // with it for back-compat). A later in-place PUT can still change it.
         let mut config = config;
+        normalize_config(&mut config);
+        validate_config(&config)?;
         config.normalize_durability();
 
         // A queue's dead-letter topic must differ from itself (API §0.10).
@@ -1217,7 +1343,9 @@ impl Engine {
             if cur_type != config.r#type {
                 return Err(Error::new(
                     ErrorCode::TopicExistsIncompatible,
-                    format!("topic {name:?} already exists as type {cur_type:?}; type is immutable"),
+                    format!(
+                        "topic {name:?} already exists as type {cur_type:?}; type is immutable"
+                    ),
                 )
                 .with_detail(serde_json::json!({
                     "topic": name,
@@ -1328,7 +1456,7 @@ impl Engine {
         // so insert it into the registry. `insert_reserved_topic` still defends
         // against an Occupied entry (releasing the slot) but it can no longer be hit
         // by a same-name create race.
-        let created = self.insert_reserved_topic(name, config.clone(), topic_id);
+        let created = self.insert_reserved_topic(name, config.clone(), topic_id)?;
         Ok((created, config))
     }
 
@@ -1370,7 +1498,12 @@ impl Engine {
     /// frame is already durable, so we don't re-log). The cap slot for `topic_id`
     /// was reserved by [`Self::reserve_topic_slot`]; on the lost-race path it is
     /// released here so the count gauge stays exact.
-    fn insert_reserved_topic(&self, name: &str, config: TopicConfig, topic_id: u32) -> bool {
+    fn insert_reserved_topic(
+        &self,
+        name: &str,
+        config: TopicConfig,
+        topic_id: u32,
+    ) -> Result<bool> {
         use dashmap::mapref::entry::Entry;
         match self.topics.entry(name.to_string()) {
             Entry::Occupied(e) => {
@@ -1379,9 +1512,10 @@ impl Engine {
                 // counts against the cap) and drop the unused id.
                 let b = e.get();
                 *b.config.write() = config;
-                b.enforce_retention(self.clock.now_ms());
+                let harden = self.enforce_retention_durable(b, self.clock.now_ms());
                 self.topic_count.fetch_sub(1, Ordering::AcqRel);
-                false
+                harden?;
+                Ok(false)
             }
             Entry::Vacant(e) => {
                 let mut state = TopicState::new(name.to_string(), topic_id, config, SEQ_BASE, 1);
@@ -1394,7 +1528,7 @@ impl Engine {
                     state.attach_segwriter(writer);
                 }
                 e.insert(Arc::new(state));
-                true
+                Ok(true)
             }
         }
     }
@@ -1601,7 +1735,9 @@ impl Engine {
                 // legacy frame (absent pair) recomputes from the live source head.
                 if created {
                     let cursor = op.initial_cursor.unwrap_or_else(|| {
-                        self.get_topic(&op.source).map(|b| b.head_seq()).unwrap_or(0)
+                        self.get_topic(&op.source)
+                            .map(|b| b.head_seq())
+                            .unwrap_or(0)
                     });
                     let dest_base = op.initial_dest_base.unwrap_or_else(|| {
                         self.get_topic(&op.dest).map(|b| b.head_seq()).unwrap_or(0)
@@ -1610,7 +1746,10 @@ impl Engine {
                     graph.seed_dest_base(&op.name, dest_base);
                 }
             } else {
-                let src_head = self.get_topic(&op.source).map(|b| b.head_seq()).unwrap_or(0);
+                let src_head = self
+                    .get_topic(&op.source)
+                    .map(|b| b.head_seq())
+                    .unwrap_or(0);
                 graph.note_forwarded(&op.name, src_head, 0);
             }
         }
@@ -1880,10 +2019,7 @@ impl Engine {
         let freed_bytes = b.bytes();
         if self.topics.remove(name).is_some() {
             self.topic_count.fetch_sub(1, Ordering::AcqRel);
-            self.total_bytes_live.fetch_sub(
-                freed_bytes.min(self.total_bytes_live.load(Ordering::Relaxed)),
-                Ordering::AcqRel,
-            );
+            self.release_total_bytes(freed_bytes);
         }
         self.routers.lock().remove_touching_topic(name);
         self.refresh_router_source_flags();
@@ -1952,7 +2088,9 @@ impl Engine {
                     return Err(Error::topic_not_found(name));
                 }
                 if !config::is_valid_name(name) {
-                    return Err(Error::invalid_request(format!("invalid topic name {name:?}")));
+                    return Err(Error::invalid_request(format!(
+                        "invalid topic name {name:?}"
+                    )));
                 }
                 validate_config(&create_cfg)?;
                 let (was_created, _cfg) = self.put_topic(name, create_cfg)?;
@@ -2014,7 +2152,7 @@ impl Engine {
 
         // --- Admission (discard:"reject" full-topic check, DESIGN §5.3). ------
         // Enforce retention first so current occupancy is the logical floor.
-        b.enforce_retention(now);
+        self.enforce_retention_durable(&b, now)?;
         let cfg = b.config.read();
         let discard = cfg.discard;
         let cap_records = cfg.cap_records;
@@ -2415,7 +2553,13 @@ impl Engine {
             let cap_bytes = cfg.cap_bytes;
             drop(cfg);
             if discard == Discard::Reject {
-                dest.enforce_retention(now);
+                if let Err(e) = self.enforce_retention_durable(&dest, now) {
+                    tracing::warn!(
+                        router = %r.name, dest = %r.dest, error = %e,
+                        "forward: dest retention harden failed; leaving in source"
+                    );
+                    continue;
+                }
                 let incoming_bytes: u64 = to_append.iter().map(|s| s.bytes).sum();
                 let decision = eviction::admit(
                     discard,
@@ -2608,7 +2752,13 @@ impl Engine {
             (cfg.discard, cfg.cap_records, cfg.cap_bytes)
         };
         if discard == Discard::Reject {
-            dest.enforce_retention(now);
+            if let Err(e) = self.enforce_retention_durable(&dest, now) {
+                tracing::warn!(
+                    router = %router.name, dest = %router.dest, error = %e,
+                    "forward_v2: dest retention harden failed; deferring forward"
+                );
+                return 0;
+            }
         }
 
         let mut seq = cursor + 1;
@@ -2709,7 +2859,18 @@ impl Engine {
         // deterministic seqs (at-least-once, no silent loss).
         let forwarded = to_append.len() as u64;
         if !to_append.is_empty() {
-            self.derived_append(&dest, to_append, now);
+            if let Err(e) = self.derived_append(&dest, to_append, now) {
+                tracing::warn!(
+                    router = %router.name, dest = %router.dest, error = %e,
+                    "forward_v2: derived dest append failed; leaving cursor behind"
+                );
+                self.scheduler.mark_dirty_fast(
+                    &router.source,
+                    self.effective_priority(&source),
+                    &source.sched_dirty,
+                );
+                return 0;
+            }
             // A forward that pushes the dest past a TTL/byte-cap floor durably
             // persists the new floor before it advances (R7), retried on failure.
             if let Err(e) = self.enforce_retention_durable(&dest, now) {
@@ -3100,7 +3261,7 @@ impl Engine {
             let _guard = b.append_lock.lock();
             // Sync floors so `head` reflects current logical state, then pin the
             // point-in-time bound under the lock.
-            b.enforce_retention(now);
+            self.enforce_retention_durable(&b, now)?;
             bound_head = b.head_seq().saturating_add(1);
             commit_token = match &self.wal {
                 Some(w) => {
@@ -3174,7 +3335,10 @@ impl Engine {
         }
         // Durably logged (or pure in-memory): NOW apply the delete in memory,
         // bounded by the same point-in-time head so it matches replay exactly.
-        let deleted = b.apply_delete(req.before_seq, req.match_.as_ref(), Some(bound_head), now);
+        let stats =
+            b.apply_delete_stats(req.before_seq, req.match_.as_ref(), Some(bound_head), now);
+        self.release_total_bytes(stats.bytes_freed);
+        let deleted = stats.deleted;
         ticket.done();
 
         Ok(DeleteResponse {
@@ -3251,12 +3415,15 @@ impl Engine {
         if self.forward_v2 {
             let fan_in = {
                 let graph = self.routers.lock();
-                graph.routers_touching_topic(&req.dest).into_iter().any(|rn| {
-                    rn != name
-                        && graph
-                            .get(&rn)
-                            .is_some_and(|r| r.dest == req.dest && r.source != req.source)
-                })
+                graph
+                    .routers_touching_topic(&req.dest)
+                    .into_iter()
+                    .any(|rn| {
+                        rn != name
+                            && graph
+                                .get(&rn)
+                                .is_some_and(|r| r.dest == req.dest && r.source != req.source)
+                    })
             };
             if fan_in {
                 return Err(Error::new(
@@ -3316,7 +3483,10 @@ impl Engine {
         // committed after this PUT are forwarded (per-source FIFO from "now"). A
         // not-yet-created source reads as head 0 (its auto-create below assigns the
         // same fresh base), which is correct — no historical backfill.
-        let src_head = self.get_topic(&req.source).map(|b| b.head_seq()).unwrap_or(0);
+        let src_head = self
+            .get_topic(&req.source)
+            .map(|b| b.head_seq())
+            .unwrap_or(0);
 
         // Resource limit + cycle check + insert, ALL under the single graph lock
         // (codex P2 #10): `upsert_capped` refuses a NEW router with `429 throttled`
@@ -3681,11 +3851,30 @@ fn name_allowed(name: &str, allow_prefixes: &[String]) -> bool {
     allow_prefixes.is_empty() || allow_prefixes.iter().any(|p| name.starts_with(p.as_str()))
 }
 
-/// Validate a topic config's value ranges (API §1.1). `priority` is clamped on
-/// read, but an out-of-range value supplied here is accepted and clamped by the
-/// scheduler; only structurally-impossible values are rejected. Phase 2 has no
-/// additional invalid combinations, so this currently always succeeds.
-fn validate_config(_config: &TopicConfig) -> Result<()> {
+/// Normalize topic config fields whose API contract says "clamped".
+/// Persisting the normalized value keeps recovered configs from reintroducing an
+/// oversized runtime knob.
+fn normalize_config(config: &mut TopicConfig) {
+    config.lease_ms = config
+        .lease_ms
+        .clamp(crate::config::MIN_LEASE_MS, crate::config::MAX_LEASE_MS);
+    config.claim_jitter_ms = config
+        .claim_jitter_ms
+        .min(crate::config::MAX_CLAIM_JITTER_MS);
+}
+
+/// Validate a topic config's structural constraints (API §1.1). `priority` is
+/// clamped on read, but names that will later be used as topics must be valid at
+/// configuration time.
+fn validate_config(config: &TopicConfig) -> Result<()> {
+    if let Some(dl) = &config.dead_letter {
+        if !crate::config::is_valid_name(dl) {
+            return Err(
+                Error::invalid_request("dead_letter must be a valid topic name")
+                    .with_detail(serde_json::json!({ "dead_letter": dl })),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3896,6 +4085,112 @@ mod tests {
             config: None,
             disable_backpressure: false,
         }
+    }
+
+    #[test]
+    fn queue_config_is_normalized_and_dead_letter_validated() {
+        let (engine, _clock) = engine_with_clock();
+
+        let bad = TopicConfig {
+            r#type: TopicType::Queue,
+            dead_letter: Some("bad name!".to_string()),
+            ..TopicConfig::default()
+        };
+        assert!(engine.put_topic("jobs", bad).is_err());
+
+        let cfg = TopicConfig {
+            r#type: TopicType::Queue,
+            lease_ms: 1,
+            claim_jitter_ms: u64::MAX,
+            dead_letter: Some("dlq".to_string()),
+            ..TopicConfig::default()
+        };
+        let (_created, cfg) = engine.put_topic("jobs", cfg).unwrap();
+        assert_eq!(cfg.lease_ms, crate::config::MIN_LEASE_MS);
+        assert_eq!(cfg.claim_jitter_ms, crate::config::MAX_CLAIM_JITTER_MS);
+    }
+
+    #[test]
+    fn total_bytes_quota_is_released_by_eviction_and_delete() {
+        let clock = TestClock::new(1_000_000);
+        let shared: SharedClock = Arc::new(clock.clone());
+        let data = json!("x".repeat(40));
+        let bytes = payload_bytes(&data, &None);
+        let mut cfg = ServerConfig::default();
+        cfg.limits.max_total_bytes = bytes.saturating_mul(2);
+        let engine = Engine::new(cfg, shared);
+
+        engine
+            .put_topic(
+                "capped",
+                TopicConfig {
+                    cap_bytes: bytes,
+                    discard: Discard::Old,
+                    ..TopicConfig::default()
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            engine
+                .write(
+                    "capped",
+                    write_req(vec![rec(data.clone(), None, None)]),
+                    false,
+                )
+                .unwrap();
+        }
+        let st = engine.topic_state("capped", false).unwrap();
+        assert_eq!(
+            st.count, 1,
+            "discard-old keeps one record under the byte cap"
+        );
+
+        engine
+            .write(
+                "delete-source",
+                write_req(vec![rec(data.clone(), None, None)]),
+                false,
+            )
+            .unwrap();
+        let err = engine
+            .write(
+                "blocked",
+                write_req(vec![rec(data.clone(), None, None)]),
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Throttled);
+        engine
+            .delete(
+                "delete-source",
+                DeleteRequest {
+                    before_seq: Some(2),
+                    match_: None,
+                },
+            )
+            .unwrap();
+        engine
+            .write("blocked", write_req(vec![rec(data, None, None)]), false)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_rejects_second_live_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ServerConfig {
+            data_dir: Some(dir.path().to_string_lossy().into_owned()),
+            ..ServerConfig::default()
+        };
+        let clock: SharedClock = Arc::new(TestClock::new(1_000_000));
+        let first = Engine::with_data_dir(cfg.clone(), clock.clone()).unwrap();
+        let second = Engine::with_data_dir(cfg.clone(), clock.clone());
+        assert!(
+            second.is_err(),
+            "second live owner must not open same data dir"
+        );
+        drop(first);
+        Engine::with_data_dir(cfg, clock).unwrap();
     }
 
     fn diff_from(from_seq: u64) -> DiffRequest {
@@ -4850,7 +5145,9 @@ mod tests {
                 .unwrap();
         }
         // Prefix filter.
-        let page = engine.list_topics(Some("a"), 100, None, false, &[]).unwrap();
+        let page = engine
+            .list_topics(Some("a"), 100, None, false, &[])
+            .unwrap();
         assert_eq!(page.topics.len(), 3);
         assert!(page.next_cursor.is_none());
 

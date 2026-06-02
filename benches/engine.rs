@@ -21,9 +21,9 @@ use serde_json::{json, Value};
 
 use streams::clock::{Clock, SharedClock, SystemClock};
 use streams::config::ServerConfig;
-use streams::engine::topic_state::{TopicIndex, TopicState, StoredRecord};
+use streams::engine::topic_state::{StoredRecord, TopicIndex, TopicState};
 use streams::engine::{Engine, SEQ_BASE};
-use streams::types::{TopicConfig, DiffRequest, Discard, Filter, FilterOp, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, Discard, Filter, FilterOp, RecordIn, TopicConfig, WriteRequest};
 
 const TOPIC: &str = "bench";
 

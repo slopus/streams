@@ -59,7 +59,7 @@ use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage
 use streams::storage::{
     load_latest_with, next_snapshot_id_with, write_snapshot_with, Checkpoint, Fs, Snapshot,
 };
-use streams::types::{TopicConfig, TopicType, DiffRequest, RecordIn, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 const DATA_DIR: &str = "/data";
 

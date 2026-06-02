@@ -51,7 +51,7 @@ use streams::config::SegmentConfig;
 use streams::engine::segwriter::{copy_segment_to_cold, SegmentWriter};
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, MonitorFs, TornDamage};
 use streams::storage::{
-    data_name, TopicTier, Fs, LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier,
+    data_name, Fs, LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier, TopicTier,
 };
 
 // ===========================================================================

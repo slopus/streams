@@ -35,7 +35,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::types::{TopicConfig, Durability, RecordIn, WriteRequest};
+use streams::types::{Durability, RecordIn, TopicConfig, WriteRequest};
 
 /// One benchmark configuration.
 struct Params {

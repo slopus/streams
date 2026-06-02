@@ -37,7 +37,7 @@ use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::wal::{Wal, WalConfig, WalReader, WalRecord};
 use streams::storage::{Fs, OpenOpts};
-use streams::types::{TopicConfig, TopicType, RecordIn, WriteRequest};
+use streams::types::{RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Shared plumbing (mirrors tests/crash_oracle.rs and src/storage/testfs.rs)
@@ -939,7 +939,7 @@ fn f_seg_crash_after_data_before_idx() {
 #[test]
 fn f_cold_crash_after_copy_before_flip() {
     use streams::storage::segment::{data_name, idx_name, SegmentBuilder, SegmentRecord};
-    use streams::storage::{TopicTier, LocalSegmentStore, SegmentPart, SegmentStore, Tier};
+    use streams::storage::{LocalSegmentStore, SegmentPart, SegmentStore, Tier, TopicTier};
 
     let disk = FakeDisk::new();
     let hot_root = PathBuf::from(DATA_DIR).join("hot");

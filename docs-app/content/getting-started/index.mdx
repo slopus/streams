@@ -123,7 +123,8 @@ operational edges are partial or planned.
   WAL-logged so one source append is one WAL write, durable per-router cursor with
   replay-from-cursor recovery, single-source-per-dest); the
   three durability classes (`memory`/`disk`/`fsync`); segments, snapshots, and crash
-  recovery; the per-topic tag index; node loop-prevention; bearer auth with keys hashed at
+  recovery; advisory single-writer fencing on the data directory; the per-topic tag index;
+  node loop-prevention; bearer auth with keys hashed at
   rest, optional per-key scopes and a topic-name prefix allowlist; DoS-hardening resource
   limits; optional hot→cold segment tiering; and the loopback-default bind.
 - **Partial** — the cap-vs-TTL tombstone *reason* is best-effort across a restart (the gap
@@ -133,8 +134,9 @@ operational edges are partial or planned.
 - **Out of scope (by design, not on the roadmap)** — native TLS (terminate at a
   TLS-terminating reverse proxy), hard multi-tenant **namespace** isolation beyond the
   per-key scope + topic-name-prefix allowlist that ships today, multi-server / replication /
-  HA / single-writer fencing, LSM / keyed log compaction, and durable consumer groups as a
-  server primitive (built instead as an app pattern: a topic per consumer + delete).
+  HA beyond the single-process data-dir lock, LSM / keyed log compaction, and durable
+  consumer groups as a server primitive (built instead as an app pattern: a topic per
+  consumer + delete).
 
 <Callout type="warning">
   streams speaks **plain HTTP** — it does not terminate TLS. For any non-loopback

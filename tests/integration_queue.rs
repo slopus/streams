@@ -246,7 +246,10 @@ fn work_stream_releases_leases_on_disconnect() {
             .build()
             .unwrap();
         let mut resp = client
-            .get(format!("{}/v0/topics/jobs/work?node=w1&max=2", h.base_url()))
+            .get(format!(
+                "{}/v0/topics/jobs/work?node=w1&max=2",
+                h.base_url()
+            ))
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send()
             .unwrap();
@@ -677,7 +680,10 @@ fn queue_survives_restart_and_leases_self_heal() {
             "non-durable leases self-heal: all jobs claimable after restart",
         );
         // And they can all be claimed.
-        let (_, body) = h.post("/v0/topics/jobs/claim", json!({ "node": "w-new", "max": 3 }));
+        let (_, body) = h.post(
+            "/v0/topics/jobs/claim",
+            json!({ "node": "w-new", "max": 3 }),
+        );
         assert_eq!(body["count"], json!(3));
     }
 }

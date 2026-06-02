@@ -25,7 +25,7 @@ use serde_json::json;
 use streams::clock::{SharedClock, SystemClock};
 use streams::config::ServerConfig;
 use streams::engine::Engine;
-use streams::types::{TopicConfig, DiffRequest, RecordIn, RouterCreateRequest, WriteRequest};
+use streams::types::{DiffRequest, RecordIn, RouterCreateRequest, TopicConfig, WriteRequest};
 
 fn durable_engine(dir: &std::path::Path) -> Arc<Engine> {
     let clock: SharedClock = Arc::new(SystemClock);

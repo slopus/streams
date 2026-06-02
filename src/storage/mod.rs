@@ -48,15 +48,15 @@ pub use segment::{
     SEG_DEL_SENTINEL, SEG_FRAME_CRC_LEN, SEG_FRAME_DEL_LEN, SEG_FRAME_HEADER_LEN,
 };
 pub use segstore::{
-    TopicTier, LocalSegmentStore, SegmentId, SegmentPart, SegmentStore, StoreError, Tier,
+    LocalSegmentStore, SegmentId, SegmentPart, SegmentStore, StoreError, Tier, TopicTier,
 };
 pub use sharded_wal::{shard_for_topic, shard_wal_dir, ShardedWal, ShardedWalWriter};
 pub use snapshot::{
     load_latest, load_latest_with, next_snapshot_id, next_snapshot_id_with, write_snapshot,
-    write_snapshot_with, Checkpoint, Snapshot, SnapshotTopic, SnapshotError, SnapshotRecord,
-    SnapshotRouter,
+    write_snapshot_with, Checkpoint, Snapshot, SnapshotError, SnapshotRecord, SnapshotRouter,
+    SnapshotTopic,
 };
 pub use wal::{
-    TopicConfigOp, CommitToken, LeaseEvent, MatchSel, RouterOp, Wal, WalConfig, WalError, WalFrame,
+    CommitToken, LeaseEvent, MatchSel, RouterOp, TopicConfigOp, Wal, WalConfig, WalError, WalFrame,
     WalMetrics, WalReader, WalRecord, WalWriter, FRAME_CRC_LEN, FRAME_HEADER_LEN, FSYNC_BUCKETS_US,
 };

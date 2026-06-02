@@ -51,7 +51,7 @@ use streams::config::ServerConfig;
 use streams::engine::Engine;
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
-use streams::types::{TopicConfig, TopicType, Durability, RecordIn, WriteRequest};
+use streams::types::{Durability, RecordIn, TopicConfig, TopicType, WriteRequest};
 
 // ===========================================================================
 // Engine build / clock / data-dir plumbing through a FakeDisk (mirrors

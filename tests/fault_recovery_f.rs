@@ -44,7 +44,7 @@ use streams::storage::testfs::{FakeDisk, TornDamage};
 use streams::storage::wal::{encode_frame, WalReader, WalRecord};
 use streams::storage::OpenOpts;
 use streams::types::{
-    TopicConfig, TopicType, DeleteRequest, DiffRequest, Filter, RecordIn, WriteRequest,
+    DeleteRequest, DiffRequest, Filter, RecordIn, TopicConfig, TopicType, WriteRequest,
 };
 
 // ===========================================================================
@@ -103,7 +103,10 @@ impl RefModel {
     }
 
     fn ack_append(&mut self, name: &str, seqs: &[u64], recs: &[ModelRecord]) {
-        let b = self.topics.get_mut(name).expect("topic modeled before append");
+        let b = self
+            .topics
+            .get_mut(name)
+            .expect("topic modeled before append");
         for (s, r) in seqs.iter().zip(recs.iter()) {
             b.acked.insert(*s, r.clone());
             b.ever_acked.insert(*s, r.clone());
@@ -333,7 +336,12 @@ fn dump_topic(engine: &Engine, name: &str) -> Option<TopicDump> {
 // (distilled from `tests/crash_oracle.rs::assert_topic_contract`).
 // ===========================================================================
 
-fn assert_topic_contract(name: &str, model: &ModelTopic, dump: &TopicDump, whole_tail_durable: bool) {
+fn assert_topic_contract(
+    name: &str,
+    model: &ModelTopic,
+    dump: &TopicDump,
+    whole_tail_durable: bool,
+) {
     let live = model.live_seqs();
     let survivors: Vec<u64> = dump.records.keys().copied().collect();
 

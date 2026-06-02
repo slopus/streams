@@ -208,9 +208,9 @@ recovery costs.
   application level with a tag + a point-in-time `match` delete of prior versions.
 - **Durable consumer groups as a server primitive:** **Out of scope** — they are an application-level
   pattern (a topic per consumer + delete-as-ack), not a built-in server feature.
-- **Multi-server / replication / HA / single-writer fencing, native TLS, hard multi-tenancy:**
-  **Out of scope** — streams is single-server (TLS terminates at a reverse proxy; tenancy is per-key
-  scopes + topic-name-prefix allowlists).
+- **Multi-server / replication / HA, native TLS, hard multi-tenancy:**
+  **Out of scope** — streams is single-server with an advisory data-dir single-writer lock
+  (TLS terminates at a reverse proxy; tenancy is per-key scopes + topic-name-prefix allowlists).
 - **Auto-priority constants** (`AUTO_MAX=500`, `HALF_LIFE_MS=30000`) and **band weights/boundaries**
   are starting defaults; phase 3/4 benchmarks may retune them. The formula and knobs are stable; the
   numbers are tunable.

@@ -375,7 +375,10 @@ fn diff_node_loop_prevention_advances_cursor_silently() {
         json!({ "records": [{ "data": 1, "node": "me" }, { "data": 2, "node": "me" }] }),
     );
     assert_eq!(status, StatusCode::CREATED);
-    let (_, body) = h.post("/v0/topics/own/diff", json!({ "from_seq": 0, "node": "me" }));
+    let (_, body) = h.post(
+        "/v0/topics/own/diff",
+        json!({ "from_seq": 0, "node": "me" }),
+    );
     assert_eq!(body["records"].as_array().unwrap().len(), 0);
     assert_eq!(body["caught_up"], true);
     assert_eq!(body["next_from_seq"], 2);

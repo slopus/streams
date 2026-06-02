@@ -28,6 +28,7 @@ top-level subtrees: `meta/`, `wal/`, and `topics/`.
 
 <FileTree>
   <FileTree.Folder name="streams-data (STREAMS_DATA_DIR)" defaultOpen>
+    <FileTree.File name=".streams.lock" />
     <FileTree.Folder name="meta" defaultOpen>
       <FileTree.File name="snapshot.0007.bin" />
       <FileTree.File name="snapshot.0006.bin" />
@@ -68,6 +69,8 @@ top-level subtrees: `meta/`, `wal/`, and `topics/`.
 - **`topics/`** — one directory **per topic**, named by the interned **numeric topic id** (hex), not
   the topic name (this is what makes [path traversal impossible](/deployment/security#no-path-traversal)).
   Segments are per-topic so eviction, mmap, and read locality are independent across topics.
+- **`.streams.lock`** — an advisory exclusive lock held by the running process. A second process
+  pointed at the same data directory fails startup instead of appending to the same WAL.
 
 <Callout type="warning">
   The data directory holds **every record's payload in the clear** (WAL frames and segment

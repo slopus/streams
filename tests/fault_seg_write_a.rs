@@ -42,7 +42,7 @@ use streams::storage::segment::{
     data_name, decode_data_frame, idx_name, lookup, SegmentBuilder, SegmentError, SegmentRecord,
 };
 use streams::storage::segstore::{
-    TopicTier, LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier,
+    LocalSegmentStore, SegmentPart, SegmentStore, StoreError, Tier, TopicTier,
 };
 use streams::storage::testfs::{FakeDisk, FaultFs, FaultKind, FaultOp, TornDamage};
 use streams::storage::Fs;
