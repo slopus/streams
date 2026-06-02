@@ -7,7 +7,7 @@ import { Callout, Steps, Cards } from 'nextra/components'
 
 # Running streams
 
-streams ships as one **durable single binary**: the complete `/v0` API backed by a
+streams runs as one **self-contained server**: the complete `/v0` API backed by a
 write-ahead log on local disk, with no external dependencies — no database, no broker, no
 sidecar. You build it once, point it at a data directory, and run it. This page covers
 what the process does on start, how it binds and authenticates, and how it shuts down.

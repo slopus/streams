@@ -27,16 +27,16 @@ Get those two halves right and an A↔B↔C mirror is echo-free and loop-free wi
 
 Complementary: node-filtering prevents *delivery* of your own events; the hop-cap prevents *unbounded forwarding*.
 
-## Recipe — a two-node A↔B mirror
+## Recipe — a two-node api-fra-1 ↔ api-iad-1 mirror
 
 The simplest multi-master: two logical nodes (origin labels), each with its own topic **in the same server**, mirrored both ways with local routers so each node sees the other's writes. (Nodes are content labels, not machines — streams is single-server.)
 
 ```text
-   node A (label)                        node B (label)
-   write $node=A ──► ┌────────┐  router A→B  ┌────────┐ ◄── write $node=B
-                     │ topic-A   │ ───────────► │ topic-B  │
-   read node=A   ◄── │ (local) │ ◄─────────── │(local) │ ──► read node=B
-                     └────────┘  router B→A  └────────┘
+   node api-fra-1 (label)                                node api-iad-1 (label)
+   write $node=api-fra-1 ─► ┌──────────────┐  router fra→iad  ┌──────────────────────┐ ◄─ write $node=api-iad-1
+                            │ chat:general │ ───────────────► │ chat:general:mirror  │
+   read node=api-fra-1   ◄─ │   (local)    │ ◄─────────────── │       (local)        │ ─► read node=api-iad-1
+                            └──────────────┘  router iad→fra  └──────────────────────┘
 ```
 
 <Steps>
@@ -45,42 +45,44 @@ The simplest multi-master: two logical nodes (origin labels), each with its own 
 
 A node stamps every write with its identity. The batch-level `node` is the common one-writer case.
 
-```bash
-# On node A:
-curl -X POST localhost:4000/v0/topics/events \
-  -H 'content-type: application/json' \
-  -d '{ "node": "A",
-        "records": [ { "data": { "evt": "user.created", "id": 42 } } ] }'
+Examples use `$STREAMS` as the base URL — see the [Quickstart](/getting-started/quickstart).
 
-# On node B:
-curl -X POST localhost:4000/v0/topics/events \
+```bash
+# On node api-fra-1:
+curl -X POST $STREAMS/v0/topics/chat:general \
   -H 'content-type: application/json' \
-  -d '{ "node": "B",
-        "records": [ { "data": { "evt": "order.placed", "id": 7 } } ] }'
+  -d '{ "node": "api-fra-1",
+        "records": [ { "data": { "from": "user-1042", "text": "hey team" } } ] }'
+
+# On node api-iad-1:
+curl -X POST $STREAMS/v0/topics/chat:general \
+  -H 'content-type: application/json' \
+  -d '{ "node": "api-iad-1",
+        "records": [ { "data": { "from": "user-2087", "text": "on my way" } } ] }'
 ```
 
-The origin `$node` (`A` or `B`) is now immutable and rides through every forward.
+The origin `$node` (`api-fra-1` or `api-iad-1`) is now immutable and rides through every forward.
 
 ### Create symmetric routers between the nodes
 
-One router each direction. Because A→B and B→A together form a directed cycle, set `allow_cycle: true` on both so creation isn't rejected with `409 router_cycle`; the route then uses hop-cap loop-breaking. `preserve_node: true` (the default) is what carries `$node` across the forward — **do not** set it false, or loop-prevention breaks.
+One router each direction. Because fra→iad and iad→fra together form a directed cycle, set `allow_cycle: true` on both so creation isn't rejected with `409 router_cycle`; the route then uses hop-cap loop-breaking. `preserve_node: true` (the default) is what carries `$node` across the forward — **do not** set it false, or loop-prevention breaks.
 
 ```bash
-# Router forwarding A's topic into B's topic:
-curl -X PUT localhost:4000/v0/routers/a-to-b \
+# Router forwarding api-fra-1's topic into api-iad-1's topic:
+curl -X PUT $STREAMS/v0/routers/fra-to-iad \
   -H 'content-type: application/json' \
-  -d '{ "source": "events", "dest": "events-mirror", "allow_cycle": true }'
+  -d '{ "source": "chat:general", "dest": "chat:general:mirror", "allow_cycle": true }'
 
-# Router forwarding B's topic back into A's topic (symmetric):
-curl -X PUT localhost:4000/v0/routers/b-to-a \
+# Router forwarding api-iad-1's topic back into api-fra-1's topic (symmetric):
+curl -X PUT $STREAMS/v0/routers/iad-to-fra \
   -H 'content-type: application/json' \
-  -d '{ "source": "events-mirror", "dest": "events", "allow_cycle": true }'
+  -d '{ "source": "chat:general:mirror", "dest": "chat:general", "allow_cycle": true }'
 ```
 
 ```json
 # →
-{ "router": "a-to-b", "created": true,
-  "source": "events", "dest": "events-mirror",
+{ "router": "fra-to-iad", "created": true,
+  "source": "chat:general", "dest": "chat:general:mirror",
   "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": true,
   "performance": { "server_total_ms": 0.20 } }
 ```
@@ -99,25 +101,25 @@ curl -X PUT localhost:4000/v0/routers/b-to-a \
 Each node reads the merged stream and passes **its own** node id as the loop-prevention filter, so it sees the others' events but never its own echoes.
 
 ```bash
-# On node A — read everything, drop records A produced:
-curl -X POST localhost:4000/v0/topics/events/diff \
+# On node api-fra-1 — read everything, drop records api-fra-1 produced:
+curl -X POST $STREAMS/v0/topics/chat:general/diff \
   -H 'content-type: application/json' \
-  -d '{ "from_seq": 0, "node": "A" }'
+  -d '{ "from_seq": 0, "node": "api-fra-1" }'
 ```
 
 ```json
 # →
-{ "topic": "events",
+{ "topic": "chat:general",
   "records": [
-    { "$seq": 12, "$ts": 1748470000500, "$node": "B",
-      "data": { "evt": "order.placed", "id": 7 } }
+    { "$seq": 12, "$ts": 1748470000500, "$node": "api-iad-1",
+      "data": { "from": "user-2087", "text": "on my way" } }
   ],
   "next_from_seq": 12, "head_seq": 12, "earliest_seq": 1,
   "caught_up": true, "tombstone": null, "lag": 0,
   "performance": { "server_total_ms": 0.31 } }
 ```
 
-A's own records (`$node: "A"`) were filtered out — but the cursor still advanced **past** them. So `caught_up`, not `records.length`, is the "no more right now" signal.
+api-fra-1's own records (`$node: "api-fra-1"`) were filtered out — but the cursor still advanced **past** them. So `caught_up`, not `records.length`, is the "no more right now" signal.
 
 </Steps>
 
@@ -131,15 +133,15 @@ A's own records (`$node: "A"`) were filtered out — but the cursor still advanc
 
 ## Scaling to N nodes
 
-The pattern generalizes: each of N nodes sets a distinct `node` id, and you connect them with routers so every node's writes reach every other node. You can use a full mesh (a router from each node to each other), a ring, or a hub — node loop-prevention keeps delivery echo-free in any topology, because the origin `$node` is preserved no matter how many hops a record takes. Reads on each node pass that node's own id (or several ids, `"node": ["A","A-replica"]`, to filter multiple of its own identities).
+The pattern generalizes: each of N nodes sets a distinct `node` id, and you connect them with routers so every node's writes reach every other node. You can use a full mesh (a router from each node to each other), a ring, or a hub — node loop-prevention keeps delivery echo-free in any topology, because the origin `$node` is preserved no matter how many hops a record takes. Reads on each node pass that node's own id (or several ids, `"node": ["api-fra-1","api-fra-1-replica"]`, to filter multiple of its own identities).
 
 Watch the merged stream live instead of polling — the loop-prevention filter applies to SSE identically:
 
 ```bash
-curl -X POST localhost:4000/v0/watch \
+curl -X POST $STREAMS/v0/watch \
   -H 'content-type: application/json' \
-  -d '{ "node": "A", "topics": { "events": { "from_seq": 0 } } }'
-# → returns a wid; GET it to stream. Records with $node "A" are never delivered to A.
+  -d '{ "node": "api-fra-1", "topics": { "chat:general": { "from_seq": 0 } } }'
+# → returns a wid; GET it to stream. Records with $node "api-fra-1" are never delivered to api-fra-1.
 ```
 
 ## Loop-breaking: why it never runs forever

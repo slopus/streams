@@ -13,7 +13,7 @@ deleting one (`DELETE`). Writing and reading *records* live on [Writing](/api/wr
 [Reading](/api/reading); this is the control plane.
 
 Topic names match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` — 1–255 chars, starting alphanumeric,
-allowing `. _ : -`. The `:` enables namespacing like `jobs:tenantA`. Names are
+allowing `. _ : -`. The `:` enables namespacing like `orders:tenantA`. Names are
 case-sensitive and byte-exact. A topic is created lazily on first write, so the `PUT` here is
 optional — use it to set config up front.
 
@@ -32,15 +32,15 @@ this a queue (and supply the queue-tuning fields here too).
 { "ttl_ms": 60000, "cap_records": 1000000, "discard": "old", "durable": true, "priority": 10 }
 ```
 
-A durable, unbounded `jobs` queue that fails loudly rather than dropping unconsumed work:
+A durable, unbounded `transcode` queue that fails loudly rather than dropping unconsumed work:
 
 ```json
 { "type": "queue", "durable": true, "discard": "reject",
-  "lease_ms": 30000, "claim_jitter_ms": 0, "max_deliveries": 5, "dead_letter": "jobs.dlq" }
+  "lease_ms": 30000, "claim_jitter_ms": 0, "max_deliveries": 5, "dead_letter": "transcode.dlq" }
 ```
 
 ```bash
-curl -X PUT localhost:4000/v0/topics/jobs \
+curl -X PUT $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
   -d '{ "durable": true, "cap_records": 1000000, "ttl_ms": 0 }'
 ```
@@ -63,7 +63,7 @@ curl -X PUT localhost:4000/v0/topics/jobs \
 
 ```json
 {
-  "topic": "jobs",
+  "topic": "orders",
   "created": true,
   "config": { "type": "log", "ttl_ms": 0, "cap_records": 1000000, "cap_bytes": 0,
               "discard": "old", "durable": true, "durability": "fsync", "priority": null,
@@ -101,14 +101,14 @@ auto-priority recency clock.
 recency (for monitoring scrapes that should not make a topic look "hot").
 
 ```bash
-curl localhost:4000/v0/topics/jobs
+curl $STREAMS/v0/topics/orders
 ```
 
 **Response** (`200`) — a plain log topic
 
 ```json
 {
-  "topic": "jobs",
+  "topic": "orders",
   "type": "log",
   "head_seq": 480231,
   "earliest_seq": 479101,
@@ -149,7 +149,7 @@ counters:
 
 ```json
 {
-  "topic": "jobs",
+  "topic": "transcode",
   "type": "queue",
   "head_seq": 480231, "earliest_seq": 479101, "next_seq": 480232,
   "count": 1130, "bytes": 2310912,
@@ -194,7 +194,7 @@ prefix-restricted key sees only the names inside its allowlist.
 | `touch` | bool | `false` | Listing does not bump auto-priority unless set `true`. |
 
 ```bash
-curl 'localhost:4000/v0/topics?prefix=jobs&page_size=100'
+curl "$STREAMS/v0/topics?prefix=orders&page_size=100"
 ```
 
 **Response** (`200`)
@@ -202,10 +202,10 @@ curl 'localhost:4000/v0/topics?prefix=jobs&page_size=100'
 ```json
 {
   "topics": [
-    { "topic": "jobs",   "head_seq": 480231, "earliest_seq": 479101, "count": 1130, "bytes": 2310912, "durable": true,  "effective_priority": 500 },
+    { "topic": "orders", "head_seq": 480231, "earliest_seq": 479101, "count": 1130, "bytes": 2310912, "durable": true,  "effective_priority": 500 },
     { "topic": "events", "head_seq": 99,     "earliest_seq": 1,      "count": 99,   "bytes": 8112,    "durable": false, "effective_priority": 3 }
   ],
-  "next_cursor": "eyJhZnRlciI6ImpvYnMifQ==",
+  "next_cursor": "eyJhZnRlciI6Im9yZGVycyJ9",
   "performance": { "server_total_ms": 0.18 }
 }
 ```
@@ -239,14 +239,14 @@ every router referencing it as `source` or `dest`. Idempotent and irreversible. 
 else `409 topic_not_empty`.
 
 ```bash
-curl -X DELETE localhost:4000/v0/topics/jobs
+curl -X DELETE $STREAMS/v0/topics/orders
 ```
 
 **Response** (`200`)
 
 ```json
-{ "topic": "jobs", "deleted": true,
-  "routers_removed": ["jobs->audit", "jobs->mirror"],
+{ "topic": "orders", "deleted": true,
+  "routers_removed": ["orders->audit", "orders->analytics"],
   "performance": { "server_total_ms": 0.31 } }
 ```
 

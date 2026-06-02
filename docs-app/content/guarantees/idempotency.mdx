@@ -30,13 +30,13 @@ The control plane (create, configure, delete) is idempotent without you doing an
 
 ```bash
 # Identical PUTs are no-ops; safe to retry.
-curl -X PUT localhost:4000/v0/topics/jobs \
+curl -X PUT $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
   -d '{ "durable": true, "cap_records": 1000000 }'
 ```
 
 ```json
-{ "topic": "jobs", "created": false,
+{ "topic": "orders", "created": false,
   "config": { "...": "..." },
   "performance": { "server_total_ms": 0.08 } }
 ```
@@ -55,19 +55,19 @@ key, to the same topic, **within the window** returns the **original** seqs with
 `"deduped": true` and does **not** append again.
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs \
+curl -X POST $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
-  -d '{ "node": "worker-eu-1",
+  -d '{ "node": "checkout-1",
         "idempotency_key": "client-batch-7f3a",
         "records": [
-          { "data": { "url": "s3://b/a.png" }, "tag": "tenant42:job-9001" }
+          { "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 }, "tag": "order-7731" }
         ] }'
 ```
 
 The first call appends and returns the assigned seqs:
 
 ```json
-{ "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
+{ "topic": "orders", "first_seq": 1, "last_seq": 1, "seqs": [1],
   "head_seq": 1, "count": 1, "created": false, "deduped": false,
   "performance": { "server_total_ms": 0.62, "fsync_ms": 0.39 } }
 ```
@@ -75,7 +75,7 @@ The first call appends and returns the assigned seqs:
 A retry with the same key, in-window, returns the **same** seqs and appends nothing:
 
 ```json
-{ "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
+{ "topic": "orders", "first_seq": 1, "last_seq": 1, "seqs": [1],
   "head_seq": 1, "count": 1, "created": false, "deduped": true,
   "performance": { "server_total_ms": 0.05 } }
 ```
@@ -103,10 +103,10 @@ The key may be supplied either as the body field `idempotency_key` or as the HTT
 convenient for clients that attach an idempotency key uniformly across requests.
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs \
+curl -X POST $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: client-batch-7f3a' \
-  -d '{ "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
+  -d '{ "records": [ { "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 } } ] }'
 ```
 
 The key is scoped to the topic and bounded to 256 characters.

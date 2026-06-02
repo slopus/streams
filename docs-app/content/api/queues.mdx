@@ -74,11 +74,11 @@ changes it returns `409 topic_exists_incompatible`.
 
 ```bash
 # A durable queue that fails loudly when full, with dead-lettering after 5 deliveries.
-curl -X PUT localhost:4000/v0/topics/jobs \
+curl -X PUT $STREAMS/v0/topics/transcode \
   -H 'content-type: application/json' \
   -d '{ "type": "queue", "durable": true, "discard": "reject",
         "lease_ms": 30000, "claim_jitter_ms": 0,
-        "max_deliveries": 5, "dead_letter": "jobs.dlq" }'
+        "max_deliveries": 5, "dead_letter": "transcode.dlq" }'
 ```
 
 | Field | Type | Default | Meaning |
@@ -92,10 +92,10 @@ curl -X PUT localhost:4000/v0/topics/jobs \
 Produce jobs with a normal write — the queue is just a topic:
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs \
+curl -X POST $STREAMS/v0/topics/transcode \
   -H 'content-type: application/json' \
-  -d '{ "records": [ { "data": { "type": "resize", "url": "s3://b/x.png" },
-                       "tag": "tenant42:job-8800" } ] }'
+  -d '{ "records": [ { "data": { "type": "transcode", "src": "s3://uploads/clip-8800.mov", "preset": "h264-1080p" },
+                       "tag": "clip-8800" } ] }'
 ```
 
 ## POST /v0/topics/:q/claim — lease jobs to a worker
@@ -110,7 +110,7 @@ counter.
 **Request body**
 
 ```json
-{ "node": "worker-eu-1", "max": 16, "lease_ms": 30000 }
+{ "node": "api-fra-1", "max": 16, "lease_ms": 30000 }
 ```
 
 | Field | Type | Req? | Default | Meaning |
@@ -123,14 +123,14 @@ counter.
 
 ```json
 {
-  "topic": "jobs",
+  "topic": "transcode",
   "claimed": [
     { "$seq": 480101, "lease_id": "lease_7f3a9c", "deadline": 1748450039000,
-      "$ts": 1748450001000, "$tag": "tenant42:job-8800", "deliveries": 1,
-      "data": { "type": "resize", "url": "s3://b/x.png" }, "meta": { "trace": "z9" } },
+      "$ts": 1748450001000, "$tag": "clip-8800", "deliveries": 1,
+      "data": { "type": "transcode", "src": "s3://uploads/clip-8800.mov", "preset": "h264-1080p" }, "meta": { "trace": "z9" } },
     { "$seq": 480104, "lease_id": "lease_7f3a9d", "deadline": 1748450039000,
       "$ts": 1748450001050, "deliveries": 2,
-      "data": { "type": "thumbnail", "url": "s3://b/y.png" } }
+      "data": { "type": "thumbnail", "src": "s3://uploads/clip-8804.mov", "at_sec": 5 } }
   ],
   "count": 2,
   "ready": 840,
@@ -161,7 +161,7 @@ equals the topic's `durable` — an acked+deleted job stays gone iff its delete 
 **Request body**
 
 ```json
-{ "node": "worker-eu-1", "seqs": [480101, 480104], "lease_ids": ["lease_1a2b", "lease_3c4d"] }
+{ "node": "api-fra-1", "seqs": [480101, 480104], "lease_ids": ["lease_1a2b", "lease_3c4d"] }
 ```
 
 | Field | Type | Req? | Meaning |
@@ -179,7 +179,7 @@ the lease, so its ack is skipped and the job may run twice.
 **Response** (`200`)
 
 ```json
-{ "topic": "jobs", "acked": 2, "skipped": [],
+{ "topic": "transcode", "acked": 2, "skipped": [],
   "ready": 840, "in_flight": 286,
   "performance": { "server_total_ms": 0.30, "fsync_ms": 0.21 } }
 ```
@@ -206,7 +206,7 @@ sooner (or after `delay_ms`).
 **Request body**
 
 ```json
-{ "node": "worker-eu-1", "seqs": [480104], "delay_ms": 0, "lease_ids": ["lease_3c4d"] }
+{ "node": "api-fra-1", "seqs": [480104], "delay_ms": 0, "lease_ids": ["lease_3c4d"] }
 ```
 
 | Field | Type | Req? | Default | Meaning |
@@ -222,7 +222,7 @@ incrementing the delivery counter on its next claim (and subject to dead-letteri
 **Response** (`200`)
 
 ```json
-{ "topic": "jobs", "nacked": 1, "skipped": [],
+{ "topic": "transcode", "nacked": 1, "skipped": [],
   "ready": 841, "in_flight": 285,
   "performance": { "server_total_ms": 0.18 } }
 ```
@@ -246,7 +246,7 @@ now."
 **Request body**
 
 ```json
-{ "node": "worker-eu-1", "seqs": [480101], "lease_ms": 30000, "lease_ids": ["lease_1a2b"] }
+{ "node": "api-fra-1", "seqs": [480101], "lease_ms": 30000, "lease_ids": ["lease_1a2b"] }
 ```
 
 | Field | Type | Req? | Meaning |
@@ -262,7 +262,7 @@ skipped; the worker should re-claim. Extending does **not** change the delivery 
 **Response** (`200`)
 
 ```json
-{ "topic": "jobs", "extended": 1, "skipped": [],
+{ "topic": "transcode", "extended": 1, "skipped": [],
   "deadlines": { "480101": 1748450069000 },
   "performance": { "server_total_ms": 0.12 } }
 ```
@@ -345,7 +345,7 @@ sub-object beside the normal topic state:
 
 ```json
 {
-  "topic": "jobs", "type": "queue",
+  "topic": "transcode", "type": "queue",
   "head_seq": 480231, "earliest_seq": 479101, "count": 1130,
   "config": { "type": "queue", "lease_ms": 30000 },
   "queue": { "ready": 842, "in_flight": 288, "dead_lettered": 4 },
@@ -375,7 +375,7 @@ scope](/deployment/security)) — the worker still **acks** (and may nack/extend
 separate `POST` endpoints above; the stream only *delivers*.
 
 ```bash
-curl -N 'localhost:4000/v0/topics/jobs/work?node=worker-eu-1&max=8' \
+curl -N "$STREAMS/v0/topics/transcode/work?node=api-fra-1&max=8" \
   -H 'accept: text/event-stream'
 ```
 
@@ -397,7 +397,7 @@ the job `$seq` (an opaque resume hint; the authoritative lease state lives serve
 ```text
 id: 480101
 event: job
-data: {"topic":"jobs","$seq":480101,"lease_id":"lease_7f3a9c","deadline":1748450039000,"$ts":1748450001000,"$tag":"tenant42:job-8800","deliveries":1,"data":{"type":"resize","url":"s3://b/x.png"}}
+data: {"topic":"transcode","$seq":480101,"lease_id":"lease_7f3a9c","deadline":1748450039000,"$ts":1748450001000,"$tag":"clip-8800","deliveries":1,"data":{"type":"transcode","src":"s3://uploads/clip-8800.mov","preset":"h264-1080p"}}
 
 : hb
 ```

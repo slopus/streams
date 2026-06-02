@@ -64,11 +64,11 @@ Validate the subscription and return a `wid` plus the per-topic starting waterma
 
 ```json
 {
-  "node": "worker-eu-1",
+  "node": "web-1",
   "topics": {
-    "jobs":   { "from_seq": 4096 },
-    "events": { "tail": true },
-    "audit":  { "from_seq": 1 }
+    "orders":        { "from_seq": 4096 },
+    "notifications": { "tail": true },
+    "audit":         { "from_seq": 1 }
   },
   "limit": 256,
   "max_batch_bytes": 262144,
@@ -102,9 +102,9 @@ Validate the subscription and return a `wid` plus the per-topic starting waterma
   "stream_url": "/v0/watch/wid_BuRguGorNdVFWNQULz-rrw",
   "session_ttl_ms": 300000,
   "topics": {
-    "jobs":   { "from_seq": 4096,  "head_seq": 5210,  "earliest_seq": 3001 },
-    "events": { "from_seq": 88123, "head_seq": 88123, "earliest_seq": 80000 },
-    "audit":  { "from_seq": 1,     "head_seq": 990,   "earliest_seq": 1 }
+    "orders":        { "from_seq": 4096,  "head_seq": 5210,  "earliest_seq": 3001 },
+    "notifications": { "from_seq": 88123, "head_seq": 88123, "earliest_seq": 80000 },
+    "audit":         { "from_seq": 1,     "head_seq": 990,   "earliest_seq": 1 }
   },
   "performance": { "server_total_ms": 0.7 }
 }
@@ -137,7 +137,7 @@ optionally, a `Last-Event-ID` to resume from a known cursor map.
 ```text
 GET /v0/watch/wid_BuRguGorNdVFWNQULz-rrw HTTP/1.1
 Accept: text/event-stream
-Last-Event-ID: eyJqb2JzIjo1MjEwLCJldmVudHMiOjg4MTMwfQ
+Last-Event-ID: eyJvcmRlcnMiOjUyMTAsIm5vdGlmaWNhdGlvbnMiOjg4MTMwfQ
 ```
 
 **Response headers** (tuned for low latency through proxies)
@@ -169,7 +169,7 @@ Every **data-bearing** frame carries an `id:` that encodes the **entire per-topi
 at that moment, as base64url-encoded JSON:
 
 ```text
-id = base64url( {"jobs":5210,"events":88130,"audit":990} )
+id = base64url( {"orders":5210,"notifications":88130,"audit":990} )
 ```
 
 On reconnect the server resolves the starting position in this order:
@@ -213,9 +213,9 @@ present only with `include_tags`; `$node` is present when the record has one; `d
 omitted per-record when `include_data:false`.
 
 ```text
-id: eyJqb2JzIjo0MDk4fQ
+id: eyJvcmRlcnMiOjQwOTh9
 event: record
-data: {"topic":"jobs","records":[{"$seq":4097,"$ts":1748467200111,"$tag":"job:render","$node":"node-B","data":{"url":"..."}},{"$seq":4098,"$ts":1748467200119,"$node":"node-C","data":{"id":42}}],"from_seq":4096,"to_seq":4098,"head_seq":5210}
+data: {"topic":"orders","records":[{"$seq":4097,"$ts":1748467200111,"$tag":"order-7731","$node":"node-B","data":{"sku":"AEROPRESS-GO","qty":1,"total":3499}},{"$seq":4098,"$ts":1748467200119,"$node":"node-C","data":{"sku":"FILTER-PACK","qty":2,"total":1598}}],"from_seq":4096,"to_seq":4098,"head_seq":5210}
 ```
 
 The payload carries `topic`, `records[]`, and a `from_seq`/`to_seq`/`head_seq` triple per
@@ -228,9 +228,9 @@ topic. The frame's `id` already advances the topic cursor to `gap_to`, so a resu
 correct.
 
 ```text
-id: eyJldmVudHMiOjgzMDAwfQ
+id: eyJub3RpZmljYXRpb25zIjo4MzAwMH0
 event: tombstone
-data: {"topic":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
+data: {"topic":"notifications","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
 ```
 
 `reason` ∈ `cap` | `ttl` | `mixed` | `recreated` | `source_trim` (a derived-router dest reflecting source-side eviction), plus `from_seq_too_old` — emitted
@@ -244,9 +244,9 @@ The topic is drained to head; the client is now live. One per topic, re-emitted 
 backlog→tailing transition.
 
 ```text
-id: eyJqb2JzIjo1MjEwfQ
+id: eyJvcmRlcnMiOjUyMTB9
 event: caught-up
-data: {"topic":"jobs","head_seq":5210}
+data: {"topic":"orders","head_seq":5210}
 ```
 
 `caught-up` — not an empty `record` batch — is the reliable "no more right now" signal,
@@ -258,9 +258,9 @@ The topic was deleted while watched. Terminal for **that topic only** — the re
 continues.
 
 ```text
-id: eyJqb2JzLmRscSI6MTJ9
+id: eyJvcmRlcnMuZGxxIjoxMn0
 event: topic-deleted
-data: {"topic":"jobs.dlq","head_seq":12,"reason":"deleted"}
+data: {"topic":"orders.dlq","head_seq":12,"reason":"deleted"}
 ```
 
 ### Heartbeat

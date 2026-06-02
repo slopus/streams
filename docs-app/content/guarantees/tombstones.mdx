@@ -67,7 +67,7 @@ In a `diff` response it is the `tombstone` field (`null` when there is no gap):
 
 ```json
 {
-  "topic": "events",
+  "topic": "pageviews",
   "records": [ { "$seq": 479101, "$ts": 1748450001000, "data": { "...": "..." } } ],
   "tombstone": {
     "gap_from": 478501,
@@ -121,7 +121,7 @@ crosses *this consumer's* cursor for a topic:
 ```text
 id: eyJldmVudHMiOjgzMDAwfQ
 event: tombstone
-data: {"topic":"events","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
+data: {"topic":"pageviews","reason":"cap","gap_from":80000,"gap_to":83000,"earliest_seq":83001,"head_seq":88130}
 ```
 
 The frame's `id:` already advances the topic cursor to `gap_to`, so a reconnect resuming after

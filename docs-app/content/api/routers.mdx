@@ -101,7 +101,7 @@ diff, a new one returns `201`.
 **Request body**
 
 ```json
-{ "source": "jobs", "dest": "audit",
+{ "source": "orders", "dest": "fulfillment",
   "preserve_node": true, "preserve_tag": true,
   "create_dest": true, "filter": null, "allow_cycle": false }
 ```
@@ -119,8 +119,8 @@ diff, a new one returns `201`.
 **Response** (`201` / `200`)
 
 ```json
-{ "router": "jobs->audit", "created": true,
-  "source": "jobs", "dest": "audit",
+{ "router": "orders->fulfillment", "created": true,
+  "source": "orders", "dest": "fulfillment",
   "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
   "performance": { "server_total_ms": 0.20 } }
 ```
@@ -150,7 +150,7 @@ Read a single router's config plus a lifetime forward counter.
 **Response** (`200`)
 
 ```json
-{ "router": "jobs->audit", "source": "jobs", "dest": "audit",
+{ "router": "orders->fulfillment", "source": "orders", "dest": "fulfillment",
   "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
   "forwarded_total": 480231,
   "performance": { "server_total_ms": 0.04 } }
@@ -176,10 +176,10 @@ allowlist, so a prefix-limited key cannot enumerate cross-tenant routers.
 
 ```json
 { "routers": [
-    { "router": "jobs->audit",  "source": "jobs", "dest": "audit",  "forwarded_total": 480231 },
-    { "router": "jobs->mirror", "source": "jobs", "dest": "mirror", "forwarded_total": 480231 }
+    { "router": "orders->fulfillment", "source": "orders", "dest": "fulfillment", "forwarded_total": 480231 },
+    { "router": "orders->analytics",   "source": "orders", "dest": "analytics",   "forwarded_total": 480231 }
   ],
-  "next_cursor": "eyJhZnRlciI6ImpvYnMtPmF1ZGl0In0=",
+  "next_cursor": "eyJhZnRlciI6Im9yZGVycy0+ZnVsZmlsbG1lbnQifQ==",
   "performance": { "server_total_ms": 0.09 } }
 ```
 
@@ -198,7 +198,7 @@ Stop forwarding immediately and remove the router. Idempotent. Already-forwarded
 **Response** (`200`)
 
 ```json
-{ "router": "jobs->audit", "deleted": true, "performance": { "server_total_ms": 0.06 } }
+{ "router": "orders->fulfillment", "deleted": true, "performance": { "server_total_ms": 0.06 } }
 ```
 
 Deleting an absent router returns `200` with `"deleted": false`.
@@ -211,23 +211,23 @@ Deleting an absent router returns `200` with `"deleted": false`.
 
 **Errors** — `403 forbidden` (lacks `delete` scope or outside the prefix allowlist).
 
-## Example: mirror a queue into an audit log
+## Example: mirror a stream into an audit log
 
-A router copies every record appended to `jobs` into `audit`, at-least-once and per-source
+A router copies every record appended to `orders` into `audit`, at-least-once and per-source
 FIFO. The origin `$node` rides through untouched.
 
 <Tabs items={['curl', 'Response']}>
   <Tabs.Tab>
 ```bash
-curl -X PUT localhost:4000/v0/routers/jobs-to-audit \
+curl -X PUT $STREAMS/v0/routers/orders-to-audit \
   -H 'content-type: application/json' \
-  -d '{ "source": "jobs", "dest": "audit" }'
+  -d '{ "source": "orders", "dest": "audit" }'
 ```
   </Tabs.Tab>
   <Tabs.Tab>
 ```json
-{ "router": "jobs-to-audit", "created": true,
-  "source": "jobs", "dest": "audit",
+{ "router": "orders-to-audit", "created": true,
+  "source": "orders", "dest": "audit",
   "preserve_node": true, "preserve_tag": true, "filter": null, "allow_cycle": false,
   "performance": { "server_total_ms": 0.20 } }
 ```

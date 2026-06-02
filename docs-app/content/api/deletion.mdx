@@ -46,15 +46,15 @@ At least one of `before_seq` / `match` is **required** (else `400 invalid_reques
 both to AND them.
 
 ```bash
-# Cancel one job by exact tag match.
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+# Cancel one order by exact tag match.
+curl -X POST $STREAMS/v0/topics/orders/delete \
   -H 'content-type: application/json' \
-  -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
+  -d '{ "match": ["tag", "Eq", "order-7731"] }'
 ```
 
 ```json
 # → 200 OK
-{ "topic": "jobs", "deleted": 1, "earliest_seq": 480001, "head_seq": 480234,
+{ "topic": "orders", "deleted": 1, "earliest_seq": 480001, "head_seq": 480234,
   "count": 233, "bytes": 478342,
   "performance": { "server_total_ms": 0.12 } }
 ```
@@ -62,7 +62,7 @@ curl -X POST localhost:4000/v0/topics/jobs/delete \
 | Field | Type | Req? | Meaning |
 |---|---|---|---|
 | `before_seq` | `u64` | one of | Delete every record with `$seq < before_seq` (a snapshot / drop-prefix by seq — logical removal, not physical compaction). |
-| `match` | predicate | one of | A tag predicate: `["tag","Eq","X"]` exact match, or `["tag","Glob","X*"]` **trailing-prefix only** (a literal prefix followed by a single `*`). A bare string is shorthand for `Eq`: `"match": "tenant42:job-9001"` == `["tag","Eq","tenant42:job-9001"]`. |
+| `match` | predicate | one of | A tag predicate: `["tag","Eq","X"]` exact match, or `["tag","Glob","X*"]` **trailing-prefix only** (a literal prefix followed by a single `*`). A bare string is shorthand for `Eq`: `"match": "order-7731"` == `["tag","Eq","order-7731"]`. |
 
 <Callout type="info">
   `Glob` is deliberately limited to a trailing `*` — a literal prefix plus one `*`. Full
@@ -76,13 +76,13 @@ curl -X POST localhost:4000/v0/topics/jobs/delete \
 | Body | Effect |
 |---|---|
 | `before_seq` only | Delete every record with `$seq < before_seq` (a snapshot / drop-prefix by seq). |
-| `match` only | Delete every **existing** record whose tag matches, bounded by the current head at call time. Point-in-time: future records with that tag are **not** deleted (e.g. revoke a kicked user's chat history with `match ["tag","Glob","chat-42:*"]`). |
-| `match` + `before_seq` | Delete records with `$seq < before_seq` **AND** a matching tag (e.g. publish v2 of a message then delete its prior versions, keeping the new one: `match ["tag","Eq","msg-123"]`, `before_seq = <seq of v2>`). |
+| `match` only | Delete every **existing** record whose tag matches, bounded by the current head at call time. Point-in-time: future records with that tag are **not** deleted (e.g. revoke a kicked user's chat history with `match ["tag","Glob","user-1042:*"]`). |
+| `match` + `before_seq` | Delete records with `$seq < before_seq` **AND** a matching tag (e.g. publish v2 of a message then delete its prior versions, keeping the new one: `match ["tag","Eq","user-1042:msg-5"]`, `before_seq = <seq of v2>`). |
 
 ### Response
 
 ```json
-{ "topic": "jobs",
+{ "topic": "orders",
   "deleted": 14,
   "earliest_seq": 480001,
   "head_seq": 480234,

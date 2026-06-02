@@ -20,7 +20,9 @@ http://{host}:{port}/v0/...
 
 The API version is the **first path segment** (`/v0`). The default bind is
 `127.0.0.1:4000`, so a local server is `http://localhost:4000/v0/...`. There is no region
-or tenant in the host — streams is single-machine.
+or tenant in the host — streams is single-machine. Examples across these docs use
+`$STREAMS` for the base URL — set it with `export STREAMS=http://localhost:4000` (or your
+server's address).
 
 Breaking changes would ship as a new prefix (`/v1`) that may run concurrently. Within a
 version, all changes are **additive**: new optional request fields, new response fields,
@@ -106,8 +108,8 @@ Every non-2xx response (except in-stream SSE errors) carries this exact shape:
 {
   "error": {
     "code": "topic_not_found",
-    "message": "topic \"jobs\" does not exist",
-    "detail": { "topic": "jobs" }
+    "message": "topic \"orders\" does not exist",
+    "detail": { "topic": "orders" }
   }
 }
 ```

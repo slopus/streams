@@ -72,7 +72,7 @@ The `match` predicate is deliberately narrow — there is **no general globbing 
   prefix. The trailing `*` is the only wildcard. This keeps a tag delete a point lookup or a
   bounded prefix range scan over the tag index — never a full-log scan, never a regex engine.
 - **`"X"`** — a bare string is shorthand for `["tag","Eq","X"]`; a bare string ending in `*`
-  (e.g. `"chat-42:*"`) is shorthand for the corresponding `Glob` prefix.
+  (e.g. `"user-1042:*"`) is shorthand for the corresponding `Glob` prefix.
 
 Records with **no tag** are never matched by a `match` (they can only be removed by
 `before_seq`).
@@ -108,13 +108,13 @@ above; disk space is only released when a whole segment is cleared.)
 
 ```bash
 # Drop everything the durable consumer has already checkpointed past.
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+curl -X POST $STREAMS/v0/topics/orders/delete \
   -H 'content-type: application/json' \
   -d '{ "before_seq": 480001 }'
 ```
 
 ```json
-{ "topic": "jobs", "deleted": 14, "earliest_seq": 480001, "head_seq": 480234,
+{ "topic": "orders", "deleted": 14, "earliest_seq": 480001, "head_seq": 480234,
   "count": 234, "bytes": 478820, "performance": { "server_total_ms": 0.12 } }
 ```
 
@@ -127,13 +127,13 @@ match with a `before_seq` set to the new version's seq.
 
 ```bash
 # v2 was just appended at seq 480300; remove only the earlier versions of this tag.
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+curl -X POST $STREAMS/v0/topics/orders/delete \
   -H 'content-type: application/json' \
-  -d '{ "match": ["tag", "Eq", "msg-123"], "before_seq": 480300 }'
+  -d '{ "match": ["tag", "Eq", "order-7731"], "before_seq": 480300 }'
 ```
 
 Because the bound is exclusive (`$seq < before_seq`), the v2 record at `480300` survives
-and every older `msg-123` is removed.
+and every older `order-7731` is removed.
 
   </Tabs.Tab>
   <Tabs.Tab>
@@ -143,14 +143,14 @@ without installing a standing filter that would also kill later writes. The clas
 a kicked user, revoke their chat.
 
 ```bash
-# Cancel every job that exists right now under this tenant's chat room.
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+# Cancel every message that exists right now under this user's chat history.
+curl -X POST $STREAMS/v0/topics/chat:general/delete \
   -H 'content-type: application/json' \
-  -d '{ "match": ["tag", "Glob", "chat-42:*"] }'
+  -d '{ "match": ["tag", "Glob", "user-1042:*"] }'
 ```
 
 This removes only what is present at call time. A message a producer sends a millisecond
-later with `tag: "chat-42:99"` is **not** affected — the delete is bounded by `head_seq + 1`
+later with `tag: "user-1042:msg-5"` is **not** affected — the delete is bounded by `head_seq + 1`
 at the instant of the call, not a subscription.
 
   </Tabs.Tab>
@@ -211,7 +211,7 @@ The response reports the count removed plus the post-delete topic state. `count`
 already exclude the deleted records.
 
 ```json
-{ "topic": "jobs",
+{ "topic": "orders",
   "deleted": 14,
   "earliest_seq": 480001,
   "head_seq": 480234,

@@ -8,7 +8,7 @@ import { Callout } from 'nextra/components'
 # vs Apache Kafka
 
 Apache Kafka is a distributed commit-log cluster built for horizontal scale, replicated HA,
-and exactly-once processing. streams is a single binary built for operational simplicity and
+and exactly-once processing. streams is a single-machine server built for operational simplicity and
 an explicit in-band loss signal. They solve different scale problems; this page compares them
 dimension by dimension and is honest about where Kafka is the right tool.
 
@@ -120,7 +120,7 @@ Kafka is a **multi-node JVM cluster**. KRaft (Kafka 4.0+) removes the ZooKeeper 
 moving metadata into Kafka itself, which simplifies operations — but it is still a cluster of
 JVM brokers to provision, balance, and monitor.
 
-streams is **one static binary** and one data directory. No JVM, no cluster bootstrap, no
+streams is **one self-contained server** and one data directory. No JVM, no cluster bootstrap, no
 quorum, no partition rebalancing. You run it, point it at a data dir, and talk to it over
 HTTP. Graceful shutdown writes a final snapshot; a readiness probe (`/v0/ready`) gates
 traffic during WAL replay. The simplicity is the point — and the cost is that there is no
@@ -153,7 +153,7 @@ multiplexed SSE, and lease queues, all on one substrate reachable with `curl`.
   <div className="verdict win">
     <h4>streams wins when</h4>
     <ul>
-      <li>You want <strong>one binary</strong>, no JVM and no cluster, with plain HTTP/JSON and <code>curl</code> as a client.</li>
+      <li>You want <strong>plain HTTP/JSON</strong>, no JVM and no cluster, with <code>curl</code> as a client.</li>
       <li>You need an <strong>explicit, in-band gap signal</strong> at delivery time, not silent offset resets.</li>
       <li>You want <strong>production lease queues</strong> today (per-message ack, dead-letter move) without KIP-932 preview caveats.</li>
       <li>You need <strong>targeted, permanent deletes</strong> by seq range or tag, not just key compaction.</li>

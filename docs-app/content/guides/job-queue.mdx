@@ -27,15 +27,17 @@ A durable, unbounded topic. Producers append jobs; each worker reads from its ow
 
 Durable so an acked job survives a crash; unbounded (`cap_records: 0`) so nothing is ever lost to eviction — replay is just reading from an earlier `from_seq`.
 
+Examples use `$STREAMS` as the base URL — see the [Quickstart](/getting-started/quickstart).
+
 ```bash
-curl -X PUT localhost:4000/v0/topics/jobs \
+curl -X PUT $STREAMS/v0/topics/transcode \
   -H 'content-type: application/json' \
   -d '{ "durable": true, "cap_records": 0, "ttl_ms": 0 }'
 ```
 
 ```json
 # →
-{ "topic": "jobs", "created": true,
+{ "topic": "transcode", "created": true,
   "config": { "ttl_ms": 0, "cap_records": 0, "cap_bytes": 0, "discard": "old",
               "durable": true, "durability": "fsync", "auto_create": true,
               "idempotency_window_ms": 120000, "dedupe_node": true },
@@ -54,17 +56,17 @@ curl -X PUT localhost:4000/v0/topics/jobs \
 A producer appends with a normal write. Tag each job so you can cancel it later. Set `node` only if a producer also consumes (so [loop-prevention](/guarantees/node-loop-prevention) filters its own jobs back out).
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs \
+curl -X POST $STREAMS/v0/topics/transcode \
   -H 'content-type: application/json' \
   -d '{ "records": [
-          { "data": { "url": "s3://b/a.png", "w": 256 }, "tag": "tenant42:job-9001" },
-          { "data": { "url": "s3://b/b.png", "w": 512 }, "tag": "tenant42:job-9002" }
+          { "data": { "src": "s3://uploads/clip-9001.mov", "preset": "1080p" }, "tag": "tenant42:clip-9001" },
+          { "data": { "src": "s3://uploads/clip-9002.mov", "preset": "720p" }, "tag": "tenant42:clip-9002" }
         ] }'
 ```
 
 ```json
 # →
-{ "topic": "jobs", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
+{ "topic": "transcode", "first_seq": 1, "last_seq": 2, "seqs": [1, 2],
   "head_seq": 2, "count": 2, "created": false, "deduped": false,
   "performance": { "server_total_ms": 0.62, "fsync_ms": 0.39 } }
 ```
@@ -81,17 +83,17 @@ curl -X POST localhost:4000/v0/topics/jobs \
 Each worker reads from its stored `from_seq`, processes the batch, then persists `next_from_seq`. Pass the worker's own `node` so it never receives jobs it produced.
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs/diff \
+curl -X POST $STREAMS/v0/topics/transcode/diff \
   -H 'content-type: application/json' \
-  -d '{ "from_seq": 0, "limit": 50, "node": "worker-1" }'
+  -d '{ "from_seq": 0, "limit": 50, "node": "transcode-1" }'
 ```
 
 ```json
 # →
-{ "topic": "jobs",
+{ "topic": "transcode",
   "records": [
-    { "$seq": 1, "$ts": 1748470000123, "data": { "url": "s3://b/a.png", "w": 256 } },
-    { "$seq": 2, "$ts": 1748470000140, "data": { "url": "s3://b/b.png", "w": 512 } }
+    { "$seq": 1, "$ts": 1748470000123, "data": { "src": "s3://uploads/clip-9001.mov", "preset": "1080p" } },
+    { "$seq": 2, "$ts": 1748470000140, "data": { "src": "s3://uploads/clip-9002.mov", "preset": "720p" } }
   ],
   "next_from_seq": 2, "head_seq": 2, "earliest_seq": 1,
   "caught_up": true, "tombstone": null, "lag": 0,
@@ -108,7 +110,7 @@ The loop is: **read → process the batch → persist `next_from_seq` → repeat
   [Ordering & Cursors](/guarantees/ordering-and-cursors).
 </Callout>
 
-To wake on new work instead of polling, set `wait_ms` on the diff (long-poll, clamped to 30000 ms) or — for true streaming — open an [SSE watch](/api/watch) on `jobs` and advance your cursor from the frames.
+To wake on new work instead of polling, set `wait_ms` on the diff (long-poll, clamped to 30000 ms) or — for true streaming — open an [SSE watch](/api/watch) on `transcode` and advance your cursor from the frames.
 
 ### Cancel a job (tag-delete)
 
@@ -118,15 +120,15 @@ Cancellation is a [permanent delete](/api/deletion) by tag. It is silent (never 
   <Tabs.Tab>
 ```bash
 # Cancel one job by exact tag match.
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+curl -X POST $STREAMS/v0/topics/transcode/delete \
   -H 'content-type: application/json' \
-  -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
+  -d '{ "match": ["tag", "Eq", "tenant42:clip-9001"] }'
 ```
   </Tabs.Tab>
   <Tabs.Tab>
 ```bash
 # Cancel every currently-queued job for a tenant (trailing-prefix match).
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+curl -X POST $STREAMS/v0/topics/transcode/delete \
   -H 'content-type: application/json' \
   -d '{ "match": ["tag", "Glob", "tenant42:*"] }'
 ```
@@ -135,14 +137,14 @@ curl -X POST localhost:4000/v0/topics/jobs/delete \
 
 ```json
 # →
-{ "topic": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
+{ "topic": "transcode", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
   "performance": { "server_total_ms": 0.12 } }
 ```
 
 A consumer whose cursor was behind the deleted seq simply advances past it — no tombstone, because a delete is voluntary removal, not capacity loss. To compact already-processed jobs, delete by `before_seq` after a checkpoint:
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs/delete -d '{ "before_seq": 480000 }'
+curl -X POST $STREAMS/v0/topics/transcode/delete -d '{ "before_seq": 480000 }'
 ```
 
 ### When the cursor queue fits
@@ -164,19 +166,19 @@ Internally a queue is two logs: the **jobs log** (the topic you produce to, dura
 `discard: "reject"` so a full durable queue refuses new jobs loudly instead of dropping unconsumed work. `dead_letter` + `max_deliveries` send poison jobs aside after N failed deliveries.
 
 ```bash
-curl -X PUT localhost:4000/v0/topics/jobs \
+curl -X PUT $STREAMS/v0/topics/transcode \
   -H 'content-type: application/json' \
   -d '{ "type": "queue", "durable": true, "discard": "reject",
         "lease_ms": 30000, "claim_jitter_ms": 0,
-        "max_deliveries": 5, "dead_letter": "jobs.dlq" }'
+        "max_deliveries": 5, "dead_letter": "transcode.dlq" }'
 ```
 
 ```json
 # →
-{ "topic": "jobs", "created": true,
+{ "topic": "transcode", "created": true,
   "config": { "type": "queue", "durable": true, "durability": "fsync",
               "discard": "reject", "lease_ms": 30000, "claim_jitter_ms": 0,
-              "max_deliveries": 5, "dead_letter": "jobs.dlq", "leases_durable": false,
+              "max_deliveries": 5, "dead_letter": "transcode.dlq", "leases_durable": false,
               "...": "..." },
   "performance": { "server_total_ms": 0.24 } }
 ```
@@ -186,7 +188,7 @@ curl -X PUT localhost:4000/v0/topics/jobs \
   `queue` returns `409 topic_exists_incompatible`. Decide the type at creation.
 </Callout>
 
-Produce jobs with the same normal write as Model A (`POST /v0/topics/jobs`). A non-queue topic rejects every claim/ack/nack/extend/work endpoint with `409 not_a_queue`.
+Produce jobs with the same normal write as Model A (`POST /v0/topics/transcode`). A non-queue topic rejects every claim/ack/nack/extend/work endpoint with `409 not_a_queue`.
 
 ### Claim → process → ack
 
@@ -197,18 +199,18 @@ Produce jobs with the same normal write as Model A (`POST /v0/topics/jobs`). A n
 Lease up to `max` claimable jobs to a worker `node`. A job is claimable iff it is in the jobs log, not acked, and has no active lease.
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs/claim \
+curl -X POST $STREAMS/v0/topics/transcode/claim \
   -H 'content-type: application/json' \
-  -d '{ "node": "worker-1", "max": 8, "lease_ms": 30000 }'
+  -d '{ "node": "transcode-1", "max": 8, "lease_ms": 30000 }'
 ```
 
 ```json
 # →
-{ "topic": "jobs",
+{ "topic": "transcode",
   "claimed": [
     { "$seq": 1, "lease_id": "lease_7f3a9c", "deadline": 1748470030000,
-      "$ts": 1748470000123, "$tag": "tenant42:job-9001", "deliveries": 1,
-      "data": { "url": "s3://b/a.png", "w": 256 } }
+      "$ts": 1748470000123, "$tag": "tenant42:clip-9001", "deliveries": 1,
+      "data": { "src": "s3://uploads/clip-9001.mov", "preset": "1080p" } }
   ],
   "count": 1, "ready": 0,
   "performance": { "server_total_ms": 0.42, "throttle_wait_ms": 0.0 } }
@@ -221,14 +223,14 @@ curl -X POST localhost:4000/v0/topics/jobs/claim \
 Ack the seqs you completed. **The ack is the delete** — the server records the completion and permanently removes the job from the jobs log. Ack is idempotent: seqs not currently leased to `node` are silently skipped and reported in `skipped`. To fence a stale worker, optionally echo the claim's `lease_id` tokens in a `lease_ids` array (validate-when-supplied — a superseded token's seq is skipped); omit it for the plain `node` + `seqs` match.
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs/ack \
+curl -X POST $STREAMS/v0/topics/transcode/ack \
   -H 'content-type: application/json' \
-  -d '{ "node": "worker-1", "seqs": [1] }'
+  -d '{ "node": "transcode-1", "seqs": [1] }'
 ```
 
 ```json
 # →
-{ "topic": "jobs", "acked": 1, "skipped": [], "ready": 0, "in_flight": 0,
+{ "topic": "transcode", "acked": 1, "skipped": [], "ready": 0, "in_flight": 0,
   "performance": { "server_total_ms": 0.30, "fsync_ms": 0.21 } }
 ```
 
@@ -240,12 +242,12 @@ Ack durability equals the topic's `durable`: on an `fsync` queue the delete is f
 
 ```bash
 # Nack: release a job back to the queue, optionally delayed (backoff).
-curl -X POST localhost:4000/v0/topics/jobs/nack \
-  -d '{ "node": "worker-1", "seqs": [2], "delay_ms": 5000 }'
+curl -X POST $STREAMS/v0/topics/transcode/nack \
+  -d '{ "node": "transcode-1", "seqs": [2], "delay_ms": 5000 }'
 
 # Extend: heartbeat a long-running job to push its deadline out.
-curl -X POST localhost:4000/v0/topics/jobs/extend \
-  -d '{ "node": "worker-1", "seqs": [3], "lease_ms": 30000 }'
+curl -X POST $STREAMS/v0/topics/transcode/extend \
+  -d '{ "node": "transcode-1", "seqs": [3], "lease_ms": 30000 }'
 ```
 
 A **nack** drops the lease and makes the job claimable again at `now + delay_ms` — semantically identical to letting the lease expire, just sooner. An **extend** sets a new `deadline = now + lease_ms` (it sets, not adds — "I need this much more time from now") and does **not** touch the delivery counter. A seq whose lease already expired and was reclaimed cannot be extended; it is skipped and the worker should re-claim.
@@ -271,7 +273,7 @@ Each job carries a delivery counter incremented on every claim (including reclai
 The dead-letter topic is an ordinary topic, so inspect poison jobs with a normal read:
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs.dlq/diff -d '{ "from_seq": 0, "include_meta": true }'
+curl -X POST $STREAMS/v0/topics/transcode.dlq/diff -d '{ "from_seq": 0, "include_meta": true }'
 ```
 
 To re-drive, read the dead-letter topic and re-produce the jobs into the source queue.
@@ -281,7 +283,7 @@ To re-drive, read the dead-letter topic and re-produce the jobs into the source 
 Instead of a claim→ack→claim poll loop, open the `/work` SSE stream. The server keeps up to `max` jobs leased-and-pushed to that one connection, claiming replacements as you ack, applying backpressure at `max` in-flight.
 
 ```bash
-curl -N "localhost:4000/v0/topics/jobs/work?node=worker-1&max=8" \
+curl -N "$STREAMS/v0/topics/transcode/work?node=transcode-1&max=8" \
   -H 'accept: text/event-stream'
 ```
 
@@ -290,7 +292,7 @@ retry: 2000
 
 id: 1
 event: job
-data: {"topic":"jobs","$seq":1,"lease_id":"lease_7f3a9c","deadline":1748470030000,"$ts":1748470000123,"$tag":"tenant42:job-9001","deliveries":1,"data":{"url":"s3://b/a.png"}}
+data: {"topic":"transcode","$seq":1,"lease_id":"lease_7f3a9c","deadline":1748470030000,"$ts":1748470000123,"$tag":"tenant42:clip-9001","deliveries":1,"data":{"src":"s3://uploads/clip-9001.mov","preset":"1080p"}}
 
 : hb
 ```

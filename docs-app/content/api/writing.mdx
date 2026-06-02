@@ -30,15 +30,15 @@ alphanumeric, allows `. _ : -`). Case-sensitive, byte-exact.
 ### Request body
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs \
+curl -X POST $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
   -d '{
-        "node": "worker-eu-1",
+        "node": "checkout-1",
         "idempotency_key": "client-batch-7f3a",
         "records": [
-          { "data": { "type": "resize", "url": "s3://b/a.png", "w": 256 },
-            "tag": "tenant42:job-9001", "meta": { "trace": "abc123" } },
-          { "data": "raw-opaque-or-base64", "tag": "tenant42:job-9002" }
+          { "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 },
+            "tag": "order-7731", "meta": { "trace": "abc123" } },
+          { "data": "raw-opaque-or-base64", "tag": "order-7732" }
         ]
       }'
 ```
@@ -46,7 +46,7 @@ curl -X POST localhost:4000/v0/topics/jobs \
 ```json
 # → 200 OK (or 201 if this write created the topic)
 {
-  "topic": "jobs",
+  "topic": "orders",
   "first_seq": 480232, "last_seq": 480233,
   "seqs": [480232, 480233],
   "head_seq": 480233, "count": 2,
@@ -106,7 +106,7 @@ on its next read.
 
 ```json
 {
-  "topic": "jobs",
+  "topic": "orders",
   "first_seq": 480232, "last_seq": 480234,
   "seqs": [480232, 480233, 480234],
   "head_seq": 480234, "count": 3,

@@ -50,7 +50,7 @@ decision.
 
 A topic is addressed by **name** in the path (`/v0/topics/:topic`); the name *is* the
 identity. Names match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$` — 1–255 bytes, starting
-alphanumeric, allowing `.` `_` `:` `-`. The `:` is for namespacing (`jobs:tenantA`). Names
+alphanumeric, allowing `.` `_` `:` `-`. The `:` is for namespacing (`chat:general`). Names
 are case-sensitive and byte-exact, with no Unicode normalization. On disk, files are keyed
 by a numeric topic id rather than the name, so a topic name can never become a path-traversal
 vector.
@@ -117,9 +117,9 @@ present and unchanged, or removed and gone.
 A record returned by a read looks like this:
 
 ```json
-{ "$seq": 4096, "$ts": 1748470000123, "$node": "worker-7", "$tag": "job:tenantA:1234",
+{ "$seq": 4096, "$ts": 1748470000123, "$node": "api-fra-1", "$tag": "order-7731",
   "meta": { "content-type": "application/json" },
-  "data": { "url": "https://...", "attempts": 0 } }
+  "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 } }
 ```
 
 `data` is opaque — the product treats it as bytes and never inspects it. `tag` is the
@@ -349,13 +349,13 @@ log scan.
 
 ```bash
 # Cancel one job by exact tag.
-curl -X POST localhost:4000/v0/topics/jobs/delete \
+curl -X POST $STREAMS/v0/topics/transcode/delete \
   -H 'content-type: application/json' \
-  -d '{ "match": ["tag", "Eq", "tenant42:job-9001"] }'
+  -d '{ "match": ["tag", "Eq", "transcode-9001"] }'
 ```
 
 ```json
-{ "topic": "jobs", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
+{ "topic": "transcode", "deleted": 1, "earliest_seq": 2, "head_seq": 2, "count": 1,
   "performance": { "server_total_ms": 0.12 } }
 ```
 

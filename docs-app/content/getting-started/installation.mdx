@@ -111,13 +111,13 @@ curl -fsS http://127.0.0.1:4000/v0/ready
 A topic is created lazily on first write — no setup needed.
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs \
+curl -X POST $STREAMS/v0/topics/orders \
   -H 'content-type: application/json' \
-  -d '{ "records": [ { "data": { "url": "s3://b/a.png" } } ] }'
+  -d '{ "records": [ { "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 } } ] }'
 ```
 
 ```json
-{ "topic": "jobs", "first_seq": 1, "last_seq": 1, "seqs": [1],
+{ "topic": "orders", "first_seq": 1, "last_seq": 1, "seqs": [1],
   "head_seq": 1, "count": 1, "created": true, "deduped": false,
   "performance": { "server_total_ms": 0.62 } }
 ```

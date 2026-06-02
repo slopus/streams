@@ -23,7 +23,7 @@ leaves to advisories you wire up yourself.
 
 ## The shape of each system
 
-streams writes records to named **topics** addressed directly by name (`jobs`,
+streams writes records to named **topics** addressed directly by name (`orders`,
 `audit`). A topic has a per-topic [durability class](/guarantees/durability) and is read by
 its monotonic `seq` cursor over plain HTTP/JSON, with live delivery over
 [multiplexed SSE](/api/watch).
@@ -166,7 +166,7 @@ until you restore a backup. There is no quorum, no follower, no automatic failov
 <Callout type="warning">
   If you need to survive the loss of a node without operator intervention, you need
   replication — and that is JetStream (or another replicated system), not streams.
-  streams trades HA for the simplicity of one binary and one disk.
+  streams trades HA for the simplicity of one process and one disk.
 </Callout>
 
 ## Accounts isolation + native TLS, and scale
@@ -206,7 +206,7 @@ streams is more modest on all three axes, and says so:
         rather than one per-stream file/memory switch.</li>
       <li>You want a producer to <strong>fail fast</strong> (<code>discard:"reject"</code>,
         <code>422 topic_full</code>) before a seq is assigned on a full topic.</li>
-      <li>You want one small binary and one disk, with no cluster to operate.</li>
+      <li>You want one self-contained server and one disk, with no cluster to operate.</li>
     </ul>
   </div>
   <div className="verdict lose">

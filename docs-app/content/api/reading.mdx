@@ -29,12 +29,12 @@ recency clock.
 ### Request body
 
 ```bash
-curl -X POST localhost:4000/v0/topics/jobs/diff \
+curl -X POST $STREAMS/v0/topics/orders/diff \
   -H 'content-type: application/json' \
   -d '{
         "from_seq": 479100,
         "limit": 500,
-        "node": "worker-eu-1",
+        "node": "checkout-1",
         "include_tags": false,
         "include_meta": true,
         "wait_ms": 0
@@ -44,12 +44,12 @@ curl -X POST localhost:4000/v0/topics/jobs/diff \
 ```json
 # → 200 OK
 {
-  "topic": "jobs",
+  "topic": "orders",
   "records": [
-    { "$seq": 479101, "$ts": 1748450001000, "$node": "worker-us-2",
-      "data": { "type": "resize", "url": "s3://b/x.png" }, "meta": { "trace": "z9" } },
+    { "$seq": 479101, "$ts": 1748450001000, "$node": "web-1",
+      "data": { "sku": "AEROPRESS-GO", "qty": 1, "total": 3499 }, "meta": { "trace": "z9" } },
     { "$seq": 479102, "$ts": 1748450001050,
-      "data": { "type": "thumbnail", "url": "s3://b/y.png" } }
+      "data": { "sku": "FILTER-PACK", "qty": 2, "total": 1198 } }
   ],
   "next_from_seq": 479102,
   "head_seq": 480234,
@@ -122,7 +122,7 @@ contiguous range).
 
 ```json
 {
-  "topic": "jobs",
+  "topic": "orders",
   "records": [ { "$seq": 479101, "$ts": 1748450001000, "data": { "...": "..." } } ],
   "tombstone": {
     "gap_from": 478501,
