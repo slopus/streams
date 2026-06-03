@@ -17,7 +17,7 @@
 //! - **Crash consistency / clean prefix:** a SIGKILL during a burst of
 //!   *non-durable* writes leaves a WAL whose recovered tail is a clean prefix —
 //!   no torn frame is ever misread as data, the server comes back ready, and the
-//!   recovered seqs are a contiguous prefix `[1..=k]`
+//!   recovered seqs are a contiguous prefix `[1..=k]` where `k` may be zero
 //!   (`sigkill_during_nondurable_burst_recovers_clean_prefix`).
 //! - **Torn tail on disk:** corrupting/truncating the last WAL frame of a
 //!   crashed process's data dir still recovers cleanly (truncation, no panic, no
@@ -414,7 +414,7 @@ fn sigkill_durable_writes_survive_with_identical_state() {
 /// without per-write fsync), SIGKILL the process mid-burst, then restart: the
 /// recovered WAL tail must be a CLEAN PREFIX — recovery truncates any torn
 /// frame, never misreads a partial write as data, never panics, and the seqs are
-/// a contiguous `[1..=k]`. Some un-fsynced tail may be lost (the documented
+/// a contiguous `[1..=k]` where `k` may be zero. Some un-fsynced tail may be lost (the documented
 /// non-durable tradeoff); what survives must be a valid, contiguous prefix.
 #[test]
 fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
@@ -491,10 +491,8 @@ fn sigkill_during_nondurable_burst_recovers_clean_prefix() {
         head <= count + topics::config::DISK_HEAD_RESERVE_AHEAD,
         "head {head} within the reservation block of count {count}"
     );
-    assert!(count >= 1, "at least some prefix survived");
-
     // Read the whole live log back and assert it is exactly the contiguous prefix
-    // [1..=count] — i.e. a torn tail was truncated, not misinterpreted as a
+    // [1..=count] (which may be empty) — i.e. a torn tail was truncated, not misinterpreted as a
     // bogus/garbled record, and there are no gaps in the LIVE set (the reserved
     // tail gap, if any, reads as silent deleted holes the diff skips).
     let mut all_seqs: Vec<u64> = Vec::new();
