@@ -38,6 +38,8 @@ jobs:
 
       - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
@@ -59,6 +61,8 @@ jobs:
 
       - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
