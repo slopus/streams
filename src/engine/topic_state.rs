@@ -1499,17 +1499,8 @@ impl TopicState {
         }
         let live_popped = index.drain_front(drop_n);
         drop(index);
-        if freed > 0 {
-            // saturating: bytes_retained is the authoritative retained sum.
-            let prev = self.bytes_retained.load(Ordering::Relaxed);
-            self.bytes_retained
-                .store(prev.saturating_sub(freed), Ordering::Relaxed);
-        }
-        if live_popped > 0 {
-            let prev = self.live_count.load(Ordering::Relaxed);
-            self.live_count
-                .store(prev.saturating_sub(live_popped), Ordering::Relaxed);
-        }
+        self.subtract_bytes_retained(freed);
+        self.subtract_live_count(live_popped);
         freed
     }
 
@@ -1623,16 +1614,8 @@ impl TopicState {
                 }
             }
         }
-        if freed_bytes > 0 {
-            let prev = self.bytes_retained.load(Ordering::Relaxed);
-            self.bytes_retained
-                .store(prev.saturating_sub(freed_bytes), Ordering::Relaxed);
-        }
-        if deleted > 0 {
-            let prev = self.live_count.load(Ordering::Relaxed);
-            self.live_count
-                .store(prev.saturating_sub(deleted), Ordering::Relaxed);
-        }
+        self.subtract_bytes_retained(freed_bytes);
+        self.subtract_live_count(deleted);
         self.reclaim_front(head);
     }
 
@@ -1671,6 +1654,28 @@ impl TopicState {
     /// Current retained payload bytes (approximate under lazy eviction).
     pub fn bytes(&self) -> u64 {
         self.bytes_retained.load(Ordering::Relaxed)
+    }
+
+    fn subtract_live_count(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let _ = self
+            .live_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(prev.saturating_sub(count))
+            });
+    }
+
+    fn subtract_bytes_retained(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self
+            .bytes_retained
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(prev.saturating_sub(bytes))
+            });
     }
 
     /// Apply a permanent, point-in-time, silent delete (DESIGN §7, API §5).
@@ -1778,16 +1783,8 @@ impl TopicState {
         let delete_below = index.delete_below;
         drop(index);
 
-        if freed_bytes > 0 {
-            let prev = self.bytes_retained.load(Ordering::Relaxed);
-            self.bytes_retained
-                .store(prev.saturating_sub(freed_bytes), Ordering::Relaxed);
-        }
-        if deleted > 0 {
-            let prev = self.live_count.load(Ordering::Relaxed);
-            self.live_count
-                .store(prev.saturating_sub(deleted), Ordering::Relaxed);
-        }
+        self.subtract_bytes_retained(freed_bytes);
+        self.subtract_live_count(deleted);
         // Advance the voluntary delete_floor (NOT evict_floor) for the prefix.
         if delete_below > 0 {
             let mut floors = self.floors.write();
@@ -1844,16 +1841,8 @@ impl TopicState {
                 }
             }
         }
-        if freed_bytes > 0 {
-            let prev = self.bytes_retained.load(Ordering::Relaxed);
-            self.bytes_retained
-                .store(prev.saturating_sub(freed_bytes), Ordering::Relaxed);
-        }
-        if deleted > 0 {
-            let prev = self.live_count.load(Ordering::Relaxed);
-            self.live_count
-                .store(prev.saturating_sub(deleted), Ordering::Relaxed);
-        }
+        self.subtract_bytes_retained(freed_bytes);
+        self.subtract_live_count(deleted);
         let front_freed = self.reclaim_front(head);
         // Segment-granular reclaim for the queue ack / dead-letter delete path:
         // an acked job whose whole sealed segment is now dead drops that file
